@@ -1,0 +1,393 @@
+import { std::collections::DynamicArray, std::collections::ConstView,
+         postgres::protocol::Cursor, postgres::protocol::ProtocolError, postgres::protocol::MAX_MESSAGE };
+export { Frame, frame, decode, BackendMessage, FieldDescription, RowValues, ErrorFields, CopyFormats,
+         HEADER_BYTES };
+
+// Every message a server sends: framing a byte stream into messages, and decoding one message's body into
+// data. Written from the "Message Formats" chapter of the PostgreSQL documentation. Messages of a fixed shape
+// must consume their body exactly, so trailing bytes are `Malformed` rather than ignored.
+
+// A backend message starts with a type byte and a 4-byte length that counts itself but not the type byte.
+comptime isize HEADER_BYTES = 5;
+
+// What the front of a receive buffer holds.
+type enum Frame {
+    // Not a whole message yet: at least `needed` bytes in all are required before trying again.
+    Incomplete(isize needed),
+    // One whole message: its type byte, and its total size including the header.
+    Complete(uint8 tag, isize total),
+    // A header no server would send. The connection cannot recover its framing.
+    Invalid(ProtocolError error)
+}
+
+fn Frame frame(ConstView<uint8> buf) {
+    if (buf.length() < HEADER_BYTES) { return Frame::Incomplete(needed: HEADER_BYTES); }
+    uint8 tag = buf[0];
+    int64 len = (cast<int64>(buf[1]) << 24) | (cast<int64>(buf[2]) << 16) | (cast<int64>(buf[3]) << 8) | cast<int64>(buf[4]);
+    if (len < 4i64) { return Frame::Invalid(error: ProtocolError::BadLength(tag: tag, length: len)); }
+    if (len > MAX_MESSAGE) { return Frame::Invalid(error: ProtocolError::TooLarge(tag: tag, length: len)); }
+    isize total = cast<isize>(len) + 1;
+    if (buf.length() < total) { return Frame::Incomplete(needed: total); }
+    return Frame::Complete(tag: tag, total: total);
+}
+
+// One column of a RowDescription.
+type resource FieldDescription {
+    string label;
+    uint32 table = 0ui32;     // the source table's OID, 0 if the column is not a plain table column
+    int16 attnum = 0i16;      // the column's number in that table, 0 if none
+    uint32 oid = 0ui32;       // the data type's OID
+    int16 size = 0i16;        // pg_type.typlen: negative for variable width
+    int32 modifier = 0;       // the type modifier (atttypmod), type-specific
+    int16 fmt = 0i16;         // 0 text, 1 binary (0 when it comes from a statement Describe)
+
+    public ctor make(string label, uint32 table, int16 attnum, uint32 oid, int16 size, int32 modifier, int16 fmt) {
+        this.label = give label; this.table = table; this.attnum = attnum; this.oid = oid;
+        this.size = size; this.modifier = modifier; this.fmt = fmt;
+    }
+    public const fn const ref string name() { return this.label; }
+    public const fn uint32 tableOid() { return this.table; }
+    public const fn int16 columnNumber() { return this.attnum; }
+    public const fn uint32 typeOid() { return this.oid; }
+    public const fn int16 typeSize() { return this.size; }
+    public const fn int32 typeModifier() { return this.modifier; }
+    public const fn int16 format() { return this.fmt; }
+}
+
+// The values of one DataRow, kept as the bytes the server sent (one allocation per row), with each column's
+// place in them. A NULL has no bytes. The structure is validated when decoded, so reading a column cannot
+// run past the row.
+type resource RowValues {
+    DynamicArray<uint8> body;
+    DynamicArray<isize> starts;
+    DynamicArray<int32> lengths;   // -1 for NULL
+
+    public ctor make(DynamicArray<uint8> body, DynamicArray<isize> starts, DynamicArray<int32> lengths) {
+        this.body = give body; this.starts = give starts; this.lengths = give lengths;
+    }
+    public const fn isize columnCount() { return this.lengths.length(); }
+    public const fn bool isNull(isize column) { return this.lengths[column] < 0; }
+    // A column's bytes; empty for NULL (ask `isNull` to tell NULL from an empty value).
+    public unsafe const fn ConstView<uint8> value(isize column) {
+        int32 n = this.lengths[column];
+        if (n < 0) { return this.body.slice(from: 0, count: 0); }
+        return this.body.slice(from: this.starts[column], count: cast<isize>(n));
+    }
+}
+
+// The fields of an ErrorResponse or NoticeResponse: one-letter codes ('S' severity, 'C' SQLSTATE, 'M'
+// message, 'D' detail, …) each with a text value, in the order sent.
+type resource ErrorFields {
+    DynamicArray<uint8> codes;
+    DynamicArray<string> texts;
+
+    public ctor make(DynamicArray<uint8> codes, DynamicArray<string> texts) { this.codes = give codes; this.texts = give texts; }
+    public const fn isize count() { return this.codes.length(); }
+    public const fn uint8 codeAt(isize i) { return this.codes[i]; }
+    public const fn const ref string textAt(isize i) { return this.texts[i]; }
+    // The value of field `code`, if it was sent.
+    public const fn Optional<string> field(uint8 code) {
+        isize i = 0;
+        while (i < this.codes.length()) {
+            if (this.codes[i] == code) { return Optional::Some(value: copy this.texts[i]); }
+            i = i + 1;
+        }
+        return Optional::None;
+    }
+}
+
+// The formats a COPY will use: overall (0 text, 1 binary) and per column.
+type resource CopyFormats {
+    int8 overallFormat = 0i8;
+    DynamicArray<int16> columns;
+    public ctor make(int8 overall, DynamicArray<int16> columns) { this.overallFormat = overall; this.columns = give columns; }
+    public const fn int8 overall() { return this.overallFormat; }
+    public const fn isize columnCount() { return this.columns.length(); }
+    public const fn int16 columnFormat(isize i) { return this.columns[i]; }
+}
+
+type enum BackendMessage {
+    AuthenticationOk,
+    AuthenticationCleartextPassword,
+    AuthenticationMd5Password(InlineArray<uint8>#(4) salt),
+    AuthenticationSasl(DynamicArray<string> mechanisms),
+    AuthenticationSaslContinue(DynamicArray<uint8> data),
+    AuthenticationSaslFinal(DynamicArray<uint8> data),
+    // Kerberos V5 (2), GSSAPI (7, 8), SSPI (9), or a method newer than this client.
+    AuthenticationUnsupported(int32 method),
+    BackendKeyData(int32 processId, DynamicArray<uint8> secretKey),
+    BindComplete,
+    CloseComplete,
+    CommandComplete(string commandTag),
+    CopyData(DynamicArray<uint8> data),
+    CopyDone,
+    CopyInResponse(CopyFormats formats),
+    CopyOutResponse(CopyFormats formats),
+    CopyBothResponse(CopyFormats formats),
+    DataRow(RowValues row),
+    EmptyQueryResponse,
+    ErrorResponse(ErrorFields fields),
+    NoticeResponse(ErrorFields fields),
+    NegotiateProtocolVersion(int32 newestMinor, DynamicArray<string> unrecognized),
+    NoData,
+    NotificationResponse(int32 processId, string channel, string payload),
+    ParameterDescription(DynamicArray<uint32> oids),
+    ParameterStatus(string name, string value),
+    ParseComplete,
+    PortalSuspended,
+    // 'I' idle, 'T' in a transaction block, 'E' in a failed transaction block.
+    ReadyForQuery(uint8 status),
+    RowDescription(DynamicArray<FieldDescription> fields)
+}
+
+// Decode one message: `tag` is its type byte and `body` everything after the length field.
+unsafe fn Result<BackendMessage, ProtocolError> decode(uint8 tag, ConstView<uint8> body) {
+    Cursor c = Cursor.at(tag: tag);
+    if (tag == 82ui8) { return decodeAuthentication(c: c, b: body); }                 // 'R'
+    if (tag == 75ui8) {                                                               // 'K'
+        Result<int32, ProtocolError> pid = c.readI32(b: body);
+        int32 p = match (give pid) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        isize keyLen = c.remaining(b: body);
+        if (keyLen < 4 || keyLen > 256) { return Result::Err(error: ProtocolError::Malformed(tag: tag, what: "a cancel key of ${keyLen} bytes")); }
+        Result<DynamicArray<uint8>, ProtocolError> key = c.readRest(b: body);
+        return match (give key) {
+            case Ok(value: k): Result::Ok(value: BackendMessage::BackendKeyData(processId: p, secretKey: give k));
+            case Err(error: e): Result::Err(error: give e);
+        };
+    }
+    if (tag == 50ui8) { return empty(tag: tag, b: body, m: BackendMessage::BindComplete); }       // '2'
+    if (tag == 51ui8) { return empty(tag: tag, b: body, m: BackendMessage::CloseComplete); }      // '3'
+    if (tag == 67ui8) {                                                               // 'C'
+        Result<string, ProtocolError> t = c.readCString(b: body);
+        string s = match (give t) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (!c.atEnd(b: body)) { return trailing(tag: tag); }
+        return Result::Ok(value: BackendMessage::CommandComplete(commandTag: give s));
+    }
+    if (tag == 100ui8) {                                                              // 'd'
+        Result<DynamicArray<uint8>, ProtocolError> d = c.readRest(b: body);
+        return match (give d) { case Ok(value: v): Result::Ok(value: BackendMessage::CopyData(data: give v)); case Err(error: e): Result::Err(error: give e); };
+    }
+    if (tag == 99ui8) { return empty(tag: tag, b: body, m: BackendMessage::CopyDone); }           // 'c'
+    if (tag == 71ui8 || tag == 72ui8 || tag == 87ui8) {                               // 'G' 'H' 'W'
+        Result<CopyFormats, ProtocolError> f = decodeCopyFormats(c: c, b: body);
+        CopyFormats formats = match (give f) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (tag == 71ui8) { return Result::Ok(value: BackendMessage::CopyInResponse(formats: give formats)); }
+        if (tag == 72ui8) { return Result::Ok(value: BackendMessage::CopyOutResponse(formats: give formats)); }
+        return Result::Ok(value: BackendMessage::CopyBothResponse(formats: give formats));
+    }
+    if (tag == 68ui8) {                                                               // 'D'
+        Result<RowValues, ProtocolError> r = decodeDataRow(c: c, b: body);
+        return match (give r) { case Ok(value: v): Result::Ok(value: BackendMessage::DataRow(row: give v)); case Err(error: e): Result::Err(error: give e); };
+    }
+    if (tag == 73ui8) { return empty(tag: tag, b: body, m: BackendMessage::EmptyQueryResponse); } // 'I'
+    if (tag == 69ui8 || tag == 78ui8) {                                               // 'E' 'N'
+        Result<ErrorFields, ProtocolError> f = decodeErrorFields(c: c, b: body);
+        ErrorFields fields = match (give f) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (tag == 69ui8) { return Result::Ok(value: BackendMessage::ErrorResponse(fields: give fields)); }
+        return Result::Ok(value: BackendMessage::NoticeResponse(fields: give fields));
+    }
+    if (tag == 118ui8) {                                                              // 'v'
+        Result<int32, ProtocolError> minor = c.readI32(b: body);
+        int32 m = match (give minor) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        Result<int32, ProtocolError> count = c.readI32(b: body);
+        int32 n = match (give count) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (n < 0 || cast<isize>(n) > c.remaining(b: body)) { return Result::Err(error: ProtocolError::BadLength(tag: tag, length: cast<int64>(n))); }
+        DynamicArray<string> names = DynamicArray.empty();
+        int32 i = 0;
+        while (i < n) {
+            Result<string, ProtocolError> s = c.readCString(b: body);
+            match (give s) { case Ok(value: v): { names.add(item: give v); } case Err(error: e): { return Result::Err(error: give e); } };
+            i = i + 1;
+        }
+        if (!c.atEnd(b: body)) { return trailing(tag: tag); }
+        return Result::Ok(value: BackendMessage::NegotiateProtocolVersion(newestMinor: m, unrecognized: give names));
+    }
+    if (tag == 110ui8) { return empty(tag: tag, b: body, m: BackendMessage::NoData); }            // 'n'
+    if (tag == 65ui8) {                                                               // 'A'
+        Result<int32, ProtocolError> pid = c.readI32(b: body);
+        int32 p = match (give pid) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        Result<string, ProtocolError> ch = c.readCString(b: body);
+        string channel = match (give ch) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        Result<string, ProtocolError> pl = c.readCString(b: body);
+        string payload = match (give pl) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (!c.atEnd(b: body)) { return trailing(tag: tag); }
+        return Result::Ok(value: BackendMessage::NotificationResponse(processId: p, channel: give channel, payload: give payload));
+    }
+    if (tag == 116ui8) {                                                              // 't'
+        Result<int16, ProtocolError> count = c.readI16(b: body);
+        int16 n = match (give count) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (n < 0i16 || cast<isize>(n) * 4 != c.remaining(b: body)) { return Result::Err(error: ProtocolError::BadLength(tag: tag, length: cast<int64>(n))); }
+        DynamicArray<uint32> oids = DynamicArray.withCapacity(capacity: cast<isize>(n));
+        int16 i = 0i16;
+        while (i < n) {
+            Result<uint32, ProtocolError> o = c.readU32(b: body);
+            match (give o) { case Ok(value: v): { oids.add(item: v); } case Err(error: e): { return Result::Err(error: give e); } };
+            i = i + 1i16;
+        }
+        return Result::Ok(value: BackendMessage::ParameterDescription(oids: give oids));
+    }
+    if (tag == 83ui8) {                                                               // 'S'
+        Result<string, ProtocolError> k = c.readCString(b: body);
+        string name = match (give k) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        Result<string, ProtocolError> v = c.readCString(b: body);
+        string value = match (give v) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+        if (!c.atEnd(b: body)) { return trailing(tag: tag); }
+        return Result::Ok(value: BackendMessage::ParameterStatus(name: give name, value: give value));
+    }
+    if (tag == 49ui8) { return empty(tag: tag, b: body, m: BackendMessage::ParseComplete); }      // '1'
+    if (tag == 115ui8) { return empty(tag: tag, b: body, m: BackendMessage::PortalSuspended); }   // 's'
+    if (tag == 90ui8) {                                                               // 'Z'
+        Result<uint8, ProtocolError> s = c.readU8(b: body);
+        uint8 status = match (give s) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (!c.atEnd(b: body)) { return trailing(tag: tag); }
+        if (status != 73ui8 && status != 84ui8 && status != 69ui8) {
+            return Result::Err(error: ProtocolError::Malformed(tag: tag, what: "transaction status ${status}"));
+        }
+        return Result::Ok(value: BackendMessage::ReadyForQuery(status: status));
+    }
+    if (tag == 84ui8) {                                                               // 'T'
+        Result<DynamicArray<FieldDescription>, ProtocolError> f = decodeRowDescription(c: c, b: body);
+        return match (give f) { case Ok(value: v): Result::Ok(value: BackendMessage::RowDescription(fields: give v)); case Err(error: e): Result::Err(error: give e); };
+    }
+    return Result::Err(error: ProtocolError::Unexpected(tag: tag));
+}
+
+fn Result<BackendMessage, ProtocolError> empty(uint8 tag, ConstView<uint8> b, BackendMessage m) {
+    if (b.length() != 0) { return trailing(tag: tag); }
+    return Result::Ok(value: give m);
+}
+
+fn Result<BackendMessage, ProtocolError> trailing(uint8 tag) {
+    return Result::Err(error: ProtocolError::Malformed(tag: tag, what: "bytes after the last field"));
+}
+
+unsafe fn Result<BackendMessage, ProtocolError> decodeAuthentication(ref Cursor c, ConstView<uint8> b) {
+    uint8 tag = 82ui8;
+    Result<int32, ProtocolError> code = c.readI32(b: b);
+    int32 method = match (give code) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+    if (method == 0 || method == 3) {
+        if (!c.atEnd(b: b)) { return trailing(tag: tag); }
+        if (method == 0) { return Result::Ok(value: BackendMessage::AuthenticationOk); }
+        return Result::Ok(value: BackendMessage::AuthenticationCleartextPassword);
+    }
+    if (method == 5) {
+        if (c.remaining(b: b) != 4) { return Result::Err(error: ProtocolError::Malformed(tag: tag, what: "an md5 salt that is not 4 bytes")); }
+        InlineArray<uint8>#(4) salt = [0; 4];
+        isize i = 0;
+        while (i < 4) {
+            Result<uint8, ProtocolError> v = c.readU8(b: b);
+            match (give v) { case Ok(value: x): { salt[cast<usize>(i)] = x; } case Err(error: e): { return Result::Err(error: give e); } };
+            i = i + 1;
+        }
+        return Result::Ok(value: BackendMessage::AuthenticationMd5Password(salt: salt));
+    }
+    if (method == 10) {
+        DynamicArray<string> mechanisms = DynamicArray.empty();
+        while (true) {
+            Result<string, ProtocolError> s = c.readCString(b: b);
+            string name = match (give s) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+            if (name.length() == 0) { break; }
+            mechanisms.add(item: give name);
+        }
+        if (!c.atEnd(b: b)) { return trailing(tag: tag); }
+        return Result::Ok(value: BackendMessage::AuthenticationSasl(mechanisms: give mechanisms));
+    }
+    if (method == 11 || method == 12) {
+        Result<DynamicArray<uint8>, ProtocolError> d = c.readRest(b: b);
+        DynamicArray<uint8> data = match (give d) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (method == 11) { return Result::Ok(value: BackendMessage::AuthenticationSaslContinue(data: give data)); }
+        return Result::Ok(value: BackendMessage::AuthenticationSaslFinal(data: give data));
+    }
+    return Result::Ok(value: BackendMessage::AuthenticationUnsupported(method: method));
+}
+
+fn Result<CopyFormats, ProtocolError> decodeCopyFormats(ref Cursor c, ConstView<uint8> b) {
+    uint8 tag = 71ui8;
+    Result<uint8, ProtocolError> o = c.readU8(b: b);
+    uint8 overall = match (give o) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+    Result<int16, ProtocolError> count = c.readI16(b: b);
+    int16 n = match (give count) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+    if (n < 0i16 || cast<isize>(n) * 2 != c.remaining(b: b)) { return Result::Err(error: ProtocolError::BadLength(tag: tag, length: cast<int64>(n))); }
+    DynamicArray<int16> columns = DynamicArray.withCapacity(capacity: cast<isize>(n));
+    int16 i = 0i16;
+    while (i < n) {
+        Result<int16, ProtocolError> f = c.readI16(b: b);
+        match (give f) { case Ok(value: v): { columns.add(item: v); } case Err(error: e): { return Result::Err(error: give e); } };
+        i = i + 1i16;
+    }
+    return Result::Ok(value: CopyFormats.make(overall: truncate<int8>(overall), columns: give columns));
+}
+
+fn Result<RowValues, ProtocolError> decodeDataRow(ref Cursor c, ConstView<uint8> b) {
+    uint8 tag = 68ui8;
+    Result<int16, ProtocolError> count = c.readI16(b: b);
+    int16 n = match (give count) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+    if (n < 0i16 || cast<isize>(n) * 4 > c.remaining(b: b)) { return Result::Err(error: ProtocolError::BadLength(tag: tag, length: cast<int64>(n))); }
+    // The whole body is kept; each column's offset is relative to it.
+    DynamicArray<isize> starts = DynamicArray.withCapacity(capacity: cast<isize>(n));
+    DynamicArray<int32> lengths = DynamicArray.withCapacity(capacity: cast<isize>(n));
+    int16 i = 0i16;
+    while (i < n) {
+        Result<int32, ProtocolError> l = c.readI32(b: b);
+        int32 len = match (give l) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (len < -1 || cast<isize>(len) > c.remaining(b: b)) { return Result::Err(error: ProtocolError::BadLength(tag: tag, length: cast<int64>(len))); }
+        starts.add(item: c.position());
+        lengths.add(item: len);
+        if (len > 0) {
+            Result<Unit, ProtocolError> skipped = c.skip(b: b, n: cast<isize>(len));
+            match (give skipped) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        }
+        i = i + 1i16;
+    }
+    if (!c.atEnd(b: b)) { return Result::Err(error: ProtocolError::Malformed(tag: tag, what: "bytes after the last column")); }
+    Cursor whole = Cursor.at(tag: tag);
+    Result<DynamicArray<uint8>, ProtocolError> body = whole.readRest(b: b);
+    DynamicArray<uint8> kept = match (give body) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    return Result::Ok(value: RowValues.make(body: give kept, starts: give starts, lengths: give lengths));
+}
+
+unsafe fn Result<ErrorFields, ProtocolError> decodeErrorFields(ref Cursor c, ConstView<uint8> b) {
+    DynamicArray<uint8> codes = DynamicArray.empty();
+    DynamicArray<string> texts = DynamicArray.empty();
+    while (true) {
+        Result<uint8, ProtocolError> k = c.readU8(b: b);
+        uint8 code = match (give k) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (code == 0ui8) { break; }
+        Result<string, ProtocolError> t = c.readCString(b: b);
+        string text = match (give t) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        codes.add(item: code);
+        texts.add(item: give text);
+    }
+    if (!c.atEnd(b: b)) { return Result::Err(error: ProtocolError::Malformed(tag: c.messageTag(), what: "bytes after the field terminator")); }
+    return Result::Ok(value: ErrorFields.make(codes: give codes, texts: give texts));
+}
+
+unsafe fn Result<DynamicArray<FieldDescription>, ProtocolError> decodeRowDescription(ref Cursor c, ConstView<uint8> b) {
+    uint8 tag = 84ui8;
+    Result<int16, ProtocolError> count = c.readI16(b: b);
+    int16 n = match (give count) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+    // Each field is at least a 1-byte name terminator and 18 bytes of numbers.
+    if (n < 0i16 || cast<isize>(n) * 19 > c.remaining(b: b)) { return Result::Err(error: ProtocolError::BadLength(tag: tag, length: cast<int64>(n))); }
+    DynamicArray<FieldDescription> fields = DynamicArray.withCapacity(capacity: cast<isize>(n));
+    int16 i = 0i16;
+    while (i < n) {
+        Result<string, ProtocolError> nm = c.readCString(b: b);
+        string name = match (give nm) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        Result<uint32, ProtocolError> table = c.readU32(b: b);
+        Result<int16, ProtocolError> attnum = c.readI16(b: b);
+        Result<uint32, ProtocolError> oid = c.readU32(b: b);
+        Result<int16, ProtocolError> size = c.readI16(b: b);
+        Result<int32, ProtocolError> modifier = c.readI32(b: b);
+        Result<int16, ProtocolError> fmt = c.readI16(b: b);
+        uint32 tv = match (give table) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        int16 av = match (give attnum) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        uint32 ov = match (give oid) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        int16 sv = match (give size) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        int32 mv = match (give modifier) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        int16 fv = match (give fmt) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        fields.add(item: FieldDescription.make(label: give name, table: tv, attnum: av, oid: ov, size: sv, modifier: mv, fmt: fv));
+        i = i + 1i16;
+    }
+    if (!c.atEnd(b: b)) { return Result::Err(error: ProtocolError::Malformed(tag: tag, what: "bytes after the last field")); }
+    return Result::Ok(value: give fields);
+}

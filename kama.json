@@ -11,6 +11,7 @@
     ]
   },
   "modules": {
-    ".": { "visibility": "public" }
+    ".":        { "visibility": "public" },
+    "protocol": { "visibility": "public" }
   }
 }

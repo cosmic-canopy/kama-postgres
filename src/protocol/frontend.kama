@@ -1,0 +1,214 @@
+import { std::collections::DynamicArray, std::collections::ConstView, postgres::protocol::MessageWriter };
+export { PROTOCOL_3_0, PROTOCOL_3_2, BindValues, startup, sslRequest, gssEncRequest, cancelRequest, password,
+         saslInitialResponse, saslResponse, query, parse, bind, describePortal, describeStatement, execute,
+         closePortal, closeStatement, sync, flush, terminate, copyData, copyDone, copyFail };
+
+// Every message a client sends, one function each, written from the "Message Formats" chapter of the
+// PostgreSQL documentation. Each appends one framed message to a `MessageWriter`. A function that takes text
+// answers false, writing nothing, when the text holds a NUL byte, which no string field can carry.
+
+// Protocol versions, as the StartupMessage carries them: major << 16 | minor. 3.2 is PostgreSQL 18's, with a
+// variable-length cancel key; a server that is older answers NegotiateProtocolVersion.
+comptime int32 PROTOCOL_3_0 = 196608;
+comptime int32 PROTOCOL_3_2 = 196610;
+
+// The request codes that stand where a protocol version would in an untagged message.
+comptime int32 CANCEL_REQUEST_CODE = 80877102;
+comptime int32 SSL_REQUEST_CODE = 80877103;
+comptime int32 GSSENC_REQUEST_CODE = 80877104;
+
+// The parameters of one Bind: per value its type OID (0 lets the server infer it), its format (0 text,
+// 1 binary) and its bytes, or NULL. The same object supplies Parse's parameter types.
+type resource BindValues {
+    DynamicArray<uint32> oids;
+    DynamicArray<int16> formats;
+    DynamicArray<int32> lengths;   // -1 for NULL
+    DynamicArray<uint8> data;      // every non-NULL value, back to back
+
+    public ctor make() {
+        this.oids = DynamicArray.empty();
+        this.formats = DynamicArray.empty();
+        this.lengths = DynamicArray.empty();
+        this.data = DynamicArray.empty();
+    }
+
+    public fn void addNull(uint32 oid) {
+        this.oids.add(item: oid);
+        this.formats.add(item: 0i16);
+        this.lengths.add(item: -1);
+    }
+
+    public fn void add(uint32 oid, int16 format, ConstView<uint8> value) {
+        this.oids.add(item: oid);
+        this.formats.add(item: format);
+        this.lengths.add(item: cast<int32>(value.length()));
+        isize i = 0;
+        while (i < value.length()) { this.data.add(item: value[i]); i = i + 1; }
+    }
+
+    public fn void addText(uint32 oid, const ref string text) { this.add(oid: oid, format: 0i16, value: text.bytes()); }
+
+    public const fn isize count() { return this.oids.length(); }
+    public const fn uint32 oidAt(isize i) { return this.oids[i]; }
+    public const fn int16 formatAt(isize i) { return this.formats[i]; }
+    public const fn int32 lengthAt(isize i) { return this.lengths[i]; }
+    public const fn ConstView<uint8> bytes() { return this.data.view(); }
+}
+
+// StartupMessage: the protocol version, then name/value pairs (user, database, application_name, options,
+// any run-time parameter), then a terminating zero byte. `names` and `values` pair up by index.
+fn bool startup(ref MessageWriter w, int32 version, const ref DynamicArray<string> names,
+                const ref DynamicArray<string> values) {
+    if (names.length() != values.length()) { panic(msg: "startup: names and values must pair up"); }
+    MessageWriter body = MessageWriter.make();
+    isize i = 0;
+    while (i < names.length()) {
+        if (!body.putCString(s: names[i]) || !body.putCString(s: values[i])) { return false; }
+        i = i + 1;
+    }
+    w.beginUntagged();
+    w.putI32(v: version);
+    w.putBytes(b: body.view());
+    w.putU8(v: 0ui8);
+    w.end();
+    return true;
+}
+
+fn void sslRequest(ref MessageWriter w) { w.beginUntagged(); w.putI32(v: SSL_REQUEST_CODE); w.end(); }
+
+fn void gssEncRequest(ref MessageWriter w) { w.beginUntagged(); w.putI32(v: GSSENC_REQUEST_CODE); w.end(); }
+
+// CancelRequest: sent on a NEW connection, with the process id and secret key BackendKeyData gave. The key is
+// 4 bytes under protocol 3.0 and up to 256 under 3.2; it is sent as the server gave it.
+fn void cancelRequest(ref MessageWriter w, int32 processId, ConstView<uint8> secretKey) {
+    w.beginUntagged();
+    w.putI32(v: CANCEL_REQUEST_CODE);
+    w.putI32(v: processId);
+    w.putBytes(b: secretKey);
+    w.end();
+}
+
+// PasswordMessage: a cleartext password, or an md5 response ("md5" + 32 hex digits).
+fn bool password(ref MessageWriter w, const ref string text) {
+    MessageWriter body = MessageWriter.make();
+    if (!body.putCString(s: text)) { return false; }
+    w.begin(tag: 112ui8);   // 'p'
+    w.putBytes(b: body.view());
+    w.end();
+    return true;
+}
+
+// SASLInitialResponse: the chosen mechanism and the client-first message.
+fn bool saslInitialResponse(ref MessageWriter w, const ref string mechanism, ConstView<uint8> data) {
+    MessageWriter body = MessageWriter.make();
+    if (!body.putCString(s: mechanism)) { return false; }
+    w.begin(tag: 112ui8);   // 'p'
+    w.putBytes(b: body.view());
+    w.putI32(v: cast<int32>(data.length()));
+    w.putBytes(b: data);
+    w.end();
+    return true;
+}
+
+// SASLResponse: the next SASL message, raw.
+fn void saslResponse(ref MessageWriter w, ConstView<uint8> data) {
+    w.begin(tag: 112ui8);   // 'p'
+    w.putBytes(b: data);
+    w.end();
+}
+
+// Query: the simple protocol, one or more statements separated by semicolons.
+fn bool query(ref MessageWriter w, const ref string sql) {
+    MessageWriter body = MessageWriter.make();
+    if (!body.putCString(s: sql)) { return false; }
+    w.begin(tag: 81ui8);    // 'Q'
+    w.putBytes(b: body.view());
+    w.end();
+    return true;
+}
+
+// Parse: prepare `sql` as statement `name` ("" is the unnamed statement), with the parameter types `params`
+// declares (0 for "infer").
+fn bool parse(ref MessageWriter w, const ref string name, const ref string sql, const ref BindValues params) {
+    MessageWriter body = MessageWriter.make();
+    if (!body.putCString(s: name) || !body.putCString(s: sql)) { return false; }
+    w.begin(tag: 80ui8);    // 'P'
+    w.putBytes(b: body.view());
+    w.putI16(v: cast<int16>(params.count()));
+    isize i = 0;
+    while (i < params.count()) { w.putU32(v: params.oidAt(i: i)); i = i + 1; }
+    w.end();
+    return true;
+}
+
+// Bind: statement `statement` with `params` into portal `portal` ("" for the unnamed one), asking for every
+// result column in `resultFormat` (0 text, 1 binary).
+fn bool bind(ref MessageWriter w, const ref string portal, const ref string statement,
+             const ref BindValues params, int16 resultFormat) {
+    MessageWriter body = MessageWriter.make();
+    if (!body.putCString(s: portal) || !body.putCString(s: statement)) { return false; }
+    w.begin(tag: 66ui8);    // 'B'
+    w.putBytes(b: body.view());
+    isize n = params.count();
+    w.putI16(v: cast<int16>(n));
+    isize i = 0;
+    while (i < n) { w.putI16(v: params.formatAt(i: i)); i = i + 1; }
+    w.putI16(v: cast<int16>(n));
+    isize offset = 0;
+    i = 0;
+    while (i < n) {
+        int32 len = params.lengthAt(i: i);
+        w.putI32(v: len);
+        if (len > 0) {
+            w.putBytes(b: params.bytes().slice(from: offset, count: cast<isize>(len)));
+            offset = offset + cast<isize>(len);
+        }
+        i = i + 1;
+    }
+    w.putI16(v: 1i16);      // one result format, applied to every column
+    w.putI16(v: resultFormat);
+    w.end();
+    return true;
+}
+
+fn bool describePortal(ref MessageWriter w, const ref string name) { return describeOrClose(w: w, tag: 68ui8, kind: 80ui8, name: name); }
+fn bool describeStatement(ref MessageWriter w, const ref string name) { return describeOrClose(w: w, tag: 68ui8, kind: 83ui8, name: name); }
+fn bool closePortal(ref MessageWriter w, const ref string name) { return describeOrClose(w: w, tag: 67ui8, kind: 80ui8, name: name); }
+fn bool closeStatement(ref MessageWriter w, const ref string name) { return describeOrClose(w: w, tag: 67ui8, kind: 83ui8, name: name); }
+
+// Describe ('D') and Close ('C') share a shape: the kind ('S' statement, 'P' portal) and a name.
+fn bool describeOrClose(ref MessageWriter w, uint8 tag, uint8 kind, const ref string name) {
+    MessageWriter body = MessageWriter.make();
+    if (!body.putCString(s: name)) { return false; }
+    w.begin(tag: tag);
+    w.putU8(v: kind);
+    w.putBytes(b: body.view());
+    w.end();
+    return true;
+}
+
+// Execute: run portal `portal`, returning at most `maxRows` rows (0 for all) before PortalSuspended.
+fn bool execute(ref MessageWriter w, const ref string portal, int32 maxRows) {
+    MessageWriter body = MessageWriter.make();
+    if (!body.putCString(s: portal)) { return false; }
+    w.begin(tag: 69ui8);    // 'E'
+    w.putBytes(b: body.view());
+    w.putI32(v: maxRows);
+    w.end();
+    return true;
+}
+
+fn void sync(ref MessageWriter w) { w.begin(tag: 83ui8); w.end(); }        // 'S'
+fn void flush(ref MessageWriter w) { w.begin(tag: 72ui8); w.end(); }       // 'H'
+fn void terminate(ref MessageWriter w) { w.begin(tag: 88ui8); w.end(); }   // 'X'
+
+fn void copyData(ref MessageWriter w, ConstView<uint8> data) { w.begin(tag: 100ui8); w.putBytes(b: data); w.end(); }  // 'd'
+fn void copyDone(ref MessageWriter w) { w.begin(tag: 99ui8); w.end(); }    // 'c'
+fn bool copyFail(ref MessageWriter w, const ref string reason) {
+    MessageWriter body = MessageWriter.make();
+    if (!body.putCString(s: reason)) { return false; }
+    w.begin(tag: 102ui8);   // 'f'
+    w.putBytes(b: body.view());
+    w.end();
+    return true;
+}

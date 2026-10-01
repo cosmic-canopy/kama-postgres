@@ -1,0 +1,305 @@
+// postgres::protocol, byte for byte. Every expected encoding below is written out from the "Message Formats"
+// chapter of the PostgreSQL documentation (type byte, Int32 length counting itself, fields big-endian, strings
+// NUL-terminated). The live-server integration tests then prove the same encoder against real servers.
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::hex::encode as hexEncode,
+         std::encoding::hex::decode as hexDecode, std::encoding::hex::DecodeError,
+         std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error,
+         postgres::protocol::MessageWriter, postgres::protocol::BindValues, postgres::protocol::ProtocolError,
+         postgres::protocol::PROTOCOL_3_0, postgres::protocol::startup, postgres::protocol::sslRequest,
+         postgres::protocol::cancelRequest, postgres::protocol::query, postgres::protocol::parse,
+         postgres::protocol::bind, postgres::protocol::execute, postgres::protocol::describePortal,
+         postgres::protocol::closeStatement, postgres::protocol::sync, postgres::protocol::saslInitialResponse,
+         postgres::protocol::password,
+         postgres::protocol::Frame, postgres::protocol::frame, postgres::protocol::decode,
+         postgres::protocol::BackendMessage, postgres::protocol::FieldDescription, postgres::protocol::RowValues,
+         postgres::protocol::ErrorFields,
+         postgres_unit_tests::check };
+export { protocolTests, unhex };
+
+fn DynamicArray<uint8> unhex(const ref string text) {
+    string compact = text.replace(old: " ", with: "");
+    Result<DynamicArray<uint8>, DecodeError> r = hexDecode(text: compact);
+    return match (give r) { case Ok(value: b): give b; case Err(error: e): { panic(msg: "unhex: a typo in a test vector"); return DynamicArray.empty(); } };
+}
+
+// Indexing a view a call returns is KTLS-2 (../kama-tls/KAMA_GAPS.md); a view parameter is not.
+fn uint8 byteAt(ConstView<uint8> v, isize i) { return v[i]; }
+
+fn bool sameHex(ConstView<uint8> got, const ref string want) {
+    string compact = want.replace(old: " ", with: "");
+    string g = hexEncode(bytes: got);
+    return g.equals(other: compact);
+}
+
+// ---- frontend --------------------------------------------------------------------------------------------
+
+fn int32 frontendTests() {
+    int32 f = 0;
+    MessageWriter w = MessageWriter.make();
+
+    sync(w: w);
+    f = f + check(ok: sameHex(got: w.view(), want: "53 00000004"), what: "frontend: Sync");
+    w.clear();
+
+    string select1 = "SELECT 1";
+    bool q = query(w: w, sql: select1);
+    f = f + check(ok: q && sameHex(got: w.view(), want: "51 0000000d 53454c4543542031 00"), what: "frontend: Query");
+    w.clear();
+
+    DynamicArray<string> names = DynamicArray.empty();
+    DynamicArray<string> values = DynamicArray.empty();
+    names.add(item: "user"); values.add(item: "kp");
+    names.add(item: "database"); values.add(item: "db");
+    bool s = startup(w: w, version: PROTOCOL_3_0, names: names, values: values);
+    f = f + check(ok: s && sameHex(got: w.view(), want: "0000001d 00030000 7573657200 6b7000 646174616261736500 646200 00"), what: "frontend: StartupMessage (protocol 3.0)");
+    w.clear();
+
+    sslRequest(w: w);
+    f = f + check(ok: sameHex(got: w.view(), want: "00000008 04d2162f"), what: "frontend: SSLRequest (80877103)");
+    w.clear();
+
+    DynamicArray<uint8> key = unhex(text: "01020304");
+    cancelRequest(w: w, processId: 7, secretKey: key.view());
+    f = f + check(ok: sameHex(got: w.view(), want: "00000010 04d2162e 00000007 01020304"), what: "frontend: CancelRequest (80877102)");
+    w.clear();
+
+    BindValues none = BindValues.make();
+    string s1 = "s1";
+    string sql = "SELECT $1";
+    BindValues one = BindValues.make();
+    string v42 = "42";
+    one.addText(oid: 23ui32, text: v42);
+    bool p = parse(w: w, name: s1, sql: sql, params: one);
+    f = f + check(ok: p && sameHex(got: w.view(), want: "50 00000017 733100 53454c45435420243100 0001 00000017"), what: "frontend: Parse with one int4 parameter");
+    w.clear();
+
+    BindValues two = BindValues.make();
+    two.addText(oid: 23ui32, text: v42);
+    two.addNull(oid: 25ui32);
+    string unnamed = "";
+    bool b = bind(w: w, portal: unnamed, statement: s1, params: two, resultFormat: 1i16);
+    f = f + check(ok: b && sameHex(got: w.view(), want: "42 0000001e 00 733100 0002 0000 0000 0002 00000002 3432 ffffffff 0001 0001"), what: "frontend: Bind with a value, a NULL, binary results");
+    w.clear();
+
+    bool e = execute(w: w, portal: unnamed, maxRows: 0);
+    f = f + check(ok: e && sameHex(got: w.view(), want: "45 00000009 00 00000000"), what: "frontend: Execute");
+    w.clear();
+
+    bool d = describePortal(w: w, name: unnamed);
+    f = f + check(ok: d && sameHex(got: w.view(), want: "44 00000006 50 00"), what: "frontend: Describe portal");
+    w.clear();
+
+    bool c = closeStatement(w: w, name: s1);
+    f = f + check(ok: c && sameHex(got: w.view(), want: "43 00000008 53 733100"), what: "frontend: Close statement");
+    w.clear();
+
+    string mech = "SCRAM-SHA-256";
+    string first = "n,,n=,r=abc";
+    bool si = saslInitialResponse(w: w, mechanism: mech, data: first.bytes());
+    f = f + check(ok: si && sameHex(got: w.view(), want: "70 00000021 534352414d2d5348412d32353600 0000000b 6e2c2c6e3d2c723d616263"), what: "frontend: SASLInitialResponse");
+    w.clear();
+
+    // Several messages queue in one buffer: a pipeline is exactly that.
+    bool q2 = query(w: w, sql: select1);
+    sync(w: w);
+    f = f + check(ok: q2 && w.length() == 14 + 5, what: "frontend: messages queue back to back");
+    w.clear();
+
+    // A NUL cannot travel in a string field: refused, and nothing is written.
+    DynamicArray<uint8> withNul = unhex(text: "61 00 62");
+    Result<string, Utf8Error> nulText = utf8Decode(bytes: withNul.view());
+    string evil = match (give nulText) { case Ok(value: t): give t; case Err(error: x): ""; };
+    bool refused = !query(w: w, sql: evil) && !password(w: w, text: evil);
+    f = f + check(ok: refused && w.isEmpty(), what: "frontend: a string with a NUL byte is refused, nothing written");
+    return f;
+}
+
+// ---- framing ---------------------------------------------------------------------------------------------
+
+fn bool isIncomplete(Frame fr, isize needed) { return match (fr) { case Incomplete(needed: n): n == needed; case _: false; }; }
+fn bool isComplete(Frame fr, uint8 tag, isize total) { return match (fr) { case Complete(tag: t, total: n): t == tag && n == total; case _: false; }; }
+fn bool isBadLength(Frame fr) { return match (fr) { case Invalid(error: e): match (e) { case BadLength(tag: t, length: n): true; case _: false; }; case _: false; }; }
+fn bool isTooLarge(Frame fr) { return match (fr) { case Invalid(error: e): match (e) { case TooLarge(tag: t, length: n): true; case _: false; }; case _: false; }; }
+
+fn int32 framingTests() {
+    int32 f = 0;
+    DynamicArray<uint8> nothing = DynamicArray.empty();
+    f = f + check(ok: isIncomplete(fr: frame(buf: nothing.view()), needed: 5), what: "frame: an empty buffer needs a header");
+    DynamicArray<uint8> header = unhex(text: "5a 00000005");
+    f = f + check(ok: isIncomplete(fr: frame(buf: header.view()), needed: 6), what: "frame: a header alone needs its body");
+    DynamicArray<uint8> ready = unhex(text: "5a 00000005 49 5a");
+    f = f + check(ok: isComplete(fr: frame(buf: ready.view()), tag: 90ui8, total: 6), what: "frame: one whole message, with the next one's first byte after it");
+    DynamicArray<uint8> tiny = unhex(text: "5a 00000003 00");
+    f = f + check(ok: isBadLength(fr: frame(buf: tiny.view())), what: "frame: a length under 4 is invalid");
+    DynamicArray<uint8> huge = unhex(text: "44 7fffffff");
+    f = f + check(ok: isTooLarge(fr: frame(buf: huge.view())), what: "frame: a length over 1 GiB is refused before anything is allocated");
+    return f;
+}
+
+// ---- backend ---------------------------------------------------------------------------------------------
+
+fn Result<BackendMessage, ProtocolError> dec(uint8 tag, const ref string body) {
+    DynamicArray<uint8> b = unhex(text: body);
+    return decode(tag: tag, body: b.view());
+}
+
+fn bool isErr(Result<BackendMessage, ProtocolError> r) { return match (give r) { case Ok(value: m): false; case Err(error: e): true; }; }
+
+fn bool errIs(Result<BackendMessage, ProtocolError> r, int32 kind) {
+    ProtocolError e = match (give r) { case Ok(value: m): { return false; } case Err(error: x): give x; };
+    int32 k = match (e) { case Truncated(tag: t): 1; case BadLength(tag: t, length: n): 2; case TooLarge(tag: t, length: n): 3;
+                          case Unexpected(tag: t): 4; case NotUtf8(tag: t): 5; case Malformed(tag: t, what: w): 6; };
+    return k == kind;
+}
+
+fn BackendMessage ok(Result<BackendMessage, ProtocolError> r, const ref string what) {
+    return match (give r) {
+        case Ok(value: m): give m;
+        case Err(error: e): { string why = e.message(); panic(msg: "decode failed for ".concat(other: what).concat(other: ": ").concat(other: why)); return BackendMessage::NoData; }
+    };
+}
+
+fn int32 backendTests() {
+    int32 f = 0;
+
+    BackendMessage z = ok(r: dec(tag: 90ui8, body: "49"), what: "ReadyForQuery");
+    f = f + check(ok: match (z) { case ReadyForQuery(status: s): s == 73ui8; case _: false; }, what: "backend: ReadyForQuery idle");
+    f = f + check(ok: errIs(r: dec(tag: 90ui8, body: "58"), kind: 6), what: "backend: ReadyForQuery with an unknown status is Malformed");
+    f = f + check(ok: errIs(r: dec(tag: 90ui8, body: ""), kind: 1), what: "backend: ReadyForQuery with no status is Truncated");
+    f = f + check(ok: errIs(r: dec(tag: 90ui8, body: "4949"), kind: 6), what: "backend: ReadyForQuery with a trailing byte is Malformed");
+
+    BackendMessage cc = ok(r: dec(tag: 67ui8, body: "53454c4543542031 00"), what: "CommandComplete");
+    f = f + check(ok: match (cc) { case CommandComplete(commandTag: t): t.equals(other: "SELECT 1"); case _: false; }, what: "backend: CommandComplete");
+    f = f + check(ok: errIs(r: dec(tag: 67ui8, body: "ff 00"), kind: 5), what: "backend: CommandComplete that is not UTF-8 is NotUtf8");
+
+    BackendMessage a0 = ok(r: dec(tag: 82ui8, body: "00000000"), what: "AuthenticationOk");
+    f = f + check(ok: match (a0) { case AuthenticationOk: true; case _: false; }, what: "backend: AuthenticationOk");
+    BackendMessage a3 = ok(r: dec(tag: 82ui8, body: "00000003"), what: "AuthenticationCleartextPassword");
+    f = f + check(ok: match (a3) { case AuthenticationCleartextPassword: true; case _: false; }, what: "backend: AuthenticationCleartextPassword");
+    BackendMessage a5 = ok(r: dec(tag: 82ui8, body: "00000005 0a0b0c0d"), what: "AuthenticationMD5Password");
+    f = f + check(ok: match (a5) { case AuthenticationMd5Password(salt: s): s[0] == 10ui8 && s[3] == 13ui8; case _: false; }, what: "backend: AuthenticationMD5Password carries its salt");
+    BackendMessage a10 = ok(r: dec(tag: 82ui8, body: "0000000a 534352414d2d5348412d323536 00 534352414d2d5348412d3235362d504c5553 00 00"), what: "AuthenticationSASL");
+    f = f + check(ok: match (a10) { case AuthenticationSasl(mechanisms: m): m.length() == 2 && m[1].equals(other: "SCRAM-SHA-256-PLUS"); case _: false; }, what: "backend: AuthenticationSASL lists its mechanisms");
+    BackendMessage a7 = ok(r: dec(tag: 82ui8, body: "00000007"), what: "AuthenticationGSS");
+    f = f + check(ok: match (a7) { case AuthenticationUnsupported(method: m): m == 7; case _: false; }, what: "backend: GSSAPI is reported as unsupported, not misread");
+
+    BackendMessage k = ok(r: dec(tag: 75ui8, body: "00001234 deadbeef"), what: "BackendKeyData");
+    f = f + check(ok: match (k) { case BackendKeyData(processId: p, secretKey: s): p == 4660 && s.length() == 4; case _: false; }, what: "backend: BackendKeyData (protocol 3.0, 4-byte key)");
+    BackendMessage k32 = ok(r: dec(tag: 75ui8, body: "00001234 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"), what: "BackendKeyData 3.2");
+    f = f + check(ok: match (k32) { case BackendKeyData(processId: p, secretKey: s): s.length() == 32; case _: false; }, what: "backend: BackendKeyData (protocol 3.2, 32-byte key)");
+    f = f + check(ok: errIs(r: dec(tag: 75ui8, body: "00001234 dead"), kind: 6), what: "backend: a 2-byte cancel key is Malformed");
+
+    BackendMessage ps = ok(r: dec(tag: 83ui8, body: "54696d655a6f6e6500 55544300"), what: "ParameterStatus");
+    f = f + check(ok: match (ps) { case ParameterStatus(name: n, value: v): n.equals(other: "TimeZone") && v.equals(other: "UTC"); case _: false; }, what: "backend: ParameterStatus");
+
+    BackendMessage dr = ok(r: dec(tag: 68ui8, body: "0003 00000002 3432 ffffffff 00000000"), what: "DataRow");
+    bool rowOk = match (dr) {
+        case DataRow(row: r): r.columnCount() == 3 && !r.isNull(column: 0) && r.value(column: 0).length() == 2
+                              && byteAt(v: r.value(column: 0), i: 1) == 50ui8 && r.isNull(column: 1) && !r.isNull(column: 2) && r.value(column: 2).length() == 0;
+        case _: false;
+    };
+    f = f + check(ok: rowOk, what: "backend: DataRow with a value, a NULL and an empty value");
+    f = f + check(ok: errIs(r: dec(tag: 68ui8, body: "0001 00000005 3432"), kind: 2), what: "backend: a DataRow column longer than the row is BadLength");
+    f = f + check(ok: errIs(r: dec(tag: 68ui8, body: "0001 fffffffe"), kind: 2), what: "backend: a DataRow column length below -1 is BadLength");
+    f = f + check(ok: errIs(r: dec(tag: 68ui8, body: "0001 00000001 34 35"), kind: 6), what: "backend: bytes after the last DataRow column are Malformed");
+
+    BackendMessage rd = ok(r: dec(tag: 84ui8, body: "0001 696400 00004000 0001 00000017 0004 ffffffff 0000"), what: "RowDescription");
+    bool descOk = match (rd) {
+        case RowDescription(fields: fs): fs.length() == 1 && fs[0].name().equals(other: "id") && fs[0].tableOid() == 16384ui32
+                                         && fs[0].columnNumber() == 1i16 && fs[0].typeOid() == 23ui32 && fs[0].typeSize() == 4i16
+                                         && fs[0].typeModifier() == -1 && fs[0].format() == 0i16;
+        case _: false;
+    };
+    f = f + check(ok: descOk, what: "backend: RowDescription with every attribute");
+
+    BackendMessage er = ok(r: dec(tag: 69ui8, body: "53 4552524f5200 43 323335303500 4d 64757000 00"), what: "ErrorResponse");
+    bool errOk = match (er) {
+        case ErrorResponse(fields: e): e.count() == 3 && match (e.field(code: 67ui8)) { case Some(value: c): c.equals(other: "23505"); case None: false; };
+        case _: false;
+    };
+    f = f + check(ok: errOk, what: "backend: ErrorResponse fields by code");
+    BackendMessage nr = ok(r: dec(tag: 78ui8, body: "53 4e4f5449434500 00"), what: "NoticeResponse");
+    f = f + check(ok: match (nr) { case NoticeResponse(fields: e): e.count() == 1; case _: false; }, what: "backend: NoticeResponse");
+
+    BackendMessage an = ok(r: dec(tag: 65ui8, body: "00000001 636800 686900"), what: "NotificationResponse");
+    f = f + check(ok: match (an) { case NotificationResponse(processId: p, channel: c, payload: x): p == 1 && c.equals(other: "ch") && x.equals(other: "hi"); case _: false; }, what: "backend: NotificationResponse");
+
+    BackendMessage pd = ok(r: dec(tag: 116ui8, body: "0002 00000017 00000019"), what: "ParameterDescription");
+    f = f + check(ok: match (pd) { case ParameterDescription(oids: o): o.length() == 2 && o[1] == 25ui32; case _: false; }, what: "backend: ParameterDescription");
+
+    BackendMessage nv = ok(r: dec(tag: 118ui8, body: "00000000 00000001 5f70712e666f6f00"), what: "NegotiateProtocolVersion");
+    f = f + check(ok: match (nv) { case NegotiateProtocolVersion(newestMinor: m, unrecognized: u): m == 0 && u.length() == 1 && u[0].equals(other: "_pq.foo"); case _: false; }, what: "backend: NegotiateProtocolVersion");
+
+    BackendMessage co = ok(r: dec(tag: 72ui8, body: "00 0002 0000 0000"), what: "CopyOutResponse");
+    f = f + check(ok: match (co) { case CopyOutResponse(formats: x): x.overall() == 0i8 && x.columnCount() == 2; case _: false; }, what: "backend: CopyOutResponse");
+
+    f = f + check(ok: errIs(r: dec(tag: 81ui8, body: ""), kind: 4), what: "backend: a frontend-only tag ('Q') is Unexpected");
+    return f;
+}
+
+// Every strict prefix of a fixed-shape message must be refused: accepting one would mean reading a truncated
+// message as a whole one.
+fn int32 prefixesRefused(uint8 tag, const ref string body, const ref string what) {
+    DynamicArray<uint8> full = unhex(text: body);
+    isize n = 0;
+    while (n < full.length()) {
+        Result<BackendMessage, ProtocolError> r = decode(tag: tag, body: full.slice(from: 0, count: n));
+        if (!isErr(r: r)) { return check(ok: false, what: "prefixes: ".concat(other: what).concat(other: " accepted a truncated body")); }
+        n = n + 1;
+    }
+    return 0;
+}
+
+fn int32 robustnessTests() {
+    int32 f = 0;
+    f = f + prefixesRefused(tag: 90ui8, body: "49", what: "ReadyForQuery");
+    f = f + prefixesRefused(tag: 67ui8, body: "53454c4543542031 00", what: "CommandComplete");
+    f = f + prefixesRefused(tag: 82ui8, body: "00000005 0a0b0c0d", what: "AuthenticationMD5Password");
+    f = f + prefixesRefused(tag: 82ui8, body: "0000000a 534352414d2d5348412d323536 00 00", what: "AuthenticationSASL");
+    f = f + prefixesRefused(tag: 75ui8, body: "00001234 deadbeef", what: "BackendKeyData");
+    f = f + prefixesRefused(tag: 83ui8, body: "54696d655a6f6e6500 55544300", what: "ParameterStatus");
+    f = f + prefixesRefused(tag: 68ui8, body: "0003 00000002 3432 ffffffff 00000000", what: "DataRow");
+    f = f + prefixesRefused(tag: 84ui8, body: "0001 696400 00004000 0001 00000017 0004 ffffffff 0000", what: "RowDescription");
+    f = f + prefixesRefused(tag: 69ui8, body: "53 4552524f5200 43 323335303500 00", what: "ErrorResponse");
+    f = f + prefixesRefused(tag: 65ui8, body: "00000001 636800 686900", what: "NotificationResponse");
+    f = f + prefixesRefused(tag: 116ui8, body: "0002 00000017 00000019", what: "ParameterDescription");
+    f = f + prefixesRefused(tag: 118ui8, body: "00000000 00000001 5f70712e666f6f00", what: "NegotiateProtocolVersion");
+    f = f + prefixesRefused(tag: 72ui8, body: "00 0002 0000 0000", what: "CopyOutResponse");
+
+    // Deterministic noise for every tag: whatever the bytes, decode answers — Ok or Err — and never panics or
+    // reads past the body (a fault there kills this program, which fails the run).
+    uint64 state = 88172645463325252ui64;
+    int32 round = 0;
+    while (round < 4000) {
+        state = state ^ (state << 13);
+        state = state ^ (state >> 7);
+        state = state ^ (state << 17);
+        isize len = cast<isize>(state % 64ui64);
+        uint8 tag = truncate<uint8>(65ui64 + (state >> 8) % 58ui64);
+        DynamicArray<uint8> noise = DynamicArray.withCapacity(capacity: len);
+        isize i = 0;
+        uint64 s = state;
+        while (i < len) {
+            s = s * 6364136223846793005ui64 + 1442695040888963407ui64;
+            // Bias towards small numbers so counts and lengths are often plausible and deeper paths run.
+            uint8 byte = truncate<uint8>(s >> 56);
+            if ((s >> 20) % 3ui64 == 0ui64) { byte = 0ui8; }
+            noise.add(item: byte);
+            i = i + 1;
+        }
+        Result<BackendMessage, ProtocolError> r = decode(tag: tag, body: noise.view());
+        bool done = isErr(r: r) || true;
+        round = round + 1;
+    }
+    f = f + check(ok: round == 4000, what: "fuzz: 4000 random bodies across every tag decoded without a fault");
+    return f;
+}
+
+fn int32 protocolTests() {
+    int32 f = 0;
+    f = f + frontendTests();
+    f = f + framingTests();
+    f = f + backendTests();
+    f = f + robustnessTests();
+    return f;
+}

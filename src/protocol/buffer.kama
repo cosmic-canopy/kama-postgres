@@ -1,0 +1,203 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error };
+export { MessageWriter, Cursor, ProtocolError, MAX_MESSAGE };
+
+// postgres::protocol — the PostgreSQL v3 wire protocol as data: building every frontend message, and framing
+// and decoding every backend one. No I/O happens here. A connection moves the bytes; this module only says
+// what they mean. It is public because a proxy, a pooler or a test harness wants exactly this layer, as
+// rust-postgres's `postgres-protocol` crate does.
+//
+// The rules this module holds:
+//   - Nothing from the server is trusted. Every read is bounds-checked against the message it belongs to, and
+//     every length is checked against what remains before it is used. Text is validated as UTF-8. A message
+//     that breaks any of that is a `ProtocolError`, never a panic and never a read past the end.
+//   - Everything on the wire is big-endian.
+
+// The largest backend message accepted: PostgreSQL's MaxAllocSize (1 GiB − 1), which bounds any single
+// value the server can send. A declared length beyond it is `ProtocolError::TooLarge`, before anything is
+// allocated for it.
+comptime int64 MAX_MESSAGE = 1073741823i64;
+
+// What can be wrong with bytes that claim to be a backend message.
+type enum ProtocolError implements Error {
+    // The message ended before a field it must contain.
+    Truncated(uint8 tag),
+    // A declared length below the minimum (4 bytes for the length itself), or past the message end.
+    BadLength(uint8 tag, int64 length),
+    // A declared length over MAX_MESSAGE.
+    TooLarge(uint8 tag, int64 length),
+    // A tag this client does not know, or a known one where the protocol forbids it.
+    Unexpected(uint8 tag),
+    // A field that must be UTF-8 text is not.
+    NotUtf8(uint8 tag),
+    // A field with a value the protocol does not allow; `what` says which.
+    Malformed(uint8 tag, string what);
+
+    public const fn string message() {
+        return match (this) {
+            case Truncated(tag: t): "message '${t}' ended early";
+            case BadLength(tag: t, length: n): "message '${t}' declared an impossible length ${n}";
+            case TooLarge(tag: t, length: n): "message '${t}' declared ${n} bytes, over the 1 GiB limit";
+            case Unexpected(tag: t): "unexpected message '${t}'";
+            case NotUtf8(tag: t): "message '${t}' carries text that is not UTF-8";
+            case Malformed(tag: t, what: w): "message '${t}': ".concat(other: w);
+        };
+    }
+}
+
+fn bool hasNul(ConstView<uint8> b) {
+    isize i = 0;
+    while (i < b.length()) { if (b[i] == 0ui8) { return true; } i = i + 1; }
+    return false;
+}
+
+// Builds frontend messages into one growable buffer: `begin(tag:)`, the fields, `end()`. The length field is
+// written as a placeholder and patched at `end()`, so a message is always framed correctly however it was
+// filled. Several messages may be queued before the buffer is sent (a pipeline is exactly that).
+type resource MessageWriter {
+    DynamicArray<uint8> buf;
+    isize mark = -1;   // offset of the open message's length field; -1 when none is open
+
+    public ctor make() { this.buf = DynamicArray.empty(); this.mark = -1; }
+
+    // Open a message with a type byte.
+    public fn void begin(uint8 tag) {
+        if (this.mark >= 0) { panic(msg: "MessageWriter.begin: the previous message was not ended"); }
+        this.buf.add(item: tag);
+        this.mark = this.buf.length();
+        this.putI32(v: 0);
+    }
+
+    // Open a message with no type byte: StartupMessage, SSLRequest, GSSENCRequest and CancelRequest.
+    public fn void beginUntagged() {
+        if (this.mark >= 0) { panic(msg: "MessageWriter.beginUntagged: the previous message was not ended"); }
+        this.mark = this.buf.length();
+        this.putI32(v: 0);
+    }
+
+    // Close the open message: its length counts itself and everything after it.
+    public fn void end() {
+        if (this.mark < 0) { panic(msg: "MessageWriter.end: no message is open"); }
+        int64 n = cast<int64>(this.buf.length() - this.mark);
+        this.buf[this.mark]     = truncate<uint8>(n >> 24);
+        this.buf[this.mark + 1] = truncate<uint8>(n >> 16);
+        this.buf[this.mark + 2] = truncate<uint8>(n >> 8);
+        this.buf[this.mark + 3] = truncate<uint8>(n);
+        this.mark = -1;
+    }
+
+    public fn void putU8(uint8 v) { this.buf.add(item: v); }
+    public fn void putI16(int16 v) {
+        this.buf.add(item: truncate<uint8>(v >> 8));
+        this.buf.add(item: truncate<uint8>(v));
+    }
+    public fn void putI32(int32 v) {
+        this.buf.add(item: truncate<uint8>(v >> 24));
+        this.buf.add(item: truncate<uint8>(v >> 16));
+        this.buf.add(item: truncate<uint8>(v >> 8));
+        this.buf.add(item: truncate<uint8>(v));
+    }
+    public fn void putU32(uint32 v) { this.putI32(v: cast<int32>(v)); }
+    public fn void putBytes(ConstView<uint8> b) {
+        isize i = 0;
+        while (i < b.length()) { this.buf.add(item: b[i]); i = i + 1; }
+    }
+
+    // A NUL-terminated string. Answers false, writing nothing, if `s` itself contains a NUL: the protocol has
+    // no way to carry one in a string field, and truncating silently would send a different string.
+    public fn bool putCString(const ref string s) {
+        if (hasNul(b: s.bytes())) { return false; }
+        this.putBytes(b: s.bytes());
+        this.buf.add(item: 0ui8);
+        return true;
+    }
+
+    // Everything queued so far.
+    public const fn ConstView<uint8> view() { return this.buf.view(); }
+    public const fn isize length() { return this.buf.length(); }
+    public const fn bool isEmpty() { return this.buf.length() == 0; }
+    // Forget everything queued (after it was sent). A message must not be open.
+    public fn void clear() {
+        if (this.mark >= 0) { panic(msg: "MessageWriter.clear: a message is still open"); }
+        this.buf.clear();
+    }
+}
+
+// A read position in one backend message body. The body is passed to every read rather than held, because a
+// view cannot be stored; every read checks it against the body's length, and a short body is
+// `ProtocolError::Truncated` with the message's tag.
+type value Cursor {
+    isize pos = 0;
+    uint8 tag = 0ui8;
+
+    public ctor at(uint8 tag) { this.pos = 0; this.tag = tag; }
+
+    public const fn isize position() { return this.pos; }
+    public const fn uint8 messageTag() { return this.tag; }
+
+    // Step over `n` bytes without copying them.
+    public fn Result<Unit, ProtocolError> skip(ConstView<uint8> b, isize n) {
+        if (n < 0) { return Result::Err(error: ProtocolError::BadLength(tag: this.tag, length: cast<int64>(n))); }
+        if (this.pos + n > b.length()) { return Result::Err(error: ProtocolError::Truncated(tag: this.tag)); }
+        this.pos = this.pos + n;
+        return Result::Ok(value: Unit::Unit);
+    }
+    public const fn isize remaining(ConstView<uint8> b) { return b.length() - this.pos; }
+    public const fn bool atEnd(ConstView<uint8> b) { return this.pos >= b.length(); }
+
+    public fn Result<uint8, ProtocolError> readU8(ConstView<uint8> b) {
+        if (this.pos + 1 > b.length()) { return Result::Err(error: ProtocolError::Truncated(tag: this.tag)); }
+        uint8 v = b[this.pos];
+        this.pos = this.pos + 1;
+        return Result::Ok(value: v);
+    }
+
+    public fn Result<int16, ProtocolError> readI16(ConstView<uint8> b) {
+        if (this.pos + 2 > b.length()) { return Result::Err(error: ProtocolError::Truncated(tag: this.tag)); }
+        uint16 v = (cast<uint16>(b[this.pos]) << 8) | cast<uint16>(b[this.pos + 1]);
+        this.pos = this.pos + 2;
+        return Result::Ok(value: truncate<int16>(v));
+    }
+
+    public fn Result<int32, ProtocolError> readI32(ConstView<uint8> b) {
+        if (this.pos + 4 > b.length()) { return Result::Err(error: ProtocolError::Truncated(tag: this.tag)); }
+        uint32 v = (cast<uint32>(b[this.pos]) << 24) | (cast<uint32>(b[this.pos + 1]) << 16)
+                 | (cast<uint32>(b[this.pos + 2]) << 8) | cast<uint32>(b[this.pos + 3]);
+        this.pos = this.pos + 4;
+        return Result::Ok(value: truncate<int32>(v));
+    }
+
+    public fn Result<uint32, ProtocolError> readU32(ConstView<uint8> b) {
+        Result<int32, ProtocolError> r = this.readI32(b: b);
+        return match (give r) { case Ok(value: v): Result::Ok(value: truncate<uint32>(v)); case Err(error: e): Result::Err(error: give e); };
+    }
+
+    // `n` raw bytes, copied out. A negative or too-large `n` is a bad length, not a short read.
+    public fn Result<DynamicArray<uint8>, ProtocolError> readBytes(ConstView<uint8> b, isize n) {
+        if (n < 0) { return Result::Err(error: ProtocolError::BadLength(tag: this.tag, length: cast<int64>(n))); }
+        if (this.pos + n > b.length()) { return Result::Err(error: ProtocolError::Truncated(tag: this.tag)); }
+        DynamicArray<uint8> copied = DynamicArray.withCapacity(capacity: n);
+        isize i = 0;
+        while (i < n) { copied.add(item: b[this.pos + i]); i = i + 1; }
+        this.pos = this.pos + n;
+        return Result::Ok(value: give copied);
+    }
+
+    // Everything left in the body.
+    public fn Result<DynamicArray<uint8>, ProtocolError> readRest(ConstView<uint8> b) {
+        return this.readBytes(b: b, n: b.length() - this.pos);
+    }
+
+    // A NUL-terminated string, validated as UTF-8. A string with no terminator is a truncation.
+    public unsafe fn Result<string, ProtocolError> readCString(ConstView<uint8> b) {
+        isize end = this.pos;
+        while (end < b.length() && b[end] != 0ui8) { end = end + 1; }
+        if (end >= b.length()) { return Result::Err(error: ProtocolError::Truncated(tag: this.tag)); }
+        Result<string, Utf8Error> text = decode(bytes: b.slice(from: this.pos, count: end - this.pos));
+        this.pos = end + 1;
+        return match (give text) {
+            case Ok(value: s): Result::Ok(value: give s);
+            case Err(error: e): Result::Err(error: ProtocolError::NotUtf8(tag: this.tag));
+        };
+    }
+}

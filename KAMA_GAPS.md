@@ -18,6 +18,7 @@ changes the right design here, say so and we will follow it.
 **Open now:**
 - KPG-23, found porting to 0.9.506.
 - KPG-24, found adopting KPG-15's fix (SASLprep).
+- KPG-25 and KPG-26, found probing phase 5's typed parameters and rows.
 
 Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
@@ -29,6 +30,84 @@ Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below
 ---
 
 ## OPEN
+
+### KPG-25 · HIGH · A string tag's holes lose their type, so an `Optional` hole is sent as the text "None"
+
+**Status:** open. Reproduces on 0.9.506, with std's own `sql` tag.
+
+A tag receives every hole already rendered to a string through `Formattable` (`prelude/global.kama:688-699`;
+`SPEC.md:264-268` lists typed holes as the future "Model B"). For a SQL tag that is a hazard:
+- An `Optional` hole of a `Formattable` payload is sent as its derived text: `Some { value: 5 }`, or `None`.
+  Into a text column it is stored as that text. Nothing fails.
+- NULL cannot be expressed at all, and neither can bytes (a `DynamicArray<uint8>` hole does not compile).
+- An `Optional<string>` hole is refused at compile time, because `string` reaches interpolation by a fast path,
+  not through `Formattable`. The two `Optional`s behave differently.
+
+```kama
+import { core::println, std::fmt::sql, std::fmt::SqlQuery };
+fn int32 main() {
+    Optional<int32> score = Optional::None;
+    SqlQuery q = sql"update t set score = ${score}";
+    string p = copy q.param(at: 0);
+    println(s: copy q.queryText());
+    println(s: "param 0 is \"".concat(other: p).concat(other: "\""));
+    return 0;
+}
+```
+
+```
+update t set score = ?
+param 0 is "None"
+```
+
+**Why it matters here.** The `pg"…"` tag is how most code in this package's README will run a query. A hole is
+always a parameter and never spliced, so it is safe against injection. But a NULL written as `${x}` with
+`x` an `Optional` sends the word "None".
+
+**Workaround here.** `postgres::pg` refuses a hole whose text is exactly `None` or starts with `Some { value: `.
+The error names `Query.add`/`addOptional`, which take the value through `Serializable` and do send NULL. A
+genuine string "None" is refused too, with the same advice. This workaround should go when holes keep their
+type.
+
+**Suggested fix.** Typed holes: a tag sees each hole's value through a contract (`Serializable` would suit a
+SQL tag), so `Optional` can be NULL and bytes can be bytes. Short of that, refuse an `Optional` hole in a tagged
+string, as an `Optional<string>` already is, so the hazard is a compile error.
+
+### KPG-26 · MED · `@generate(Deserializable)` never reports a missing field
+
+**Status:** open. Reproduces on 0.9.506, with std's JSON backend.
+
+The derived `deserialize` zero-initializes the result and fills the fields whose keys arrive. A field whose key
+never arrives keeps its zero (`src/kama.cemit.cpp`, `emitDeserializeDefinition`). `DeError::MissingField` exists,
+but the derive never raises it.
+
+```kama
+import { core::println, std::memory::Owned, std::serialization::text::json::deserializeJsonBuffer };
+@generate(Deserializable)
+type value Point { @field public int32 x = 0; @field public int32 y = 0; }
+fn int32 main() {
+    // The JSON has no "y": the derive could report MissingField, and does not.
+    Result<Point, Owned<Error>> p = deserializeJsonBuffer::<Point>(src: "{\"x\": 1}");
+    string r = match (p) { case Ok(value: v): "Ok(x: ${v.x}, y: ${v.y})"; case Err(error: e): e.message(); };
+    println(s: give r);
+    return 0;
+}
+```
+
+```
+Ok(x: 1, y: 0)
+```
+
+**Why it matters here.** `rowAs::<T>` reads a row into a struct by column name. A query that does not select a
+field's column should fail, not fill the field with 0 or "". That is what sqlx's and pgx's row mapping do.
+
+**Workaround here.** The row reader counts the keys that were read rather than skipped, and fails at
+`endObject` with `MissingField` if fewer were read than `beginObject`'s count (the derive checks `failed()`
+after `endObject`). It works for a flat struct, which is all a row is. An `Optional` field counts as required:
+its column must be selected, and may be NULL.
+
+**Suggested fix.** The derive knows which slots it filled. After the loop, a field that is not `Optional` and has
+no default, whose slot was never filled, raises `MissingField`. That makes this hold for every backend.
 
 ### KPG-23 · LOW · `IoError` gives the OS's words only inside its message, never alone
 

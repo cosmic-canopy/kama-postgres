@@ -1,0 +1,31 @@
+// The generated SQLSTATE and type tables (tools/gen-pg-catalog.sh): spot checks that the packing round-trips and
+// the names line up with PostgreSQL's.
+import { postgres::sqlstate::sqlstateText, postgres::sqlstate::sqlstateCode, postgres::sqlstate::sqlstateClass,
+         postgres::sqlstate::conditionName, postgres::sqlstate::UNIQUE_VIOLATION,
+         postgres::sqlstate::INTEGRITY_CONSTRAINT_VIOLATION, postgres::sqlstate::T_R_SERIALIZATION_FAILURE,
+         postgres::sqlstate::SUCCESSFUL_COMPLETION, postgres::sqlstate::QUERY_CANCELED,
+         postgres::types::typeName, postgres::types::INT4, postgres::types::INT4_ARRAY, postgres::types::UUID,
+         postgres::types::JSONB, postgres::types::NUMERIC,
+         postgres_unit_tests::check };
+export { catalogTests };
+
+fn int32 catalogTests() {
+    int32 f = 0;
+    string u = sqlstateText(code: UNIQUE_VIOLATION);
+    f = f + check(ok: u.equals(other: "23505"), what: "sqlstate: UNIQUE_VIOLATION is 23505");
+    string s = "40001";
+    f = f + check(ok: sqlstateCode(text: s) == T_R_SERIALIZATION_FAILURE, what: "sqlstate: 40001 is T_R_SERIALIZATION_FAILURE (the ERRCODE_ macro name)");
+    string c = "57014";
+    f = f + check(ok: sqlstateCode(text: c) == QUERY_CANCELED, what: "sqlstate: 57014 is QUERY_CANCELED");
+    f = f + check(ok: sqlstateClass(code: UNIQUE_VIOLATION) == INTEGRITY_CONSTRAINT_VIOLATION, what: "sqlstate: 23505's class is 23000");
+    f = f + check(ok: SUCCESSFUL_COMPLETION == 0, what: "sqlstate: 00000 packs to 0");
+    string bad = "2350";
+    string lower = "2350a";
+    f = f + check(ok: sqlstateCode(text: bad) == -1 && sqlstateCode(text: lower) == -1, what: "sqlstate: not five of [0-9A-Z] is -1");
+    bool named = match (conditionName(code: UNIQUE_VIOLATION)) { case Some(value: n): n.equals(other: "unique_violation"); case None: false; };
+    f = f + check(ok: named, what: "sqlstate: the condition name is unique_violation");
+    f = f + check(ok: typeName(oid: INT4).equals(other: "int4") && typeName(oid: INT4_ARRAY).equals(other: "_int4"), what: "types: int4 and its array");
+    f = f + check(ok: UUID == 2950ui32 && typeName(oid: JSONB).equals(other: "jsonb") && typeName(oid: NUMERIC).equals(other: "numeric"), what: "types: uuid, jsonb, numeric");
+    f = f + check(ok: typeName(oid: 999999ui32).length() == 0, what: "types: an unknown OID has no name");
+    return f;
+}

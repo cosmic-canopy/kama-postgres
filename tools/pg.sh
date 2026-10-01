@@ -56,6 +56,7 @@ PGTEST_SUPERUSER_PASSWORD=$SUPERPW
 PGTEST_SCRAM_PASSWORD=kp_scram_pw
 PGTEST_PASSWORD_PASSWORD=kp_password_pw
 PGTEST_MD5_PASSWORD=kp_md5_pw
+PGTEST_MD5_SCRAM_PASSWORD=kp_md5_scram_pw
 PGTEST_SSL_ONLY_PASSWORD=kp_ssl_only_pw
 PGTEST_NOSSL_PASSWORD=kp_nossl_pw
 EOF
@@ -121,6 +122,7 @@ B="host=127.0.0.1 dbname=kp_test"
 try ok   "trust"                         "$B user=kp_trust sslmode=disable"
 try ok   "password (cleartext)"          "$B user=kp_password sslmode=disable" kp_password_pw
 try ok   "md5"                           "$B user=kp_md5 sslmode=disable" kp_md5_pw
+try ok   "md5 method, SCRAM password"    "$B user=kp_md5_scram sslmode=disable require_auth=scram-sha-256" kp_md5_scram_pw
 try ok   "scram-sha-256"                 "$B user=kp_scram sslmode=disable" kp_scram_pw
 try ok   "scram-sha-256-plus (TLS)"      "$B user=kp_scram sslmode=require channel_binding=require" kp_scram_pw
 try ok   "verify-full vs test CA"        "host=localhost dbname=kp_test user=kp_scram sslmode=verify-full sslrootcert=/certs/ca.crt" kp_scram_pw

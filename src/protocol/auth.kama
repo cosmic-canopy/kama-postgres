@@ -9,11 +9,11 @@ export { Md5, md5, md5Password, ScramClient, ChannelBinding, AuthError };
 // tls-server-end-point channel binding (RFC 5929) — SCRAM-SHA-256-PLUS. HMAC, PBKDF2 and SHA-256 are kama's
 // std::digest; MD5 is here because only this deprecated method needs it.
 
-// What can go wrong in a SASL exchange.
+// What can go wrong in a SASL exchange. The messages are libpq's (fe-auth-scram.c).
 type enum AuthError implements Error {
     // The server's nonce does not extend ours: a replay, or a server that is not following SCRAM.
     NonceMismatch,
-    // A server message that does not parse; `what` says which part.
+    // A server message that does not parse; `what` says which part, in libpq's words.
     BadServerMessage(string what),
     // The server ended the exchange with an error attribute (e=…).
     ServerRejected(string reason),
@@ -22,10 +22,10 @@ type enum AuthError implements Error {
 
     public const fn string message() {
         return match (this) {
-            case NonceMismatch: "SCRAM: the server's nonce does not extend the client's";
-            case BadServerMessage(what: w): "SCRAM: malformed server message: ".concat(other: w);
-            case ServerRejected(reason: r): "SCRAM: the server rejected the exchange: ".concat(other: r);
-            case SignatureMismatch: "SCRAM: the server's signature is wrong — it does not know the password";
+            case NonceMismatch: "invalid SCRAM response (nonce mismatch)";
+            case BadServerMessage(what: w): "malformed SCRAM message (".concat(other: w).concat(other: ")");
+            case ServerRejected(reason: r): "error received from server in SCRAM exchange: ".concat(other: r);
+            case SignatureMismatch: "incorrect server signature";
         };
     }
 }
@@ -230,17 +230,17 @@ type resource ScramClient {
         Optional<string> rAttr = attribute(message: serverFirst, name: "r");
         Optional<string> sAttr = attribute(message: serverFirst, name: "s");
         Optional<string> iAttr = attribute(message: serverFirst, name: "i");
-        if (serverFirst.startsWith(prefix: "m=")) { return bad(what: "a mandatory extension (m=) this client does not support"); }
-        string serverNonce = match (give rAttr) { case Some(value: v): give v; case None: { return bad(what: "no nonce (r=)"); } };
-        string saltText = match (give sAttr) { case Some(value: v): give v; case None: { return bad(what: "no salt (s=)"); } };
-        string iterText = match (give iAttr) { case Some(value: v): give v; case None: { return bad(what: "no iteration count (i=)"); } };
+        if (serverFirst.startsWith(prefix: "m=")) { return bad(what: "attribute \"r\" expected"); }
+        string serverNonce = match (give rAttr) { case Some(value: v): give v; case None: { return bad(what: "attribute \"r\" expected"); } };
+        string saltText = match (give sAttr) { case Some(value: v): give v; case None: { return bad(what: "attribute \"s\" expected"); } };
+        string iterText = match (give iAttr) { case Some(value: v): give v; case None: { return bad(what: "attribute \"i\" expected"); } };
         if (!serverNonce.startsWith(prefix: this.clientNonce) || serverNonce.length() <= this.clientNonce.length()) {
             return Result::Err(error: AuthError::NonceMismatch);
         }
         Result<DynamicArray<uint8>, DecodeError> saltBytes = b64decode(text: saltText);
-        DynamicArray<uint8> salt = match (give saltBytes) { case Ok(value: v): give v; case Err(error: e): { return bad(what: "a salt that is not base64"); } };
+        DynamicArray<uint8> salt = match (give saltBytes) { case Ok(value: v): give v; case Err(error: e): { return bad(what: "invalid salt"); } };
         int32 iterations = parsePositive(b: iterText.bytes());
-        if (iterations < 1) { return bad(what: "an iteration count that is not a positive integer"); }
+        if (iterations < 1) { return bad(what: "invalid iteration count"); }
 
         // SaltedPassword := Hi(Normalize(password), salt, i); the keys and signatures of RFC 5802 §3.
         FixedArray<uint8> salted = FixedArray.make(size: 32);
@@ -281,9 +281,9 @@ type resource ScramClient {
         Optional<string> eAttr = attribute(message: serverFinal, name: "e");
         match (give eAttr) { case Some(value: reason): { return Result::Err(error: AuthError::ServerRejected(reason: give reason)); } case None: { } };
         Optional<string> vAttr = attribute(message: serverFinal, name: "v");
-        string sig = match (give vAttr) { case Some(value: v): give v; case None: { return Result::Err(error: AuthError::BadServerMessage(what: "no verifier (v=)")); } };
+        string sig = match (give vAttr) { case Some(value: v): give v; case None: { return Result::Err(error: AuthError::BadServerMessage(what: "attribute \"v\" expected")); } };
         Result<DynamicArray<uint8>, DecodeError> got = b64decode(text: sig);
-        DynamicArray<uint8> bytes = match (give got) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: AuthError::BadServerMessage(what: "a verifier that is not base64")); } };
+        DynamicArray<uint8> bytes = match (give got) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: AuthError::BadServerMessage(what: "invalid server signature")); } };
         if (!constantTimeEqual(a: bytes.view(), b: this.expectedServerSignature.view())) {
             return Result::Err(error: AuthError::SignatureMismatch);
         }

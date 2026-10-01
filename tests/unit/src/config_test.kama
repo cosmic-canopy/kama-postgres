@@ -1,0 +1,273 @@
+// postgres::Config against libpq. The tables in libpq_cases.kama are libpq's own: require_auth values from
+// PostgreSQL's authentication tests, and .pgpass lines, service files and connection settings with the verdict
+// of a live libpq (tools/gen-libpq-test-cases.sh). The rest is what that libpq cannot answer, because it has TLS
+// and this client does not yet: the environment, the StartupMessage, and the refusals of a client without SSL.
+import { std::collections::DynamicArray, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error, postgres::Config, postgres::Environment, postgres::RequireAuth,
+         postgres::PgError, postgres::SslMode, postgres::HostKind,
+         postgres::conninfo::ConnInfo, postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
+         postgres::conninfo::pgpassLookup, postgres::conninfo::parseServiceFile, postgres::conninfo::ServiceEntries,
+         postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
+         postgres_unit_tests::check,
+         postgres_unit_tests::requireAuthValues, postgres_unit_tests::requireAuthErrors,
+         postgres_unit_tests::pgpassUpstreamFiles, postgres_unit_tests::pgpassUpstreamUsers,
+         postgres_unit_tests::pgpassUpstreamFound, postgres_unit_tests::pgpassFiles, postgres_unit_tests::pgpassHosts,
+         postgres_unit_tests::pgpassFound, postgres_unit_tests::serviceFiles, postgres_unit_tests::serviceNames,
+         postgres_unit_tests::serviceConnected, postgres_unit_tests::serviceResults,
+         postgres_unit_tests::settingStages, postgres_unit_tests::settingStrings, postgres_unit_tests::settingAccepted,
+         postgres_unit_tests::settingErrors };
+export { configTests, testEnvironment, resolveWith };
+
+// An environment with nothing set but the local user.
+fn Environment testEnvironment() {
+    Environment env = Environment.empty();
+    env.setUser(name: "tester");
+    return env;
+}
+
+fn Result<Config, PgError> resolveWith(const ref string text, const ref Environment env) {
+    Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: text);
+    ConnInfo info = match (give parsed) { case Ok(value: i): give i; case Err(error: e): { return Result::Err(error: PgError::Config(detail: e.message())); } };
+    return Config.resolve(info: give info, environment: env);
+}
+
+fn string errorOf(const ref Result<Config, PgError> r) {
+    return match (r) { case Ok(value: c): ""; case Err(error: e): e.message(); };
+}
+
+fn bool resolved(const ref Result<Config, PgError> r) { return match (r) { case Ok(value: c): true; case Err(error: e): false; }; }
+
+// libpq reports some settings while connecting to the first host, after that attempt's identity; this client
+// checks them before connecting. The message is the rest.
+fn string withoutAttempt(const ref string message) {
+    if (!message.startsWith(prefix: "connection to server at ")) { return copy message; }
+    Optional<usize> at = message.find(substring: "failed: ");
+    return match (at) {
+        case Some(value: i): message.substring(start: cast<isize>(i) + 8, end: message.length());
+        case None: copy message;
+    };
+}
+
+fn bool isParseError(const ref string message) {
+    return message.contains(substring: "cannot be mixed") || message.contains(substring: "more than once")
+        || message.contains(substring: "invalid require_auth value");
+}
+
+fn int32 requireAuthTests() {
+    int32 f = 0;
+    DynamicArray<string> values = requireAuthValues();
+    DynamicArray<string> errors = requireAuthErrors();
+    isize i = 0;
+    while (i < values.length()) {
+        Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: values[i]);
+        Optional<string> setting = match (parsed) { case Ok(value: info): info.get(keyword: "require_auth"); case Err(error: e): Optional::None; };
+        string text = match (give setting) { case Some(value: s): give s; case None: "?"; };
+        Result<RequireAuth, ConnInfoError> r = RequireAuth.parse(text: text);
+        string got = match (r) { case Ok(value: a): ""; case Err(error: e): e.message(); };
+        string want = copy errors[i];
+        if (!isParseError(message: want)) { want = ""; }
+        f = f + check(ok: got.equals(other: want), what: "require_auth: \"".concat(other: text).concat(other: "\" parses as libpq parses it (got \"").concat(other: got).concat(other: "\")"));
+        i = i + 1;
+    }
+    return f;
+}
+
+fn string lookedUp(const ref string file, const ref string host, const ref string port, const ref string dbname, const ref string user) {
+    Optional<DynamicArray<uint8>> found = pgpassLookup(file: file.bytes(), host: host, port: port, dbname: dbname, user: user);
+    DynamicArray<uint8> pw = match (give found) { case Some(value: p): give p; case None: { return "(none)"; } };
+    Result<string, Utf8Error> text = decode(bytes: pw.view());
+    return match (give text) { case Ok(value: t): give t; case Err(error: e): "(not UTF-8)"; };
+}
+
+fn int32 pgpassTests() {
+    int32 f = 0;
+    // PostgreSQL's own: its harness connects with PGDATABASE=postgres, and the role's password is "pass".
+    DynamicArray<string> files = pgpassUpstreamFiles();
+    DynamicArray<string> users = pgpassUpstreamUsers();
+    DynamicArray<bool> found = pgpassUpstreamFound();
+    isize i = 0;
+    while (i < files.length()) {
+        string pw = lookedUp(file: files[i], host: "", port: "", dbname: "postgres", user: users[i]);
+        f = f + check(ok: pw.equals(other: "pass") == found[i], what: "pgpass: 001_password.pl case ${i} for ".concat(other: users[i]).concat(other: " (got ").concat(other: pw).concat(other: ")"));
+        i = i + 1;
+    }
+    // libpq's verdict: it found kp_password_pw for kp_password@host:5432/kp_test, or it did not.
+    DynamicArray<string> lines = pgpassFiles();
+    DynamicArray<string> hosts = pgpassHosts();
+    DynamicArray<bool> verdicts = pgpassFound();
+    i = 0;
+    while (i < lines.length()) {
+        string pw = lookedUp(file: lines[i], host: hosts[i], port: "5432", dbname: "kp_test", user: "kp_password");
+        f = f + check(ok: pw.equals(other: "kp_password_pw") == verdicts[i], what: "pgpass: libpq case ${i} (got ".concat(other: pw).concat(other: ")"));
+        i = i + 1;
+    }
+    string text = "localhost:5432:db:u:pw\n";
+    string viaDefault = lookedUp(file: text, host: "", port: "", dbname: "db", user: "u");
+    string viaSocket = lookedUp(file: text, host: "/tmp", port: "5432", dbname: "db", user: "u");
+    string viaOther = lookedUp(file: text, host: "/var/run/postgresql", port: "5432", dbname: "db", user: "u");
+    f = f + check(ok: viaDefault.equals(other: "pw") && viaSocket.equals(other: "pw") && viaOther.equals(other: "(none)"), what: "pgpass: an empty host and /tmp match localhost, another socket directory does not");
+    string noDb = lookedUp(file: "*:*:*:*:pw\n", host: "h", port: "1", dbname: "", user: "u");
+    f = f + check(ok: noDb.equals(other: "(none)"), what: "pgpass: an empty database name matches nothing");
+    return f;
+}
+
+// The first value a service gives a keyword: the one libpq keeps.
+fn string firstValue(const ref ServiceEntries entries, const ref string keyword) {
+    isize i = 0;
+    while (i < entries.count()) { if (entries.keyAt(i: i).equals(other: keyword)) { return copy entries.valueAt(i: i); } i = i + 1; }
+    return "";
+}
+
+// What libpq reports for a service the file defines, or does not.
+fn string describeService(const ref ServiceEntries entries, const ref string service) {
+    if (!entries.found()) { return "definition of service \"".concat(other: service).concat(other: "\" not found"); }
+    return firstValue(entries: entries, keyword: "user").concat(other: "|").concat(other: firstValue(entries: entries, keyword: "dbname"));
+}
+
+fn int32 serviceTests() {
+    int32 f = 0;
+    DynamicArray<string> files = serviceFiles();
+    DynamicArray<string> names = serviceNames();
+    DynamicArray<bool> connected = serviceConnected();
+    DynamicArray<string> results = serviceResults();
+    isize i = 0;
+    while (i < files.length()) {
+        Result<ServiceEntries, ConnInfoError> parsed = parseServiceFile(path: "@DIR@/pg_service.conf", text: files[i].bytes(), service: names[i]);
+        string got = match (parsed) {
+            case Ok(value: e): describeService(entries: e, service: names[i]);
+            case Err(error: e): e.message();
+        };
+        f = f + check(ok: got.equals(other: results[i]), what: "service: libpq case ${i}: want ".concat(other: results[i]).concat(other: ", got ").concat(other: got));
+        i = i + 1;
+    }
+    return f;
+}
+
+fn int32 settingTests() {
+    int32 f = 0;
+    DynamicArray<string> stages = settingStages();
+    DynamicArray<string> settings = settingStrings();
+    DynamicArray<bool> accepted = settingAccepted();
+    DynamicArray<string> errors = settingErrors();
+    Environment env = testEnvironment();
+    isize i = 0;
+    while (i < settings.length()) {
+        if (stages[i].equals(other: "config")) {
+            string text = "host=127.0.0.1 port=5432 dbname=kp_test user=kp_trust sslmode=disable ".concat(other: settings[i]);
+            Result<Config, PgError> r = resolveWith(text: text, env: env);
+            string got = errorOf(r: r);
+            string want = withoutAttempt(message: errors[i]);
+            f = f + check(ok: got.equals(other: want), what: "settings: \"".concat(other: settings[i]).concat(other: "\": want \"").concat(other: want).concat(other: "\", got \"").concat(other: got).concat(other: "\""));
+        }
+        i = i + 1;
+    }
+    return f;
+}
+
+// The StartupMessage parameters as "name=value;" pairs.
+fn string startupText(const ref Config c) {
+    string got = "";
+    isize i = 0;
+    while (i < c.startupNames().length()) {
+        got = got.concat(other: c.startupNames()[i]).concat(other: "=").concat(other: c.startupValues()[i]).concat(other: ";");
+        i = i + 1;
+    }
+    return got;
+}
+
+fn int32 environmentTests() {
+    int32 f = 0;
+    Environment env = testEnvironment();
+    env.set(name: "PGHOST", value: "from-env");
+    env.set(name: "PGPORT", value: "6543");
+    env.set(name: "PGDATABASE", value: "envdb");
+    env.set(name: "PGAPPNAME", value: "envapp");
+    env.set(name: "PGTZ", value: "UTC");
+    env.set(name: "PGDATESTYLE", value: "DEFAULT");
+    env.set(name: "PGOPTIONS", value: "-c search_path=x");
+    Result<Config, PgError> r = resolveWith(text: "host=from-string", env: env);
+    match (r) {
+        case Ok(value: c): {
+            f = f + check(ok: c.hostCount() == 1 && c.host(index: 0).name().equals(other: "from-string"), what: "config: the string beats the environment");
+            f = f + check(ok: c.host(index: 0).port().equals(other: "6543"), what: "config: PGPORT fills an unset port");
+            string user = c.user();
+            string db = c.dbname();
+            f = f + check(ok: user.equals(other: "tester") && db.equals(other: "envdb"), what: "config: the local user, and PGDATABASE");
+            string got = startupText(c: c);
+            f = f + check(ok: got.equals(other: "user=tester;database=envdb;options=-c search_path=x;application_name=envapp;client_encoding=UTF8;timezone=UTC;"),
+                          what: "config: the StartupMessage in libpq's order, PGDATESTYLE=default left out (got ".concat(other: got).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "config: resolve under an environment"); }
+    };
+
+    Environment bare = testEnvironment();
+    Result<Config, PgError> d = resolveWith(text: "", env: bare);
+    match (d) {
+        case Ok(value: c): {
+            string db = c.dbname();
+            f = f + check(ok: db.equals(other: "tester"), what: "config: the database defaults to the user");
+            f = f + check(ok: c.hostCount() == 1 && c.host(index: 0).kind() == HostKind::Socket && c.host(index: 0).name().equals(other: "/tmp"), what: "config: the default host is libpq's /tmp socket");
+            f = f + check(ok: c.sslMode() == SslMode::Prefer && c.minProtocolVersion() == PROTOCOL_3_0 && c.maxProtocolVersion() == PROTOCOL_3_0, what: "config: sslmode prefer, protocol 3.0 by default");
+            f = f + check(ok: c.keepalives() && c.keepalivesIdle() == -1 && c.connectTimeout() == 0, what: "config: keepalives on, system defaults, no connect timeout");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "config: resolve an empty string"); }
+    };
+
+    Environment nobody = Environment.empty();
+    Result<Config, PgError> n = resolveWith(text: "host=h", env: nobody);
+    string nm = errorOf(r: n);
+    f = f + check(ok: nm.equals(other: "the local user name is not known"), what: "config: no user anywhere is an error");
+
+    Environment requiressl = testEnvironment();
+    requiressl.set(name: "PGREQUIRESSL", value: "1");
+    Result<Config, PgError> rq = resolveWith(text: "host=h", env: requiressl);
+    string rm = errorOf(r: rq);
+    f = f + check(ok: rm.equals(other: "sslmode value \"require\" invalid when SSL support is not compiled in"), what: "config: PGREQUIRESSL=1 means sslmode require, which needs TLS");
+    Result<Config, PgError> prefer = resolveWith(text: "host=h sslmode=prefer", env: requiressl);
+    f = f + check(ok: resolved(r: prefer), what: "config: an explicit sslmode beats PGREQUIRESSL");
+
+    Result<Config, PgError> system = resolveWith(text: "host=h sslrootcert=system", env: testEnvironment());
+    string sm = errorOf(r: system);
+    f = f + check(ok: sm.equals(other: "sslrootcert value \"system\" invalid when SSL support is not compiled in"), what: "config: sslrootcert=system needs TLS");
+    Result<Config, PgError> direct = resolveWith(text: "host=h sslnegotiation=direct", env: testEnvironment());
+    string dm = errorOf(r: direct);
+    f = f + check(ok: dm.equals(other: "sslnegotiation value \"direct\" invalid when SSL support is not compiled in"), what: "config: sslnegotiation=direct needs TLS");
+    Result<Config, PgError> gss = resolveWith(text: "host=h gssencmode=require", env: testEnvironment());
+    string gm = errorOf(r: gss);
+    f = f + check(ok: gm.equals(other: "gssencmode value \"require\" invalid when GSSAPI support is not compiled in"), what: "config: gssencmode=require needs GSSAPI");
+    Result<Config, PgError> latin = resolveWith(text: "host=h client_encoding=LATIN1", env: testEnvironment());
+    string lm = errorOf(r: latin);
+    f = f + check(ok: lm.contains(substring: "LATIN1") && lm.contains(substring: "UTF8"), what: "config: a client_encoding other than UTF8 is refused");
+    Result<Config, PgError> utf = resolveWith(text: "host=h client_encoding=utf-8", env: testEnvironment());
+    f = f + check(ok: resolved(r: utf), what: "config: utf-8 is UTF8");
+    Result<Config, PgError> repl = resolveWith(text: "host=h replication=database", env: testEnvironment());
+    f = f + check(ok: !resolved(r: repl), what: "config: replication is refused");
+
+    Result<Config, PgError> multi = resolveWith(text: "host=a,b,c port=1", env: testEnvironment());
+    match (multi) {
+        case Ok(value: c): { f = f + check(ok: c.hostCount() == 3 && c.host(index: 2).port().equals(other: "1"), what: "config: one port for every host"); }
+        case Err(error: e): { f = f + check(ok: false, what: "config: three hosts, one port"); }
+    };
+    Result<Config, PgError> numeric = resolveWith(text: "hostaddr=127.0.0.1 host=db.example", env: testEnvironment());
+    match (numeric) {
+        case Ok(value: c): {
+            f = f + check(ok: c.host(index: 0).kind() == HostKind::Address && c.host(index: 0).name().equals(other: "db.example"), what: "config: hostaddr pairs with host");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "config: hostaddr with host"); }
+    };
+    Result<Config, PgError> latest = resolveWith(text: "host=h min_protocol_version=3.2", env: testEnvironment());
+    match (latest) {
+        case Ok(value: c): { f = f + check(ok: c.maxProtocolVersion() == PROTOCOL_3_2, what: "config: a minimum above 3.0 raises the default maximum to the latest"); }
+        case Err(error: e): { f = f + check(ok: false, what: "config: min_protocol_version=3.2"); }
+    };
+    return f;
+}
+
+fn int32 configTests() {
+    int32 f = 0;
+    f = f + requireAuthTests();
+    f = f + pgpassTests();
+    f = f + serviceTests();
+    f = f + settingTests();
+    f = f + environmentTests();
+    return f;
+}

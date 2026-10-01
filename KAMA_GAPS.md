@@ -17,7 +17,7 @@ changes the right design here, say so and we will follow it.
 
 **Open now:**
 - KPG-11 to KPG-14, found building the protocol and type layers.
-- KPG-15 to KPG-17, found planning the first live connection (phase 4).
+- KPG-15 to KPG-19, found planning and building the first live connection (phase 4).
 
 Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
@@ -105,6 +105,74 @@ honest, until this is fixed.
 **Suggested fix.** Either one would do. The first is the general fix, and Rust has both.
 - Add `IoError::Interrupted` (Rust's `ErrorKind::Interrupted`), classified in `lastError()`.
 - Have `Poller.wait` retry EINTR internally, with the remaining time recomputed against the monotonic clock.
+
+### KPG-18 · LOW · `Metadata` has no file type, and an open `File` cannot be asked for its metadata
+
+**Status:** open. An absence, checked on 0.9.490.
+
+`std::fs::Metadata` (`lib/std/fs/fs.kama:124-130`) has `size`, `isDir`, `modified` and `permissions`, and nothing
+else. The runtime drops the rest of `st_mode`: `kama_path_meta` keeps `S_ISDIR` and `st_mode & 0777`
+(`include/kama_os.h:1390-1392`), so nothing says whether a path is a regular file, a FIFO, a device or a socket.
+`File` has no `metadata()` (no `fstat`), so the only check is by path, before the open.
+
+**Why it matters here.** libpq reads `~/.pgpass` by opening it and then calling `fstat` on that descriptor
+(`passwordFromFile` in `fe-connect.c`):
+- A file that is not regular is refused with `WARNING: password file "…" is not a plain file`. This is the usual
+  way to turn the file off (`PGPASSFILE=/dev/null`). A FIFO would otherwise block the connect.
+- Only then is it refused for group or world access.
+- Both checks are on the descriptor, so there is no time-of-check race.
+
+**Workaround here.** None. This package calls `stat` by path and treats a directory as "not a plain file". Any
+other non-regular file goes on to the permission check: `/dev/null` (mode 0666) gets the "group or world access"
+warning instead of libpq's, and a FIFO would be opened. Both are documented.
+
+**Suggested fix.** A file type on `Metadata`, such as `FileKind { File, Dir, Symlink, Fifo, CharDevice,
+BlockDevice, Socket }` from `st_mode`, where `isDir` becomes `kind == Dir`. Also `File.metadata()` through
+`fstat`, so a check and a read can share one descriptor.
+
+### KPG-19 · MED · A field default naming an enum variant breaks when the type is a std generic's element
+
+**Status:** open. Reproduces on 0.9.490.
+
+A field whose default initializer names an enum variant is resolved in std's scope, not in the type's own, once
+the type is an argument of a std generic such as `DynamicArray`. The error points into std's source. The fix it
+suggests, importing the enum, does not help.
+
+```kama
+import { core::println, std::collections::DynamicArray };
+type enum Kind { First, Second }
+type resource Item {
+    string name;
+    Kind kind = Kind::First;          // the default that breaks it
+    public ctor make(string name, Kind kind) { this.name = give name; this.kind = kind; }
+}
+fn int32 main() {
+    DynamicArray<Item> list = DynamicArray.empty();
+    list.add(item: Item.make(name: "a", kind: Kind::Second));
+    println(s: "ok");
+    return 0;
+}
+```
+
+```
+loose.kama:9:0: error: cannot resolve `Kind::First` — `Kind` is not a type or module in reach here (in
+`DynamicArray<Item, GlobalAllocator>`, instantiated here; raised at …/lib/std/collections/dynamic_array.kama:5)
+…/lib/std/collections/view.kama:5:0: error: cannot resolve `Kind::First` — `Kind` is not a type or module in reach here
+```
+
+The same code in a library module reports `type 'Kind' is not imported — it lives in 'gapdef'; add import {
+gapdef::Kind };`. Adding that import (to the file that declares `Kind`) changes nothing. Without the default
+(`Kind kind;`, set in the constructor), both check clean. A default of a number or a bool does not trigger it
+(`isize start = 0;` is used in a `DynamicArray` element type elsewhere in this package).
+
+**Impact.** It cost a debugging round. In `postgres::Config`, the error pointed at the `DynamicArray<Host>` field,
+naming a type declared ten lines above it.
+
+**Workaround here.** `Host.hostKind` (`src/config.kama`) has no default. Every constructor sets it, which they did
+anyway.
+
+**Suggested fix.** Resolve a field's default initializer in the scope of the type that declares it, wherever the
+type is instantiated.
 
 ### KPG-11 · MED · A generic-inference error is reported against the wrong file, and `kama query --diagnostics` misses it
 

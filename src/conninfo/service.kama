@@ -1,0 +1,108 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, postgres::conninfo::ConnInfoError, postgres::conninfo::Keyword,
+         postgres::conninfo::libpqKeywords };
+export { ServiceEntries, parseServiceFile };
+
+// The connection service file (pg_service.conf), as libpq reads it: a port of parseServiceFile. Finding the file,
+// and applying what it says, live with the caller (postgres::Config).
+//
+// A service is a `[name]` line followed by `keyword=value` lines up to the next `[`. Lines are trimmed, `#` starts
+// a comment, and a line splits at its first '=' with nothing trimmed around it. Every keyword must be one libpq
+// knows, and `service` itself may not appear.
+
+// What one file says about one service.
+type resource ServiceEntries {
+    bool present = false;
+    DynamicArray<string> keys;
+    DynamicArray<string> values;
+
+    public ctor make(bool found, DynamicArray<string> keys, DynamicArray<string> values) {
+        this.present = found; this.keys = give keys; this.values = give values;
+    }
+    // Whether the file defines the service at all (it may define it with no lines).
+    public const fn bool found() { return this.present; }
+    // Its settings in file order. A keyword set twice is listed twice; the first one is the one libpq keeps.
+    public const fn isize count() { return this.keys.length(); }
+    public const fn const ref string keyAt(isize i) { return this.keys[i]; }
+    public const fn const ref string valueAt(isize i) { return this.values[i]; }
+}
+
+// libpq reads a service file a line at a time into a 1024-byte buffer: a line that, with its newline, fills it is
+// "too long".
+comptime isize LINE_LIMIT = 1023;
+
+// Service `service` in the file at `path`, whose contents are `text`. The errors are libpq's, word for word.
+fn Result<ServiceEntries, ConnInfoError> parseServiceFile(const ref string path, ConstView<uint8> text, const ref string service) {
+    DynamicArray<Keyword> known = libpqKeywords();
+    DynamicArray<string> keys = DynamicArray.empty();
+    DynamicArray<string> values = DynamicArray.empty();
+    bool found = false;
+    int32 line = 0;
+    isize at = 0;
+    while (at < text.length()) {
+        line = line + 1;
+        isize end = at;
+        while (end < text.length() && text[end] != 10ui8) { end = end + 1; }
+        isize withNewline = end - at;
+        if (end < text.length()) { withNewline = withNewline + 1; }
+        if (withNewline >= LINE_LIMIT) {
+            return Result::Err(error: ConnInfoError::Invalid(detail: "line ${line} too long in service file \"".concat(other: path).concat(other: "\"")));
+        }
+        isize next = end + 1;
+        isize from = at;
+        while (end > from && isSpace(c: text[end - 1])) { end = end - 1; }
+        while (from < end && isSpace(c: text[from])) { from = from + 1; }
+        at = next;
+        if (from == end || text[from] == 35ui8) { continue; }   // empty, or a '#' comment
+        if (text[from] == 91ui8) {                                 // '['
+            if (found) { break; }                                  // the next group: the service is complete
+            found = isHeader(b: text, from: from, to: end, service: service.bytes());
+            continue;
+        }
+        if (!found) { continue; }
+        isize eq = from;
+        while (eq < end && text[eq] != 61ui8) { eq = eq + 1; }
+        if (eq >= end) { return Result::Err(error: syntaxError(path: path, line: line)); }
+        Optional<string> keyText = utf8(b: text, from: from, to: eq);
+        Optional<string> valueText = utf8(b: text, from: eq + 1, to: end);
+        string key = match (keyText) { case Some(value: k): copy k; case None: { return Result::Err(error: syntaxError(path: path, line: line)); } };
+        string value = match (valueText) {
+            case Some(value: v): copy v;
+            case None: { return Result::Err(error: ConnInfoError::Invalid(detail: "service file \"".concat(other: path).concat(other: "\", line ${line}: the value is not valid UTF-8"))); }
+        };
+        if (key.equals(other: "service")) {
+            return Result::Err(error: ConnInfoError::Invalid(detail: "nested service specifications not supported in service file \"".concat(other: path).concat(other: "\", line ${line}")));
+        }
+        if (!isKeyword(known: known, name: key)) { return Result::Err(error: syntaxError(path: path, line: line)); }
+        keys.add(item: give key);
+        values.add(item: give value);
+    }
+    return Result::Ok(value: ServiceEntries.make(found: found, keys: give keys, values: give values));
+}
+
+// libpq's test: the bytes after '[' start with the service name, and the next byte is ']'. Anything after the ']'
+// is ignored.
+fn bool isHeader(ConstView<uint8> b, isize from, isize to, ConstView<uint8> service) {
+    isize n = service.length();
+    if (from + 1 + n >= to) { return false; }
+    isize i = 0;
+    while (i < n) { if (b[from + 1 + i] != service[i]) { return false; } i = i + 1; }
+    return b[from + 1 + n] == 93ui8;
+}
+
+fn ConnInfoError syntaxError(const ref string path, int32 line) {
+    return ConnInfoError::Invalid(detail: "syntax error in service file \"".concat(other: path).concat(other: "\", line ${line}"));
+}
+
+fn bool isSpace(uint8 c) { return c == 32ui8 || (c >= 9ui8 && c <= 13ui8); }
+
+fn bool isKeyword(const ref DynamicArray<Keyword> known, const ref string name) {
+    isize i = 0;
+    while (i < known.length()) { if (known[i].name().equals(other: name)) { return true; } i = i + 1; }
+    return false;
+}
+
+unsafe fn Optional<string> utf8(ConstView<uint8> b, isize from, isize to) {
+    Result<string, Utf8Error> s = decode(bytes: b.slice(from: from, count: to - from));
+    return match (give s) { case Ok(value: t): Optional::Some(value: give t); case Err(error: e): Optional::None; };
+}

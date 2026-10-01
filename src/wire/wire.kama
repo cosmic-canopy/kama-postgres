@@ -1,0 +1,160 @@
+import { std::collections::FixedArray, std::collections::ConstView, std::io::IoError, std::memory::Owned,
+         std::net::Interest, std::net::Ready, std::time::Instant, std::time::Duration, std::time::monotonicNow,
+         postgres::Transport, postgres::PgError,
+         postgres::protocol::Frame, postgres::protocol::frame, postgres::protocol::decode,
+         postgres::protocol::BackendMessage, postgres::protocol::ProtocolError, postgres::protocol::HEADER_BYTES };
+export { Wire, Deadline };
+
+// postgres::wire — messages over a `Transport`: framing the bytes that arrive into backend messages, and writing
+// frontend bytes out, each step bounded by a deadline. Internal: a connection is the only user.
+
+// When a wait must end: never, or at an instant of the monotonic clock.
+type value Deadline {
+    bool bounded = false;
+    Instant at;
+
+    public ctor none() { this.bounded = false; this.at = Instant.of(rawNanos: 0ui64); }
+    public unsafe ctor after(Duration span) { this.bounded = true; this.at = monotonicNow() + span; }
+
+    public const fn bool isBounded() { return this.bounded; }
+
+    // What `Transport.wait` takes: -1 for no limit, else the milliseconds left, rounded up so a wait never ends
+    // just short of the deadline and spins; 0 once it has passed.
+    public unsafe const fn int32 remainingMs() {
+        if (!this.bounded) { return -1; }
+        Instant now = monotonicNow();
+        if (now >= this.at) { return 0; }
+        int64 nanos = (this.at - now).asNanos();
+        int64 ms = (nanos + 999999i64) / 1000000i64;
+        if (ms > 2147483647i64) { return 2147483647; }
+        return cast<int32>(ms);
+    }
+}
+
+// The receive buffer starts at libpq's size and grows to hold the largest message it is given, up to the
+// protocol's 1 GiB cap. Once it has drained, a buffer grown past RETAIN_BYTES is given back.
+comptime isize INITIAL_BYTES = 16384;
+comptime isize RETAIN_BYTES = 1048576;
+
+type resource Wire implements Sendable {
+    Owned<Transport> link;
+    FixedArray<uint8> buf;
+    isize start = 0;   // the first byte not yet consumed
+    isize end = 0;     // one past the last byte read
+
+    public ctor over(Owned<Transport> transport) {
+        this.link = give transport;
+        this.buf = FixedArray.make(size: INITIAL_BYTES);
+        this.start = 0;
+        this.end = 0;
+    }
+
+    // The next message from the server. The bytes of every message are checked before anything is believed
+    // (postgres::protocol): a malformed one is `Protocol`, and the connection cannot recover its framing after it.
+    public unsafe fn Result<BackendMessage, PgError> receive(Deadline deadline) {
+        while (true) {
+            Frame f = frame(buf: this.buf.slice(from: this.start, count: this.end - this.start));
+            match (give f) {
+                case Complete(tag: t, total: n): {
+                    Result<BackendMessage, ProtocolError> m = decode(tag: t, body: this.buf.slice(from: this.start + HEADER_BYTES, count: n - HEADER_BYTES));
+                    this.consume(n: n);
+                    return match (give m) {
+                        case Ok(value: v): Result::Ok(value: give v);
+                        case Err(error: e): Result::Err(error: PgError::Protocol(error: give e));
+                    };
+                }
+                case Incomplete(needed: k): {
+                    Result<Unit, PgError> filled = this.fill(needed: k, deadline: deadline);
+                    match (give filled) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                }
+                case Invalid(error: e): { return Result::Err(error: PgError::Protocol(error: give e)); }
+            };
+        }
+        return Result::Err(error: PgError::Closed);
+    }
+
+    // Write all of `bytes`, waiting for the transport as often as it needs, until `deadline`.
+    public unsafe fn Result<Unit, PgError> send(ConstView<uint8> bytes, Deadline deadline) {
+        isize sent = 0;
+        while (sent < bytes.length()) {
+            Result<isize, IoError> w = this.link.write(bytes: bytes.slice(from: sent, count: bytes.length() - sent));
+            bool wait = false;
+            match (w) {
+                case Ok(value: n): { if (n > 0) { sent = sent + n; } else { wait = true; } }
+                case Err(error: e): {
+                    match (e) { case WouldBlock: { wait = true; } case _: { return Result::Err(error: PgError::Io(error: e)); } };
+                }
+            };
+            if (wait) {
+                Result<Unit, PgError> ready = this.await(interest: Interest::Write, deadline: deadline);
+                match (give ready) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+            }
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Stop the transport in both directions. Buffered bytes are dropped with it.
+    public unsafe fn void shutdown() {
+        this.link.shutdown();
+        this.start = 0;
+        this.end = 0;
+    }
+
+    // Read until at least `needed` bytes from `start` are buffered.
+    unsafe fn Result<Unit, PgError> fill(isize needed, Deadline deadline) {
+        this.makeRoom(needed: needed);
+        while (this.end - this.start < needed) {
+            Result<isize, IoError> r = this.link.read(into: this.buf.sliceMut(from: this.end, count: this.buf.length() - this.end));
+            bool wait = false;
+            match (r) {
+                case Ok(value: n): {
+                    if (n == 0) { return Result::Err(error: PgError::Io(error: IoError::UnexpectedEof)); }
+                    this.end = this.end + n;
+                }
+                case Err(error: e): {
+                    match (e) { case WouldBlock: { wait = true; } case _: { return Result::Err(error: PgError::Io(error: e)); } };
+                }
+            };
+            if (wait) {
+                Result<Unit, PgError> ready = this.await(interest: Interest::Read, deadline: deadline);
+                match (give ready) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+            }
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    unsafe fn Result<Unit, PgError> await(Interest interest, Deadline deadline) {
+        Result<Ready, IoError> w = this.link.wait(interest: interest, timeoutMs: deadline.remainingMs());
+        Ready r = match (w) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: PgError::Io(error: e)); } };
+        if (!r.readable && !r.writable) { return Result::Err(error: PgError::Timeout); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Space for `needed` bytes from `start`: the unread bytes move to the front, and the buffer doubles until
+    // they fit.
+    unsafe fn void makeRoom(isize needed) {
+        if (this.start + needed <= this.buf.length()) { return; }
+        isize size = this.buf.length();
+        while (size < needed) { size = size * 2; }
+        isize unread = this.end - this.start;
+        if (size == this.buf.length()) {
+            isize i = 0;
+            while (i < unread) { this.buf[i] = this.buf[this.start + i]; i = i + 1; }
+        } else {
+            FixedArray<uint8> grown = FixedArray.make(size: size);
+            isize i = 0;
+            while (i < unread) { grown[i] = this.buf[this.start + i]; i = i + 1; }
+            this.buf = give grown;
+        }
+        this.start = 0;
+        this.end = unread;
+    }
+
+    fn void consume(isize n) {
+        this.start = this.start + n;
+        if (this.start < this.end) { return; }
+        this.start = 0;
+        this.end = 0;
+        if (this.buf.length() > RETAIN_BYTES) { this.buf = FixedArray.make(size: INITIAL_BYTES); }
+    }
+}

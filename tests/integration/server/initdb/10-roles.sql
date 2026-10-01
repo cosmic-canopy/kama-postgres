@@ -7,6 +7,9 @@ CREATE ROLE kp_password LOGIN PASSWORD 'kp_password_pw';   -- stored as SCRAM; t
                                                           -- sends cleartext and the server checks it
 CREATE ROLE kp_ssl_only LOGIN PASSWORD 'kp_ssl_only_pw';
 CREATE ROLE kp_nossl    LOGIN PASSWORD 'kp_nossl_pw';
+-- Stored as SCRAM, but pg_hba.conf gives it the `md5` method: the server then runs SCRAM anyway. This is the
+-- md5 section of PostgreSQL's own src/test/authentication/t/001_password.pl, whose require_auth cases run here.
+CREATE ROLE kp_md5_scram LOGIN PASSWORD 'kp_md5_scram_pw';
 CREATE ROLE kp_trust    LOGIN;
 CREATE ROLE kp_cert     LOGIN;
 

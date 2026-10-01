@@ -15,6 +15,7 @@
     "protocol": { "visibility": "public" },
     "conninfo": { "visibility": "public" },
     "sqlstate": { "visibility": "public" },
-    "types":    { "visibility": "public" }
+    "types":    { "visibility": "public" },
+    "wire":     { "visibility": "internal" }
   }
 }

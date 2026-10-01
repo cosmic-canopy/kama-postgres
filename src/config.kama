@@ -1,0 +1,957 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode as utf8Decode,
+         std::encoding::utf8::Utf8Error, std::encoding::base64::decode as b64decode,
+         std::encoding::base64::DecodeError, std::fs::readFile, std::fs::stat, std::fs::Metadata,
+         std::fs::Permissions, std::io::IoError, std::process::currentUser, std::process::UserId,
+         std::log::logWarn, core::env,
+         postgres::PgError, postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
+         postgres::conninfo::ConnInfo, postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
+         postgres::conninfo::Keyword, postgres::conninfo::libpqKeywords, postgres::conninfo::EnvironmentOption,
+         postgres::conninfo::libpqEnvironmentOptions, postgres::conninfo::pgpassLookup,
+         postgres::conninfo::defaultSocketDir, postgres::conninfo::parseServiceFile,
+         postgres::conninfo::ServiceEntries };
+export { Config, Environment, Host, HostKind, SslMode, ChannelBindingMode, RequireAuth };
+
+// postgres::Config — everything a connection needs, resolved the way libpq resolves it:
+//   1. the connection string (postgres::conninfo);
+//   2. the service file, for keywords the string left unset (parseServiceInfo);
+//   3. each unset keyword's environment variable, then libpq's compiled default (conninfo_add_defaults);
+//   4. defaults that depend on others: the user is the local account, the database is the user, the password
+//      comes from the password file for each host (pqConnectOptions2);
+//   5. every value checked, with libpq's messages (pqConnectOptions2, pqParseIntParam).
+// A setting this client cannot honour yet is refused here, never ignored.
+
+// ---- the environment ---------------------------------------------------------------------------------------
+
+// The process environment, as far as a connection reads it: every keyword's PG* variable, PGSERVICEFILE,
+// PGSYSCONFDIR, PGREQUIRESSL, the variables libpq sends as run-time settings (PGTZ, PGDATESTYLE, PGGEQO), the
+// home directory (HOME, and APPDATA on Windows), and the local user name. `process()` reads it; a test, or a
+// program that keeps settings elsewhere, builds one.
+type resource Environment implements Sendable {
+    DynamicArray<string> names;
+    DynamicArray<string> values;
+    string user;
+    string userProblem;   // why `user` is "", in libpq's words
+
+    public ctor empty() {
+        this.names = DynamicArray.empty();
+        this.values = DynamicArray.empty();
+        this.user = "";
+        this.userProblem = "the local user name is not known";
+    }
+
+    public unsafe ctor process() {
+        this.names = DynamicArray.empty();
+        this.values = DynamicArray.empty();
+        DynamicArray<Keyword> known = libpqKeywords();
+        isize i = 0;
+        while (i < known.length()) {
+            if (known[i].environment().length() > 0) { this.capture(name: known[i].environment()); }
+            i = i + 1;
+        }
+        DynamicArray<EnvironmentOption> settings = libpqEnvironmentOptions();
+        i = 0;
+        while (i < settings.length()) { this.capture(name: settings[i].environment()); i = i + 1; }
+        DynamicArray<string> more = DynamicArray.empty();
+        more.add(item: "PGSERVICEFILE"); more.add(item: "PGSYSCONFDIR"); more.add(item: "PGREQUIRESSL");
+        more.add(item: "HOME"); more.add(item: "APPDATA");
+        i = 0;
+        while (i < more.length()) { this.capture(name: more[i]); i = i + 1; }
+        Result<string, ConnInfoError> who = localUserName();
+        match (give who) {
+            case Ok(value: n): { this.user = give n; this.userProblem = ""; }
+            case Err(error: e): { this.user = ""; this.userProblem = e.message(); }
+        };
+    }
+
+    unsafe fn void capture(const ref string name) {
+        Optional<string> v = env(name: copy name);
+        match (give v) { case Some(value: x): { this.set(name: name, value: give x); } case None: { } };
+    }
+
+    // Set a variable. An empty value is still set, as an empty environment variable is to libpq.
+    public fn void set(const ref string name, string value) {
+        isize found = -1;
+        isize i = 0;
+        while (i < this.names.length() && found < 0) {
+            if (this.names[i].equals(other: name)) { found = i; }
+            i = i + 1;
+        }
+        if (found >= 0) { this.values[found] = give value; return; }
+        this.names.add(item: copy name);
+        this.values.add(item: give value);
+    }
+
+    public const fn Optional<string> get(const ref string name) {
+        isize i = 0;
+        while (i < this.names.length()) {
+            if (this.names[i].equals(other: name)) { return Optional::Some(value: copy this.values[i]); }
+            i = i + 1;
+        }
+        return Optional::None;
+    }
+
+    // The account this process runs as: the default user name.
+    public fn void setUser(string name) { this.user = give name; this.userProblem = ""; }
+    public const fn const ref string localUser() { return this.user; }
+    public const fn const ref string localUserProblem() { return this.userProblem; }
+
+    // libpq's pqGetHomeDirectory: $HOME, or on Windows %APPDATA%\postgresql. None when it is not set (libpq would
+    // then ask the passwd entry, which std cannot yet: KPG-16).
+    public const fn Optional<string> homeDirectory() { return homeFrom(vars: this); }
+}
+
+@compileFor(!OS_WINDOWS)
+unsafe fn Result<string, ConnInfoError> localUserName() {
+    Result<UserId, IoError> who = currentUser();
+    UserId id = match (who) { case Ok(value: u): u; case Err(error: e): { return Result::Err(error: fail(detail: e.message())); } };
+    Result<string, IoError> name = id.name();
+    uint32 raw = id.raw();
+    return match (give name) {
+        case Ok(value: n): Result::Ok(value: give n);
+        case Err(error: e): match (e) {
+            case NotFound: Result::Err(error: fail(detail: "local user with ID ${raw} does not exist"));
+            case _: Result::Err(error: fail(detail: "could not look up local user ID ${raw}: ".concat(other: e.message())));
+        };
+    };
+}
+
+@compileFor(OS_WINDOWS)
+unsafe fn Result<string, ConnInfoError> localUserName() {
+    Result<UserId, IoError> who = currentUser();
+    UserId id = match (who) { case Ok(value: u): u; case Err(error: e): { return Result::Err(error: fail(detail: "user name lookup failure: ".concat(other: e.message()))); } };
+    Result<string, IoError> name = id.name();
+    return match (give name) {
+        case Ok(value: n): Result::Ok(value: give n);
+        case Err(error: e): Result::Err(error: fail(detail: "user name lookup failure: ".concat(other: e.message())));
+    };
+}
+
+@compileFor(!OS_WINDOWS)
+fn Optional<string> homeFrom(const ref Environment vars) {
+    Optional<string> home = vars.get(name: "HOME");
+    return match (give home) { case Some(value: h): nonEmpty(s: give h); case None: Optional::None; };
+}
+
+@compileFor(OS_WINDOWS)
+fn Optional<string> homeFrom(const ref Environment vars) {
+    Optional<string> appdata = vars.get(name: "APPDATA");
+    return match (give appdata) {
+        case Some(value: a): { if (a.length() == 0) { return Optional::None; } return Optional::Some(value: a.concat(other: "/postgresql")); }
+        case None: Optional::None;
+    };
+}
+
+// The password file in the home directory: ~/.pgpass, or pgpass.conf on Windows.
+@compileFor(!OS_WINDOWS) fn string passfileName() { return ".pgpass"; }
+@compileFor(OS_WINDOWS) fn string passfileName() { return "pgpass.conf"; }
+
+fn Optional<string> nonEmpty(string s) { if (s.length() == 0) { return Optional::None; } return Optional::Some(value: give s); }
+
+// ---- settings ------------------------------------------------------------------------------------------------
+
+type enum SslMode implements Sendable { Disable, Allow, Prefer, Require, VerifyCa, VerifyFull }
+type enum ChannelBindingMode implements Sendable { Disable, Prefer, Require }
+// A host given by name (resolved through DNS), by numeric address (`hostaddr`), or as a Unix-socket directory.
+type enum HostKind implements Sendable { Name, Address, Socket }
+
+// One server to try, as pqConnectOptions2 lays them out: `host` and `hostaddr` paired by position, a port each.
+type resource Host implements Sendable {
+    string hostName;
+    string hostAddr;
+    string portText;
+    HostKind hostKind;
+    bool fromFile = false;
+    string filePassword;
+
+    public ctor make(string name, string address, string port, HostKind kind) {
+        this.hostName = give name; this.hostAddr = give address; this.portText = give port; this.hostKind = kind;
+        this.fromFile = false; this.filePassword = "";
+    }
+    fn void setFilePassword(string password) { this.fromFile = true; this.filePassword = give password; }
+    friend Config::readPassfile[setFilePassword];
+
+    // The host name or socket directory; "" when only `hostaddr` was given.
+    public const fn const ref string name() { return this.hostName; }
+    // The numeric address to connect to, skipping DNS; "" when none was given.
+    public const fn const ref string address() { return this.hostAddr; }
+    // The port as configured; "" means 5432. It is parsed when the host is tried, as libpq parses it.
+    public const fn const ref string port() { return this.portText; }
+    public const fn HostKind kind() { return this.hostKind; }
+    // The password the password file gave for this host, if the connection string gave none.
+    public const fn Optional<string> filePasswordFor() {
+        if (!this.fromFile) { return Optional::None; }
+        return Optional::Some(value: copy this.filePassword);
+    }
+    // What libpq displays for this host: the name, or the address when there is no name.
+    public const fn string display() {
+        if (this.hostKind == HostKind::Address) { return copy this.hostAddr; }
+        return copy this.hostName;
+    }
+}
+
+// The authentication request codes (AUTH_REQ_* in src/include/libpq/protocol.h).
+comptime int32 AUTH_OK = 0;
+comptime int32 AUTH_PASSWORD = 3;
+comptime int32 AUTH_MD5 = 5;
+comptime int32 AUTH_GSS = 7;
+comptime int32 AUTH_GSS_CONT = 8;
+comptime int32 AUTH_SSPI = 9;
+comptime int32 AUTH_SASL = 10;
+comptime int32 AUTH_SASL_CONT = 11;
+comptime int32 AUTH_SASL_FIN = 12;
+
+fn uint32 bit(int32 code) { return 1ui32 << cast<uint32>(code); }
+
+// `require_auth`: the methods the server may use, and whether it must use one. A port of the require_auth block
+// of pqConnectOptions2 and of check_expected_areq (fe-auth.c), with their messages.
+type resource RequireAuth implements Sendable {
+    bool given = false;         // the keyword has a value (libpq: require_auth != NULL), even an empty one
+    string spec;
+    bool required = false;      // auth_required: an exchange must complete
+    uint32 methods = 0ui32;     // allowed_auth_methods: bit n allows AUTH_REQ n
+    bool scram = false;         // the SASL mechanisms allowed
+    bool oauth = false;
+
+    // No requirement: the keyword was not given.
+    public ctor none() {
+        this.given = false; this.spec = ""; this.required = false; this.methods = 0ui32; this.scram = false; this.oauth = false;
+    }
+
+    // The keyword's value, checked as pqConnectOptions2 checks it. The error is libpq's message.
+    public ctor Result<RequireAuth, ConnInfoError> parse(const ref string text) {
+        RequireAuth r = RequireAuth.none();
+        r.given = true;
+        r.spec = copy text;
+        if (text.length() == 0) { return Result::Ok(value: give r); }
+        r.required = true;
+        bool negated = false;
+        bool first = true;
+        foreach (string part in text.split(separator: ",")) {
+            string method = copy part;
+            if (method.startsWith(prefix: "!")) {
+                if (first) {
+                    // A negated list starts from everything and subtracts.
+                    r.required = false;
+                    r.methods = 4294967295ui32;
+                    r.scram = true;
+                    r.oauth = true;
+                } else if (!negated) {
+                    return Result::Err(error: fail(detail: "negative require_auth method \"".concat(other: part).concat(other: "\" cannot be mixed with non-negative methods")));
+                }
+                negated = true;
+                method = part.substring(start: 1, end: part.length());
+            } else if (negated) {
+                return Result::Err(error: fail(detail: "require_auth method \"".concat(other: part).concat(other: "\" cannot be mixed with negative methods")));
+            }
+            first = false;
+            uint32 bits = 0ui32;
+            int32 mech = 0;   // 1 SCRAM, 2 OAuth
+            if (method.equals(other: "password")) { bits = bit(code: AUTH_PASSWORD); }
+            else if (method.equals(other: "md5")) { bits = bit(code: AUTH_MD5); }
+            else if (method.equals(other: "gss")) { bits = bit(code: AUTH_GSS) | bit(code: AUTH_GSS_CONT); }
+            else if (method.equals(other: "sspi")) { bits = bit(code: AUTH_SSPI) | bit(code: AUTH_GSS_CONT); }
+            else if (method.equals(other: "scram-sha-256")) { mech = 1; }
+            else if (method.equals(other: "oauth")) { mech = 2; }
+            else if (method.equals(other: "none")) {
+                if (negated) {
+                    if (r.required) { return Result::Err(error: fail(detail: duplicate(part: part))); }
+                    r.required = true;
+                } else {
+                    if (!r.required) { return Result::Err(error: fail(detail: duplicate(part: part))); }
+                    r.required = false;
+                }
+                continue;
+            } else {
+                return Result::Err(error: fail(detail: "invalid require_auth value: \"".concat(other: method).concat(other: "\"")));
+            }
+            if (mech != 0) {
+                bool allowed = r.scram;
+                if (mech == 2) { allowed = r.oauth; }
+                if (negated == !allowed) { return Result::Err(error: fail(detail: duplicate(part: part))); }
+                if (mech == 1) { r.scram = !negated; } else { r.oauth = !negated; }
+            } else if (negated) {
+                if ((r.methods & bits) == 0ui32) { return Result::Err(error: fail(detail: duplicate(part: part))); }
+                r.methods = r.methods & ~bits;
+            } else {
+                if ((r.methods & bits) == bits) { return Result::Err(error: fail(detail: duplicate(part: part))); }
+                r.methods = r.methods | bits;
+            }
+        }
+        uint32 sasl = bit(code: AUTH_SASL) | bit(code: AUTH_SASL_CONT) | bit(code: AUTH_SASL_FIN);
+        bool anyMech = r.scram || r.oauth;
+        if (!negated && anyMech) { r.methods = r.methods | sasl; }
+        else if (negated && !anyMech) { r.methods = r.methods & ~sasl; }
+        return Result::Ok(value: give r);
+    }
+
+    public const fn bool isGiven() { return this.given; }
+    public const fn const ref string text() { return this.spec; }
+
+    // check_expected_areq's require_auth half: None if the server may make authentication request `code` now,
+    // else libpq's message. `finished` is whether this client has completed an exchange (client_finished_auth).
+    public const fn Optional<string> refuse(int32 code, bool finished) {
+        if (!this.given) { return Optional::None; }
+        if (code == AUTH_OK) {
+            if (!this.required || finished) { return Optional::None; }
+            return Optional::Some(value: this.failed(reason: "server did not complete authentication"));
+        }
+        bool allowed = false;
+        if (code == AUTH_PASSWORD || code == AUTH_MD5 || code == AUTH_GSS || code == AUTH_GSS_CONT || code == AUTH_SSPI
+            || code == AUTH_SASL || code == AUTH_SASL_CONT || code == AUTH_SASL_FIN) {
+            allowed = (this.methods & bit(code: code)) != 0ui32;
+        }
+        if (allowed) { return Optional::None; }
+        return Optional::Some(value: this.failed(reason: describe(code: code)));
+    }
+
+    // pg_SASL_init's check of the mechanism the client chose: None if allowed, else libpq's message.
+    public const fn Optional<string> refuseMechanism(const ref string mechanism) {
+        if (!this.given) { return Optional::None; }
+        bool allowed = this.scram;
+        if (mechanism.equals(other: "OAUTHBEARER")) { allowed = this.oauth; }
+        if (allowed) { return Optional::None; }
+        return Optional::Some(value: this.failed(reason: "server requested ".concat(other: mechanism).concat(other: " authentication")));
+    }
+
+    const fn string failed(const ref string reason) {
+        return "authentication method requirement \"".concat(other: this.spec).concat(other: "\" failed: ").concat(other: reason);
+    }
+}
+
+fn string duplicate(const ref string part) {
+    return "require_auth method \"".concat(other: part).concat(other: "\" is specified more than once");
+}
+
+// auth_method_description.
+fn string describe(int32 code) {
+    if (code == AUTH_PASSWORD) { return "server requested a cleartext password"; }
+    if (code == AUTH_MD5) { return "server requested a hashed password"; }
+    if (code == AUTH_GSS || code == AUTH_GSS_CONT) { return "server requested GSSAPI authentication"; }
+    if (code == AUTH_SSPI) { return "server requested SSPI authentication"; }
+    if (code == AUTH_SASL || code == AUTH_SASL_CONT || code == AUTH_SASL_FIN) { return "server requested SASL authentication"; }
+    return "server requested an unknown authentication type";
+}
+
+// ---- the configuration --------------------------------------------------------------------------------------
+
+type resource Config implements Sendable {
+    DynamicArray<string> names;    // every libpq keyword, in libpq's order
+    DynamicArray<string> values;   // its resolved value ("" when unset)
+    DynamicArray<bool> present;    // whether it has a value at all
+    DynamicArray<Host> hostList;
+    string passfilePath;           // the password file consulted, "" if none
+    SslMode ssl = SslMode::Prefer;
+    ChannelBindingMode binding = ChannelBindingMode::Prefer;
+    RequireAuth auth;
+    int32 minProtocol = 0;
+    int32 maxProtocol = 0;
+    int32 timeoutSeconds = 0;      // connect_timeout; 0 for none
+    bool keepalivesOn = true;
+    int32 idleSeconds = -1;        // keepalives_idle, keepalives_interval, keepalives_count, tcp_user_timeout:
+    int32 intervalSeconds = -1;    //   -1 when not set, so the system's default stays
+    int32 probeCount = -1;
+    int32 userTimeoutMs = -1;
+    DynamicArray<string> params;          // the StartupMessage's parameters, in libpq's order
+    DynamicArray<string> paramValues;
+    DynamicArray<uint8> clientKey;        // scram_client_key and scram_server_key, decoded; empty when not given
+    DynamicArray<uint8> serverKey;
+
+    // A connection string, resolved under the process environment.
+    public unsafe ctor Result<Config, PgError> parse(const ref string text) {
+        Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: text);
+        ConnInfo info = match (give parsed) { case Ok(value: i): give i; case Err(error: e): { return Result::Err(error: PgError::Config(detail: e.message())); } };
+        Environment vars = Environment.process();
+        return Config.resolve(info: give info, environment: vars);
+    }
+
+    // What a connection string (or keywords set one by one on a `ConnInfo`) says, resolved under `env`.
+    public unsafe ctor Result<Config, PgError> resolve(ConnInfo info, const ref Environment environment) {
+        Config c = Config.blank();
+        DynamicArray<Keyword> known = libpqKeywords();
+        isize i = 0;
+        while (i < known.length()) {
+            Optional<string> v = info.get(keyword: known[i].name());
+            match (give v) { case Some(value: x): { c.setAt(i: i, value: give x); } case None: { } };
+            i = i + 1;
+        }
+        Result<Unit, ConnInfoError> service = c.applyService(vars: environment);
+        match (give service) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: PgError::Config(detail: e.message())); } };
+        c.applyDefaults(known: known, vars: environment);
+        Result<Unit, ConnInfoError> checked = c.check(vars: environment);
+        match (give checked) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: PgError::Config(detail: e.message())); } };
+        return Result::Ok(value: give c);
+    }
+
+    ctor blank() {
+        this.names = DynamicArray.empty();
+        this.values = DynamicArray.empty();
+        this.present = DynamicArray.empty();
+        DynamicArray<Keyword> known = libpqKeywords();
+        isize i = 0;
+        while (i < known.length()) {
+            this.names.add(item: copy known[i].name());
+            this.values.add(item: "");
+            this.present.add(item: false);
+            i = i + 1;
+        }
+        this.hostList = DynamicArray.empty();
+        this.passfilePath = "";
+        this.auth = RequireAuth.none();
+        this.params = DynamicArray.empty();
+        this.paramValues = DynamicArray.empty();
+        this.clientKey = DynamicArray.empty();
+        this.serverKey = DynamicArray.empty();
+    }
+
+    // ---- reading it ----
+
+    // A keyword's resolved value, as PQconninfo reports it; None when it has none.
+    public const fn Optional<string> get(const ref string keyword) {
+        isize i = this.indexOf(keyword: keyword);
+        if (i < 0 || !this.present[i]) { return Optional::None; }
+        return Optional::Some(value: copy this.values[i]);
+    }
+
+    public const fn string user() { return this.text(keyword: "user"); }
+    public const fn string dbname() { return this.text(keyword: "dbname"); }
+    // The password the connection string or PGPASSWORD gave; "" if none (a host may still have one from the
+    // password file).
+    public const fn string password() { return this.text(keyword: "password"); }
+    public const fn const ref string passfile() { return this.passfilePath; }
+    public const fn isize hostCount() { return this.hostList.length(); }
+    public const fn const ref Host host(isize index) { return this.hostList[index]; }
+    public const fn SslMode sslMode() { return this.ssl; }
+    public const fn ChannelBindingMode channelBinding() { return this.binding; }
+    public const fn const ref RequireAuth requireAuth() { return this.auth; }
+    // The protocol versions to accept, as the StartupMessage spells them (PROTOCOL_3_0, PROTOCOL_3_2).
+    public const fn int32 minProtocolVersion() { return this.minProtocol; }
+    public const fn int32 maxProtocolVersion() { return this.maxProtocol; }
+    // connect_timeout in seconds, applied to each address tried; 0 for no limit.
+    public const fn int32 connectTimeout() { return this.timeoutSeconds; }
+    public const fn bool keepalives() { return this.keepalivesOn; }
+    // keepalives_idle, keepalives_interval and keepalives_count; -1 when not set.
+    public const fn int32 keepalivesIdle() { return this.idleSeconds; }
+    public const fn int32 keepalivesInterval() { return this.intervalSeconds; }
+    public const fn int32 keepalivesCount() { return this.probeCount; }
+    // tcp_user_timeout in milliseconds; -1 when not set.
+    public const fn int32 tcpUserTimeout() { return this.userTimeoutMs; }
+    // The run-time parameters of the StartupMessage, in the order libpq sends them.
+    public const fn const ref DynamicArray<string> startupNames() { return this.params; }
+    public const fn const ref DynamicArray<string> startupValues() { return this.paramValues; }
+    // scram_client_key and scram_server_key: SCRAM's ClientKey and ServerKey, given instead of a password.
+    public const fn const ref DynamicArray<uint8> scramClientKey() { return this.clientKey; }
+    public const fn const ref DynamicArray<uint8> scramServerKey() { return this.serverKey; }
+
+    const fn isize indexOf(const ref string keyword) {
+        isize i = 0;
+        while (i < this.names.length()) { if (this.names[i].equals(other: keyword)) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    const fn string text(const ref string keyword) {
+        isize i = this.indexOf(keyword: keyword);
+        if (i < 0) { return ""; }
+        return copy this.values[i];
+    }
+
+    const fn bool has(const ref string keyword) {
+        isize i = this.indexOf(keyword: keyword);
+        return i >= 0 && this.present[i];
+    }
+
+    fn void setAt(isize i, string value) { this.values[i] = give value; this.present[i] = true; }
+
+    fn void setIfUnset(const ref string keyword, const ref string value) {
+        isize i = this.indexOf(keyword: keyword);
+        if (i >= 0 && !this.present[i]) { this.setAt(i: i, value: copy value); }
+    }
+
+    // ---- resolving it ----
+
+    // parseServiceInfo: the service file's settings for keywords still unset.
+    unsafe fn Result<Unit, ConnInfoError> applyService(const ref Environment vars) {
+        Optional<string> fromString = this.get(keyword: "service");
+        string service = match (give fromString) {
+            case Some(value: s): give s;
+            case None: match (vars.get(name: "PGSERVICE")) { case Some(value: s): copy s; case None: { return Result::Ok(value: Unit::Unit); } };
+        };
+        bool found = false;
+        Optional<string> userFile = vars.get(name: "PGSERVICEFILE");
+        string path = "";
+        bool mustExist = false;
+        match (give userFile) {
+            case Some(value: f): { path = give f; mustExist = true; }
+            case None: {
+                Optional<string> home = vars.homeDirectory();
+                match (give home) { case Some(value: h): { path = h.concat(other: "/.pg_service.conf"); } case None: { } };
+            }
+        };
+        if (path.length() > 0) {
+            Result<bool, ConnInfoError> r = this.applyServiceFile(path: path, service: service, mustExist: mustExist);
+            match (give r) { case Ok(value: f): { found = f; } case Err(error: e): { return Result::Err(error: give e); } };
+            if (found) { return Result::Ok(value: Unit::Unit); }
+        }
+        // There is no compiled-in SYSCONFDIR here: the system-wide file is found through PGSYSCONFDIR only.
+        Optional<string> sysconf = vars.get(name: "PGSYSCONFDIR");
+        match (give sysconf) {
+            case Some(value: d): {
+                string system = d.concat(other: "/pg_service.conf");
+                Result<bool, ConnInfoError> r = this.applyServiceFile(path: system, service: service, mustExist: false);
+                match (give r) { case Ok(value: f): { found = f; } case Err(error: e): { return Result::Err(error: give e); } };
+            }
+            case None: { }
+        };
+        if (!found) { return Result::Err(error: fail(detail: "definition of service \"".concat(other: service).concat(other: "\" not found"))); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // One service file: whether it defines the service. A file that does not exist is skipped unless it was
+    // named by PGSERVICEFILE, which libpq reports.
+    unsafe fn Result<bool, ConnInfoError> applyServiceFile(const ref string path, const ref string service, bool mustExist) {
+        Result<DynamicArray<uint8>, IoError> read = readFile(path: path);
+        DynamicArray<uint8> bytes = match (give read) {
+            case Ok(value: b): give b;
+            case Err(error: e): {
+                if (!mustExist) {
+                    match (e) { case NotFound: { return Result::Ok(value: false); } case _: { } };
+                }
+                return Result::Err(error: fail(detail: "service file \"".concat(other: path).concat(other: "\" not found")));
+            }
+        };
+        Result<ServiceEntries, ConnInfoError> parsed = parseServiceFile(path: path, text: bytes.view(), service: service);
+        ServiceEntries entries = match (give parsed) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+        isize i = 0;
+        while (i < entries.count()) {
+            this.setIfUnset(keyword: entries.keyAt(i: i), value: entries.valueAt(i: i));
+            i = i + 1;
+        }
+        return Result::Ok(value: entries.found());
+    }
+
+    // conninfo_add_defaults: each unset keyword's environment variable, then its compiled default; PGREQUIRESSL;
+    // the local user; and sslmode verify-full when sslrootcert=system and no sslmode was given.
+    fn void applyDefaults(const ref DynamicArray<Keyword> known, const ref Environment vars) {
+        bool sslmodeDefaulted = false;
+        isize i = 0;
+        while (i < known.length()) {
+            if (this.present[i]) { i = i + 1; continue; }
+            if (known[i].environment().length() > 0) {
+                Optional<string> v = vars.get(name: known[i].environment());
+                bool fromEnv = false;
+                match (give v) { case Some(value: x): { this.setAt(i: i, value: give x); fromEnv = true; } case None: { } };
+                if (fromEnv) { i = i + 1; continue; }
+            }
+            if (known[i].name().equals(other: "sslmode")) {
+                Optional<string> requiressl = vars.get(name: "PGREQUIRESSL");
+                bool required = match (requiressl) { case Some(value: r): r.startsWith(prefix: "1"); case None: false; };
+                if (required) { this.setAt(i: i, value: "require"); i = i + 1; continue; }
+                sslmodeDefaulted = true;
+            }
+            if (known[i].hasDefault()) { this.setAt(i: i, value: copy known[i].defaultValue()); i = i + 1; continue; }
+            if (known[i].name().equals(other: "user") && vars.localUser().length() > 0) { this.setAt(i: i, value: copy vars.localUser()); }
+            i = i + 1;
+        }
+        if (sslmodeDefaulted && this.text(keyword: "sslrootcert").equals(other: "system")) {
+            this.setAt(i: this.indexOf(keyword: "sslmode"), value: "verify-full");
+        }
+    }
+
+    // pqConnectOptions2, and the integer settings libpq parses when it connects: every value checked, the hosts
+    // laid out, the user and database defaulted, the password file read, the StartupMessage's parameters built.
+    unsafe fn Result<Unit, ConnInfoError> check(const ref Environment vars) {
+        Result<Unit, ConnInfoError> hosts = this.layOutHosts();
+        match (give hosts) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+
+        if (this.text(keyword: "user").length() == 0) {
+            if (vars.localUser().length() == 0) { return Result::Err(error: fail(detail: copy vars.localUserProblem())); }
+            this.setAt(i: this.indexOf(keyword: "user"), value: copy vars.localUser());
+        }
+        if (this.text(keyword: "dbname").length() == 0) { this.setAt(i: this.indexOf(keyword: "dbname"), value: this.user()); }
+
+        if (this.password().length() == 0) { this.readPassfile(vars: vars); }
+
+        if (this.has(keyword: "require_auth")) {
+            Result<RequireAuth, ConnInfoError> ra = RequireAuth.parse(text: this.text(keyword: "require_auth"));
+            match (give ra) { case Ok(value: r): { this.auth = give r; } case Err(error: e): { return Result::Err(error: give e); } };
+        }
+
+        string cb = this.text(keyword: "channel_binding");
+        if (cb.equals(other: "disable")) { this.binding = ChannelBindingMode::Disable; }
+        else if (cb.equals(other: "prefer")) { this.binding = ChannelBindingMode::Prefer; }
+        else if (cb.equals(other: "require")) { this.binding = ChannelBindingMode::Require; }
+        else { return Result::Err(error: fail(detail: invalidValue(keyword: "channel_binding", value: cb))); }
+
+        // TLS arrives with @kama/tls. Until then this client is libpq built without SSL, and says what libpq says.
+        string rootcert = this.text(keyword: "sslrootcert");
+        if (rootcert.equals(other: "system")) { return Result::Err(error: fail(detail: notCompiledIn(keyword: "sslrootcert", value: rootcert, what: "SSL"))); }
+        string mode = this.text(keyword: "sslmode");
+        if (mode.equals(other: "disable")) { this.ssl = SslMode::Disable; }
+        else if (mode.equals(other: "allow")) { this.ssl = SslMode::Allow; }
+        else if (mode.equals(other: "prefer")) { this.ssl = SslMode::Prefer; }
+        else if (mode.equals(other: "require") || mode.equals(other: "verify-ca") || mode.equals(other: "verify-full")) {
+            return Result::Err(error: fail(detail: notCompiledIn(keyword: "sslmode", value: mode, what: "SSL")));
+        } else { return Result::Err(error: fail(detail: invalidValue(keyword: "sslmode", value: mode))); }
+        string negotiation = this.text(keyword: "sslnegotiation");
+        if (negotiation.equals(other: "direct")) { return Result::Err(error: fail(detail: notCompiledIn(keyword: "sslnegotiation", value: negotiation, what: "SSL"))); }
+        if (!negotiation.equals(other: "postgres")) { return Result::Err(error: fail(detail: invalidValue(keyword: "sslnegotiation", value: negotiation))); }
+        string tlsMin = this.text(keyword: "ssl_min_protocol_version");
+        string tlsMax = this.text(keyword: "ssl_max_protocol_version");
+        if (!tlsVersionValid(v: tlsMin)) { return Result::Err(error: fail(detail: "invalid \"ssl_min_protocol_version\" value: \"".concat(other: tlsMin).concat(other: "\""))); }
+        if (!tlsVersionValid(v: tlsMax)) { return Result::Err(error: fail(detail: "invalid \"ssl_max_protocol_version\" value: \"".concat(other: tlsMax).concat(other: "\""))); }
+        if (!tlsRangeValid(min: tlsMin, max: tlsMax)) { return Result::Err(error: fail(detail: "invalid SSL protocol version range")); }
+        if (this.has(keyword: "sslcertmode")) {
+            string certmode = this.text(keyword: "sslcertmode");
+            if (!certmode.equals(other: "disable") && !certmode.equals(other: "allow") && !certmode.equals(other: "require")) {
+                return Result::Err(error: fail(detail: invalidValue(keyword: "sslcertmode", value: certmode)));
+            }
+            if (certmode.equals(other: "require")) { return Result::Err(error: fail(detail: notCompiledIn(keyword: "sslcertmode", value: certmode, what: "SSL"))); }
+        }
+        string gss = this.text(keyword: "gssencmode");
+        if (!gss.equals(other: "disable") && !gss.equals(other: "prefer") && !gss.equals(other: "require")) {
+            return Result::Err(error: fail(detail: invalidValue(keyword: "gssencmode", value: gss)));
+        }
+        if (gss.equals(other: "require")) {
+            return Result::Err(error: fail(detail: "gssencmode value \"".concat(other: gss).concat(other: "\" invalid when GSSAPI support is not compiled in")));
+        }
+
+        string target = this.text(keyword: "target_session_attrs");
+        if (!target.equals(other: "any")) {
+            if (target.equals(other: "read-write") || target.equals(other: "read-only") || target.equals(other: "primary")
+                || target.equals(other: "standby") || target.equals(other: "prefer-standby")) {
+                return Result::Err(error: fail(detail: "target_session_attrs value \"".concat(other: target).concat(other: "\" is not supported by this client yet")));
+            }
+            return Result::Err(error: fail(detail: invalidValue(keyword: "target_session_attrs", value: target)));
+        }
+
+        Result<Unit, ConnInfoError> keys = this.decodeScramKeys();
+        match (give keys) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+
+        string balance = this.text(keyword: "load_balance_hosts");
+        if (balance.equals(other: "random")) {
+            return Result::Err(error: fail(detail: "load_balance_hosts value \"random\" is not supported by this client yet"));
+        }
+        if (!balance.equals(other: "disable")) { return Result::Err(error: fail(detail: invalidValue(keyword: "load_balance_hosts", value: balance))); }
+
+        Result<Unit, ConnInfoError> versions = this.protocolRange();
+        match (give versions) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+
+        if (this.text(keyword: "replication").length() > 0) {
+            return Result::Err(error: fail(detail: "replication connections are not supported by this client"));
+        }
+
+        Result<Unit, ConnInfoError> ints = this.parseIntegers();
+        match (give ints) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+
+        return this.buildStartup(vars: vars);
+    }
+
+    // pqConnectOptions2's host layout: hostaddr and host lists paired by position, the default host, one port for
+    // every host or one each.
+    fn Result<Unit, ConnInfoError> layOutHosts() {
+        DynamicArray<string> addrs = DynamicArray.empty();
+        DynamicArray<string> hostNames = DynamicArray.empty();
+        string hostaddr = this.text(keyword: "hostaddr");
+        string host = this.text(keyword: "host");
+        isize count = 1;
+        if (hostaddr.length() > 0) {
+            foreach (string a in hostaddr.split(separator: ",")) { addrs.add(item: give a); }
+            count = addrs.length();
+        } else if (host.length() > 0) {
+            count = commaCount(s: host);
+        }
+        if (host.length() > 0) {
+            foreach (string h in host.split(separator: ",")) { hostNames.add(item: give h); }
+            if (hostNames.length() != count) {
+                isize given = hostNames.length();
+                return Result::Err(error: fail(detail: "could not match ${given} host names to ${count} hostaddr values"));
+            }
+        }
+        DynamicArray<string> ports = DynamicArray.empty();
+        string port = this.text(keyword: "port");
+        if (port.length() > 0) {
+            foreach (string p in port.split(separator: ",")) { ports.add(item: give p); }
+            if (ports.length() != 1 && ports.length() != count) {
+                isize given = ports.length();
+                return Result::Err(error: fail(detail: "could not match ${given} port numbers to ${count} hosts"));
+            }
+        }
+        isize i = 0;
+        while (i < count) {
+            string a = "";
+            if (i < addrs.length()) { a = copy addrs[i]; }
+            string n = "";
+            if (i < hostNames.length()) { n = copy hostNames[i]; }
+            string p = "";
+            if (ports.length() == 1) { p = copy ports[0]; } else if (i < ports.length()) { p = copy ports[i]; }
+            HostKind kind = HostKind::Name;
+            if (a.length() > 0) { kind = HostKind::Address; }
+            else if (n.length() > 0) { if (isSocketPath(path: n)) { kind = HostKind::Socket; } }
+            else { n = defaultSocketDir(); kind = HostKind::Socket; }
+            this.hostList.add(item: Host.make(name: give n, address: give a, port: give p, kind: kind));
+            i = i + 1;
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The password file, read once for every host: passwordFromFile's file checks, then pgpassLookup.
+    unsafe fn void readPassfile(const ref Environment vars) {
+        string path = this.text(keyword: "passfile");
+        if (path.length() == 0) {
+            Optional<string> home = vars.homeDirectory();
+            match (give home) { case Some(value: h): { path = h.concat(other: "/").concat(other: passfileName()); } case None: { return; } };
+        }
+        this.passfilePath = copy path;
+        string db = this.dbname();
+        string who = this.user();
+        if (db.length() == 0 || who.length() == 0) { return; }
+        Result<Metadata, IoError> meta = stat(path: path);
+        Metadata m = match (meta) { case Ok(value: x): x; case Err(error: e): { return; } };
+        if (!passfileUsable(path: path, meta: m)) { return; }
+        Result<DynamicArray<uint8>, IoError> read = readFile(path: path);
+        DynamicArray<uint8> bytes = match (give read) { case Ok(value: b): give b; case Err(error: e): { return; } };
+        isize i = 0;
+        while (i < this.hostList.length()) {
+            string key = copy this.hostList[i].name();
+            if (key.length() == 0) { key = copy this.hostList[i].address(); }
+            Optional<DynamicArray<uint8>> found = pgpassLookup(file: bytes.view(), host: key, port: this.hostList[i].port(), dbname: db, user: who);
+            match (give found) {
+                case Some(value: pw): {
+                    Result<string, Utf8Error> text = utf8Decode(bytes: pw.view());
+                    match (give text) {
+                        case Ok(value: t): { this.hostList[i].setFilePassword(password: give t); }
+                        case Err(error: e): { logWarn(tag: "postgres", msg: "password file \"".concat(other: path).concat(other: "\" has a password that is not valid UTF-8; it is not used")); }
+                    };
+                }
+                case None: { }
+            };
+            i = i + 1;
+        }
+        // The bytes held passwords: clear them before they are freed.
+        i = 0;
+        while (i < bytes.length()) { bytes[i] = 0ui8; i = i + 1; }
+    }
+
+    fn Result<Unit, ConnInfoError> decodeScramKeys() {
+        Result<Unit, ConnInfoError> c = decodeKey(text: this.text(keyword: "scram_client_key"), into: ref this.clientKey, which: "client");
+        match (give c) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return decodeKey(text: this.text(keyword: "scram_server_key"), into: ref this.serverKey, which: "server");
+    }
+
+    fn Result<Unit, ConnInfoError> protocolRange() {
+        this.minProtocol = PROTOCOL_3_0;
+        if (this.has(keyword: "min_protocol_version")) {
+            int32 v = protocolVersion(text: this.text(keyword: "min_protocol_version"));
+            if (v == 0) { return Result::Err(error: fail(detail: invalidValue(keyword: "min_protocol_version", value: this.text(keyword: "min_protocol_version")))); }
+            this.minProtocol = v;
+        }
+        if (this.has(keyword: "max_protocol_version")) {
+            int32 v = protocolVersion(text: this.text(keyword: "max_protocol_version"));
+            if (v == 0) { return Result::Err(error: fail(detail: invalidValue(keyword: "max_protocol_version", value: this.text(keyword: "max_protocol_version")))); }
+            this.maxProtocol = v;
+        } else if (this.minProtocol > PROTOCOL_3_0) {
+            this.maxProtocol = PROTOCOL_3_2;
+        } else {
+            this.maxProtocol = PROTOCOL_3_0;
+        }
+        if (this.minProtocol > this.maxProtocol) { return Result::Err(error: fail(detail: "\"min_protocol_version\" is greater than \"max_protocol_version\"")); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The integer settings, each parsed as pqParseIntParam parses it. libpq parses them when it connects; the
+    // message is the same here, only earlier.
+    fn Result<Unit, ConnInfoError> parseIntegers() {
+        Result<int32, ConnInfoError> t = this.integer(keyword: "connect_timeout", unset: 0);
+        int32 timeout = match (give t) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (timeout < 0) { timeout = 0; }
+        this.timeoutSeconds = timeout;
+        Result<int32, ConnInfoError> k = this.integer(keyword: "keepalives", unset: 1);
+        int32 on = match (give k) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        this.keepalivesOn = on != 0;
+        Result<int32, ConnInfoError> idle = this.nonNegative(keyword: "keepalives_idle");
+        int32 idleValue = match (give idle) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        this.idleSeconds = idleValue;
+        Result<int32, ConnInfoError> interval = this.nonNegative(keyword: "keepalives_interval");
+        int32 intervalValue = match (give interval) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        this.intervalSeconds = intervalValue;
+        Result<int32, ConnInfoError> count = this.nonNegative(keyword: "keepalives_count");
+        int32 countValue = match (give count) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        this.probeCount = countValue;
+        Result<int32, ConnInfoError> user = this.nonNegative(keyword: "tcp_user_timeout");
+        int32 userValue = match (give user) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+        this.userTimeoutMs = userValue;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // keepalives_idle and the rest: -1 when not set; a negative value is taken as 0, as libpq takes it.
+    const fn Result<int32, ConnInfoError> nonNegative(const ref string keyword) {
+        if (!this.has(keyword: keyword)) { return Result::Ok(value: -1); }
+        Result<int32, ConnInfoError> v = this.integer(keyword: keyword, unset: -1);
+        int32 n = match (give v) { case Ok(value: x): x; case Err(error: e): { return Result::Err(error: give e); } };
+        if (n < 0) { return Result::Ok(value: 0); }
+        return Result::Ok(value: n);
+    }
+
+    // An integer keyword's value, or `unset` when it has none.
+    const fn Result<int32, ConnInfoError> integer(const ref string keyword, int32 unset) {
+        if (!this.has(keyword: keyword)) { return Result::Ok(value: unset); }
+        string v = this.text(keyword: keyword);
+        Optional<int32> n = parseIntParam(text: v);
+        return match (n) {
+            case Some(value: x): Result::Ok(value: x);
+            case None: Result::Err(error: fail(detail: "invalid integer value \"".concat(other: v).concat(other: "\" for connection option \"").concat(other: keyword).concat(other: "\"")));
+        };
+    }
+
+    // build_startup_packet's parameters, in its order. client_encoding is always UTF8: every text this client
+    // reads is validated as UTF-8, so `auto` and any spelling of UTF8 send UTF8, and another encoding is refused.
+    fn Result<Unit, ConnInfoError> buildStartup(const ref Environment vars) {
+        this.params = DynamicArray.empty();
+        this.paramValues = DynamicArray.empty();
+        this.startupParameter(name: "user", value: this.user());
+        this.startupParameter(name: "database", value: this.dbname());
+        this.startupParameter(name: "options", value: this.text(keyword: "options"));
+        string app = this.text(keyword: "application_name");
+        if (app.length() == 0) { app = this.text(keyword: "fallback_application_name"); }
+        this.startupParameter(name: "application_name", value: give app);
+        string encoding = this.text(keyword: "client_encoding");
+        if (encoding.length() > 0 && !encoding.equals(other: "auto") && !isUtf8Name(name: encoding)) {
+            return Result::Err(error: fail(detail: "client_encoding value \"".concat(other: encoding).concat(other: "\" is not supported: this client speaks UTF8 only")));
+        }
+        this.startupParameter(name: "client_encoding", value: "UTF8");
+        DynamicArray<EnvironmentOption> settings = libpqEnvironmentOptions();
+        isize i = 0;
+        while (i < settings.length()) {
+            Optional<string> v = vars.get(name: settings[i].environment());
+            match (give v) {
+                case Some(value: x): { if (!x.toLower().equals(other: "default")) { this.startupParameter(name: settings[i].parameter(), value: copy x); } }
+                case None: { }
+            };
+            i = i + 1;
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    fn void startupParameter(const ref string name, string value) {
+        if (value.length() == 0) { return; }
+        this.params.add(item: copy name);
+        this.paramValues.add(item: give value);
+    }
+}
+
+fn ConnInfoError fail(string detail) { return ConnInfoError::Invalid(detail: give detail); }
+
+fn string invalidValue(const ref string keyword, const ref string value) {
+    return "invalid ".concat(other: keyword).concat(other: " value: \"").concat(other: value).concat(other: "\"");
+}
+
+fn string notCompiledIn(const ref string keyword, const ref string value, const ref string what) {
+    return keyword.concat(other: " value \"").concat(other: value).concat(other: "\" invalid when ").concat(other: what).concat(other: " support is not compiled in");
+}
+
+// count_comma_separated_elems.
+fn isize commaCount(const ref string s) {
+    isize n = 1;
+    foreach (uint8 b in s) { if (b == 44ui8) { n = n + 1; } }
+    return n;
+}
+
+// is_unixsock_path: an absolute path, or a Linux abstract-namespace name ('@').
+fn bool isSocketPath(const ref string path) {
+    if (path.length() == 0) { return false; }
+    uint8 first = path[0];
+    if (first == 47ui8 || first == 64ui8) { return true; }   // '/', '@'
+    // A Windows drive path: "C:\…" or "C:/…".
+    if (path.length() >= 3 && path[1] == 58ui8 && (path[2] == 92ui8 || path[2] == 47ui8)) {
+        return (first >= 65ui8 && first <= 90ui8) || (first >= 97ui8 && first <= 122ui8);
+    }
+    return false;
+}
+
+// passwordFromFile's checks: a file with group or world access is ignored with libpq's warning. A directory is
+// "not a plain file"; std cannot tell a FIFO or a device from a plain file yet (KPG-18).
+@compileFor(!OS_WINDOWS)
+unsafe fn bool passfileUsable(const ref string path, const ref Metadata meta) {
+    if (meta.isDir) {
+        logWarn(tag: "postgres", msg: "password file \"".concat(other: path).concat(other: "\" is not a plain file"));
+        return false;
+    }
+    if ((meta.permissions.mode() & 63ui32) != 0ui32) {   // S_IRWXG | S_IRWXO
+        logWarn(tag: "postgres", msg: "password file \"".concat(other: path).concat(other: "\" has group or world access; permissions should be u=rw (0600) or less"));
+        return false;
+    }
+    return true;
+}
+
+// On Windows the directory is protected, and libpq checks nothing.
+@compileFor(OS_WINDOWS)
+unsafe fn bool passfileUsable(const ref string path, const ref Metadata meta) { return !meta.isDir; }
+
+// pqParseIntParam: strtol in base 10, surrounding whitespace allowed, the whole value an int.
+fn Optional<int32> parseIntParam(const ref string text) { return parseIntBytes(b: text.bytes()); }
+
+fn Optional<int32> parseIntBytes(ConstView<uint8> b) {
+    isize i = 0;
+    while (i < b.length() && isSpace(c: b[i])) { i = i + 1; }
+    bool negative = false;
+    if (i < b.length() && (b[i] == 43ui8 || b[i] == 45ui8)) { negative = b[i] == 45ui8; i = i + 1; }
+    isize digits = i;
+    int64 v = 0i64;
+    while (i < b.length() && b[i] >= 48ui8 && b[i] <= 57ui8) {
+        v = v * 10i64 + cast<int64>(b[i] - 48ui8);
+        if (v > 2147483648i64) { return Optional::None; }
+        i = i + 1;
+    }
+    if (i == digits) { return Optional::None; }
+    while (i < b.length() && isSpace(c: b[i])) { i = i + 1; }
+    if (i != b.length()) { return Optional::None; }
+    if (negative) { v = -v; }
+    if (v > 2147483647i64 || v < -2147483648i64) { return Optional::None; }
+    return Optional::Some(value: cast<int32>(v));
+}
+
+fn bool isSpace(uint8 c) { return c == 32ui8 || (c >= 9ui8 && c <= 13ui8); }
+
+// pqParseProtocolVersion: the StartupMessage version, or 0 for a value libpq refuses.
+fn int32 protocolVersion(const ref string text) {
+    if (text.equals(other: "latest") || text.equals(other: "3.2")) { return PROTOCOL_3_2; }
+    if (text.equals(other: "3.0")) { return PROTOCOL_3_0; }
+    return 0;
+}
+
+// sslVerifyProtocolVersion and sslVerifyProtocolRange, case-insensitive as libpq's.
+fn int32 tlsRank(const ref string v) {
+    string l = v.toLower();
+    if (l.equals(other: "tlsv1")) { return 1; }
+    if (l.equals(other: "tlsv1.1")) { return 2; }
+    if (l.equals(other: "tlsv1.2")) { return 3; }
+    if (l.equals(other: "tlsv1.3")) { return 4; }
+    return 0;
+}
+fn bool tlsVersionValid(const ref string v) { return v.length() == 0 || tlsRank(v: v) > 0; }
+fn bool tlsRangeValid(const ref string min, const ref string max) {
+    if (min.length() == 0 || max.length() == 0) { return true; }
+    return tlsRank(v: min) <= tlsRank(v: max);
+}
+
+// PostgreSQL's spellings of its UTF-8 encoding, compared as pg_char_to_encoding compares (case and punctuation
+// ignored): UTF8, UTF-8, Unicode.
+fn bool isUtf8Name(const ref string name) {
+    string folded = name.toLower().replace(old: "-", with: "").replace(old: "_", with: "");
+    return folded.equals(other: "utf8") || folded.equals(other: "unicode");
+}
+
+// A scram_*_key: base64 of exactly 32 bytes, the SHA-256 key length (SCRAM_MAX_KEY_LEN).
+fn Result<Unit, ConnInfoError> decodeKey(const ref string text, ref DynamicArray<uint8> into, const ref string which) {
+    if (text.length() == 0) { return Result::Ok(value: Unit::Unit); }
+    Result<DynamicArray<uint8>, DecodeError> d = b64decode(text: text);
+    DynamicArray<uint8> key = match (give d) {
+        case Ok(value: k): give k;
+        case Err(error: e): { return Result::Err(error: fail(detail: "invalid SCRAM ".concat(other: which).concat(other: " key"))); }
+    };
+    if (key.length() != 32) {
+        isize n = key.length();
+        return Result::Err(error: fail(detail: "invalid SCRAM ".concat(other: which).concat(other: " key length: ${n}")));
+    }
+    into = give key;
+    return Result::Ok(value: Unit::Unit);
+}

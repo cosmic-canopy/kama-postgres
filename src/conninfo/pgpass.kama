@@ -1,0 +1,72 @@
+import { std::collections::DynamicArray, std::collections::ConstView };
+export { pgpassLookup, defaultSocketDir };
+
+// The password file (~/.pgpass), as libpq reads it: a port of passwordFromFile's matching, after the file checks,
+// which need the filesystem and live with the caller (postgres::Config).
+//
+// Each line is `hostname:port:database:username:password`. A field of exactly `*` matches anything, `\` escapes
+// the next byte (so `\:` and `\\`), a line starting `#` is a comment, and the first line that matches wins.
+
+// libpq's DEFAULT_PGSOCKET_DIR, as PostgreSQL builds it: where a client looks for the server's socket when no host
+// is given. A host of exactly this path matches the password file's `localhost`, as an empty host does.
+fn string defaultSocketDir() { return "/tmp"; }
+
+// The password `file` gives for this host, port, database and user: its bytes, de-escaped, or None. libpq's
+// defaults are applied first: an empty or default-socket host is "localhost", an empty port is 5432, and an
+// empty database or user matches nothing.
+fn Optional<DynamicArray<uint8>> pgpassLookup(ConstView<uint8> file, const ref string host, const ref string port,
+                                              const ref string dbname, const ref string user) {
+    if (dbname.length() == 0 || user.length() == 0) { return Optional::None; }
+    string h = copy host;
+    if (h.length() == 0 || h.equals(other: defaultSocketDir())) { h = "localhost"; }
+    string p = copy port;
+    if (p.length() == 0) { p = "5432"; }
+    isize at = 0;
+    while (at < file.length()) {
+        isize end = at;
+        while (end < file.length() && file[end] != 10ui8) { end = end + 1; }
+        isize next = end + 1;
+        // pg_strip_crlf: every trailing CR and LF.
+        while (end > at && (file[end - 1] == 13ui8 || file[end - 1] == 10ui8)) { end = end - 1; }
+        if (end > at && file[at] != 35ui8) {   // not empty, not a '#' comment
+            isize t = matchField(b: file, from: at, to: end, token: h.bytes());
+            if (t >= 0) { t = matchField(b: file, from: t, to: end, token: p.bytes()); }
+            if (t >= 0) { t = matchField(b: file, from: t, to: end, token: dbname.bytes()); }
+            if (t >= 0) { t = matchField(b: file, from: t, to: end, token: user.bytes()); }
+            if (t >= 0) { return Optional::Some(value: password(b: file, from: t, to: end)); }
+        }
+        at = next;
+    }
+    return Optional::None;
+}
+
+// pwdfMatchesString: does the field at `from` match `token`? The offset just past the field's ':' if so, else -1.
+fn isize matchField(ConstView<uint8> b, isize from, isize to, ConstView<uint8> token) {
+    if (from + 1 < to && b[from] == 42ui8 && b[from + 1] == 58ui8) { return from + 2; }   // "*:"
+    isize i = from;
+    isize k = 0;
+    bool escaped = false;
+    while (i < to) {
+        if (b[i] == 92ui8 && !escaped) {   // '\'
+            i = i + 1;
+            escaped = true;
+        }
+        if (i < to && b[i] == 58ui8 && k == token.length() && !escaped) { return i + 1; }
+        escaped = false;
+        if (k == token.length()) { return -1; }
+        if (i < to && b[i] == token[k]) { i = i + 1; k = k + 1; } else { return -1; }
+    }
+    return -1;
+}
+
+// The password field, de-escaped: it ends at the first unescaped ':' or the end of the line.
+fn DynamicArray<uint8> password(ConstView<uint8> b, isize from, isize to) {
+    DynamicArray<uint8> pw = DynamicArray.empty();
+    isize i = from;
+    while (i < to && b[i] != 58ui8) {
+        if (b[i] == 92ui8 && i + 1 < to) { i = i + 1; }
+        pw.add(item: b[i]);
+        i = i + 1;
+    }
+    return pw;
+}

@@ -1,0 +1,221 @@
+import { std::collections::DynamicArray, std::io::IoError, postgres::protocol::ErrorFields,
+         postgres::protocol::ProtocolError, postgres::sqlstate::sqlstateCode };
+export { PgError, ServerError, ConnectError, ConnectAttempt };
+
+// What can go wrong talking to PostgreSQL. A data error is one of these; a contract violation (a column index out
+// of range, a field read on a closed result) panics, as an index out of range does on a collection.
+//
+// Every message is libpq's wording wherever libpq has one, so a message from this client reads the same as psql's.
+
+type enum PgError implements Error {
+    // A connection setting that cannot be used: a connection string that does not parse, an invalid value, a
+    // service that is not defined.
+    Config(string detail),
+    // The socket failed. A server that closed the connection is `UnexpectedEof`.
+    Io(IoError error),
+    // `connect_timeout` passed before the connection was ready.
+    Timeout,
+    // The server sent bytes that are not the protocol, or a message the protocol does not allow at that point.
+    Protocol(ProtocolError error),
+    // This client refused to authenticate, or could not: no password, a method `require_auth` does not allow, a
+    // method this client does not speak, or a server that failed to prove it knows the password.
+    Auth(string detail),
+    // The server reported an error.
+    Server(ServerError error),
+    // Every connection attempt failed. Each attempt is kept, with its own error.
+    Connect(ConnectError error),
+    // A call this client does not make in this form: query text holding a NUL byte, or COPY through
+    // `simpleQuery`. The connection is still usable.
+    Usage(string detail),
+    // The connection is closed: by `close()`, or by an earlier failure that left it unusable.
+    Closed;
+
+    public const fn string message() {
+        return match (this) {
+            case Config(detail: d): copy d;
+            case Io(error: e): ioMessage(e: e);
+            case Timeout: "timeout expired";
+            case Protocol(error: e): e.message();
+            case Auth(detail: d): copy d;
+            case Server(error: e): e.message();
+            case Connect(error: e): e.message();
+            case Usage(detail: d): copy d;
+            case Closed: "no connection to the server";
+        };
+    }
+
+    // The packed SQLSTATE of a server error (compare it with `postgres::sqlstate`'s constants), looking through a
+    // failed connect to its last attempt; -1 for an error that did not come from the server.
+    public const fn int32 sqlstate() {
+        return match (this) {
+            case Server(error: e): e.sqlstate();
+            case Connect(error: c): c.last().sqlstate();
+            case _: -1;
+        };
+    }
+}
+
+fn string ioMessage(const ref IoError e) {
+    return match (e) {
+        case UnexpectedEof: "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request.";
+        case _: e.message();
+    };
+}
+
+// An ErrorResponse or a NoticeResponse: every field the server sent, by the one-letter codes of the protocol's
+// "Error and Notice Message Fields". The accessors are named after libpq's PG_DIAG_* fields.
+type resource ServerError {
+    ErrorFields all;
+
+    public ctor make(ErrorFields fields) { this.all = give fields; }
+
+    // Every field, in the order sent, for one this type has no accessor for.
+    public const fn const ref ErrorFields fields() { return this.all; }
+
+    // ERROR, FATAL or PANIC for an error; WARNING, NOTICE, DEBUG, INFO or LOG for a notice. Never localized ('V'),
+    // falling back to 'S' for a server older than 9.6.
+    public const fn string severity() {
+        Optional<string> v = this.all.field(code: 86ui8);   // 'V'
+        return match (v) { case Some(value: t): copy t; case None: this.localizedSeverity(); };
+    }
+    // The severity in the server's lc_messages language ('S').
+    public const fn string localizedSeverity() { return orEmpty(v: this.all.field(code: 83ui8)); }
+    // The SQLSTATE ('C'), packed as `postgres::sqlstate` packs it; -1 if the server sent none.
+    public const fn int32 sqlstate() {
+        Optional<string> c = this.all.field(code: 67ui8);
+        return match (c) { case Some(value: t): sqlstateCode(text: t); case None: -1; };
+    }
+    // The primary message ('M').
+    public const fn string primary() { return orEmpty(v: this.all.field(code: 77ui8)); }
+    public const fn Optional<string> detail() { return this.all.field(code: 68ui8); }           // 'D'
+    public const fn Optional<string> hint() { return this.all.field(code: 72ui8); }             // 'H'
+    // Where in the query the error is: a 1-based character index ('P').
+    public const fn Optional<int32> position() { return decimal(v: this.all.field(code: 80ui8)); }
+    // The same, in an internally generated query ('p'), with that query ('q').
+    public const fn Optional<int32> internalPosition() { return decimal(v: this.all.field(code: 112ui8)); }
+    public const fn Optional<string> internalQuery() { return this.all.field(code: 113ui8); }
+    // The call stack of the error, innermost first, one entry per line ('W').
+    public const fn Optional<string> context() { return this.all.field(code: 87ui8); }
+    public const fn Optional<string> schema() { return this.all.field(code: 115ui8); }          // 's'
+    public const fn Optional<string> table() { return this.all.field(code: 116ui8); }           // 't'
+    public const fn Optional<string> column() { return this.all.field(code: 99ui8); }           // 'c'
+    public const fn Optional<string> dataType() { return this.all.field(code: 100ui8); }        // 'd'
+    public const fn Optional<string> constraint() { return this.all.field(code: 110ui8); }      // 'n'
+    // Where in the server's source the error was raised ('F', 'L', 'R').
+    public const fn Optional<string> sourceFile() { return this.all.field(code: 70ui8); }
+    public const fn Optional<int32> sourceLine() { return decimal(v: this.all.field(code: 76ui8)); }
+    public const fn Optional<string> sourceFunction() { return this.all.field(code: 82ui8); }
+
+    // FATAL or PANIC: the server ends the session after sending it.
+    public const fn bool isFatal() {
+        string s = this.severity();
+        return s.equals(other: "FATAL") || s.equals(other: "PANIC");
+    }
+
+    // The message as libpq's pqBuildErrorMessage3 builds it at the default verbosity: "SEVERITY:  primary", then
+    // DETAIL, HINT and QUERY lines, and CONTEXT for an error but not a notice. A position is " at character N":
+    // libpq draws a cursor under the query instead when it holds the query text, and this type does not.
+    public const fn string message() {
+        string text = "";
+        string sev = this.localizedSeverity();
+        if (sev.length() > 0) { text = sev.concat(other: ":  "); }
+        text = text.concat(other: this.primary());
+        Optional<string> pos = this.all.field(code: 80ui8);
+        Optional<string> internal = this.all.field(code: 112ui8);
+        match (pos) {
+            case Some(value: p): { text = text.concat(other: " at character ").concat(other: p); }
+            case None: { match (internal) { case Some(value: p): { text = text.concat(other: " at character ").concat(other: p); } case None: { } }; }
+        };
+        text = line(text: text, label: "DETAIL", v: this.detail());
+        text = line(text: text, label: "HINT", v: this.hint());
+        text = line(text: text, label: "QUERY", v: this.internalQuery());
+        string s = this.severity();
+        if (s.equals(other: "ERROR") || s.equals(other: "FATAL") || s.equals(other: "PANIC")) {
+            text = line(text: text, label: "CONTEXT", v: this.context());
+        }
+        return text;
+    }
+}
+
+fn string orEmpty(Optional<string> v) { return match (v) { case Some(value: t): copy t; case None: ""; }; }
+
+fn string line(const ref string text, const ref string label, Optional<string> v) {
+    return match (v) {
+        case Some(value: t): text.concat(other: "\n").concat(other: label).concat(other: ":  ").concat(other: t);
+        case None: copy text;
+    };
+}
+
+// A non-negative decimal field, as the server writes positions and line numbers; None if absent or not one.
+fn Optional<int32> decimal(Optional<string> v) {
+    string t = match (v) { case Some(value: x): copy x; case None: { return Optional::None; } };
+    if (t.length() == 0 || t.length() > 9) { return Optional::None; }
+    int32 n = 0;
+    foreach (uint8 b in t) {
+        if (b < 48ui8 || b > 57ui8) { return Optional::None; }
+        n = n * 10 + cast<int32>(b - 48ui8);
+    }
+    return Optional::Some(value: n);
+}
+
+// One host and address tried during a connect, and why it failed.
+type resource ConnectAttempt {
+    string hostText;
+    string addressText;
+    string portText;
+    string lead;                   // what libpq prints before the error
+    DynamicArray<PgError> cause;   // exactly one
+    string passfile;               // the password file the password came from; "" if none
+
+    // `lead` is the text libpq puts before the error. For an address that was tried, that is libpq's host
+    // identity ("connection to server at \"h\" (a), port p failed: "). For a host that never got that far, it is
+    // empty, or names the step that failed ("could not translate host name \"h\" to address: ").
+    public ctor make(string host, string address, string port, string lead, PgError error, string passfile) {
+        this.hostText = give host; this.addressText = give address; this.portText = give port;
+        this.lead = give lead;
+        this.cause = DynamicArray.empty();
+        this.cause.add(item: give error);
+        this.passfile = give passfile;
+    }
+
+    // The host as configured: a name, or the `hostaddr` when one was given.
+    public const fn const ref string host() { return this.hostText; }
+    // The address tried, or "" if the host never resolved to one.
+    public const fn const ref string address() { return this.addressText; }
+    public const fn const ref string port() { return this.portText; }
+    public const fn const ref PgError error() { return this.cause[0]; }
+
+    // The lead, the error, and libpq's pgpassfileWarning: the password file is named on a wrong password that
+    // came from it.
+    public const fn string message() {
+        string text = this.lead.concat(other: this.cause[0].message());
+        if (this.passfile.length() > 0 && this.cause[0].sqlstate() == sqlstateCode(text: "28P01")) {
+            text = text.concat(other: "\npassword retrieved from file \"").concat(other: this.passfile).concat(other: "\"");
+        }
+        return text;
+    }
+}
+
+// Every attempt of a failed connect, in the order made. There is at least one.
+type resource ConnectError {
+    DynamicArray<ConnectAttempt> tried;
+
+    public ctor make() { this.tried = DynamicArray.empty(); }
+    public fn void add(ConnectAttempt attempt) { this.tried.add(item: give attempt); }
+
+    public const fn isize count() { return this.tried.length(); }
+    public const fn const ref ConnectAttempt attempt(isize index) { return this.tried[index]; }
+    // The last attempt's error: the one a caller usually acts on.
+    public const fn const ref PgError last() { return this.tried[this.tried.length() - 1].error(); }
+
+    public const fn string message() {
+        string text = "";
+        isize i = 0;
+        while (i < this.tried.length()) {
+            if (i > 0) { text = text.concat(other: "\n"); }
+            text = text.concat(other: this.tried[i].message());
+            i = i + 1;
+        }
+        return text;
+    }
+}

@@ -1,0 +1,95 @@
+import { std::collections::View, std::collections::ConstView, std::io::IoError, std::net::TcpStream,
+         std::net::SocketAddr, std::net::Poller, std::net::Interest, std::net::Ready, std::net::Shutdown,
+         std::time::Duration };
+export { Transport, TcpTransport };
+
+// The byte stream a connection runs over. It is non-blocking: `read` and `write` move what they can now, or say
+// `WouldBlock`, and `wait` blocks until one of them can proceed or a timeout passes. This is libpq's own shape
+// (a non-blocking socket and poll with a deadline), and it is what lets one connection honour a deadline on
+// every step, and later write and read at once for a pipeline.
+//
+// A connection made with `Connection.connect` runs over TCP. `Connection.connectOver` takes any transport: a
+// tunnel, a proxy, or a test's scripted server.
+type contract Transport for resource implements Sendable {
+    // The bytes available now, up to `into`'s length: the count, or 0 when the peer has closed its side.
+    // `WouldBlock` when none are available.
+    fn Result<isize, IoError> read(View<uint8> into);
+    // As many of `bytes` as can be written now: the count. `WouldBlock` when none can.
+    fn Result<isize, IoError> write(ConstView<uint8> bytes);
+    // Block until `interest` can proceed, or `timeoutMs` passes (< 0: no limit). A timeout is a `Ready` with
+    // neither side set. A peer that closed or failed reads as readable, so the following read reports it.
+    fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs);
+    // Stop both directions. Called once, when the connection closes; the transport may still be dropped later.
+    fn void shutdown();
+}
+
+// TCP, as `Connection.connect` makes it: a non-blocking `TcpStream` and its own `Poller`.
+type resource TcpTransport implements Transport, Sendable {
+    TcpStream stream;
+    Poller poller;
+    isize handle = 0;
+
+    unsafe ctor make(TcpStream stream, Poller poller) {
+        this.handle = stream.rawHandle();
+        this.stream = give stream;
+        this.poller = give poller;
+    }
+
+    // Connect to `address` within `timeoutMs` (< 0: no limit). A timeout is `IoError::TimedOut`, the same error
+    // the operating system gives for a connect it gave up on. TCP_NODELAY is set, as libpq sets it: every
+    // message this client sends is complete when it is written.
+    public unsafe ctor Result<TcpTransport, IoError> connect(const ref SocketAddr address, int32 timeoutMs) {
+        Result<TcpStream, IoError> started = TcpStream.connectToNonBlocking(address: address);
+        TcpStream stream = match (give started) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: e); } };
+        Result<Poller, IoError> made = Poller.create();
+        Poller poller = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
+        poller.add(fd: stream.rawHandle(), interest: Interest::Write);
+        Result<int32, IoError> waited = poller.wait(timeoutMs: timeoutMs);
+        int32 ready = match (waited) { case Ok(value: n): n; case Err(error: e): { return Result::Err(error: e); } };
+        if (ready == 0) { return Result::Err(error: IoError::TimedOut); }
+        Result<Unit, IoError> connected = stream.checkConnected();
+        match (connected) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        Result<Unit, IoError> nodelay = stream.setNoDelay(on: true);
+        match (nodelay) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        return Result::Ok(value: TcpTransport.make(stream: give stream, poller: give poller));
+    }
+
+    // TCP keepalive, as libpq's `keepalives*` settings configure it. A zero duration or count leaves the
+    // system's default in place.
+    public unsafe fn Result<Unit, IoError> keepAlive(bool on, Duration idle, Duration interval, uint32 count) {
+        Result<Unit, IoError> r = this.stream.setKeepAlive(on: on);
+        match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        if (!on) { return Result::Ok(value: Unit::Unit); }
+        if (idle.asNanos() > 0i64) {
+            Result<Unit, IoError> i = this.stream.setKeepAliveIdle(idle: idle);
+            match (i) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        }
+        if (interval.asNanos() > 0i64) {
+            Result<Unit, IoError> v = this.stream.setKeepAliveInterval(interval: interval);
+            match (v) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        }
+        if (count > 0ui32) {
+            Result<Unit, IoError> c = this.stream.setKeepAliveCount(count: count);
+            match (c) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // libpq's `tcp_user_timeout`: how long sent data may stay unacknowledged before the connection is dropped.
+    public unsafe fn Result<Unit, IoError> userTimeout(Duration timeout) { return this.stream.setUserTimeout(timeout: timeout); }
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) { return this.stream.read(into: into); }
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) { return this.stream.write(bytes: bytes); }
+
+    public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        this.poller.add(fd: this.handle, interest: interest);
+        Result<int32, IoError> waited = this.poller.wait(timeoutMs: timeoutMs);
+        int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): { return Result::Err(error: e); } };
+        if (n == 0) { return Result::Ok(value: Ready.of(readable: false, writable: false)); }
+        return Result::Ok(value: this.poller.readyFor(fd: this.handle));
+    }
+
+    public unsafe fn void shutdown() {
+        Result<Unit, IoError> r = this.stream.shutdown(how: Shutdown::Both);
+    }
+}

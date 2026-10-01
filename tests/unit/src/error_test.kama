@@ -1,0 +1,87 @@
+// postgres's errors, rendered as libpq renders them: pqBuildErrorMessage3 at the default verbosity for a server's
+// fields, emitHostIdentityInfo for a connect attempt, pgpassfileWarning for a password that came from the file.
+import { std::collections::DynamicArray, std::io::IoError,
+         postgres::PgError, postgres::ServerError, postgres::ConnectError, postgres::ConnectAttempt,
+         postgres::protocol::ErrorFields, postgres::sqlstate::UNIQUE_VIOLATION, postgres::sqlstate::INVALID_PASSWORD,
+         postgres_unit_tests::check };
+export { errorTests, serverError };
+
+// A ServerError from "C=text;C=text;…" pairs, one-letter code first.
+fn ServerError serverError(const ref string spec) {
+    DynamicArray<uint8> codes = DynamicArray.empty();
+    DynamicArray<string> texts = DynamicArray.empty();
+    foreach (string pair in spec.split(separator: ";")) {
+        codes.add(item: pair[0]);
+        texts.add(item: pair.substring(start: 2, end: pair.length()));
+    }
+    return ServerError.make(fields: ErrorFields.make(codes: give codes, texts: give texts));
+}
+
+fn int32 serverErrorTests() {
+    int32 f = 0;
+    ServerError e = serverError(spec: "S=ERROR;V=ERROR;C=23505;M=duplicate key value violates unique constraint \"t_pkey\";D=Key (id)=(1) already exists.;s=public;t=t;n=t_pkey;F=nbtinsert.c;L=666;R=_bt_check_unique");
+    string m = e.message();
+    f = f + check(ok: m.equals(other: "ERROR:  duplicate key value violates unique constraint \"t_pkey\"\nDETAIL:  Key (id)=(1) already exists."), what: "error: unique violation renders as libpq's default verbosity");
+    f = f + check(ok: e.sqlstate() == UNIQUE_VIOLATION, what: "error: sqlstate is the packed 23505");
+    string sev = e.severity();
+    f = f + check(ok: sev.equals(other: "ERROR") && !e.isFatal(), what: "error: severity ERROR is not fatal");
+    Optional<string> constraint = e.constraint();
+    f = f + check(ok: match (constraint) { case Some(value: c): c.equals(other: "t_pkey"); case None: false; }, what: "error: constraint field");
+    Optional<int32> line = e.sourceLine();
+    f = f + check(ok: match (line) { case Some(value: l): l == 666; case None: false; }, what: "error: source line parses");
+    Optional<string> hint = e.hint();
+    f = f + check(ok: match (hint) { case Some(value: h): false; case None: true; }, what: "error: an absent field is None");
+
+    ServerError syntax = serverError(spec: "S=ERROR;V=ERROR;C=42601;M=syntax error at or near \"selec\";P=1");
+    string sm = syntax.message();
+    f = f + check(ok: sm.equals(other: "ERROR:  syntax error at or near \"selec\" at character 1"), what: "error: a position with no query text is \" at character N\"");
+
+    ServerError ctx = serverError(spec: "S=ERREUR;V=ERROR;C=P0001;M=boom;H=try again;W=PL/pgSQL function inline_code_block line 1 at RAISE");
+    string cm = ctx.message();
+    f = f + check(ok: cm.equals(other: "ERREUR:  boom\nHINT:  try again\nCONTEXT:  PL/pgSQL function inline_code_block line 1 at RAISE"), what: "error: localized severity shown, CONTEXT shown for an error");
+    string cs = ctx.severity();
+    f = f + check(ok: cs.equals(other: "ERROR"), what: "error: severity() is the unlocalized V");
+
+    ServerError notice = serverError(spec: "S=NOTICE;V=NOTICE;C=00000;M=hello;W=PL/pgSQL function inline_code_block line 1 at RAISE");
+    string nm = notice.message();
+    f = f + check(ok: nm.equals(other: "NOTICE:  hello"), what: "error: CONTEXT is not shown for a notice");
+
+    ServerError fatal = serverError(spec: "S=FATAL;V=FATAL;C=28P01;M=password authentication failed for user \"kp_scram\"");
+    f = f + check(ok: fatal.isFatal(), what: "error: FATAL is fatal");
+
+    ServerError old = serverError(spec: "S=PANIC;C=XX000;M=old server");
+    string os = old.severity();
+    f = f + check(ok: os.equals(other: "PANIC") && old.isFatal(), what: "error: severity falls back to S without V");
+    return f;
+}
+
+fn int32 pgErrorTests() {
+    int32 f = 0;
+    PgError eof = PgError::Io(error: IoError::UnexpectedEof);
+    string em = eof.message();
+    f = f + check(ok: em.equals(other: "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request."), what: "error: EOF is libpq's message");
+    PgError timeout = PgError::Timeout;
+    string tm = timeout.message();
+    f = f + check(ok: tm.equals(other: "timeout expired") && timeout.sqlstate() == -1, what: "error: timeout");
+    PgError closed = PgError::Closed;
+    string clm = closed.message();
+    f = f + check(ok: clm.equals(other: "no connection to the server"), what: "error: closed");
+
+    ConnectError ce = ConnectError.make();
+    ce.add(attempt: ConnectAttempt.make(host: "localhost", address: "::1", port: "5432", lead: "connection to server at \"localhost\" (::1), port 5432 failed: ", error: PgError::Io(error: IoError::ConnectionRefused), passfile: ""));
+    ce.add(attempt: ConnectAttempt.make(host: "127.0.0.1", address: "127.0.0.1", port: "5432",
+        lead: "connection to server at \"127.0.0.1\", port 5432 failed: ", error: PgError::Server(error: serverError(spec: "S=FATAL;V=FATAL;C=28P01;M=password authentication failed for user \"kp_scram\"")),
+        passfile: "/home/u/.pgpass"));
+    PgError connect = PgError::Connect(error: give ce);
+    string cm = connect.message();
+    f = f + check(ok: cm.equals(other: "connection to server at \"localhost\" (::1), port 5432 failed: connection refused\nconnection to server at \"127.0.0.1\", port 5432 failed: FATAL:  password authentication failed for user \"kp_scram\"\npassword retrieved from file \"/home/u/.pgpass\""), what: "error: every attempt, libpq's host identity, the password file hint");
+    f = f + check(ok: connect.sqlstate() == INVALID_PASSWORD, what: "error: a failed connect's sqlstate is its last attempt's");
+    return f;
+}
+
+fn int32 errorTests() {
+    int32 f = 0;
+    f = f + serverErrorTests();
+    f = f + pgErrorTests();
+    return f;
+}

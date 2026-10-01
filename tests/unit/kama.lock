@@ -1,0 +1,6 @@
+{
+  "lockVersion": 1,
+  "packages": {
+    "@kama/postgres": { "source": "path", "path": "../..", "dependencies": [] }
+  }
+}

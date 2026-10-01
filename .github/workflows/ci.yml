@@ -1,0 +1,79 @@
+# CI for @kama/postgres. Copied in shape from @kama/sodium's workflow.
+#
+# ⚠️ NOT YET SEEN GREEN. It pins kama v0.9.486, the first release with everything this package needs (see
+# KAMA_GAPS.md). Until that tag is published, the install step has nothing to resolve.
+#
+# Two jobs:
+#   - unit: tools/test.sh, the hermetic program, debug and release, on linux-x64 and macos-arm64.
+#   - integration: a real PostgreSQL per matrix entry via tools/pg.sh (docker on the Linux runner; macOS
+#     runners have no container runtime). Until the kama integration suite exists, this job proves the
+#     server configuration with `tools/pg.sh smoke`: one login per auth method, using the server's own psql.
+#     19 is a beta, so it may fail without failing the run.
+# Windows is not in the matrix; the package has never been built there.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x64 }
+          - { os: macos-14, name: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pinned rather than `latest`, so a compiler release cannot turn this repository red without a commit.
+      # Raise it deliberately, in the same commit that raises the manifests' "kama" floor.
+      - name: Install kama
+        env:
+          KAMA_VERSION: v0.9.486
+        run: |
+          curl -fsSL https://kama-lang.org/install.sh | sh
+          echo "$HOME/.kama/bin" >> "$GITHUB_PATH"
+
+      - name: Version
+        run: kama --version
+
+      - name: Unit tests
+        run: tools/test.sh
+
+  integration:
+    name: integration (PostgreSQL ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.pg == '19' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ['14', '15', '16', '17', '18', '19']
+    env:
+      CONTAINER_RUNTIME: docker
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Start PostgreSQL ${{ matrix.pg }}
+        run: tools/pg.sh up --version ${{ matrix.pg }}
+
+      - name: Server smoke (one login per auth method)
+        run: tools/pg.sh smoke --version ${{ matrix.pg }}
+
+      - name: Server log on failure
+        if: failure()
+        run: tools/pg.sh logs --version ${{ matrix.pg }} || true
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: tools/pg.sh down --version ${{ matrix.pg }}

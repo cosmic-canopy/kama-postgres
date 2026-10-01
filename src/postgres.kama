@@ -1,0 +1,14 @@
+// @kama/postgres — the PostgreSQL client for kama. It speaks the v3 wire protocol directly, in kama, over
+// std::net; there is no libpq and nothing to install. TLS comes from @kama/tls.
+//
+// The shape of the package, as it fills in:
+//   postgres            Connection, Config, Query and the `pg"…"` tag, Row and `column::<T>`, PgError
+//   postgres::types     the value types PostgreSQL has and kama's std does not (Numeric, Interval, Inet, …)
+//   postgres::pool      a connection pool shared by isolates
+//
+// The rules every module holds:
+//   - Nothing from the server is trusted: every length is bounded before it is used, every text field is
+//     validated as UTF-8, and a malformed message is `PgError::Protocol`, never a panic.
+//   - A data error is a `Result`; a contract violation (a column index out of range) panics, exactly
+//     like an index out of range on a collection.
+//   - Blocking I/O with deadlines. A connection belongs to one isolate at a time and moves between them.

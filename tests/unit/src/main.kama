@@ -1,0 +1,18 @@
+// The package's hermetic tests: one program, one `xxxTests()` per area, exit 0 when every case holds. No
+// server, no network, no clock — these run anywhere `tools/test.sh` runs, debug and release. The cases that
+// need a live PostgreSQL are in tests/integration. A failing case prints its name, so the log says WHICH,
+// not just that.
+import { core::println };
+export { check };
+
+fn int32 check(bool ok, string what) {
+    if (!ok) { println(s: "  FAIL ${what}"); return 1; }
+    return 0;
+}
+
+fn int32 main() {
+    int32 failed = 0;
+    if (failed != 0) { println(s: "postgres unit tests: ${failed} failed"); return 1; }
+    println(s: "postgres unit tests: OK");
+    return 0;
+}

@@ -4,7 +4,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::
 export { LocalDateTime, TimeOfDay, TimeTz, Interval,
          decodeDate, encodeDate, formatDate, decodeTimestamp, encodeTimestamp, formatTimestamp,
          decodeTimestampTz, encodeTimestampTz, formatTimestampTz, decodeTime, encodeTime, decodeTimeTz,
-         encodeTimeTz, decodeInterval, encodeInterval };
+         encodeTimeTz, decodeInterval, encodeInterval, dateText, timestampText };
 
 // Dates and times. PostgreSQL counts from 2000-01-01: a date is days since then (int32), a timestamp
 // microseconds since then (int64), and both reserve their extreme values for -infinity and infinity.
@@ -263,6 +263,30 @@ fn string formatTimestampTz(const ref Timestamp v) {
     Result<string, DecodeError> s = formatPgMicros(micros: v.asUnixMicros() - PG_EPOCH_UNIX_MICROS);
     string text = match (give s) { case Ok(value: t): give t; case Err(error: e): "out of range"; };
     return text.concat(other: "+00");
+}
+
+// The text PostgreSQL prints for a binary date, timestamp or timestamptz (DateStyle ISO; a timestamptz in UTC),
+// the infinities included.
+unsafe fn Result<string, DecodeError> dateText(ConstView<uint8> raw) {
+    if (raw.length() != 4) { return Result::Err(error: DecodeError::BadLength(type: "date", got: raw.length())); }
+    int32 v = truncate<int32>(be(b: raw, from: 0, count: 4));
+    if (v == DATE_END) { return Result::Ok(value: "infinity"); }
+    if (v == DATE_BEGIN) { return Result::Ok(value: "-infinity"); }
+    Result<Date, DecodeError> d = decodeDate(format: FORMAT_BINARY, raw: raw);
+    return match (give d) { case Ok(value: x): Result::Ok(value: formatDate(d: x)); case Err(error: e): Result::Err(error: give e); };
+}
+
+unsafe fn Result<string, DecodeError> timestampText(ConstView<uint8> raw, bool zoned) {
+    string type = "timestamp";
+    if (zoned) { type = "timestamptz"; }
+    if (raw.length() != 8) { return Result::Err(error: DecodeError::BadLength(type: give type, got: raw.length())); }
+    int64 v = truncate<int64>(be(b: raw, from: 0, count: 8));
+    if (v == TIMESTAMP_END) { return Result::Ok(value: "infinity"); }
+    if (v == TIMESTAMP_BEGIN) { return Result::Ok(value: "-infinity"); }
+    string text = formatTimestamp(v: LocalDateTime.fromPgMicros(micros: v));
+    if (!zoned) { return Result::Ok(value: give text); }
+    if (text.endsWith(suffix: " BC")) { return Result::Ok(value: text.substring(start: 0, end: text.length() - 3).concat(other: "+00 BC")); }
+    return Result::Ok(value: text.concat(other: "+00"));
 }
 
 // ---- time and timetz ----------------------------------------------------------------------------------------

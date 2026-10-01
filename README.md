@@ -12,7 +12,8 @@ install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls)
 
 ```kama
 import { core::println, std::collections::DynamicArray,
-         postgres::Config, postgres::Connection, postgres::PgError, postgres::SimpleResult };
+         postgres::Config, postgres::Connection, postgres::PgError, postgres::Rows, postgres::column,
+         postgres::columnOpt };
 
 fn int32 main() {
     // A libpq connection string; the service file, PG* variables and ~/.pgpass apply as they do for psql.
@@ -21,12 +22,17 @@ fn int32 main() {
     Result<Connection, PgError> opened = Connection.connect(config: config);
     Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
 
-    Result<DynamicArray<SimpleResult>, PgError> r = conn.simpleQuery(sql: "select name, qty from items order by name");
-    DynamicArray<SimpleResult> results = match (give r) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<DynamicArray<Rows>, PgError> r = conn.simpleQuery(sql: "select name, qty from items order by name");
+    DynamicArray<Rows> results = match (give r) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
     isize i = 0;
     while (i < results[0].rowCount()) {
-        Optional<string> name = results[0].text(row: i, column: 0);
-        match (give name) { case Some(value: n): { println(s: give n); } case None: { println(s: "(null)"); } };
+        // Typed access, as PQgetvalue addresses a value: the result, the row, the column.
+        Result<Optional<string>, PgError> name = columnOpt::<string>(rows: results[0], row: i, index: 0);
+        Result<int32, PgError> qty = column::<int32>(rows: results[0], row: i, index: 1);
+        match (give name) {
+            case Ok(value: n): { match (give n) { case Some(value: s): { println(s: give s); } case None: { println(s: "(null)"); } }; }
+            case Err(error: e): { println(s: e.message()); }
+        };
         i = i + 1;
     }
     conn.close();

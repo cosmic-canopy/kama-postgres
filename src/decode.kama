@@ -1,0 +1,453 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::memory::Owned, std::uuid::Uuid,
+         postgres::PgError, postgres::Rows, postgres::protocol::FieldDescription, postgres::protocol::RowValues,
+         postgres::types::DecodeError, postgres::types::FORMAT_TEXT, postgres::types::FORMAT_BINARY,
+         postgres::types::typeName, postgres::types::utf8Text,
+         postgres::types::decodeBool, postgres::types::decodeInt2, postgres::types::decodeInt4,
+         postgres::types::decodeInt8, postgres::types::decodeOid, postgres::types::decodeFloat4,
+         postgres::types::decodeFloat8, postgres::types::decodeText, postgres::types::decodeJsonb,
+         postgres::types::decodeBytea, postgres::types::decodeUuid, postgres::types::formatBool,
+         postgres::types::formatBytea, postgres::types::dateText, postgres::types::timestampText,
+         postgres::types::decodeTime, postgres::types::decodeTimeTz, postgres::types::decodeInterval,
+         postgres::types::decodeNumeric, postgres::types::TimeOfDay, postgres::types::TimeTz,
+         postgres::types::Interval, postgres::types::Numeric,
+         postgres::types::BOOL, postgres::types::INT2, postgres::types::INT4, postgres::types::INT8,
+         postgres::types::OID, postgres::types::FLOAT4, postgres::types::FLOAT8, postgres::types::TEXT,
+         postgres::types::VARCHAR, postgres::types::BPCHAR, postgres::types::NAME, postgres::types::JSON,
+         postgres::types::JSONB, postgres::types::BYTEA, postgres::types::UUID, postgres::types::DATE,
+         postgres::types::TIME, postgres::types::TIMETZ, postgres::types::TIMESTAMP,
+         postgres::types::TIMESTAMPTZ, postgres::types::INTERVAL, postgres::types::NUMERIC };
+export { column, columnOpt, rowAs, hasBinaryCodec };
+
+// Typed access to a result's values: `column::<T>`, `columnOpt::<T>` and `rowAs::<T>`, for every T that is
+// `Deserializable`. That is the contract the primitives, std's Uuid, Timestamp and Date, this package's own types
+// and every `@generate(Deserializable)` type already share, so these functions are how a value of any of them
+// is read. (Methods cannot be generic, and a package cannot add a contract to a type it does not own.)
+//
+// A column is decoded by its type first, then served to `T.deserialize` through a Deserializer:
+//   - an integer column reads into an integer at least as wide as the column's type: int2 into int16, int32 or
+//     int64; int4 into int32 or int64; int8 into int64; oid into uint32, uint64 or int64. Never narrower, even
+//     when the value would fit, so a result does not depend on the data;
+//   - float4 into float32 or float64, float8 into float64; bool into bool;
+//   - bytea into DynamicArray<uint8>;
+//   - every non-NULL column into a string: the value's PostgreSQL text, as psql shows it (a float read from a
+//     binary column is the exact value in 17 digits, KPG-27). Uuid, Timestamp, Date, Numeric, LocalDateTime,
+//     TimeOfDay, TimeTz and Interval read that text;
+//   - a text column into a payload-less enum whose variant is named as the label is (a PostgreSQL enum);
+//   - NULL only into an Optional (a field, or columnOpt).
+// Anything else is `PgError::Value`, naming the column, its type and what was asked.
+
+// The OIDs this client reads in binary: what the extended protocol asks the server for. Every other type comes as
+// text.
+fn bool hasBinaryCodec(uint32 oid) {
+    return oid == BOOL || oid == INT2 || oid == INT4 || oid == INT8 || oid == OID || oid == FLOAT4 || oid == FLOAT8
+        || oid == TEXT || oid == VARCHAR || oid == BPCHAR || oid == NAME || oid == JSON || oid == JSONB
+        || oid == BYTEA || oid == UUID || oid == DATE || oid == TIME || oid == TIMETZ || oid == TIMESTAMP
+        || oid == TIMESTAMPTZ || oid == INTERVAL || oid == NUMERIC;
+}
+
+// A column's value, decoded by its type: what a reader serves.
+type enum Cell {
+    Null,
+    Integer(int64 value, int32 bits),
+    Oid(uint32 value),
+    // `text` is the server's own text when the value came as text, "" when it came in binary.
+    Float(float64 value, int32 bits, string text),
+    Boolean(bool value),
+    // Its PostgreSQL text: a text type's value, or the text of a type read only as text.
+    Text(string text),
+    Bytes(DynamicArray<uint8> bytes),
+    // A value that does not decode: the reason, raised when it is read.
+    Bad(string why)
+}
+
+// What went wrong in a read, for the message.
+type enum Problem { Fine, Mismatch, IsNull, Undecodable, Missing, Shape, Duplicate }
+
+unsafe fn Cell textCell(ConstView<uint8> raw) {
+    Result<string, DecodeError> t = utf8Text(raw: raw);
+    return match (give t) { case Ok(value: s): Cell::Text(text: give s); case Err(error: e): Cell::Bad(why: e.message()); };
+}
+
+unsafe fn Cell decodeCell(const ref FieldDescription f, ConstView<uint8> raw, bool isNull) {
+    if (isNull) { return Cell::Null; }
+    uint32 oid = f.typeOid();
+    int16 format = f.format();
+    if (oid == INT2) {
+        Result<int16, DecodeError> r = decodeInt2(format: format, raw: raw);
+        return match (give r) { case Ok(value: v): Cell::Integer(value: cast<int64>(v), bits: 16); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == INT4) {
+        Result<int32, DecodeError> r = decodeInt4(format: format, raw: raw);
+        return match (give r) { case Ok(value: v): Cell::Integer(value: cast<int64>(v), bits: 32); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == INT8) {
+        Result<int64, DecodeError> r = decodeInt8(format: format, raw: raw);
+        return match (give r) { case Ok(value: v): Cell::Integer(value: v, bits: 64); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == OID) {
+        Result<uint32, DecodeError> r = decodeOid(format: format, raw: raw);
+        return match (give r) { case Ok(value: v): Cell::Oid(value: v); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == FLOAT4) {
+        Result<float32, DecodeError> r = decodeFloat4(format: format, raw: raw);
+        return match (give r) { case Ok(value: v): Cell::Float(value: cast<float64>(v), bits: 32, text: textIf(format: format, raw: raw)); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == FLOAT8) {
+        Result<float64, DecodeError> r = decodeFloat8(format: format, raw: raw);
+        return match (give r) { case Ok(value: v): Cell::Float(value: v, bits: 64, text: textIf(format: format, raw: raw)); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == BOOL) {
+        Result<bool, DecodeError> r = decodeBool(format: format, raw: raw);
+        return match (give r) { case Ok(value: v): Cell::Boolean(value: v); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == BYTEA) {
+        Result<DynamicArray<uint8>, DecodeError> r = decodeBytea(format: format, raw: raw);
+        return match (give r) { case Ok(value: v): Cell::Bytes(bytes: give v); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    // Every other type a value of which is read as text. In text format that is the server's own text.
+    if (format == FORMAT_TEXT) { return textCell(raw: raw); }
+    if (format != FORMAT_BINARY) { return Cell::Bad(why: "a value in format ${format}, which is neither text nor binary"); }
+    if (oid == TEXT || oid == VARCHAR || oid == BPCHAR || oid == NAME || oid == JSON) { return textCell(raw: raw); }
+    if (oid == JSONB) {
+        Result<string, DecodeError> r = decodeJsonb(format: format, raw: raw);
+        return match (give r) { case Ok(value: s): Cell::Text(text: give s); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == UUID) {
+        Result<Uuid, DecodeError> r = decodeUuid(format: format, raw: raw);
+        return match (r) { case Ok(value: u): Cell::Text(text: "${u}"); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == DATE) { return textResult(r: dateText(raw: raw)); }
+    if (oid == TIMESTAMP) { return textResult(r: timestampText(raw: raw, zoned: false)); }
+    if (oid == TIMESTAMPTZ) { return textResult(r: timestampText(raw: raw, zoned: true)); }
+    if (oid == TIME) {
+        Result<TimeOfDay, DecodeError> r = decodeTime(format: format, raw: raw);
+        return match (r) { case Ok(value: v): Cell::Text(text: "${v}"); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == TIMETZ) {
+        Result<TimeTz, DecodeError> r = decodeTimeTz(format: format, raw: raw);
+        return match (r) { case Ok(value: v): Cell::Text(text: "${v}"); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == INTERVAL) {
+        Result<Interval, DecodeError> r = decodeInterval(format: format, raw: raw);
+        return match (r) { case Ok(value: v): Cell::Text(text: "${v}"); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    if (oid == NUMERIC) {
+        Result<Numeric, DecodeError> r = decodeNumeric(format: format, raw: raw);
+        return match (give r) { case Ok(value: n): Cell::Text(text: n.text()); case Err(error: e): Cell::Bad(why: e.message()); };
+    }
+    return Cell::Bad(why: "this client has no codec for a binary value of this type");
+}
+
+// The value's text if it came as text (already decoded once, so it is UTF-8), else "".
+unsafe fn string textIf(int16 format, ConstView<uint8> raw) {
+    if (format != FORMAT_TEXT) { return ""; }
+    Result<string, DecodeError> t = utf8Text(raw: raw);
+    return match (give t) { case Ok(value: s): give s; case Err(error: e): ""; };
+}
+
+fn Cell textResult(Result<string, DecodeError> r) {
+    return match (give r) { case Ok(value: s): Cell::Text(text: give s); case Err(error: e): Cell::Bad(why: e.message()); };
+}
+
+// A float as text: PostgreSQL's spellings of the infinities and NaN, and otherwise the exact value in as many
+// digits as its width can need (KPG-27: not PostgreSQL's shortest digits).
+fn string floatText(float64 v, int32 bits) {
+    if (v != v) { return "NaN"; }
+    if (v > 0.0 && v * 0.5 == v) { return "Infinity"; }
+    if (v < 0.0 && v * 0.5 == v) { return "-Infinity"; }
+    if (bits == 32) { float32 narrow = cast<float32>(v); return "${narrow}"; }
+    return "${v}";
+}
+
+// One value, or the columns of a row, served through the Deserializer contract. Reads never throw: a read that
+// cannot be served records why and sets the sticky error, and the caller turns that into a PgError.
+type resource CellReader implements Deserializer {
+    DynamicArray<Cell> cells;      // one per column (one in all for a single value)
+    DynamicArray<string> labels;   // the column names, for a row
+    bool whole = false;            // a whole row (rowAs), read as an object of fields
+    bool opened = false;           // the row's beginObject has been seen
+    isize current = 0;             // the cell being read
+    isize next = 0;                // the cell the next field() gives
+    isize element = -1;            // inside a bytea: the next byte; -1 outside
+    isize wanted = 0;              // beginObject's count: the fields the type has
+    isize taken = 0;               // fields read rather than skipped
+    bool err = false;
+    DeError code;
+    Problem problem;
+    isize failedCell = 0;
+    string asked;
+    string why;
+
+    ctor make(DynamicArray<Cell> cells, DynamicArray<string> labels, bool whole) {
+        this.cells = give cells; this.labels = give labels; this.whole = whole; this.opened = false;
+        this.current = 0; this.next = 0; this.element = -1; this.wanted = 0; this.taken = 0;
+        this.err = false; this.code = DeError::Malformed; this.problem = Problem::Fine;
+        this.failedCell = 0; this.asked = ""; this.why = "";
+    }
+
+    friend valueReader[make];
+    friend rowReader[make];
+    friend readFailure[failedAt, askedFor, trouble, reason, fieldsWanted, fieldsTaken];
+
+    const fn Problem trouble() { return this.problem; }
+    const fn isize failedAt() { return this.failedCell; }
+    const fn const ref string askedFor() { return this.asked; }
+    const fn const ref string reason() { return this.why; }
+    const fn isize fieldsWanted() { return this.wanted; }
+    const fn isize fieldsTaken() { return this.taken; }
+
+    // The first failure is the one reported.
+    fn void refuse(Problem p, const ref string what, string detail, DeError e) {
+        if (this.err) { return; }
+        this.err = true; this.code = e; this.problem = p; this.failedCell = this.current;
+        this.asked = copy what; this.why = give detail;
+    }
+
+    // Before a read: NULL and an undecodable value are refused here, whatever was asked.
+    fn bool usable(const ref string what) {
+        if (this.err) { return false; }
+        bool isNull = match (this.cells[this.current]) { case Null: true; case _: false; };
+        if (isNull) { this.refuse(p: Problem::IsNull, what: what, detail: "", e: DeError::TypeMismatch); return false; }
+        string bad = match (this.cells[this.current]) { case Bad(why: w): copy w; case _: ""; };
+        if (bad.length() > 0) { this.refuse(p: Problem::Undecodable, what: what, detail: give bad, e: DeError::Malformed); return false; }
+        return true;
+    }
+
+    fn int64 integer(int32 maxBits, const ref string what) {
+        if (!this.usable(what: what)) { return 0i64; }
+        int32 bits = match (this.cells[this.current]) { case Integer(value: v, bits: b): b; case _: 0; };
+        if (bits == 0 || bits > maxBits) { this.refuse(p: Problem::Mismatch, what: what, detail: "", e: DeError::TypeMismatch); return 0i64; }
+        return match (this.cells[this.current]) { case Integer(value: v, bits: b): v; case _: 0i64; };
+    }
+
+    fn uint32 oid(const ref string what) {
+        if (!this.usable(what: what)) { return 0ui32; }
+        bool isOid = match (this.cells[this.current]) { case Oid(value: v): true; case _: false; };
+        if (!isOid) { this.refuse(p: Problem::Mismatch, what: what, detail: "", e: DeError::TypeMismatch); return 0ui32; }
+        return match (this.cells[this.current]) { case Oid(value: v): v; case _: 0ui32; };
+    }
+
+    fn float64 floating(int32 maxBits, const ref string what) {
+        if (!this.usable(what: what)) { return 0.0; }
+        int32 bits = match (this.cells[this.current]) { case Float(value: v, bits: b, text: t): b; case _: 0; };
+        if (bits == 0 || bits > maxBits) { this.refuse(p: Problem::Mismatch, what: what, detail: "", e: DeError::TypeMismatch); return 0.0; }
+        return match (this.cells[this.current]) { case Float(value: v, bits: b, text: t): v; case _: 0.0; };
+    }
+
+    fn void mismatch(const ref string what) { this.refuse(p: Problem::Mismatch, what: what, detail: "", e: DeError::TypeMismatch); }
+
+    // ---- Deserializer ----
+
+    public fn void beginObject(usize count) {
+        if (!this.whole) { string w = "a struct"; this.refuse(p: Problem::Shape, what: w, detail: "a column holds one value; read a row into a struct with rowAs", e: DeError::TypeMismatch); return; }
+        if (this.opened) { string w = "a struct"; this.refuse(p: Problem::Shape, what: w, detail: "a field of a row is one column, not a nested struct", e: DeError::TypeMismatch); return; }
+        this.opened = true;
+        this.wanted = cast<isize>(count);
+        this.taken = 0;
+        this.next = 0;
+    }
+    // A field with no column is an error: the derive leaves such a field zero (KPG-26), so the count of fields read
+    // is checked against the count the type declared.
+    public fn void endObject() {
+        if (this.whole && !this.err && this.taken < this.wanted) {
+            this.err = true; this.code = DeError::MissingField; this.problem = Problem::Missing;
+        }
+    }
+    public fn bool moreFields() { return !this.err && this.whole && this.next < this.cells.length(); }
+    public fn FieldKey field() {
+        this.current = this.next;
+        this.next = this.next + 1;
+        this.taken = this.taken + 1;
+        return FieldKey::Name(name: copy this.labels[this.current]);
+    }
+    // A PostgreSQL enum's label names the kama variant.
+    public fn FieldKey variant() {
+        string what = "an enum";
+        if (!this.usable(what: what)) { return FieldKey::Name(name: ""); }
+        string label = match (this.cells[this.current]) { case Text(text: t): copy t; case _: ""; };
+        bool isText = match (this.cells[this.current]) { case Text(text: t): true; case _: false; };
+        if (!isText) { this.mismatch(what: what); return FieldKey::Name(name: ""); }
+        return FieldKey::Name(name: give label);
+    }
+    public fn void beginArray() {
+        string what = "an array";
+        if (!this.usable(what: what)) { return; }
+        bool isBytes = match (this.cells[this.current]) { case Bytes(bytes: b): true; case _: false; };
+        if (!isBytes) { this.mismatch(what: what); return; }
+        this.element = 0;
+    }
+    public fn bool moreElems() {
+        if (this.err || this.element < 0) { return false; }
+        isize n = match (this.cells[this.current]) { case Bytes(bytes: b): b.length(); case _: 0; };
+        if (this.element < n) { return true; }
+        this.element = -1;
+        return false;
+    }
+    public fn int8 readI8() { string w = "int8"; this.mismatch(what: w); return 0i8; }
+    public fn int16 readI16() { string w = "int16"; return truncate<int16>(this.integer(maxBits: 16, what: w)); }
+    public fn int32 readI32() { string w = "int32"; return truncate<int32>(this.integer(maxBits: 32, what: w)); }
+    public fn int64 readI64() {
+        string w = "int64";
+        bool isOid = match (this.cells[this.current]) { case Oid(value: v): true; case _: false; };
+        if (isOid) { return cast<int64>(this.oid(what: w)); }
+        return this.integer(maxBits: 64, what: w);
+    }
+    public fn uint8 readU8() {
+        string w = "uint8";
+        if (this.err) { return 0ui8; }
+        if (this.element < 0) { this.mismatch(what: w); return 0ui8; }
+        uint8 b = match (this.cells[this.current]) { case Bytes(bytes: x): x[this.element]; case _: 0ui8; };
+        this.element = this.element + 1;
+        return b;
+    }
+    public fn uint16 readU16() { string w = "uint16"; this.mismatch(what: w); return 0ui16; }
+    public fn uint32 readU32() { string w = "uint32"; return this.oid(what: w); }
+    public fn uint64 readU64() { string w = "uint64"; return cast<uint64>(this.oid(what: w)); }
+    public fn float32 readF32() { string w = "float32"; return cast<float32>(this.floating(maxBits: 32, what: w)); }
+    public fn float64 readF64() { string w = "float64"; return this.floating(maxBits: 64, what: w); }
+    public fn bool readBool() {
+        string w = "bool";
+        if (!this.usable(what: w)) { return false; }
+        bool isBool = match (this.cells[this.current]) { case Boolean(value: v): true; case _: false; };
+        if (!isBool) { this.mismatch(what: w); return false; }
+        return match (this.cells[this.current]) { case Boolean(value: v): v; case _: false; };
+    }
+    public fn char readChar() {
+        string w = "char";
+        if (!this.usable(what: w)) { return ' '; }
+        string text = match (this.cells[this.current]) { case Text(text: t): copy t; case _: ""; };
+        isize count = 0;
+        char only = ' ';
+        foreach (char c in text.chars()) { only = c; count = count + 1; }
+        if (count != 1) { this.mismatch(what: w); return ' '; }
+        return only;
+    }
+    // Every column's value as PostgreSQL prints it.
+    public unsafe fn string readString() {
+        string w = "string";
+        if (!this.usable(what: w)) { return ""; }
+        return match (this.cells[this.current]) {
+            case Integer(value: v, bits: b): "${v}";
+            case Oid(value: v): "${v}";
+            case Float(value: v, bits: b, text: t): { if (t.length() > 0) { return copy t; } := floatText(v: v, bits: b); }
+            case Boolean(value: v): formatBool(v: v);
+            case Text(text: t): copy t;
+            case Bytes(bytes: b): formatBytea(v: b.view());
+            case _: "";
+        };
+    }
+    // NULL is an Optional's None. Asking does not consume the value: a non-NULL one is read next.
+    public fn bool readNull() {
+        if (this.err || this.element >= 0) { return false; }
+        return match (this.cells[this.current]) { case Null: true; case _: false; };
+    }
+    // A column no field asked for.
+    public fn void skipValue() { if (this.whole) { this.taken = this.taken - 1; } }
+    public const fn bool failed() { return this.err; }
+    public fn void fail() {
+        string w = "this type";
+        this.refuse(p: Problem::Mismatch, what: w, detail: "", e: DeError::Malformed);
+    }
+    public fn void failWith(DeError e) {
+        if (this.err) { return; }
+        string w = "this type";
+        // A type's own deserialize refused the text it was given (Uuid, Timestamp, Numeric, …).
+        string text = match (this.cells[this.current]) { case Text(text: t): copy t; case _: ""; };
+        this.refuse(p: Problem::Undecodable, what: w, detail: "\"".concat(other: text).concat(other: "\" is not a value of the type read"), e: e);
+    }
+    public const fn DeError errorCode() { return this.code; }
+}
+
+// "column 2 ("score", int8)"
+fn string describeColumn(const ref Rows rows, isize index) {
+    string name = copy rows.field(index: index).name();
+    uint32 oid = rows.field(index: index).typeOid();
+    string type = typeName(oid: oid);
+    if (type.length() == 0) { type = "type ${oid}"; }
+    return "column ${index} (\"".concat(other: name).concat(other: "\", ").concat(other: type).concat(other: ")");
+}
+
+// The PgError for a reader's failure. `index` is the column a single value came from; for a row (-1) the reader
+// knows.
+fn PgError readFailure(const ref CellReader r, const ref Rows rows, isize index, Owned<Error> e) {
+    isize at = index;
+    if (index < 0) { at = r.failedAt(); }
+    string where = describeColumn(rows: rows, index: at);
+    string asked = copy r.askedFor();
+    string detail = match (r.trouble()) {
+        case Mismatch: where.concat(other: " cannot be read as ").concat(other: asked);
+        case IsNull: where.concat(other: " is NULL, and ").concat(other: asked).concat(other: " is not Optional: read it with columnOpt, or into an Optional field");
+        case Undecodable: where.concat(other: ": ").concat(other: r.reason());
+        case Shape: where.concat(other: ": ").concat(other: r.reason());
+        case Missing: {
+            isize wanted = r.fieldsWanted();
+            isize taken = r.fieldsTaken();
+            := "the row has no column for every field: the type has ${wanted} fields, and ${taken} of them name a column";
+        }
+        case _: where.concat(other: ": ").concat(other: e.message());
+    };
+    return PgError::Value(detail: give detail);
+}
+
+// The reader for one value, decoded by its column's type. Not generic, so every T shares it; and a grant to it
+// holds where one to a generic function would not (KPG-28).
+unsafe fn CellReader valueReader(const ref Rows rows, isize row, isize index) {
+    DynamicArray<Cell> cells = DynamicArray.empty();
+    cells.add(item: decodeCell(f: rows.field(index: index), raw: rows.values(row: row).value(column: index), isNull: rows.isNull(row: row, column: index)));
+    return CellReader.make(cells: give cells, labels: DynamicArray.empty(), whole: false);
+}
+
+// The reader for a whole row, or the error for a row whose columns do not have distinct names.
+unsafe fn Result<CellReader, PgError> rowReader(const ref Rows rows, isize row) {
+    DynamicArray<Cell> cells = DynamicArray.withCapacity(capacity: rows.columnCount());
+    DynamicArray<string> labels = DynamicArray.withCapacity(capacity: rows.columnCount());
+    isize c = 0;
+    while (c < rows.columnCount()) {
+        isize earlier = 0;
+        while (earlier < c) {
+            if (rows.field(index: earlier).name().equals(other: rows.field(index: c).name())) {
+                string name = copy rows.field(index: c).name();
+                return Result::Err(error: PgError::Value(detail: "columns ${earlier} and ${c} are both named \"".concat(other: name).concat(other: "\": rowAs reads a column by its name, so each name must be distinct")));
+            }
+            earlier = earlier + 1;
+        }
+        cells.add(item: decodeCell(f: rows.field(index: c), raw: rows.values(row: row).value(column: c), isNull: rows.isNull(row: row, column: c)));
+        labels.add(item: copy rows.field(index: c).name());
+        c = c + 1;
+    }
+    return Result::Ok(value: CellReader.make(cells: give cells, labels: give labels, whole: true));
+}
+
+// The value of column `index` of row `row`, as T: libpq's PQgetvalue, typed. NULL is an error: read a column that
+// can be NULL with columnOpt. A row or column index out of range panics.
+unsafe fn Result<T, PgError> column<T: Deserializable<T>>(const ref Rows rows, isize row, isize index) {
+    CellReader r = valueReader(rows: rows, row: row, index: index);
+    Result<T, Owned<Error>> v = T.deserialize(r: r);
+    return match (give v) {
+        case Ok(value: x): Result::Ok(value: give x);
+        case Err(error: e): Result::Err(error: readFailure(r: r, rows: rows, index: index, e: give e));
+    };
+}
+
+// The value of column `index` of row `row`, as T, or None for NULL.
+unsafe fn Result<Optional<T>, PgError> columnOpt<T: Deserializable<T>>(const ref Rows rows, isize row, isize index) {
+    if (rows.isNull(row: row, column: index)) { return Result::Ok(value: Optional::None); }
+    Result<T, PgError> v = column::<T>(rows: rows, row: row, index: index);
+    return match (give v) {
+        case Ok(value: x): Result::Ok(value: Optional::Some(value: give x));
+        case Err(error: e): Result::Err(error: give e);
+    };
+}
+
+// Row `row` as a T: each field reads the column of its wire name (the field's name, or @field(name: …)), and a
+// column no field names is skipped. Every field must have a column, and no two columns may share a name; an
+// Optional field's column may be NULL.
+unsafe fn Result<T, PgError> rowAs<T: Deserializable<T>>(const ref Rows rows, isize row) {
+    Result<CellReader, PgError> made = rowReader(rows: rows, row: row);
+    CellReader r = match (give made) { case Ok(value: x): give x; case Err(error: e): { return Result::Err(error: give e); } };
+    Result<T, Owned<Error>> v = T.deserialize(r: r);
+    return match (give v) {
+        case Ok(value: x): Result::Ok(value: give x);
+        case Err(error: e): Result::Err(error: readFailure(r: r, rows: rows, index: -1, e: give e));
+    };
+}

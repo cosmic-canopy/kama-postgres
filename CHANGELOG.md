@@ -14,6 +14,15 @@ Needs **kama ≥ 0.9.506**.
 - The password file is checked on the file opened, as libpq checks it. One that is not a regular file
   (`/dev/null`, a FIFO, a directory) gets libpq's "is not a plain file" warning.
 - With `HOME` unset or empty, the home directory is the account's, from its passwd entry, as libpq finds it.
+- **`Rows`**, one result type for both protocols, as libpq's PGresult is. It replaces `SimpleResult`, and the
+  description of a column is `field(index:)`. It is `Sendable`.
+- **Typed access**, through `Deserializable`: `column::<T>(rows:, row:, index:)`, `columnOpt::<T>` and
+  `rowAs::<T>(rows:, row:)`. They work for primitives, `Uuid`, `Timestamp`, `Date`, bytea as
+  `DynamicArray<uint8>`, PostgreSQL enums as kama enums, and `@generate(Deserializable)` structs by column name.
+  - An integer reads into a type at least as wide as its column's, never narrower. Any column reads as a string:
+    its PostgreSQL text. NULL reads only into an Optional.
+  - `rowAs` refuses a row with no column for a field, and a row whose columns share a name.
+  - `PgError::Value` names the column, its type, and what was asked.
 - **SASLprep** is PostgreSQL's `pg_saslprep`, step for step, so a SCRAM password with non-ASCII characters
   (full-width letters, a no-break space, a ligature) logs in as it does with psql. `postgres::protocol` has
   `saslPrep` and `scramPassword`. The stringprep tables are generated from PostgreSQL's source
@@ -59,8 +68,8 @@ Needs **kama ≥ 0.9.506**.
   - Authentication: trust, cleartext, md5, and SCRAM-SHA-256, including `scram_client_key` /
     `scram_server_key`. AuthenticationOk before the server proves its SCRAM signature is refused.
   - Protocol 3.0 or 3.2, with NegotiateProtocolVersion handled as libpq handles it.
-  - `simpleQuery` gives `SimpleResult`s: text values checked as UTF-8 on arrival, `rowsAffected` as
-    PQcmdTuples reads the tag. COPY is refused cleanly, and the session goes on.
+  - `simpleQuery` gives `Rows`: text values checked as UTF-8 on arrival, `rowsAffected` as PQcmdTuples reads
+    the tag. COPY is refused cleanly, and the session goes on.
   - Session state: parameters kept current, `serverVersion()`, the transaction status, a LISTEN/NOTIFY queue
     (`takeNotifications`).
   - Ending: `close()` and the destructor send Terminate. A FATAL error, EOF or protocol violation closes the

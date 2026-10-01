@@ -1,28 +1,34 @@
-import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
-         std::encoding::utf8::Utf8Error, postgres::protocol::FieldDescription, postgres::protocol::RowValues };
-export { SimpleResult };
+import { std::collections::DynamicArray, std::collections::ConstView, postgres::protocol::FieldDescription,
+         postgres::protocol::RowValues };
+export { Rows };
 
-// One statement's result from `Connection.simpleQuery`: its columns, its rows, and its command tag. The simple
-// protocol sends every value as text (a binary cursor's FETCH aside); each text value was checked as UTF-8 when it
-// arrived, so reading one cannot fail. A column or row index out of range panics, as an index does on a
-// collection.
-type resource SimpleResult {
+// One result: its columns, its rows, and the command tag that completed it. It is one type for both protocols, as
+// libpq's PGresult is. `simpleQuery` gives text values. The extended protocol gives binary values for the types
+// this client has a codec for, and text for the rest. Read a value with `column::<T>`, `columnOpt::<T>` or
+// `rowAs::<T>`, or take the bytes the server sent. Every text value was checked as UTF-8 when it arrived.
+//
+// A row or column index out of range panics, as an index does on a collection. A `Rows` is Sendable, so a result
+// can move to another isolate.
+type resource Rows implements Sendable {
     DynamicArray<FieldDescription> fields;
     DynamicArray<RowValues> rows;
     string tag;
+    bool more = false;
 
     public ctor make(DynamicArray<FieldDescription> fields, DynamicArray<RowValues> rows, string tag) {
-        this.fields = give fields; this.rows = give rows; this.tag = give tag;
+        this.fields = give fields; this.rows = give rows; this.tag = give tag; this.more = false;
     }
 
     // A connection fills a result as the messages arrive: the RowDescription first, then each DataRow, then the
-    // CommandComplete that names it.
+    // CommandComplete that names it, or the PortalSuspended that leaves it open.
     fn void addRow(RowValues row) { this.rows.add(item: give row); }
     fn void complete(string tag) { this.tag = give tag; }
-    friend postgres::Connection::simpleQuery[addRow, complete];
+    fn void suspend() { this.more = true; }
+    friend postgres::Connection::collect[addRow, complete, suspend];
 
     public const fn isize columnCount() { return this.fields.length(); }
-    public const fn const ref FieldDescription column(isize index) { return this.fields[index]; }
+    // The description of column `index`: its name, its type's OID, its format.
+    public const fn const ref FieldDescription field(isize index) { return this.fields[index]; }
     // The first column called `name`, compared exactly; None if there is none.
     public const fn Optional<isize> columnIndex(const ref string name) {
         isize i = 0;
@@ -33,26 +39,24 @@ type resource SimpleResult {
     public const fn isize rowCount() { return this.rows.length(); }
     public const fn bool isNull(isize row, isize column) { return this.rows[row].isNull(column: column); }
 
-    // A value as text; None for NULL. A column in binary format (a binary cursor's) has no text: read its bytes.
-    public unsafe const fn Optional<string> text(isize row, isize column) {
-        if (this.fields[column].format() != 0i16) { panic(msg: "SimpleResult.text: the column is binary; read it with bytes()"); }
-        if (this.rows[row].isNull(column: column)) { return Optional::None; }
-        Result<string, Utf8Error> s = decode(bytes: this.rows[row].value(column: column));
-        return match (give s) {
-            case Ok(value: t): Optional::Some(value: give t);
-            case Err(error: e): { panic(msg: "SimpleResult.text: a value that was checked on arrival is not UTF-8"); return Optional::None; }
-        };
-    }
-
-    // A value's bytes as the server sent them; empty for NULL (ask `isNull` to tell NULL from empty).
+    // A value's bytes as the server sent them, in the column's format; empty for NULL (ask `isNull` to tell NULL
+    // from empty).
     public unsafe const fn ConstView<uint8> bytes(isize row, isize column) { return this.rows[row].value(column: column); }
 
-    // The command tag, e.g. "SELECT 3", "INSERT 0 1", "CREATE TABLE".
+    // The command tag, e.g. "SELECT 3", "INSERT 0 1", "CREATE TABLE"; "" while a portal is suspended.
     public const fn const ref string commandTag() { return this.tag; }
 
     // The rows the command affected or returned, as libpq's PQcmdTuples reads them from the tag: for INSERT,
     // UPDATE, DELETE, MERGE, SELECT, FETCH, MOVE and COPY. None for any other command.
     public const fn Optional<int64> rowsAffected() { return countFromTag(tag: this.tag); }
+
+    // A portal's Execute stopped at its row limit (PortalSuspended): fetch again for the rest.
+    public const fn bool suspended() { return this.more; }
+
+    // The row itself, for the typed readers.
+    const fn const ref RowValues values(isize row) { return this.rows[row]; }
+    friend postgres::valueReader[values];
+    friend postgres::rowReader[values];
 }
 
 fn Optional<int64> countFromTag(const ref string tag) {

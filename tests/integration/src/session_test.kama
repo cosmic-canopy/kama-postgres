@@ -3,7 +3,7 @@
 import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender,
          std::concurrent::Receiver, std::concurrent::SendResult, std::io::IoError, std::net::TcpListener,
          std::time::monotonicNow, std::time::Instant, std::time::Duration,
-         postgres::Connection, postgres::PgError, postgres::SimpleResult, postgres::Environment,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::Environment,
          postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
          postgres::sqlstate::ADMIN_SHUTDOWN,
          postgres_integration_tests::check, postgres_integration_tests::setting,
@@ -59,10 +59,10 @@ unsafe fn int32 terminationTests() {
     Result<Connection, PgError> r = open(conninfo: conninfoFor(user: "kp_trust"));
     match (give r) {
         case Ok(value: c): {
-            Result<DynamicArray<SimpleResult>, PgError> killed = c.simpleQuery(sql: "select pg_terminate_backend(pg_backend_pid())");
+            Result<DynamicArray<Rows>, PgError> killed = c.simpleQuery(sql: "select pg_terminate_backend(pg_backend_pid())");
             bool shutdown = match (killed) { case Ok(value: v): false; case Err(error: e): e.sqlstate() == ADMIN_SHUTDOWN; };
             f = f + check(ok: shutdown && c.isClosed(), what: "termination: the server ending this session is FATAL 57P01, and the connection closes");
-            Result<DynamicArray<SimpleResult>, PgError> later = c.simpleQuery(sql: "select 1");
+            Result<DynamicArray<Rows>, PgError> later = c.simpleQuery(sql: "select 1");
             f = f + check(ok: match (later) { case Ok(value: v): false; case Err(error: e): match (e) { case Closed: true; case _: false; }; }, what: "termination: every later call is Closed");
         }
         case Err(error: e): { f = f + check(ok: false, what: "termination: connect"); }
@@ -74,7 +74,7 @@ unsafe fn int32 terminationTests() {
     Connection killer = match (give b) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "termination: second connection"); } };
     int32 pid = victim.processId();
     string done = scalar(c: killer, sql: "select pg_terminate_backend(".concat(other: "${pid}").concat(other: ", 5000)"));
-    Result<DynamicArray<SimpleResult>, PgError> next = victim.simpleQuery(sql: "select 1");
+    Result<DynamicArray<Rows>, PgError> next = victim.simpleQuery(sql: "select 1");
     string m = match (next) { case Ok(value: v): "succeeded"; case Err(error: e): e.message(); };
     f = f + check(ok: done.equals(other: "t") && victim.isClosed() && !m.equals(other: "succeeded"), what: "termination: an idle session ended elsewhere fails its next query: ".concat(other: m));
     killer.close();
@@ -149,7 +149,7 @@ unsafe fn int32 closeTests() {
     int32 pid = c.processId();
     c.close();
     c.close();
-    Result<DynamicArray<SimpleResult>, PgError> after = c.simpleQuery(sql: "select 1");
+    Result<DynamicArray<Rows>, PgError> after = c.simpleQuery(sql: "select 1");
     bool closed = match (after) { case Ok(value: v): false; case Err(error: e): match (e) { case Closed: true; case _: false; }; };
     f = f + check(ok: c.isClosed() && closed, what: "close: a closed connection is Closed, and closing twice is harmless");
     // The server ends the session when Terminate arrives, a moment later: poll for it.
@@ -158,7 +158,7 @@ unsafe fn int32 closeTests() {
     int32 tries = 0;
     while (tries < 50 && !left.equals(other: "0")) {
         left = scalar(c: w, sql: sql);
-        if (!left.equals(other: "0")) { Result<DynamicArray<SimpleResult>, PgError> pause = w.simpleQuery(sql: "select pg_sleep(0.05)"); }
+        if (!left.equals(other: "0")) { Result<DynamicArray<Rows>, PgError> pause = w.simpleQuery(sql: "select pg_sleep(0.05)"); }
         tries = tries + 1;
     }
     f = f + check(ok: left.equals(other: "0"), what: "close: the server sees the session end");

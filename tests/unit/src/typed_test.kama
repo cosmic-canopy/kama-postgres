@@ -1,0 +1,318 @@
+// Typed access to a result: column::<T>, columnOpt::<T> and rowAs::<T> over values a live PostgreSQL produced
+// (codec_vectors.kama), in both wire formats, and the rules a reader holds. Every value read as a string must be
+// the server's own text (a binary float is the one exception, KPG-27: it must be the same number). A column reads
+// into a type at least as wide as its own, never narrower; NULL only into an Optional; a struct only from a row
+// that has a column for each of its fields.
+import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::parse, std::fmt::ParseError,
+         std::time::Date, std::time::Timestamp, std::uuid::Uuid,
+         postgres::Rows, postgres::PgError, postgres::column, postgres::columnOpt, postgres::rowAs,
+         postgres::protocol::FieldDescription, postgres::protocol::RowValues,
+         postgres::types::FORMAT_TEXT, postgres::types::FORMAT_BINARY,
+         postgres::types::BOOL, postgres::types::INT2, postgres::types::INT4, postgres::types::INT8,
+         postgres::types::OID, postgres::types::FLOAT4, postgres::types::FLOAT8, postgres::types::TEXT,
+         postgres::types::VARCHAR, postgres::types::BPCHAR, postgres::types::NAME, postgres::types::JSON,
+         postgres::types::JSONB, postgres::types::BYTEA, postgres::types::UUID, postgres::types::DATE,
+         postgres::types::TIME, postgres::types::TIMETZ, postgres::types::TIMESTAMP,
+         postgres::types::TIMESTAMPTZ, postgres::types::INTERVAL, postgres::types::NUMERIC,
+         postgres_unit_tests::check, postgres_unit_tests::unhex,
+         postgres_unit_tests::codecTypes, postgres_unit_tests::codecTexts, postgres_unit_tests::codecBinaries };
+export { typedTests };
+
+fn uint32 oidOf(const ref string type) {
+    if (type.equals(other: "bool")) { return BOOL; }
+    if (type.equals(other: "int2")) { return INT2; }
+    if (type.equals(other: "int4")) { return INT4; }
+    if (type.equals(other: "int8")) { return INT8; }
+    if (type.equals(other: "oid")) { return OID; }
+    if (type.equals(other: "float4")) { return FLOAT4; }
+    if (type.equals(other: "float8")) { return FLOAT8; }
+    if (type.equals(other: "text")) { return TEXT; }
+    if (type.equals(other: "varchar")) { return VARCHAR; }
+    if (type.equals(other: "bpchar")) { return BPCHAR; }
+    if (type.equals(other: "name")) { return NAME; }
+    if (type.equals(other: "json")) { return JSON; }
+    if (type.equals(other: "jsonb")) { return JSONB; }
+    if (type.equals(other: "bytea")) { return BYTEA; }
+    if (type.equals(other: "uuid")) { return UUID; }
+    if (type.equals(other: "date")) { return DATE; }
+    if (type.equals(other: "time")) { return TIME; }
+    if (type.equals(other: "timetz")) { return TIMETZ; }
+    if (type.equals(other: "timestamp")) { return TIMESTAMP; }
+    if (type.equals(other: "timestamptz")) { return TIMESTAMPTZ; }
+    if (type.equals(other: "interval")) { return INTERVAL; }
+    if (type.equals(other: "numeric")) { return NUMERIC; }
+    panic(msg: "typed test: no OID for a vector type");
+    return 0ui32;
+}
+
+fn DynamicArray<uint8> bytesOf(ConstView<uint8> v) {
+    DynamicArray<uint8> b = DynamicArray.withCapacity(capacity: v.length());
+    isize i = 0;
+    while (i < v.length()) { b.add(item: v[i]); i = i + 1; }
+    return b;
+}
+
+// A result of one row: each column a value of its type in its format, or NULL.
+type resource Shape {
+    DynamicArray<FieldDescription> fields;
+    DynamicArray<uint8> body;
+    DynamicArray<isize> starts;
+    DynamicArray<int32> lengths;
+
+    public ctor make() { this.fields = DynamicArray.empty(); this.body = DynamicArray.empty(); this.starts = DynamicArray.empty(); this.lengths = DynamicArray.empty(); }
+    public fn void add(const ref string name, uint32 oid, int16 format, ConstView<uint8> value) {
+        this.fields.add(item: FieldDescription.make(label: copy name, table: 0ui32, attnum: 0i16, oid: oid, size: -1i16, modifier: -1, fmt: format));
+        this.starts.add(item: this.body.length());
+        this.lengths.add(item: cast<int32>(value.length()));
+        isize i = 0;
+        while (i < value.length()) { this.body.add(item: value[i]); i = i + 1; }
+    }
+    public fn void addText(const ref string name, uint32 oid, const ref string text) { this.add(name: name, oid: oid, format: FORMAT_TEXT, value: text.bytes()); }
+    public fn void addNull(const ref string name, uint32 oid) {
+        this.fields.add(item: FieldDescription.make(label: copy name, table: 0ui32, attnum: 0i16, oid: oid, size: -1i16, modifier: -1, fmt: FORMAT_TEXT));
+        this.starts.add(item: this.body.length());
+        this.lengths.add(item: -1);
+    }
+    public fn Rows rows() {
+        DynamicArray<RowValues> rs = DynamicArray.empty();
+        rs.add(item: RowValues.make(body: copy this.body, starts: copy this.starts, lengths: copy this.lengths));
+        return Rows.make(fields: copy this.fields, rows: give rs, tag: "SELECT 1");
+    }
+}
+
+unsafe fn Rows single(const ref string type, int16 format, ConstView<uint8> value) {
+    Shape s = Shape.make();
+    string name = "v";
+    s.add(name: name, oid: oidOf(type: type), format: format, value: value);
+    return s.rows();
+}
+
+fn string errorText(const ref PgError e) { return e.message(); }
+
+// column::<string>: the server's text, from text and from binary.
+unsafe fn int32 textTests() {
+    int32 f = 0;
+    DynamicArray<string> types = codecTypes();
+    DynamicArray<string> texts = codecTexts();
+    DynamicArray<string> binaries = codecBinaries();
+    isize i = 0;
+    while (i < types.length()) {
+        string type = copy types[i];
+        string text = copy texts[i];
+        Rows fromText = single(type: type, format: FORMAT_TEXT, value: texts[i].bytes());
+        Result<string, PgError> t = column::<string>(rows: fromText, row: 0, index: 0);
+        string gotText = match (give t) { case Ok(value: s): give s; case Err(error: e): e.message(); };
+        f = f + check(ok: gotText.equals(other: text), what: "typed: a text ".concat(other: type).concat(other: " reads as its text: ").concat(other: gotText));
+
+        DynamicArray<uint8> bin = unhex(text: binaries[i]);
+        Rows fromBinary = single(type: type, format: FORMAT_BINARY, value: bin.view());
+        Result<string, PgError> b = column::<string>(rows: fromBinary, row: 0, index: 0);
+        string gotBinary = match (give b) { case Ok(value: s): give s; case Err(error: e): e.message(); };
+        bool same = gotBinary.equals(other: text);
+        if (!same && (type.equals(other: "float4") || type.equals(other: "float8"))) {
+            // KPG-27: the same number, in 17 (or 9) digits rather than PostgreSQL's shortest.
+            Result<float64, ParseError> want = parse::<float64>(s: text);
+            Result<float64, ParseError> got = parse::<float64>(s: gotBinary);
+            same = match (want) { case Ok(value: w): match (got) { case Ok(value: g): g == w || (type.equals(other: "float4") && cast<float32>(g) == cast<float32>(w)); case Err(error: e): false; }; case Err(error: e): false; };
+        }
+        f = f + check(ok: same, what: "typed: a binary ".concat(other: type).concat(other: " \"").concat(other: text).concat(other: "\" reads as the server's text: ").concat(other: gotBinary));
+        i = i + 1;
+    }
+    return f;
+}
+
+// Each type into its own kama type, both formats agreeing.
+unsafe fn int32 nativeTests() {
+    int32 f = 0;
+    DynamicArray<string> types = codecTypes();
+    DynamicArray<string> texts = codecTexts();
+    DynamicArray<string> binaries = codecBinaries();
+    isize i = 0;
+    while (i < types.length()) {
+        string type = copy types[i];
+        string text = copy texts[i];
+        DynamicArray<uint8> bin = unhex(text: binaries[i]);
+        Rows rt = single(type: type, format: FORMAT_TEXT, value: texts[i].bytes());
+        Rows rb = single(type: type, format: FORMAT_BINARY, value: bin.view());
+        string what = "typed: ".concat(other: type).concat(other: " \"").concat(other: text).concat(other: "\" into its kama type");
+        if (type.equals(other: "int2")) {
+            Result<int16, PgError> a = column::<int16>(rows: rt, row: 0, index: 0);
+            Result<int16, PgError> b = column::<int16>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x == y && "${x}".equals(other: text); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "int4")) {
+            Result<int32, PgError> a = column::<int32>(rows: rt, row: 0, index: 0);
+            Result<int32, PgError> b = column::<int32>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x == y; case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "int8")) {
+            Result<int64, PgError> a = column::<int64>(rows: rt, row: 0, index: 0);
+            Result<int64, PgError> b = column::<int64>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x == y; case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "oid")) {
+            Result<uint32, PgError> a = column::<uint32>(rows: rt, row: 0, index: 0);
+            Result<uint32, PgError> b = column::<uint32>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x == y; case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "float8")) {
+            Result<float64, PgError> a = column::<float64>(rows: rt, row: 0, index: 0);
+            Result<float64, PgError> b = column::<float64>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x == y || (x != x && y != y); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "float4")) {
+            Result<float32, PgError> a = column::<float32>(rows: rt, row: 0, index: 0);
+            Result<float32, PgError> b = column::<float32>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x == y || (x != x && y != y); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "bool")) {
+            Result<bool, PgError> a = column::<bool>(rows: rt, row: 0, index: 0);
+            Result<bool, PgError> b = column::<bool>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x == y; case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "bytea")) {
+            Result<DynamicArray<uint8>, PgError> a = column::<DynamicArray<uint8>>(rows: rt, row: 0, index: 0);
+            Result<DynamicArray<uint8>, PgError> b = column::<DynamicArray<uint8>>(rows: rb, row: 0, index: 0);
+            bool same = match (a) { case Ok(value: x): match (b) { case Ok(value: y): sameBytes(a: x.view(), b: y.view()) && sameBytes(a: y.view(), b: bin.view()); case Err(error: e): false; }; case Err(error: e): false; };
+            f = f + check(ok: same, what: copy what);
+        } else if (type.equals(other: "uuid")) {
+            Result<Uuid, PgError> a = column::<Uuid>(rows: rt, row: 0, index: 0);
+            Result<Uuid, PgError> b = column::<Uuid>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): "${x}".equals(other: "${y}") && "${x}".equals(other: text); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "date") && !text.contains(substring: "infinity") && !text.equals(other: "0001-01-01")) {
+            Result<Date, PgError> a = column::<Date>(rows: rt, row: 0, index: 0);
+            Result<Date, PgError> b = column::<Date>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.unixDays() == y.unixDays(); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "timestamptz") && !text.contains(substring: "infinity")) {
+            Result<Timestamp, PgError> a = column::<Timestamp>(rows: rt, row: 0, index: 0);
+            Result<Timestamp, PgError> b = column::<Timestamp>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.asUnixMicros() == y.asUnixMicros(); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        }
+        i = i + 1;
+    }
+    return f;
+}
+
+fn bool sameBytes(ConstView<uint8> a, ConstView<uint8> b) {
+    if (a.length() != b.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) { if (a[i] != b[i]) { return false; } i = i + 1; }
+    return true;
+}
+
+@generate(Deserializable)
+type enum Mood { happy, sad }
+
+// A row as a struct: fields by column name, NULL as None, an enum by its label.
+@generate(Deserializable)
+type resource Account {
+    @field int32 id;
+    @field string name;
+    @field Optional<string> nick;
+    @field Mood mood;
+    @field DynamicArray<uint8> avatar;
+    @field(name: "created_at") Timestamp created;
+
+    public const fn int32 accountId() { return this.id; }
+    public const fn const ref string accountName() { return this.name; }
+    public const fn bool hasNick() { return match (this.nick) { case Some(value: n): true; case None: false; }; }
+    public const fn bool isHappy() { return match (this.mood) { case happy: true; case sad: false; }; }
+    public const fn isize avatarSize() { return this.avatar.length(); }
+    public const fn int64 createdMicros() { return this.created.asUnixMicros(); }
+}
+
+unsafe fn Shape accountRow(bool withNick, bool withAvatar) {
+    Shape s = Shape.make();
+    DynamicArray<uint8> id = DynamicArray.empty(); id.add(item: 0ui8); id.add(item: 0ui8); id.add(item: 0ui8); id.add(item: 7ui8);
+    s.add(name: "id", oid: INT4, format: FORMAT_BINARY, value: id.view());
+    s.addText(name: "name", oid: TEXT, text: "ann");
+    s.addText(name: "ignored", oid: TEXT, text: "a column no field names");
+    if (withNick) { s.addText(name: "nick", oid: TEXT, text: "annie"); } else { s.addNull(name: "nick", oid: TEXT); }
+    s.addText(name: "mood", oid: 0ui32, text: "sad");
+    if (withAvatar) { s.addText(name: "avatar", oid: BYTEA, text: "\\x0102ff"); }
+    s.addText(name: "created_at", oid: TIMESTAMPTZ, text: "2026-09-30 12:34:56.789012+00");
+    return s;
+}
+
+unsafe fn int32 ruleTests() {
+    int32 f = 0;
+    // Widening by the column's type, and never narrowing.
+    DynamicArray<uint8> four = DynamicArray.empty(); four.add(item: 0ui8); four.add(item: 0ui8); four.add(item: 0ui8); four.add(item: 5ui8);
+    Rows int4 = single(type: "int4", format: FORMAT_BINARY, value: four.view());
+    Result<int64, PgError> wide = column::<int64>(rows: int4, row: 0, index: 0);
+    f = f + check(ok: match (wide) { case Ok(value: v): v == 5i64; case Err(error: e): false; }, what: "typed: int4 into int64");
+    Result<int16, PgError> narrow = column::<int16>(rows: int4, row: 0, index: 0);
+    string nm = match (narrow) { case Ok(value: v): "read"; case Err(error: e): e.message(); };
+    f = f + check(ok: nm.equals(other: "column 0 (\"v\", int4) cannot be read as int16"), what: "typed: int4 into int16 is refused, even for 5: ".concat(other: nm));
+    Result<string, PgError> asText = column::<string>(rows: int4, row: 0, index: 0);
+    f = f + check(ok: match (asText) { case Ok(value: s): s.equals(other: "5"); case Err(error: e): false; }, what: "typed: int4 as a string");
+    Result<float64, PgError> asFloat = column::<float64>(rows: int4, row: 0, index: 0);
+    f = f + check(ok: match (asFloat) { case Ok(value: v): false; case Err(error: e): true; }, what: "typed: an integer is not a float");
+
+    Rows words = single(type: "text", format: FORMAT_TEXT, value: "42".bytes());
+    Result<int32, PgError> digits = column::<int32>(rows: words, row: 0, index: 0);
+    string dm = match (digits) { case Ok(value: v): "read"; case Err(error: e): e.message(); };
+    f = f + check(ok: dm.equals(other: "column 0 (\"v\", text) cannot be read as int32"), what: "typed: text of digits is still text: ".concat(other: dm));
+
+    // NULL.
+    Shape ns = Shape.make();
+    string colName = "maybe";
+    ns.addNull(name: colName, oid: INT4);
+    Rows nulls = ns.rows();
+    Result<int32, PgError> none = column::<int32>(rows: nulls, row: 0, index: 0);
+    string nullMessage = match (none) { case Ok(value: v): "read"; case Err(error: e): e.message(); };
+    f = f + check(ok: nullMessage.equals(other: "column 0 (\"maybe\", int4) is NULL, and int32 is not Optional: read it with columnOpt, or into an Optional field"),
+                  what: "typed: NULL into int32: ".concat(other: nullMessage));
+    Result<Optional<int32>, PgError> opt = columnOpt::<int32>(rows: nulls, row: 0, index: 0);
+    f = f + check(ok: match (opt) { case Ok(value: o): match (o) { case Some(value: v): false; case None: true; }; case Err(error: e): false; }, what: "typed: columnOpt gives None for NULL");
+    Result<Optional<int32>, PgError> some = columnOpt::<int32>(rows: int4, row: 0, index: 0);
+    f = f + check(ok: match (some) { case Ok(value: o): match (o) { case Some(value: v): v == 5; case None: false; }; case Err(error: e): false; }, what: "typed: columnOpt gives Some");
+
+    // An enum by its label; a label no variant has.
+    Rows label = single(type: "text", format: FORMAT_TEXT, value: "happy".bytes());
+    Result<Mood, PgError> mood = column::<Mood>(rows: label, row: 0, index: 0);
+    f = f + check(ok: match (mood) { case Ok(value: m): match (m) { case happy: true; case sad: false; }; case Err(error: e): false; }, what: "typed: an enum label");
+    Rows stranger = single(type: "text", format: FORMAT_TEXT, value: "angry".bytes());
+    Result<Mood, PgError> angry = column::<Mood>(rows: stranger, row: 0, index: 0);
+    f = f + check(ok: match (angry) { case Ok(value: m): false; case Err(error: e): true; }, what: "typed: a label no variant has is refused");
+
+    // A value its type's own parser refuses.
+    Rows badUuid = single(type: "text", format: FORMAT_TEXT, value: "not-a-uuid".bytes());
+    Result<Uuid, PgError> u = column::<Uuid>(rows: badUuid, row: 0, index: 0);
+    string um = match (u) { case Ok(value: v): "read"; case Err(error: e): e.message(); };
+    f = f + check(ok: um.equals(other: "column 0 (\"v\", text): \"not-a-uuid\" is not a value of the type read"), what: "typed: a text that is not a Uuid: ".concat(other: um));
+
+    // A whole row.
+    Shape full = accountRow(withNick: false, withAvatar: true);
+    Rows fr = full.rows();
+    Result<Account, PgError> a = rowAs::<Account>(rows: fr, row: 0);
+    match (give a) {
+        case Ok(value: x): {
+            f = f + check(ok: x.accountId() == 7 && x.accountName().equals(other: "ann") && !x.hasNick() && !x.isHappy() && x.avatarSize() == 3,
+                          what: "typed: rowAs fills every field, NULL as None, and skips a column no field names");
+            f = f + check(ok: x.createdMicros() == 1790771696789012i64, what: "typed: rowAs reads a field by its @field name");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "typed: rowAs: ".concat(other: m)); }
+    };
+    Shape missing = accountRow(withNick: true, withAvatar: false);
+    Rows mr = missing.rows();
+    Result<Account, PgError> partial = rowAs::<Account>(rows: mr, row: 0);
+    string pm = match (partial) { case Ok(value: x): "read"; case Err(error: e): e.message(); };
+    f = f + check(ok: pm.equals(other: "the row has no column for every field: the type has 6 fields, and 5 of them name a column"), what: "typed: a field with no column: ".concat(other: pm));
+
+    Shape twice = Shape.make();
+    twice.addText(name: "id", oid: TEXT, text: "a");
+    twice.addText(name: "id", oid: TEXT, text: "b");
+    Rows tr = twice.rows();
+    Result<Account, PgError> dup = rowAs::<Account>(rows: tr, row: 0);
+    string dupMessage = match (dup) { case Ok(value: x): "read"; case Err(error: e): e.message(); };
+    f = f + check(ok: dupMessage.equals(other: "columns 0 and 1 are both named \"id\": rowAs reads a column by its name, so each name must be distinct"), what: "typed: duplicate names: ".concat(other: dupMessage));
+
+    Shape nullName = accountRow(withNick: true, withAvatar: true);
+    nullName.addNull(name: "extra", oid: TEXT);
+    Rows nnr = nullName.rows();
+    Result<Account, PgError> extra = rowAs::<Account>(rows: nnr, row: 0);
+    f = f + check(ok: match (extra) { case Ok(value: x): x.hasNick(); case Err(error: e): false; }, what: "typed: a NULL column no field names is skipped");
+    return f;
+}
+
+unsafe fn int32 typedTests() {
+    int32 f = 0;
+    f = f + textTests();
+    f = f + nativeTests();
+    f = f + ruleTests();
+    return f;
+}

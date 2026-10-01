@@ -6,7 +6,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::Config, postgres::HostKind, postgres::ChannelBindingMode, postgres::RequireAuth,
          postgres::Transport, postgres::TcpTransport, postgres::UnixTransport, postgres::socketPathMax,
          postgres::NoticeHandler, postgres::Notification,
-         postgres::logNotice, postgres::SimpleResult,
+         postgres::logNotice, postgres::Rows,
          postgres::wire::Wire, postgres::wire::Deadline,
          postgres::protocol::MessageWriter, postgres::protocol::BackendMessage, postgres::protocol::ProtocolError,
          postgres::protocol::FieldDescription, postgres::protocol::RowValues, postgres::protocol::ErrorFields,
@@ -233,7 +233,7 @@ type resource Connection implements Sendable {
     // Run `sql` with the simple protocol: one or more statements separated by semicolons, each giving one result
     // (an empty statement gives none). Values arrive as text. If a statement fails, the server runs none after
     // it, and the error is returned in place of every result.
-    public unsafe fn Result<DynamicArray<SimpleResult>, PgError> simpleQuery(const ref string sql) {
+    public unsafe fn Result<DynamicArray<Rows>, PgError> simpleQuery(const ref string sql) {
         if (!this.live) { return Result::Err(error: PgError::Closed); }
         this.outbox.clear();
         if (!sendQuery(w: this.outbox, sql: sql)) {
@@ -241,8 +241,12 @@ type resource Connection implements Sendable {
         }
         Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
         match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.collect();
+    }
 
-        DynamicArray<SimpleResult> results = DynamicArray.empty();
+    // Read the server's answer through ReadyForQuery: one result per statement, or the first error.
+    unsafe fn Result<DynamicArray<Rows>, PgError> collect() {
+        DynamicArray<Rows> results = DynamicArray.empty();
         isize columns = -1;                                     // the open result's column count; -1 when none is open
         DynamicArray<int16> formats = DynamicArray.empty();     // its columns' formats, for checking each row
         DynamicArray<PgError> failed = DynamicArray.empty();    // errors, in order: the first is the one returned
@@ -262,7 +266,7 @@ type resource Connection implements Sendable {
                     formats = DynamicArray.empty();
                     isize k = 0;
                     while (k < f.length()) { formats.add(item: f[k].format()); k = k + 1; }
-                    results.add(item: SimpleResult.make(fields: give f, rows: DynamicArray.empty(), tag: ""));
+                    results.add(item: Rows.make(fields: give f, rows: DynamicArray.empty(), tag: ""));
                 }
                 case DataRow(row: r): {
                     if (columns < 0) { return this.violation(detail: "server sent data (\"D\" message) without prior row description (\"T\" message)"); }
@@ -275,7 +279,7 @@ type resource Connection implements Sendable {
                 }
                 case CommandComplete(commandTag: t): {
                     if (columns >= 0) { results[results.length() - 1].complete(tag: give t); }
-                    else { results.add(item: SimpleResult.make(fields: DynamicArray.empty(), rows: DynamicArray.empty(), tag: give t)); }
+                    else { results.add(item: Rows.make(fields: DynamicArray.empty(), rows: DynamicArray.empty(), tag: give t)); }
                     columns = -1;
                 }
                 case EmptyQueryResponse: { columns = -1; }
@@ -285,7 +289,7 @@ type resource Connection implements Sendable {
                     failed.add(item: PgError::Server(error: give e));
                     if (fatal) { this.lose(); done = true; }
                     // A result the error cut short is not one the server completed.
-                    if (columns >= 0) { Optional<SimpleResult> partial = results.pop(); }
+                    if (columns >= 0) { Optional<Rows> partial = results.pop(); }
                     columns = -1;
                 }
                 case NoticeResponse(fields: f): { this.deliver(fields: give f); }
@@ -607,7 +611,7 @@ type resource Connection implements Sendable {
     }
 
     // A message the protocol does not allow here: the session cannot recover its place, so it ends.
-    unsafe fn Result<DynamicArray<SimpleResult>, PgError> violation(const ref string detail) {
+    unsafe fn Result<DynamicArray<Rows>, PgError> violation(const ref string detail) {
         this.lose();
         return Result::Err(error: PgError::Protocol(error: ProtocolError::Violation(detail: copy detail)));
     }
@@ -739,8 +743,8 @@ unsafe fn Result<string, PgError> saslText(const ref DynamicArray<uint8> data) {
     };
 }
 
-// Every text-format value of a row is UTF-8: what the server sends in client_encoding UTF8, and what
-// SimpleResult.text relies on.
+// Every text-format value of a row is UTF-8: what the server sends in client_encoding UTF8, and what a value read
+// as text relies on.
 unsafe fn bool textValid(const ref RowValues row, const ref DynamicArray<int16> formats) {
     isize c = 0;
     while (c < row.columnCount()) {

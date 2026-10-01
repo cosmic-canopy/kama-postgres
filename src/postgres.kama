@@ -2,9 +2,9 @@
 // std::net; there is no libpq and nothing to install. TLS comes from @kama/tls.
 //
 // The shape of the package, as it fills in:
-//   postgres            Config and Environment (resolved as libpq resolves them), Connection, SimpleResult,
-//                       PgError and ServerError, NoticeHandler, Transport; later the `pg"…"` tag, Row and
-//                       `column::<T>`
+//   postgres            Config and Environment (resolved as libpq resolves them), Connection, Rows and typed
+//                       access (`column::<T>`, `columnOpt::<T>`, `rowAs::<T>`), PgError and ServerError,
+//                       NoticeHandler, Transport; later the `pg"…"` tag
 //   postgres::conninfo  connection strings, the password file and the service file, as libpq reads them
 //   postgres::protocol  the v3 wire protocol as data, for a proxy, a pooler or a test harness
 //   postgres::sqlstate  every SQLSTATE, as packed integer constants

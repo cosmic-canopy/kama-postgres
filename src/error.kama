@@ -27,6 +27,11 @@ type enum PgError implements Error {
     // A call this client does not make in this form: query text holding a NUL byte, or COPY through
     // `simpleQuery`. The connection is still usable.
     Usage(string detail),
+    // A value that cannot be read or written as asked: a column read as a type it does not convert to, NULL read
+    // into a value that is not Optional, a row with no column for a field, a parameter out of range for the type
+    // the server expects. The detail names the column or parameter, its PostgreSQL type, and what was asked.
+    // The connection is still usable.
+    Value(string detail),
     // The connection is closed: by `close()`, or by an earlier failure that left it unusable.
     Closed;
 
@@ -40,6 +45,7 @@ type enum PgError implements Error {
             case Server(error: e): e.message();
             case Connect(error: e): e.message();
             case Usage(detail: d): copy d;
+            case Value(detail: d): copy d;
             case Closed: "no connection to the server";
         };
     }

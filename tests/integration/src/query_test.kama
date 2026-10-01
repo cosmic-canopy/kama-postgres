@@ -2,7 +2,7 @@
 // parameters, transactions, notifications, and what simpleQuery refuses.
 import { std::collections::DynamicArray, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error, std::concurrent::Channel, std::concurrent::Receiver,
          std::concurrent::RecvResult, std::memory::Owned,
-         postgres::Connection, postgres::PgError, postgres::SimpleResult, postgres::ServerError,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::columnOpt, postgres::ServerError,
          postgres::TransactionStatus, postgres::NoticeHandler, postgres::Notification,
          postgres::sqlstate::SYNTAX_ERROR, postgres::sqlstate::DIVISION_BY_ZERO,
          postgres::sqlstate::INVALID_PARAMETER_VALUE, postgres::sqlstate::UNIQUE_VIOLATION,
@@ -12,16 +12,16 @@ import { std::collections::DynamicArray, std::encoding::utf8::decode, std::encod
          postgres_integration_tests::NoticeCollector };
 export { queryTests };
 
-fn bool isUsage(const ref Result<DynamicArray<SimpleResult>, PgError> r) {
+fn bool isUsage(const ref Result<DynamicArray<Rows>, PgError> r) {
     return match (r) { case Ok(value: v): false; case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; };
 }
 
-fn int32 sqlstateOf(const ref Result<DynamicArray<SimpleResult>, PgError> r) {
+fn int32 sqlstateOf(const ref Result<DynamicArray<Rows>, PgError> r) {
     return match (r) { case Ok(value: v): 0; case Err(error: e): e.sqlstate(); };
 }
 
 // The first result's command tag, or the error's message.
-fn string tagOf(const ref Result<DynamicArray<SimpleResult>, PgError> r) {
+fn string tagOf(const ref Result<DynamicArray<Rows>, PgError> r) {
     return match (r) {
         case Ok(value: rs): { if (rs.length() == 0) { return "(no result)"; } := copy rs[0].commandTag(); }
         case Err(error: e): e.message();
@@ -29,32 +29,35 @@ fn string tagOf(const ref Result<DynamicArray<SimpleResult>, PgError> r) {
 }
 
 // The first result's row count, -1 when it has none.
-fn int64 countOf(const ref Result<DynamicArray<SimpleResult>, PgError> r) {
+fn int64 countOf(const ref Result<DynamicArray<Rows>, PgError> r) {
     return match (r) {
         case Ok(value: rs): { if (rs.length() == 0) { return -1i64; } Optional<int64> n = rs[0].rowsAffected(); := match (n) { case Some(value: k): k; case None: -1i64; }; }
         case Err(error: e): -1i64;
     };
 }
 
-unsafe fn string textAt(const ref SimpleResult r, isize row, isize column) {
-    Optional<string> v = r.text(row: row, column: column);
-    return match (give v) { case Some(value: t): give t; case None: "NULL"; };
+// A value as text ("NULL" for NULL), or the error's message.
+unsafe fn string textAt(const ref Rows r, isize row, isize index) {
+    Result<Optional<string>, PgError> v = columnOpt::<string>(rows: r, row: row, index: index);
+    Optional<string> o = match (give v) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+    return match (give o) { case Some(value: t): give t; case None: "NULL"; };
 }
 
 unsafe fn int32 resultTests(ref Connection c) {
     int32 f = 0;
-    Result<DynamicArray<SimpleResult>, PgError> two = c.simpleQuery(sql: "select 1 as one; select 'a' as letter, null as nothing, '' as empty");
+    Result<DynamicArray<Rows>, PgError> two = c.simpleQuery(sql: "select 1 as one; select 'a' as letter, null as nothing, '' as empty");
     match (give two) {
         case Ok(value: rs): {
             f = f + check(ok: rs.length() == 2, what: "query: two statements, two results");
             if (rs.length() == 2) {
-                string one = textAt(r: rs[0], row: 0, column: 0);
-                f = f + check(ok: rs[0].columnCount() == 1 && rs[0].column(index: 0).name().equals(other: "one") && one.equals(other: "1"), what: "query: the first result's column and value");
-                string letter = textAt(r: rs[1], row: 0, column: 0);
+                string one = textAt(r: rs[0], row: 0, index: 0);
+                f = f + check(ok: rs[0].columnCount() == 1 && rs[0].field(index: 0).name().equals(other: "one") && one.equals(other: "1"), what: "query: the first result's column and value");
+                string letter = textAt(r: rs[1], row: 0, index: 0);
                 f = f + check(ok: letter.equals(other: "a") && rs[1].isNull(row: 0, column: 1) && !rs[1].isNull(row: 0, column: 2), what: "query: NULL is not the empty string");
                 Optional<isize> nothing = rs[1].columnIndex(name: "nothing");
                 f = f + check(ok: match (nothing) { case Some(value: i): i == 1; case None: false; }, what: "query: a column by name");
-                Optional<string> empty = rs[1].text(row: 0, column: 2);
+                Result<Optional<string>, PgError> emptyRead = columnOpt::<string>(rows: rs[1], row: 0, index: 2);
+                Optional<string> empty = match (give emptyRead) { case Ok(value: o): give o; case Err(error: e): Optional::None; };
                 f = f + check(ok: match (empty) { case Some(value: e): e.length() == 0; case None: false; }, what: "query: the empty string is Some(\"\")");
                 Optional<int64> n = rs[1].rowsAffected();
                 string tag = copy rs[1].commandTag();
@@ -64,9 +67,9 @@ unsafe fn int32 resultTests(ref Connection c) {
         }
         case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "query: two statements: ".concat(other: m)); }
     };
-    Result<DynamicArray<SimpleResult>, PgError> empty = c.simpleQuery(sql: "");
+    Result<DynamicArray<Rows>, PgError> empty = c.simpleQuery(sql: "");
     f = f + check(ok: match (empty) { case Ok(value: rs): rs.length() == 0; case Err(error: e): false; }, what: "query: an empty query gives no result");
-    Result<DynamicArray<SimpleResult>, PgError> semis = c.simpleQuery(sql: " ; ; ");
+    Result<DynamicArray<Rows>, PgError> semis = c.simpleQuery(sql: " ; ; ");
     f = f + check(ok: match (semis) { case Ok(value: rs): rs.length() == 0; case Err(error: e): false; }, what: "query: empty statements give no result");
 
     string unicode = scalar(c: c, sql: "select 'héllo wörld ✓ 𝄞'");
@@ -74,29 +77,29 @@ unsafe fn int32 resultTests(ref Connection c) {
     string length = scalar(c: c, sql: "select length('𝄞')");
     f = f + check(ok: length.equals(other: "1"), what: "query: the server counts one character");
 
-    Result<DynamicArray<SimpleResult>, PgError> ddl = c.simpleQuery(sql: "create temp table kp_t (id int primary key, v text)");
+    Result<DynamicArray<Rows>, PgError> ddl = c.simpleQuery(sql: "create temp table kp_t (id int primary key, v text)");
     string ddlTag = tagOf(r: ddl);
     f = f + check(ok: ddlTag.equals(other: "CREATE TABLE") && countOf(r: ddl) == -1i64, what: "query: CREATE TABLE's tag, and no row count");
-    Result<DynamicArray<SimpleResult>, PgError> ins = c.simpleQuery(sql: "insert into kp_t values (1, 'a'), (2, 'b')");
+    Result<DynamicArray<Rows>, PgError> ins = c.simpleQuery(sql: "insert into kp_t values (1, 'a'), (2, 'b')");
     string insTag = tagOf(r: ins);
     f = f + check(ok: insTag.equals(other: "INSERT 0 2") && countOf(r: ins) == 2i64, what: "query: INSERT 0 2 is two rows");
-    Result<DynamicArray<SimpleResult>, PgError> upd = c.simpleQuery(sql: "update kp_t set v = 'c' where id = 1");
+    Result<DynamicArray<Rows>, PgError> upd = c.simpleQuery(sql: "update kp_t set v = 'c' where id = 1");
     f = f + check(ok: countOf(r: upd) == 1i64, what: "query: UPDATE's count");
-    Result<DynamicArray<SimpleResult>, PgError> del = c.simpleQuery(sql: "delete from kp_t where id = 2");
+    Result<DynamicArray<Rows>, PgError> del = c.simpleQuery(sql: "delete from kp_t where id = 2");
     string delTag = tagOf(r: del);
     f = f + check(ok: delTag.equals(other: "DELETE 1"), what: "query: DELETE's tag");
     if (c.serverVersion() >= 150000) {
-        Result<DynamicArray<SimpleResult>, PgError> merge = c.simpleQuery(sql: "merge into kp_t using (values (1)) s(id) on kp_t.id = s.id when matched then update set v = 'm'");
+        Result<DynamicArray<Rows>, PgError> merge = c.simpleQuery(sql: "merge into kp_t using (values (1)) s(id) on kp_t.id = s.id when matched then update set v = 'm'");
         string mergeTag = tagOf(r: merge);
         f = f + check(ok: mergeTag.equals(other: "MERGE 1") && countOf(r: merge) == 1i64, what: "query: MERGE's tag (15 and later): ".concat(other: mergeTag));
     }
 
-    Result<DynamicArray<SimpleResult>, PgError> big = c.simpleQuery(sql: "select repeat('x', 10000000)");
+    Result<DynamicArray<Rows>, PgError> big = c.simpleQuery(sql: "select repeat('x', 10000000)");
     f = f + check(ok: match (big) { case Ok(value: rs): rs[0].bytes(row: 0, column: 0).length() == 10000000; case Err(error: e): false; }, what: "query: a 10 MB value");
-    Result<DynamicArray<SimpleResult>, PgError> many = c.simpleQuery(sql: "select g, 'row ' || g from generate_series(1, 100000) g");
+    Result<DynamicArray<Rows>, PgError> many = c.simpleQuery(sql: "select g, 'row ' || g from generate_series(1, 100000) g");
     match (give many) {
         case Ok(value: rs): {
-            string last = textAt(r: rs[0], row: 99999, column: 1);
+            string last = textAt(r: rs[0], row: 99999, index: 1);
             f = f + check(ok: rs[0].rowCount() == 100000 && last.equals(other: "row 100000"), what: "query: 100000 rows");
         }
         case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "query: 100000 rows: ".concat(other: m)); }
@@ -106,7 +109,7 @@ unsafe fn int32 resultTests(ref Connection c) {
 
 unsafe fn int32 errorTests(ref Connection c) {
     int32 f = 0;
-    Result<DynamicArray<SimpleResult>, PgError> syntax = c.simpleQuery(sql: "selec 1");
+    Result<DynamicArray<Rows>, PgError> syntax = c.simpleQuery(sql: "selec 1");
     match (give syntax) {
         case Ok(value: rs): { f = f + check(ok: false, what: "errors: a syntax error succeeds"); }
         case Err(error: e): {
@@ -123,10 +126,10 @@ unsafe fn int32 errorTests(ref Connection c) {
     };
     string after = scalar(c: c, sql: "select 'still here'");
     f = f + check(ok: after.equals(other: "still here"), what: "errors: the session goes on after an error");
-    Result<DynamicArray<SimpleResult>, PgError> zero = c.simpleQuery(sql: "select 1; select 1/0; select 2");
+    Result<DynamicArray<Rows>, PgError> zero = c.simpleQuery(sql: "select 1; select 1/0; select 2");
     f = f + check(ok: sqlstateOf(r: zero) == DIVISION_BY_ZERO, what: "errors: a failing statement fails the whole query (22012)");
 
-    Result<DynamicArray<SimpleResult>, PgError> raised = c.simpleQuery(sql: "do $$ begin raise exception 'kp boom' using detail = 'kp detail', hint = 'kp hint', errcode = '22023', column = 'kp_col', constraint = 'kp_con', datatype = 'kp_type', table = 'kp_tab', schema = 'kp_sch'; end $$");
+    Result<DynamicArray<Rows>, PgError> raised = c.simpleQuery(sql: "do $$ begin raise exception 'kp boom' using detail = 'kp detail', hint = 'kp hint', errcode = '22023', column = 'kp_col', constraint = 'kp_con', datatype = 'kp_type', table = 'kp_tab', schema = 'kp_sch'; end $$");
     match (give raised) {
         case Ok(value: rs): { f = f + check(ok: false, what: "errors: RAISE EXCEPTION succeeds"); }
         case Err(error: e): {
@@ -154,8 +157,8 @@ unsafe fn int32 errorTests(ref Connection c) {
         }
     };
 
-    Result<DynamicArray<SimpleResult>, PgError> mk = c.simpleQuery(sql: "create temp table kp_u (id int primary key); insert into kp_u values (1)");
-    Result<DynamicArray<SimpleResult>, PgError> dup = c.simpleQuery(sql: "insert into kp_u values (1)");
+    Result<DynamicArray<Rows>, PgError> mk = c.simpleQuery(sql: "create temp table kp_u (id int primary key); insert into kp_u values (1)");
+    Result<DynamicArray<Rows>, PgError> dup = c.simpleQuery(sql: "insert into kp_u values (1)");
     match (give dup) {
         case Ok(value: rs): { f = f + check(ok: false, what: "errors: a duplicate key succeeds"); }
         case Err(error: e): {
@@ -173,13 +176,13 @@ unsafe fn int32 errorTests(ref Connection c) {
     };
 
     f = f + check(ok: c.transactionStatus() == TransactionStatus::Idle, what: "transactions: idle");
-    Result<DynamicArray<SimpleResult>, PgError> b = c.simpleQuery(sql: "begin");
+    Result<DynamicArray<Rows>, PgError> b = c.simpleQuery(sql: "begin");
     f = f + check(ok: c.transactionStatus() == TransactionStatus::InTransaction, what: "transactions: in a transaction after BEGIN");
-    Result<DynamicArray<SimpleResult>, PgError> boom = c.simpleQuery(sql: "select 1/0");
+    Result<DynamicArray<Rows>, PgError> boom = c.simpleQuery(sql: "select 1/0");
     f = f + check(ok: c.transactionStatus() == TransactionStatus::Failed, what: "transactions: failed after an error");
-    Result<DynamicArray<SimpleResult>, PgError> stuck = c.simpleQuery(sql: "select 1");
+    Result<DynamicArray<Rows>, PgError> stuck = c.simpleQuery(sql: "select 1");
     f = f + check(ok: sqlstateOf(r: stuck) == IN_FAILED_SQL_TRANSACTION, what: "transactions: a failed transaction refuses queries (25P02)");
-    Result<DynamicArray<SimpleResult>, PgError> rb = c.simpleQuery(sql: "rollback");
+    Result<DynamicArray<Rows>, PgError> rb = c.simpleQuery(sql: "rollback");
     f = f + check(ok: c.transactionStatus() == TransactionStatus::Idle, what: "transactions: idle after ROLLBACK");
     return f;
 }
@@ -204,39 +207,39 @@ unsafe fn int32 sessionStateTests(ref Connection c) {
     Receiver<string> rx = notices.receiver();
     Owned<NoticeHandler> handler = new NoticeCollector.make(sink: notices.sender());
     c.setNoticeHandler(handler: give handler);
-    Result<DynamicArray<SimpleResult>, PgError> raised = c.simpleQuery(sql: "do $$ begin raise notice 'first'; raise warning 'second'; end $$");
+    Result<DynamicArray<Rows>, PgError> raised = c.simpleQuery(sql: "do $$ begin raise notice 'first'; raise warning 'second'; end $$");
     string got = drain(rx: rx);
     bool raisedOk = match (raised) { case Ok(value: rs): true; case Err(error: e): false; };
     f = f + check(ok: raisedOk && got.equals(other: "first;second;"), what: "notices: reach the handler in order: ".concat(other: got));
-    Result<DynamicArray<SimpleResult>, PgError> mixed = c.simpleQuery(sql: "do $$ begin raise notice 'before'; raise exception 'after'; end $$");
+    Result<DynamicArray<Rows>, PgError> mixed = c.simpleQuery(sql: "do $$ begin raise notice 'before'; raise exception 'after'; end $$");
     string before = drain(rx: rx);
     bool mixedFailed = match (mixed) { case Ok(value: rs): false; case Err(error: e): true; };
     f = f + check(ok: before.equals(other: "before;") && mixedFailed, what: "notices: a notice before an error is delivered");
     c.clearNoticeHandler();
 
-    Result<DynamicArray<SimpleResult>, PgError> set = c.simpleQuery(sql: "set application_name = 'kp_changed'");
+    Result<DynamicArray<Rows>, PgError> set = c.simpleQuery(sql: "set application_name = 'kp_changed'");
     Optional<string> app = c.parameter(name: "application_name");
     f = f + check(ok: match (app) { case Some(value: v): v.equals(other: "kp_changed"); case None: false; }, what: "parameters: SET application_name is reported");
-    Result<DynamicArray<SimpleResult>, PgError> tz = c.simpleQuery(sql: "set timezone = 'America/Chicago'");
+    Result<DynamicArray<Rows>, PgError> tz = c.simpleQuery(sql: "set timezone = 'America/Chicago'");
     Optional<string> zone = c.parameter(name: "TimeZone");
     f = f + check(ok: match (zone) { case Some(value: v): v.equals(other: "America/Chicago"); case None: false; }, what: "parameters: SET timezone is reported");
     Optional<string> encoding = c.parameter(name: "client_encoding");
     f = f + check(ok: match (encoding) { case Some(value: v): v.equals(other: "UTF8"); case None: false; }, what: "parameters: client_encoding is UTF8");
 
-    Result<DynamicArray<SimpleResult>, PgError> listen = c.simpleQuery(sql: "listen kp_chan");
-    Result<DynamicArray<SimpleResult>, PgError> notify = c.simpleQuery(sql: "notify kp_chan, 'kp payload'");
+    Result<DynamicArray<Rows>, PgError> listen = c.simpleQuery(sql: "listen kp_chan");
+    Result<DynamicArray<Rows>, PgError> notify = c.simpleQuery(sql: "notify kp_chan, 'kp payload'");
     DynamicArray<Notification> arrived = c.takeNotifications();
     f = f + check(ok: arrived.length() == 1 && arrived[0].channel().equals(other: "kp_chan") && arrived[0].payload().equals(other: "kp payload") && arrived[0].processId() == c.processId(),
                   what: "notifications: NOTIFY to a channel this session listens on arrives");
     DynamicArray<Notification> again = c.takeNotifications();
     f = f + check(ok: again.length() == 0, what: "notifications: taking them empties the queue");
 
-    Result<DynamicArray<SimpleResult>, PgError> copyOut = c.simpleQuery(sql: "copy (select 1) to stdout");
+    Result<DynamicArray<Rows>, PgError> copyOut = c.simpleQuery(sql: "copy (select 1) to stdout");
     f = f + check(ok: isUsage(r: copyOut), what: "copy: COPY TO STDOUT is refused");
     string afterOut = scalar(c: c, sql: "select 'after copy out'");
     f = f + check(ok: afterOut.equals(other: "after copy out"), what: "copy: the session goes on after COPY TO STDOUT");
-    Result<DynamicArray<SimpleResult>, PgError> mk = c.simpleQuery(sql: "create temp table kp_c (x int)");
-    Result<DynamicArray<SimpleResult>, PgError> copyIn = c.simpleQuery(sql: "copy kp_c from stdin");
+    Result<DynamicArray<Rows>, PgError> mk = c.simpleQuery(sql: "create temp table kp_c (x int)");
+    Result<DynamicArray<Rows>, PgError> copyIn = c.simpleQuery(sql: "copy kp_c from stdin");
     f = f + check(ok: isUsage(r: copyIn), what: "copy: COPY FROM STDIN is refused");
     string afterIn = scalar(c: c, sql: "select count(*) from kp_c");
     f = f + check(ok: afterIn.equals(other: "0") && c.transactionStatus() == TransactionStatus::Idle, what: "copy: the session goes on after COPY FROM STDIN, nothing copied");
@@ -246,7 +249,7 @@ unsafe fn int32 sessionStateTests(ref Connection c) {
     raw.add(item: 116ui8); raw.add(item: 32ui8); raw.add(item: 49ui8); raw.add(item: 0ui8);   // "select 1" and a NUL
     Result<string, Utf8Error> withNul = decode(bytes: raw.view());
     string nulQuery = match (give withNul) { case Ok(value: t): give t; case Err(error: e): "unreachable"; };
-    Result<DynamicArray<SimpleResult>, PgError> nul = c.simpleQuery(sql: nulQuery);
+    Result<DynamicArray<Rows>, PgError> nul = c.simpleQuery(sql: nulQuery);
     f = f + check(ok: isUsage(r: nul), what: "usage: a NUL byte in the query is refused before sending");
     string afterNul = scalar(c: c, sql: "select 'fine'");
     f = f + check(ok: afterNul.equals(other: "fine"), what: "usage: the session is unaffected");

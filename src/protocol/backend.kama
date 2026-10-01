@@ -32,7 +32,7 @@ fn Frame frame(ConstView<uint8> buf) {
 }
 
 // One column of a RowDescription.
-type resource FieldDescription {
+type resource FieldDescription implements Sendable, Copyable<This>(bare: give) {
     string label;
     uint32 table = 0ui32;     // the source table's OID, 0 if the column is not a plain table column
     int16 attnum = 0i16;      // the column's number in that table, 0 if none
@@ -44,6 +44,15 @@ type resource FieldDescription {
     public ctor make(string label, uint32 table, int16 attnum, uint32 oid, int16 size, int32 modifier, int16 fmt) {
         this.label = give label; this.table = table; this.attnum = attnum; this.oid = oid;
         this.size = size; this.modifier = modifier; this.fmt = fmt;
+    }
+    public ctor copy(ref FieldDescription source) {
+        this.label = copy source.label; this.table = source.table; this.attnum = source.attnum; this.oid = source.oid;
+        this.size = source.size; this.modifier = source.modifier; this.fmt = source.fmt;
+    }
+    // The same column in another format: what a Bind asked for, where the statement's description said 0.
+    public const fn FieldDescription withFormat(int16 format) {
+        return FieldDescription.make(label: copy this.label, table: this.table, attnum: this.attnum, oid: this.oid,
+                                     size: this.size, modifier: this.modifier, fmt: format);
     }
     public const fn const ref string name() { return this.label; }
     public const fn uint32 tableOid() { return this.table; }
@@ -57,7 +66,7 @@ type resource FieldDescription {
 // The values of one DataRow, kept as the bytes the server sent (one allocation per row), with each column's
 // place in them. A NULL has no bytes. The structure is validated when decoded, so reading a column cannot
 // run past the row.
-type resource RowValues {
+type resource RowValues implements Sendable {
     DynamicArray<uint8> body;
     DynamicArray<isize> starts;
     DynamicArray<int32> lengths;   // -1 for NULL

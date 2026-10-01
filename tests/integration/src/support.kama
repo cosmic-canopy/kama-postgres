@@ -2,7 +2,7 @@
 // counts what the client logs, and a notice handler that hands notices back to the test.
 import { std::collections::DynamicArray, std::concurrent::Sender, std::concurrent::SendResult, std::fs::writeText,
          std::fs::setPermissions, std::fs::Permissions, std::io::IoError,
-         postgres::Config, postgres::Connection, postgres::PgError, postgres::Environment, postgres::SimpleResult,
+         postgres::Config, postgres::Connection, postgres::PgError, postgres::Environment, postgres::Rows, postgres::columnOpt,
          postgres::NoticeHandler, postgres::ServerError, postgres::conninfo::ConnInfo,
          postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
          postgres_integration_tests::setting };
@@ -57,11 +57,12 @@ unsafe fn Result<Connection, PgError> open(const ref string conninfo) {
 
 // The first value of the first result as text ("NULL" for NULL), or the error's message.
 unsafe fn string scalar(ref Connection c, const ref string sql) {
-    Result<DynamicArray<SimpleResult>, PgError> r = c.simpleQuery(sql: sql);
-    DynamicArray<SimpleResult> rs = match (give r) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+    Result<DynamicArray<Rows>, PgError> r = c.simpleQuery(sql: sql);
+    DynamicArray<Rows> rs = match (give r) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
     if (rs.length() == 0 || rs[0].rowCount() == 0) { return "(no rows)"; }
-    Optional<string> v = rs[0].text(row: 0, column: 0);
-    return match (give v) { case Some(value: t): give t; case None: "NULL"; };
+    Result<Optional<string>, PgError> v = columnOpt::<string>(rows: rs[0], row: 0, index: 0);
+    Optional<string> o = match (give v) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+    return match (give o) { case Some(value: t): give t; case None: "NULL"; };
 }
 
 // Write a file only its owner may read (0600), as a password file must be.

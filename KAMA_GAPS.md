@@ -19,6 +19,7 @@ changes the right design here, say so and we will follow it.
 - KPG-23, found porting to 0.9.506.
 - KPG-24, found adopting KPG-15's fix (SASLprep).
 - KPG-25 and KPG-26, found probing phase 5's typed parameters and rows.
+- KPG-27 and KPG-28, found building phase 5's typed rows.
 
 Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
@@ -108,6 +109,83 @@ its column must be selected, and may be NULL.
 
 **Suggested fix.** The derive knows which slots it filled. After the loop, a field that is not `Optional` and has
 no default, whose slot was never filled, raises `MissingField`. That makes this hold for every backend.
+
+### KPG-27 · LOW · A float prints with 17 significant digits, not the shortest that round-trips
+
+**Status:** open. Reproduces on 0.9.506.
+
+`kama_fmt_f64` is `%.17g` and `kama_fmt_f32` is `%.9g` (`include/kama_runtime.h:1522-1540`). Their comments call
+that "shortest-round-trip precision", but it is the most digits a value can need, not the fewest it does need.
+Interpolation, `Formatter.writeF64` and the JSON backend all print through them.
+
+```kama
+import { core::println };
+fn int32 main() {
+    float64 tenth = 0.1;
+    float64 sum = 0.1 + 0.2;
+    float32 third = 0.3f32;
+    println(s: "${tenth} ${sum} ${third}");
+    return 0;
+}
+```
+
+```
+0.10000000000000001 0.30000000000000004 0.300000012
+```
+
+Rust, Go, JavaScript, Python and PostgreSQL itself (since 12, Ryu) print `0.1 0.30000000000000004 0.3`. The
+precision-taking formatter, `kama_fmt_f64_prec`, is `%.*f` only, so a caller cannot search for the shortest
+digits with `%.*g` either.
+
+**Why it matters here.** A value read as a string (`column::<string>`) is PostgreSQL's text for it. For a
+column the server sent in binary, this client formats that text itself. For float4 and float8 it cannot
+match what psql shows.
+
+**Workaround here.** None to delete later. A binary float read as a string is formatted with
+`%.17g` (`%.9g` for float4). That text round-trips exactly, but it is not PostgreSQL's. A float read as a
+float is exact.
+
+**Suggested fix.** The shortest round-trip formatting (Ryu, or Grisu with a fallback) for `float64` and
+`float32` everywhere a float is printed, with the comment made true.
+
+### KPG-28 · LOW · A `friend` grant to a generic free function is refused until something instantiates it
+
+**Status:** open. Reproduces on 0.9.506.
+
+SPEC (§ friend, "A **generic free function** accessor reaches the corresponding instance") allows a generic free
+function to be a friend. It works for an instantiation. The generic body itself, checked before any instance
+exists, is refused. A library's generic functions are not instantiated in the library, so there a grant to one
+can never be used.
+
+```kama
+import { core::println };
+type resource Box {
+    int32 v = 0;
+    public ctor make(int32 v) { this.v = v; }
+    const fn int32 secret() { return this.v; }
+    friend reader[secret];
+}
+fn T reader<T: Deserializable<T>>(const ref Box b, T fallback) { int32 s = b.secret(); return fallback; }
+fn int32 main() { println(s: "never instantiated"); return 0; }
+```
+
+```
+$ kama check v2.kama
+v2.kama:8:0: error: 'secret' is private in 'Box'
+```
+
+Add a call `reader::<int32>(b: Box.make(v: 3), fallback: 4)` to `main` and the same file checks, builds and
+runs. A library holding `Box` and `reader` and nothing else fails `kama check` the same way. With a function in
+the library that calls `reader::<int32>`, it passes.
+
+**Why it matters here.** `column::<T>` and `rowAs::<T>` read the private rows of a `Rows`, and build a private
+reader.
+
+**Workaround here.** None to delete later. The work is in non-generic functions that hold the grants
+(`valueReader`, `rowReader` in `src/decode.kama`), and the generic ones only call `T.deserialize`. That is the
+better shape anyway, because each instantiation stays small. But the grant should work as SPEC says.
+
+**Suggested fix.** When checking a generic function's body, honour a grant that names it, as the instance does.
 
 ### KPG-23 · LOW · `IoError` gives the OS's words only inside its message, never alone
 
@@ -366,8 +444,8 @@ libsodium has no TLS: a C TLS stack behind a `ReliableStream` wrapper…", and
 **Status:** closed by cstar (`98338df7`): generic methods stay a non-goal. `column::<T>(row:, index:)` is
 the idiom, because a method form beside it would be two ways to do one thing. It still parses as an
 error on 0.9.477 (`unexpected <, expecting (`), as intended. This package's public API is the free
-functions `column::<T>(row:, index:)`, `columnByName::<T>(…)` and `columnOpt::<T>(…)` over a `PgDecode`
-contract. That is the design, not a workaround, so there is nothing to remove later.
+functions `column::<T>(rows:, row:, index:)`, `columnOpt::<T>(…)` and `rowAs::<T>(rows:, row:)`, bounded on
+std's `Deserializable`. That is the design, not a workaround, so there is nothing to remove later.
 
 ---
 

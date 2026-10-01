@@ -67,11 +67,20 @@ compiler with everything this package relies on:
   - The test PKI is generated into `out/test-certs` by `tools/gen-test-certs.sh` and is never tracked.
     `kama publish` refuses a tracked `*.key`, and so does the registry.
 
-- **Typed column access is a free function: `column::<T>(row:, index:)`.** A method cannot take type
-  parameters, and cstar has decided that stays so (KPG-8). It is bounded on `Deserializable<T>`, the
-  contract primitives, `std::uuid::Uuid`, `std::time::{Timestamp, Date}` and `@generate` structs already
-  share. That matters because a package cannot add a contract to a type it does not own (SPEC,
-  retroactive conformance is gone). `rowAs::<T>` is the same mechanism over a whole row.
+- **Typed column access is a free function: `column::<T>(rows:, row:, index:)`**, addressed as libpq's
+  `PQgetvalue(res, row, col)` is, with `columnOpt::<T>` for a column that can be NULL and `rowAs::<T>(rows:,
+  row:)` for a whole row into a `@generate(Deserializable)` type.
+  - A method cannot take type parameters, and cstar has decided that stays so (KPG-8).
+  - They are bounded on `Deserializable<T>`, the contract primitives, `std::uuid::Uuid`,
+    `std::time::{Timestamp, Date}` and `@generate` structs already share. That matters because a package
+    cannot add a contract to a type it does not own (SPEC: retroactive conformance is gone).
+  - `src/decode.kama` decodes a column by its type, then serves it to `T.deserialize` through a `Deserializer`.
+    The rules are in that file's header: an integer reads into a type at least as wide as its column's, never
+    narrower; every column reads as a string, its PostgreSQL text; NULL reads only into an Optional.
+  - `Rows` holds no `Shared`, so it stays `Sendable`. A row does not carry the column descriptions, which is
+    why the functions take the result and a row index rather than a row.
+  - The non-generic `valueReader`/`rowReader` do the work and hold the `friend` grants. A grant to a generic
+    function is refused in a library (KPG-28), and a small generic body is better anyway.
 
 - **A connection is libpq's, step for step.**
   - `Config` resolves settings in libpq's order, and every setting is either honoured or refused with a clear
@@ -117,6 +126,9 @@ compiler with everything this package relies on:
     the loop, then give.
   - A field cannot be moved out (`give this.x`). Build values in place, or drain a `DynamicArray` with `pop()`.
   - A `ref` parameter cannot name an `Owned<T>`. Pass the `Owned` by value and hand it back.
+  - A parameter cannot have the name of a function in scope (no shadowing): `column::<T>`'s column is `index:`.
+  - `float` is reserved, as every C keyword is; so is `out`.
+  - A resource that implements `Copyable<This>` must say its bare hand-off: `Copyable<This>(bare: give)`.
   - `DynamicArray.remove` returns `T` and `pop` returns `Optional<T>`.
   - An `IoError` is a value: branch on `e.kind()`, and make one with `IoError.of(kind: IoErrorKind::…)`.
 

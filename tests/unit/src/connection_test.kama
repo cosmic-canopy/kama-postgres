@@ -2,7 +2,7 @@
 // query, including the ways a broken or hostile one can. Replies arrive a byte at a time and writes go out three
 // bytes at a time, so every case also exercises framing and partial writes. No network, no clock.
 import { std::collections::DynamicArray, std::memory::Owned,
-         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::SimpleResult,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::columnOpt,
          postgres::Transport, postgres::TransactionStatus, postgres::Notification,
          postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2, postgres::protocol::md5Password,
          postgres::sqlstate::INVALID_PASSWORD, postgres::sqlstate::ADMIN_SHUTDOWN, postgres::sqlstate::DIVISION_BY_ZERO,
@@ -28,11 +28,11 @@ fn DynamicArray<uint8> bytesOf(Wire m) { return m.bytes(); }
 
 fn DynamicArray<Step> steps() { return DynamicArray.empty(); }
 
-fn bool sqlstateIs(const ref Result<DynamicArray<SimpleResult>, PgError> r, int32 code) {
+fn bool sqlstateIs(const ref Result<DynamicArray<Rows>, PgError> r, int32 code) {
     return match (r) { case Ok(value: v): false; case Err(error: e): e.sqlstate() == code; };
 }
 
-fn bool isClosedError(const ref Result<DynamicArray<SimpleResult>, PgError> r) {
+fn bool isClosedError(const ref Result<DynamicArray<Rows>, PgError> r) {
     return match (r) { case Ok(value: v): false; case Err(error: e): match (e) { case Closed: true; case _: false; }; };
 }
 
@@ -318,12 +318,13 @@ unsafe fn int32 queryTests() {
     after.add(item: Step::Send(bytes: answer.bytes()));
     Result<Connection, PgError> r = session(afterStartup: give after);
     Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return check(ok: false, what: "query: connect"); } };
-    Result<DynamicArray<SimpleResult>, PgError> q = c.simpleQuery(sql: "select …; create …; ;");
+    Result<DynamicArray<Rows>, PgError> q = c.simpleQuery(sql: "select …; create …; ;");
     match (give q) {
         case Ok(value: rs): {
             f = f + check(ok: rs.length() == 2, what: "query: two results, the empty statement none");
             if (rs.length() == 2) {
-                Optional<string> v = rs[0].text(row: 1, column: 0);
+                Result<Optional<string>, PgError> read = columnOpt::<string>(rows: rs[0], row: 1, index: 0);
+                Optional<string> v = match (give read) { case Ok(value: o): give o; case Err(error: e): Optional::None; };
                 bool hello = match (v) { case Some(value: s): s.equals(other: "héllo"); case None: false; };
                 f = f + check(ok: rs[0].rowCount() == 2 && rs[0].isNull(row: 0, column: 1) && hello, what: "query: rows, NULL and UTF-8");
                 f = f + check(ok: rs[1].commandTag().equals(other: "CREATE TABLE") && rs[1].columnCount() == 0, what: "query: a command with no rows");
@@ -350,9 +351,9 @@ unsafe fn int32 queryTests() {
     errs.add(item: Step::Send(bytes: fine.bytes()));
     Result<Connection, PgError> r2 = session(afterStartup: give errs);
     Connection c2 = match (give r2) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "query: connect 2"); } };
-    Result<DynamicArray<SimpleResult>, PgError> boom = c2.simpleQuery(sql: "select 1/0");
+    Result<DynamicArray<Rows>, PgError> boom = c2.simpleQuery(sql: "select 1/0");
     f = f + check(ok: match (boom) { case Ok(value: v): false; case Err(error: e): e.sqlstate() == DIVISION_BY_ZERO; }, what: "query: an error is returned");
-    Result<DynamicArray<SimpleResult>, PgError> again = c2.simpleQuery(sql: "select");
+    Result<DynamicArray<Rows>, PgError> again = c2.simpleQuery(sql: "select");
     bool answered = match (again) { case Ok(value: v): v.length() == 1; case Err(error: e): false; };
     f = f + check(ok: answered && !c2.isClosed(), what: "query: the session goes on after an error");
 
@@ -363,8 +364,8 @@ unsafe fn int32 queryTests() {
     ft.add(item: Step::Hangup);
     Result<Connection, PgError> r3 = session(afterStartup: give ft);
     Connection c3 = match (give r3) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "query: connect 3"); } };
-    Result<DynamicArray<SimpleResult>, PgError> killed = c3.simpleQuery(sql: "select 1");
-    Result<DynamicArray<SimpleResult>, PgError> after2 = c3.simpleQuery(sql: "select 1");
+    Result<DynamicArray<Rows>, PgError> killed = c3.simpleQuery(sql: "select 1");
+    Result<DynamicArray<Rows>, PgError> after2 = c3.simpleQuery(sql: "select 1");
     bool shutdown = sqlstateIs(r: killed, code: ADMIN_SHUTDOWN);
     bool closedAfter = isClosedError(r: after2);
     f = f + check(ok: shutdown && c3.isClosed() && closedAfter,
@@ -402,7 +403,7 @@ unsafe fn int32 hostileQueryTests() {
         s.add(item: Step::Send(bytes: give reply));
         Result<Connection, PgError> r = session(afterStartup: give s);
         Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "hostile query: connect"); } };
-        Result<DynamicArray<SimpleResult>, PgError> q = c.simpleQuery(sql: "select");
+        Result<DynamicArray<Rows>, PgError> q = c.simpleQuery(sql: "select");
         string m = match (q) { case Ok(value: v): "succeeded"; case Err(error: e): e.message(); };
         f = f + check(ok: m.contains(substring: wants[i]) && c.isClosed(), what: "hostile query: ".concat(other: wants[i]).concat(other: " ends the session: ").concat(other: m));
         i = i + 1;
@@ -420,9 +421,9 @@ unsafe fn int32 hostileQueryTests() {
     copies.add(item: Step::Send(bytes: fine.bytes()));
     Result<Connection, PgError> r = session(afterStartup: give copies);
     Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "copy: connect"); } };
-    Result<DynamicArray<SimpleResult>, PgError> inward = c.simpleQuery(sql: "copy t from stdin");
-    Result<DynamicArray<SimpleResult>, PgError> outward = c.simpleQuery(sql: "copy t to stdout");
-    Result<DynamicArray<SimpleResult>, PgError> next = c.simpleQuery(sql: "select");
+    Result<DynamicArray<Rows>, PgError> inward = c.simpleQuery(sql: "copy t from stdin");
+    Result<DynamicArray<Rows>, PgError> outward = c.simpleQuery(sql: "copy t to stdout");
+    Result<DynamicArray<Rows>, PgError> next = c.simpleQuery(sql: "select");
     bool inRefused = match (inward) { case Ok(value: v): false; case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; };
     bool outRefused = match (outward) { case Ok(value: v): false; case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; };
     bool nextOk = match (next) { case Ok(value: v): v.length() == 1; case Err(error: e): false; };

@@ -9,7 +9,7 @@ import { std::collections::DynamicArray, std::memory::Owned,
          postgres::sqlstate::TOO_MANY_CONNECTIONS, postgres::sqlstate::QUERY_CANCELED,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire };
-export { connectionTests };
+export { connectionTests, over, welcome };
 
 // What every successful startup ends with: AuthenticationOk, the parameters a server reports, a cancel key,
 // ReadyForQuery.

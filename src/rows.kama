@@ -24,7 +24,8 @@ type resource Rows implements Sendable {
     fn void addRow(RowValues row) { this.rows.add(item: give row); }
     fn void complete(string tag) { this.tag = give tag; }
     fn void suspend() { this.more = true; }
-    friend postgres::Connection::collect[addRow, complete, suspend];
+    friend postgres::Connection::collect[addRow, complete];
+    friend postgres::Connection::readRows[suspend];
 
     public const fn isize columnCount() { return this.fields.length(); }
     // The description of column `index`: its name, its type's OID, its format.

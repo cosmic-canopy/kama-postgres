@@ -127,6 +127,11 @@ compiler with everything this package relies on:
   - A field cannot be moved out (`give this.x`). Build values in place, or drain a `DynamicArray` with `pop()`.
   - A `ref` parameter cannot name an `Owned<T>`. Pass the `Owned` by value and hand it back.
   - A parameter cannot have the name of a function in scope (no shadowing): `column::<T>`'s column is `index:`.
+    Nor can a match binding have the name of a local (`case Err(error: e)` beside a `Wire e`).
+  - A `ConstView` local must be rooted: pass the view as a by-value parameter to a helper instead.
+  - Never match on a method's `const ref` result (`match (this.slot())`): it destroys the referent (KPG-29).
+    Match an index expression.
+  - A row a loop drops must still be moved: `else { RowValues dropped = give r; }`.
   - `float` is reserved, as every C keyword is; so is `out`.
   - A resource that implements `Copyable<This>` must say its bare hand-off: `Copyable<This>(bare: give)`.
   - `DynamicArray.remove` returns `T` and `pop` returns `Optional<T>`.

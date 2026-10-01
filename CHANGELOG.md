@@ -14,6 +14,22 @@ Needs **kama ≥ 0.9.506**.
 - The password file is checked on the file opened, as libpq checks it. One that is not a regular file
   (`/dev/null`, a FIFO, a directory) gets libpq's "is not a plain file" warning.
 - With `HOME` unset or empty, the home directory is the account's, from its passwd entry, as libpq finds it.
+- **The extended query protocol**, as libpq and pgx drive it: Parse and Describe, then Bind, Execute and Sync.
+  - `Connection.query(q:)` gives `Rows`, and `execute(q:)` gives the count. A column of a type this client reads in
+    binary comes in binary, every other one as text.
+  - `Query`: SQL with `$n` and its parameters. `add(value:)` takes any `Serializable`, `addNull()`, and
+    `addOptional::<T>` takes an `Optional`. Each value is sent as the type the server inferred: binary when it is
+    that type's own kind, text otherwise, for the server's input function. Arrays go as array literals.
+  - The `pg"… ${x} …"` tag makes each hole a parameter, never text in the SQL. An `Optional` hole is refused
+    (KPG-25).
+  - `prepare(sql:)` gives a `Statement` ("s0", "s1", …) with its parameter types and columns, as
+    PQdescribePrepared gives them. Run it with `Query.of(statement:)`, then `closeStatement`.
+  - Chunked rows (libpq 17's mode): `startRows`, `nextRows(maxRows:)`, `discardRows`, `isStreaming`.
+  - Portals in a transaction block: `openPortal`, `fetch(portal:, maxRows:)` (`suspended()` while rows remain),
+    `closePortal`.
+  - libpq's client-side refusals ("another command is already in progress", "number of parameters must be
+    between 0 and 65535"). Every server error is returned once the server is ready again, and the session goes on.
+    Any message out of place ends the session as a protocol error.
 - **`Rows`**, one result type for both protocols, as libpq's PGresult is. It replaces `SimpleResult`, and the
   description of a column is `field(index:)`. It is `Sendable`.
 - **Typed access**, through `Deserializable`: `column::<T>(rows:, row:, index:)`, `columnOpt::<T>` and

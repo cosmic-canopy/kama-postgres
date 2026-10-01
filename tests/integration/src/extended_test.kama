@@ -1,0 +1,366 @@
+// The extended protocol against a real server: parameters of every kind as the server infers them, the pg tag,
+// prepared statements, errors at each step with the session going on after, chunked rows, portals, and typed
+// reads of what comes back.
+import { std::collections::DynamicArray, std::uuid::Uuid, std::time::Timestamp, std::time::Date,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::Query, postgres::Statement,
+         postgres::Portal, postgres::pg, postgres::addOptional, postgres::column, postgres::columnOpt,
+         postgres::rowAs, postgres::TransactionStatus, postgres::types::Numeric,
+         postgres::sqlstate::PROTOCOL_VIOLATION, postgres::sqlstate::SYNTAX_ERROR,
+         postgres::sqlstate::DIVISION_BY_ZERO, postgres::sqlstate::INVALID_TEXT_REPRESENTATION,
+         postgres::sqlstate::NUMERIC_VALUE_OUT_OF_RANGE, postgres::sqlstate::INVALID_CURSOR_NAME,
+         postgres_integration_tests::check, postgres_integration_tests::conninfoFor,
+         postgres_integration_tests::open, postgres_integration_tests::scalar };
+export { extendedTests };
+
+fn string messageOf(const ref PgError e) { return e.message(); }
+
+// The first row's first value as text, or the error's message.
+unsafe fn string firstText(ref Connection c, const ref Query q) {
+    Result<Rows, PgError> r = c.query(q: q);
+    Rows rows = match (give r) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+    if (rows.rowCount() == 0) { return "(no rows)"; }
+    Result<Optional<string>, PgError> v = columnOpt::<string>(rows: rows, row: 0, index: 0);
+    Optional<string> o = match (give v) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+    return match (give o) { case Some(value: t): give t; case None: "NULL"; };
+}
+
+unsafe fn int32 sqlstateOfRows(const ref Result<Rows, PgError> r) { return match (r) { case Ok(value: v): 0; case Err(error: e): e.sqlstate(); }; }
+
+unsafe fn int32 parameterTests(ref Connection c) {
+    int32 f = 0;
+    // Each kind of value, each as the type the server inferred.
+    Query q = Query.make(sql: "select $1::int2 + 1, $2::int4 * 2, $3::int8, $4::float8 / 2, $5::bool, $6::text, $7::bytea, $8::numeric + 1, $9::uuid, $10::int8");
+    int16 small = 41i16;
+    q.add(value: small);
+    q.add(value: 21);
+    int64 big = 9000000000000i64;
+    q.add(value: big);
+    q.add(value: 3.0);
+    q.add(value: true);
+    string unicode = "héllo ✓";
+    q.add(value: unicode);
+    DynamicArray<uint8> bytes = DynamicArray.empty(); bytes.add(item: 0ui8); bytes.add(item: 255ui8);
+    q.add(value: bytes);
+    q.add(value: 41);
+    Uuid u = Uuid.fromBytes(bytes: [171ui8; 16]);
+    q.add(value: u);
+    int32 widened = 7;
+    q.add(value: widened);
+    Result<Rows, PgError> r = c.query(q: q);
+    match (give r) {
+        case Ok(value: rows): {
+            Result<int32, PgError> a = column::<int32>(rows: rows, row: 0, index: 0);
+            Result<int32, PgError> b = column::<int32>(rows: rows, row: 0, index: 1);
+            Result<int64, PgError> d = column::<int64>(rows: rows, row: 0, index: 2);
+            Result<float64, PgError> e = column::<float64>(rows: rows, row: 0, index: 3);
+            Result<bool, PgError> g = column::<bool>(rows: rows, row: 0, index: 4);
+            Result<string, PgError> h = column::<string>(rows: rows, row: 0, index: 5);
+            Result<DynamicArray<uint8>, PgError> k = column::<DynamicArray<uint8>>(rows: rows, row: 0, index: 6);
+            Result<Numeric, PgError> n = column::<Numeric>(rows: rows, row: 0, index: 7);
+            Result<Uuid, PgError> uu = column::<Uuid>(rows: rows, row: 0, index: 8);
+            Result<int64, PgError> w = column::<int64>(rows: rows, row: 0, index: 9);
+            f = f + check(ok: match (a) { case Ok(value: v): v == 42; case Err(error: x): false; }, what: "params: int16 into int2, read back as int32");
+            f = f + check(ok: match (b) { case Ok(value: v): v == 42; case Err(error: x): false; }, what: "params: an int32 literal");
+            f = f + check(ok: match (d) { case Ok(value: v): v == 9000000000000i64; case Err(error: x): false; }, what: "params: int64");
+            f = f + check(ok: match (e) { case Ok(value: v): v == 1.5; case Err(error: x): false; }, what: "params: float64");
+            f = f + check(ok: match (g) { case Ok(value: v): v; case Err(error: x): false; }, what: "params: bool");
+            f = f + check(ok: match (h) { case Ok(value: v): v.equals(other: "héllo ✓"); case Err(error: x): false; }, what: "params: UTF-8 text");
+            f = f + check(ok: match (k) { case Ok(value: v): v.length() == 2 && v[0] == 0ui8 && v[1] == 255ui8; case Err(error: x): false; }, what: "params: bytea");
+            f = f + check(ok: match (n) { case Ok(value: v): v.text().equals(other: "42"); case Err(error: x): false; }, what: "params: an integer given for numeric");
+            f = f + check(ok: match (uu) { case Ok(value: v): "${v}".equals(other: "${u}"); case Err(error: x): false; }, what: "params: a Uuid, as its text");
+            f = f + check(ok: match (w) { case Ok(value: v): v == 7i64; case Err(error: x): false; }, what: "params: an int32 for an int8 parameter");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "params: every kind: ".concat(other: m)); }
+    };
+
+    // NULL, from addNull and from addOptional.
+    Query nq = Query.make(sql: "select $1::text is null, $2::int4 is null, $3::int4");
+    nq.addNull();
+    Optional<int32> none = Optional::None;
+    Optional<int32> some = Optional::Some(value: 5);
+    addOptional::<int32>(query: ref nq, value: none);
+    addOptional::<int32>(query: ref nq, value: some);
+    Result<Rows, PgError> nr = c.query(q: nq);
+    match (give nr) {
+        case Ok(value: rows): {
+            Result<bool, PgError> x = column::<bool>(rows: rows, row: 0, index: 0);
+            Result<bool, PgError> y = column::<bool>(rows: rows, row: 0, index: 1);
+            Result<Optional<int32>, PgError> z = columnOpt::<int32>(rows: rows, row: 0, index: 2);
+            bool xNull = match (x) { case Ok(value: v): v; case Err(error: e): false; };
+            bool yNull = match (y) { case Ok(value: v): v; case Err(error: e): false; };
+            f = f + check(ok: xNull && yNull, what: "params: addNull and addOptional(None) are NULL");
+            f = f + check(ok: match (z) { case Ok(value: o): match (o) { case Some(value: v): v == 5; case None: false; }; case Err(error: e): false; }, what: "params: addOptional(Some)");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "params: NULL: ".concat(other: m)); }
+    };
+
+    // A timestamp and an array, both ways.
+    Timestamp at = Timestamp.fromUnixMicros(us: 1790771696789012i64);
+    DynamicArray<int32> ints = DynamicArray.empty(); ints.add(item: 1); ints.add(item: 2); ints.add(item: 3);
+    DynamicArray<string> words = DynamicArray.empty(); words.add(item: "a b"); words.add(item: "q\"uote"); words.add(item: "");
+    Query aq = Query.make(sql: "select $1::timestamptz, $2::int4[], array_length($2::int4[], 1), $3::text[], $3::text[] = array['a b', 'q\"uote', '']");
+    aq.add(value: at);
+    aq.add(value: ints);
+    aq.add(value: words);
+    Result<Rows, PgError> ar = c.query(q: aq);
+    match (give ar) {
+        case Ok(value: rows): {
+            Result<Timestamp, PgError> t = column::<Timestamp>(rows: rows, row: 0, index: 0);
+            Result<DynamicArray<int32>, PgError> back = column::<DynamicArray<int32>>(rows: rows, row: 0, index: 1);
+            Result<DynamicArray<string>, PgError> strings = column::<DynamicArray<string>>(rows: rows, row: 0, index: 3);
+            Result<bool, PgError> same = column::<bool>(rows: rows, row: 0, index: 4);
+            f = f + check(ok: match (t) { case Ok(value: v): v.asUnixMicros() == 1790771696789012i64; case Err(error: e): false; }, what: "params: a Timestamp round-trips");
+            f = f + check(ok: match (back) { case Ok(value: v): v.length() == 3 && v[2] == 3; case Err(error: e): false; }, what: "params: int4[] round-trips");
+            f = f + check(ok: match (strings) { case Ok(value: v): v.length() == 3 && v[1].equals(other: "q\"uote") && v[2].length() == 0; case Err(error: e): false; }, what: "params: text[] with quotes and an empty string");
+            f = f + check(ok: match (same) { case Ok(value: v): v; case Err(error: e): false; }, what: "params: the server reads the text[] as written");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "params: timestamp and arrays: ".concat(other: m)); }
+    };
+
+    // The server's own words for a value its type refuses, and for a parameter count that does not match.
+    Query bad = Query.make(sql: "select $1::int4");
+    string word = "nope";
+    bad.add(value: word);
+    Result<Rows, PgError> br = c.query(q: bad);
+    f = f + check(ok: sqlstateOfRows(r: br) == INVALID_TEXT_REPRESENTATION, what: "params: a text the type refuses is the server's 22P02");
+    Query range = Query.make(sql: "select $1::int2");
+    range.add(value: 70000);
+    Result<Rows, PgError> rr = c.query(q: range);
+    f = f + check(ok: sqlstateOfRows(r: rr) == NUMERIC_VALUE_OUT_OF_RANGE, what: "params: 70000 for int2 is the server's 22003");
+    Query few = Query.make(sql: "select $1::int4, $2::int4");
+    few.add(value: 1);
+    Result<Rows, PgError> fr = c.query(q: few);
+    string fm = match (fr) { case Ok(value: v): "ok"; case Err(error: e): e.message(); };
+    f = f + check(ok: fm.contains(substring: "bind message supplies 1 parameters, but prepared statement \"\" requires 2"), what: "params: too few, in the server's words: ".concat(other: fm));
+    string after = scalar(c: c, sql: "select 'still here'");
+    f = f + check(ok: after.equals(other: "still here"), what: "params: the session goes on after each error");
+    return f;
+}
+
+unsafe fn int32 tagTests(ref Connection c) {
+    int32 f = 0;
+    int32 id = 7;
+    string evil = "x'); drop table nothing; --";
+    Query q = pg"select ${id}::int4 + 1, ${evil}::text";
+    Result<Rows, PgError> r = c.query(q: q);
+    match (give r) {
+        case Ok(value: rows): {
+            Result<int32, PgError> a = column::<int32>(rows: rows, row: 0, index: 0);
+            Result<string, PgError> b = column::<string>(rows: rows, row: 0, index: 1);
+            f = f + check(ok: match (a) { case Ok(value: v): v == 8; case Err(error: e): false; }, what: "pg tag: a number hole");
+            f = f + check(ok: match (b) { case Ok(value: v): v.equals(other: "x'); drop table nothing; --"); case Err(error: e): false; }, what: "pg tag: SQL in a hole is a value, never spliced");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pg tag: ".concat(other: m)); }
+    };
+    Optional<int32> maybe = Optional::Some(value: 3);
+    Query opt = pg"select ${maybe}";
+    Result<Rows, PgError> o = c.query(q: opt);
+    string om = match (o) { case Ok(value: v): "ran"; case Err(error: e): e.message(); };
+    f = f + check(ok: om.contains(substring: "is an Optional"), what: "pg tag: an Optional hole is refused before anything is sent (KPG-25): ".concat(other: om));
+    return f;
+}
+
+unsafe fn int32 executeTests(ref Connection c) {
+    int32 f = 0;
+    Query create = Query.make(sql: "create temp table kp_ext (id int4 primary key, name text, mood text, tags int4[])");
+    Result<Optional<int64>, PgError> made = c.execute(q: create);
+    f = f + check(ok: match (made) { case Ok(value: n): match (n) { case Some(value: k): false; case None: true; }; case Err(error: e): false; }, what: "execute: CREATE TABLE counts nothing");
+    Query ins = Query.make(sql: "insert into kp_ext select g, 'name ' || g, case when g % 2 = 0 then 'happy' else 'sad' end, array[g, g * 2] from generate_series(1, $1) g");
+    ins.add(value: 5);
+    Result<Optional<int64>, PgError> inserted = c.execute(q: ins);
+    f = f + check(ok: match (inserted) { case Ok(value: n): match (n) { case Some(value: k): k == 5i64; case None: false; }; case Err(error: e): false; }, what: "execute: INSERT counts its rows");
+    Query upd = Query.make(sql: "update kp_ext set name = $1 where id > $2");
+    string renamed = "renamed";
+    upd.add(value: renamed);
+    upd.add(value: 3);
+    Result<Optional<int64>, PgError> updated = c.execute(q: upd);
+    f = f + check(ok: match (updated) { case Ok(value: n): match (n) { case Some(value: k): k == 2i64; case None: false; }; case Err(error: e): false; }, what: "execute: UPDATE counts its rows");
+    Query dup = Query.make(sql: "insert into kp_ext (id) values (1)");
+    Result<Optional<int64>, PgError> dupe = c.execute(q: dup);
+    f = f + check(ok: match (dupe) { case Ok(value: n): false; case Err(error: e): e.message().contains(substring: "duplicate key"); }, what: "execute: a unique violation");
+    Query empty = Query.make(sql: "");
+    Result<Rows, PgError> er = c.query(q: empty);
+    f = f + check(ok: match (er) { case Ok(value: rows): rows.columnCount() == 0 && rows.rowCount() == 0; case Err(error: e): false; }, what: "query: an empty query gives an empty result");
+    Query syntax = Query.make(sql: "selec 1");
+    Result<Rows, PgError> sr = c.query(q: syntax);
+    f = f + check(ok: sqlstateOfRows(r: sr) == SYNTAX_ERROR, what: "query: a syntax error at Parse");
+    Query two = Query.make(sql: "select 1; select 2");
+    Result<Rows, PgError> tr = c.query(q: two);
+    string tm = match (tr) { case Ok(value: v): "ok"; case Err(error: e): e.message(); };
+    f = f + check(ok: tm.contains(substring: "cannot insert multiple commands into a prepared statement"), what: "query: one statement only, in the server's words: ".concat(other: tm));
+    Query midway = Query.make(sql: "select 10 / (3 - g) from generate_series(1, 5) g");
+    Result<Rows, PgError> mr = c.query(q: midway);
+    f = f + check(ok: sqlstateOfRows(r: mr) == DIVISION_BY_ZERO, what: "query: an error after some rows");
+    string after = scalar(c: c, sql: "select count(*) from kp_ext");
+    f = f + check(ok: after.equals(other: "5"), what: "query: the session goes on");
+    return f;
+}
+
+@generate(Deserializable)
+type enum Mood { happy, sad }
+
+@generate(Deserializable)
+type resource Entry {
+    @field int32 id;
+    @field string name;
+    @field Mood mood;
+    @field DynamicArray<int32> tags;
+    public const fn int32 entryId() { return this.id; }
+    public const fn bool isHappy() { return match (this.mood) { case happy: true; case sad: false; }; }
+    public const fn isize tagCount() { return this.tags.length(); }
+    public const fn int32 lastTag() { return this.tags[this.tags.length() - 1]; }
+}
+
+unsafe fn int32 rowTests(ref Connection c) {
+    int32 f = 0;
+    Query q = Query.make(sql: "select id, name, mood, tags from kp_ext where id = any($1) order by id");
+    DynamicArray<int32> wanted = DynamicArray.empty(); wanted.add(item: 2); wanted.add(item: 4);
+    q.add(value: wanted);
+    Result<Rows, PgError> r = c.query(q: q);
+    match (give r) {
+        case Ok(value: rows): {
+            f = f + check(ok: rows.rowCount() == 2, what: "rowAs: = any($1) with an int4[] parameter");
+            Result<Entry, PgError> e = rowAs::<Entry>(rows: rows, row: 1);
+            match (give e) {
+                case Ok(value: x): { f = f + check(ok: x.entryId() == 4 && x.isHappy() && x.tagCount() == 2 && x.lastTag() == 8, what: "rowAs: a struct from a row, an enum from its label, an array"); }
+                case Err(error: x): { string m = x.message(); f = f + check(ok: false, what: "rowAs: ".concat(other: m)); }
+            };
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "rowAs: query: ".concat(other: m)); }
+    };
+    Query missing = Query.make(sql: "select id, name from kp_ext where id = 1");
+    Result<Rows, PgError> mr = c.query(q: missing);
+    match (give mr) {
+        case Ok(value: rows): {
+            Result<Entry, PgError> e = rowAs::<Entry>(rows: rows, row: 0);
+            f = f + check(ok: match (e) { case Ok(value: x): false; case Err(error: x): x.message().contains(substring: "no column for every field"); }, what: "rowAs: a field with no column");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "rowAs: missing: query"); }
+    };
+    return f;
+}
+
+unsafe fn int32 preparedTests(ref Connection c) {
+    int32 f = 0;
+    Result<Statement, PgError> made = c.prepare(sql: "select $1::int4 * 10, $2::text");
+    Statement st = match (give made) { case Ok(value: s): give s; case Err(error: e): { string m = e.message(); return check(ok: false, what: "prepare: ".concat(other: m)); } };
+    f = f + check(ok: st.name().equals(other: "s0") && st.parameterCount() == 2 && st.parameterType(index: 0) == 23ui32 && st.columnCount() == 2, what: "prepare: named s0, described");
+    int32 i = 1;
+    int32 sum = 0;
+    while (i <= 3) {
+        Query q = Query.of(statement: st);
+        q.add(value: i);
+        string label = "x";
+        q.add(value: label);
+        Result<Rows, PgError> r = c.query(q: q);
+        Result<int32, PgError> v = match (give r) { case Ok(value: rows): column::<int32>(rows: rows, row: 0, index: 0); case Err(error: e): Result::Err(error: give e); };
+        int32 got = match (v) { case Ok(value: x): x; case Err(error: e): -1000; };
+        sum = sum + got;
+        i = i + 1;
+    }
+    f = f + check(ok: sum == 60, what: "prepare: run three times");
+    Result<Unit, PgError> closed = c.closeStatement(statement: give st);
+    f = f + check(ok: match (closed) { case Ok(value: u): true; case Err(error: e): false; }, what: "prepare: close");
+    string gone = scalar(c: c, sql: "select count(*) from pg_prepared_statements where name = 's0'");
+    f = f + check(ok: gone.equals(other: "0"), what: "prepare: closed on the server");
+    Result<Statement, PgError> broken = c.prepare(sql: "select from nowhere_at_all");
+    f = f + check(ok: match (broken) { case Ok(value: s): false; case Err(error: e): e.message().contains(substring: "nowhere_at_all"); }, what: "prepare: an error at Parse");
+    return f;
+}
+
+unsafe fn int32 streamTests(ref Connection c) {
+    int32 f = 0;
+    Query q = Query.make(sql: "select g, 'row ' || g from generate_series(1, $1) g");
+    q.add(value: 100000);
+    Result<Unit, PgError> started = c.startRows(q: q);
+    f = f + check(ok: match (started) { case Ok(value: u): true; case Err(error: e): false; }, what: "stream: start");
+    Result<Rows, PgError> busy = c.query(q: Query.make(sql: "select 1"));
+    string bm = match (busy) { case Ok(value: v): "ran"; case Err(error: e): e.message(); };
+    f = f + check(ok: bm.equals(other: "another command is already in progress"), what: "stream: another call while streaming is refused, in libpq's words: ".concat(other: bm));
+    isize total = 0;
+    isize chunks = 0;
+    isize biggest = 0;
+    string tag = "";
+    int64 last = 0i64;
+    bool failed = false;
+    while (c.isStreaming() && !failed) {
+        Result<Rows, PgError> chunk = c.nextRows(maxRows: 1000);
+        match (give chunk) {
+            case Ok(value: rows): {
+                total = total + rows.rowCount();
+                chunks = chunks + 1;
+                if (rows.rowCount() > biggest) { biggest = rows.rowCount(); }
+                if (rows.rowCount() > 0) {
+                    Result<int64, PgError> g = column::<int64>(rows: rows, row: rows.rowCount() - 1, index: 0);
+                    last = match (g) { case Ok(value: v): v; case Err(error: e): -1i64; };
+                }
+                tag = copy rows.commandTag();
+            }
+            case Err(error: e): { failed = true; }
+        };
+    }
+    f = f + check(ok: !failed && total == 100000 && biggest == 1000 && chunks >= 100 && last == 100000i64 && tag.equals(other: "SELECT 100000"),
+                  what: "stream: 100000 rows in chunks of 1000, the tag on the last");
+
+    Query again = Query.make(sql: "select g from generate_series(1, 5000) g");
+    Result<Unit, PgError> s2 = c.startRows(q: again);
+    Result<Rows, PgError> one = c.nextRows(maxRows: 10);
+    Result<Unit, PgError> dropped = c.discardRows();
+    bool tenRows = match (one) { case Ok(value: rows): rows.rowCount() == 10; case Err(error: e): false; };
+    f = f + check(ok: tenRows && !c.isStreaming(), what: "stream: discard the rest");
+    Query zero = Query.make(sql: "select 1 / (g - 3) from generate_series(1, 5) g");
+    Result<Unit, PgError> s3 = c.startRows(q: zero);
+    bool sawError = false;
+    while (c.isStreaming()) {
+        Result<Rows, PgError> chunk = c.nextRows(maxRows: 1);
+        match (chunk) { case Ok(value: rows): { } case Err(error: e): { sawError = e.sqlstate() == DIVISION_BY_ZERO; } };
+    }
+    f = f + check(ok: sawError, what: "stream: an error mid-stream ends it");
+    string after = scalar(c: c, sql: "select 'free'");
+    f = f + check(ok: after.equals(other: "free"), what: "stream: the connection is free after");
+    return f;
+}
+
+unsafe fn int32 portalTests(ref Connection c) {
+    int32 f = 0;
+    Query outside = Query.make(sql: "select 1");
+    Result<Portal, PgError> refused = c.openPortal(q: outside);
+    f = f + check(ok: match (refused) { case Ok(value: p): false; case Err(error: e): e.message().contains(substring: "transaction block"); }, what: "portal: refused outside a transaction block");
+    string began = scalar(c: c, sql: "begin");
+    Query q = Query.make(sql: "select g from generate_series(1, $1) g");
+    q.add(value: 25);
+    Result<Portal, PgError> opened = c.openPortal(q: q);
+    Portal p = match (give opened) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); string rb = scalar(c: c, sql: "rollback"); return check(ok: false, what: "portal: open: ".concat(other: m)); } };
+    f = f + check(ok: p.name().equals(other: "p0") && c.transactionStatus() == TransactionStatus::InTransaction, what: "portal: p0, in the transaction");
+    isize total = 0;
+    isize fetches = 0;
+    bool suspendedThrough = true;
+    while (!p.isFinished() && fetches < 10) {
+        Result<Rows, PgError> r = c.fetch(portal: ref p, maxRows: 10);
+        match (give r) {
+            case Ok(value: rows): { total = total + rows.rowCount(); if (fetches < 2 && !rows.suspended()) { suspendedThrough = false; } }
+            case Err(error: e): { fetches = 100; }
+        };
+        fetches = fetches + 1;
+    }
+    f = f + check(ok: total == 25 && fetches == 3 && suspendedThrough, what: "portal: 25 rows in fetches of 10, suspended until the last");
+    Result<Unit, PgError> closed = c.closePortal(portal: give p);
+    f = f + check(ok: match (closed) { case Ok(value: u): true; case Err(error: e): false; }, what: "portal: close");
+    string ended = scalar(c: c, sql: "commit");
+    return f;
+}
+
+unsafe fn int32 extendedTests() {
+    int32 f = 0;
+    Result<Connection, PgError> r = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { string m = e.message(); return check(ok: false, what: "extended: connect: ".concat(other: m)); } };
+    f = f + parameterTests(c: ref c);
+    f = f + tagTests(c: ref c);
+    f = f + executeTests(c: ref c);
+    f = f + rowTests(c: ref c);
+    f = f + preparedTests(c: ref c);
+    f = f + streamTests(c: ref c);
+    f = f + portalTests(c: ref c);
+    c.close();
+    return f;
+}

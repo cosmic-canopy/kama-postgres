@@ -290,6 +290,7 @@ type resource Account {
     @field Mood mood;
     @field DynamicArray<uint8> avatar;
     @field(name: "created_at") Timestamp created;
+    @field DynamicArray<int32> scores;
 
     public const fn int32 accountId() { return this.id; }
     public const fn const ref string accountName() { return this.name; }
@@ -297,6 +298,7 @@ type resource Account {
     public const fn bool isHappy() { return match (this.mood) { case happy: true; case sad: false; }; }
     public const fn isize avatarSize() { return this.avatar.length(); }
     public const fn int64 createdMicros() { return this.created.asUnixMicros(); }
+    public const fn int32 scoreSum() { int32 t = 0; isize i = 0; while (i < this.scores.length()) { t = t + this.scores[i]; i = i + 1; } return t; }
 }
 
 unsafe fn Shape accountRow(bool withNick, bool withAvatar) {
@@ -309,6 +311,7 @@ unsafe fn Shape accountRow(bool withNick, bool withAvatar) {
     s.addText(name: "mood", oid: 0ui32, text: "sad");
     if (withAvatar) { s.addText(name: "avatar", oid: BYTEA, text: "\\x0102ff"); }
     s.addText(name: "created_at", oid: TIMESTAMPTZ, text: "2026-09-30 12:34:56.789012+00");
+    s.addText(name: "scores", oid: INT4_ARRAY, text: "{1,2,4}");
     return s;
 }
 
@@ -369,6 +372,7 @@ unsafe fn int32 ruleTests() {
             f = f + check(ok: x.accountId() == 7 && x.accountName().equals(other: "ann") && !x.hasNick() && !x.isHappy() && x.avatarSize() == 3,
                           what: "typed: rowAs fills every field, NULL as None, and skips a column no field names");
             f = f + check(ok: x.createdMicros() == 1790771696789012i64, what: "typed: rowAs reads a field by its @field name");
+            f = f + check(ok: x.scoreSum() == 7, what: "typed: rowAs reads an array column");
         }
         case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "typed: rowAs: ".concat(other: m)); }
     };
@@ -376,7 +380,7 @@ unsafe fn int32 ruleTests() {
     Rows mr = missing.rows();
     Result<Account, PgError> partial = rowAs::<Account>(rows: mr, row: 0);
     string pm = match (partial) { case Ok(value: x): "read"; case Err(error: e): e.message(); };
-    f = f + check(ok: pm.equals(other: "the row has no column for every field: the type has 6 fields, and 5 of them name a column"), what: "typed: a field with no column: ".concat(other: pm));
+    f = f + check(ok: pm.equals(other: "the row has no column for every field: the type has 7 fields, and 6 of them name a column"), what: "typed: a field with no column: ".concat(other: pm));
 
     Shape twice = Shape.make();
     twice.addText(name: "id", oid: TEXT, text: "a");

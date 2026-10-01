@@ -4,8 +4,8 @@ The PostgreSQL client for [kama](https://kama-lang.org). It speaks the PostgreSQ
 in kama, over `std::net`, the way pgx, tokio-postgres, pgjdbc and Npgsql do. There is no libpq and nothing to
 install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
-> **Status: under construction, not yet published.** It connects, authenticates and runs simple queries on
-> PostgreSQL 14–18 and 19 beta, over TCP or a Unix-domain socket. TLS, the extended protocol and typed rows come next; see
+> **Status: under construction, not yet published.** It connects, authenticates and runs queries, with typed
+> parameters and typed rows, on PostgreSQL 14–18 and 19 beta, over TCP or a Unix-domain socket. TLS comes next; see
 > [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.506**.
 
 ## Using it
@@ -39,6 +39,18 @@ fn int32 main() {
     return 0;
 }
 ```
+
+Parameters go through the extended protocol, with the `pg` tag or a `Query`. A hole is always a parameter, never
+text in the SQL:
+
+```kama
+Query q = pg"select name, qty from items where qty > ${least} order by name";
+Result<Rows, PgError> r = conn.query(q: q);
+```
+
+`rowAs::<T>` reads a row into a `@generate(Deserializable)` type by column name. `prepare` gives a reusable
+`Statement`. `startRows`/`nextRows` read a large result a chunk at a time, and `openPortal`/`fetch` read a
+cursor inside a transaction.
 
 A server error is `PgError::Server` with every field PostgreSQL sends. Compare `e.sqlstate()` with the
 constants in `postgres::sqlstate`. Messages read as psql prints them. With no `NoticeHandler` set, notices go

@@ -9,7 +9,7 @@ import { std::collections::DynamicArray, std::collections::View, std::collection
          std::collections::FixedArray, std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready,
          std::encoding::base64::encode as b64encode, std::encoding::base64::decode as b64decode,
          std::encoding::base64::DecodeError, std::encoding::utf8::decode as utf8Decode,
-         std::encoding::utf8::Utf8Error, std::digest::pbkdf2, std::digest::sha256::Sha256,
+         std::encoding::utf8::Utf8Error, std::encoding::hex::encode as hexEncode, std::digest::pbkdf2, std::digest::sha256::Sha256,
          std::digest::sha256::hmacSha256, std::digest::sha256::sha256,
          postgres::Transport, postgres::protocol::MessageWriter, postgres::protocol::md5Password };
 export { FakeServer, Step, Wire };
@@ -28,6 +28,9 @@ type enum Step implements Sendable {
     // Reply with AuthenticationSASLFinal, `signature` saying which: "right", "wrong", or "error" (an e=
     // attribute); "none" skips SASLFinal and sends `then` at once. Then `then`.
     ScramFinal(string signature, DynamicArray<uint8> then),
+    // The message must be of type `tag` and, unless `body` is "", have exactly these bytes after its length, in hex
+    // (spaces ignored); then reply with `then`. Otherwise reply FATAL 08P01 naming what was expected, and hang up.
+    Expect(uint8 tag, string body, DynamicArray<uint8> then),
     // Close the connection: right after the previous step's reply, or, as the first step, after the first message.
     Hangup,
     // Say nothing.
@@ -115,6 +118,38 @@ type resource Wire {
     public fn void copyDone() { this.w.begin(tag: 99ui8); this.w.end(); }
     // Raw bytes, for a message no server would send.
     public fn void raw(ConstView<uint8> b) { this.w.putBytes(b: b); }
+
+    // The extended protocol's replies.
+    public fn void parseComplete() { this.w.begin(tag: 49ui8); this.w.end(); }
+    public fn void bindComplete() { this.w.begin(tag: 50ui8); this.w.end(); }
+    public fn void closeComplete() { this.w.begin(tag: 51ui8); this.w.end(); }
+    public fn void noData() { this.w.begin(tag: 110ui8); this.w.end(); }
+    public fn void portalSuspended() { this.w.begin(tag: 115ui8); this.w.end(); }
+    // ParameterDescription: each parameter's type.
+    public fn void parameterTypes(const ref DynamicArray<uint32> oids) {
+        this.w.begin(tag: 116ui8); this.w.putI16(v: cast<int16>(oids.length()));
+        isize i = 0;
+        while (i < oids.length()) { this.w.putU32(v: oids[i]); i = i + 1; }
+        this.w.end();
+    }
+    // A RowDescription of columns of the given types, as a statement's Describe gives it (format 0).
+    public fn void typedColumns(const ref DynamicArray<string> names, const ref DynamicArray<uint32> oids) {
+        this.w.begin(tag: 84ui8); this.w.putI16(v: cast<int16>(names.length()));
+        isize i = 0;
+        while (i < names.length()) {
+            bool ok = this.w.putCString(s: names[i]);
+            this.w.putI32(v: 0); this.w.putI16(v: 0i16); this.w.putU32(v: oids[i]); this.w.putI16(v: -1i16); this.w.putI32(v: -1); this.w.putI16(v: 0i16);
+            i = i + 1;
+        }
+        this.w.end();
+    }
+    // A DataRow of int4 values in binary.
+    public fn void intRow(const ref DynamicArray<int32> values) {
+        this.w.begin(tag: 68ui8); this.w.putI16(v: cast<int16>(values.length()));
+        isize i = 0;
+        while (i < values.length()) { this.w.putI32(v: 4); this.w.putI32(v: values[i]); i = i + 1; }
+        this.w.end();
+    }
 }
 
 fn DynamicArray<uint8> copied(ConstView<uint8> v) {
@@ -267,6 +302,19 @@ type resource FakeServer implements Transport, Sendable {
                     m.authSaslData(code: 12, data: "v=".concat(other: v));
                 }
                 this.queue(b: m.bytes().view());
+                this.queue(b: t.view());
+            }
+            case Expect(tag: want, body: hex, then: t): {
+                string compact = hex.replace(old: " ", with: "");
+                string got = hexEncode(bytes: body.view());
+                if (tag != want || (compact.length() > 0 && !got.equals(other: compact))) {
+                    Wire m = Wire.make();
+                    string wanted = "fake server: expected a message of type ${want}, got ${tag} with body ".concat(other: got);
+                    m.report(tag: 69ui8, severity: "FATAL", code: "08P01", message: wanted);
+                    this.queue(b: m.bytes().view());
+                    this.hungUp = true;
+                    return;
+                }
                 this.queue(b: t.view());
             }
             case Hangup: { this.hungUp = true; }

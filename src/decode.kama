@@ -351,7 +351,7 @@ type resource CellReader implements Deserializer {
             this.err = true; this.code = DeError::MissingField; this.problem = Problem::Missing;
         }
     }
-    public fn bool moreFields() { return !this.err && this.whole && this.next < this.cells.length(); }
+    public fn bool moreFields() { return !this.err && this.whole && this.next < this.elementBase; }
     public fn FieldKey field() {
         this.current = this.next;
         this.next = this.next + 1;

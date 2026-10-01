@@ -77,8 +77,19 @@ fn int32 frontendTests() {
     two.addText(oid: 23ui32, text: v42);
     two.addNull(oid: 25ui32);
     string unnamed = "";
-    bool b = bind(w: w, portal: unnamed, statement: s1, params: two, resultFormat: 1i16);
+    DynamicArray<int16> allBinary = DynamicArray.empty();
+    allBinary.add(item: 1i16);
+    bool b = bind(w: w, portal: unnamed, statement: s1, params: two, resultFormats: allBinary);
     f = f + check(ok: b && sameHex(got: w.view(), want: "42 0000001e 00 733100 0002 0000 0000 0002 00000002 3432 ffffffff 0001 0001"), what: "frontend: Bind with a value, a NULL, binary results");
+    w.clear();
+    DynamicArray<int16> perColumn = DynamicArray.empty();
+    perColumn.add(item: 0i16); perColumn.add(item: 1i16);
+    BindValues binary = BindValues.make();
+    DynamicArray<uint8> four = DynamicArray.empty(); four.add(item: 0ui8); four.add(item: 0ui8); four.add(item: 0ui8); four.add(item: 7ui8);
+    binary.add(oid: 23ui32, format: 1i16, value: four.view());
+    string p1 = "p1";
+    bool pb = bind(w: w, portal: p1, statement: s1, params: binary, resultFormats: perColumn);
+    f = f + check(ok: pb && sameHex(got: w.view(), want: "42 0000001e 703100 733100 0001 0001 0001 00000004 00000007 0002 0000 0001"), what: "frontend: Bind into a named portal, a binary parameter, a format per column");
     w.clear();
 
     bool e = execute(w: w, portal: unnamed, maxRows: 0);

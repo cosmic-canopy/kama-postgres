@@ -1,0 +1,342 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::memory::Owned,
+         postgres::PgError, postgres::Statement, postgres::protocol::FieldDescription, postgres::protocol::BindValues,
+         postgres::types::FORMAT_TEXT, postgres::types::FORMAT_BINARY, postgres::types::typeName,
+         postgres::types::elementType, postgres::types::formatArray, postgres::types::arrayDelimiter,
+         postgres::types::formatBool, postgres::types::formatBytea,
+         postgres::types::encodeBool, postgres::types::encodeInt2, postgres::types::encodeInt4,
+         postgres::types::encodeInt8, postgres::types::encodeOid, postgres::types::encodeFloat4,
+         postgres::types::encodeFloat8,
+         postgres::types::BOOL, postgres::types::INT2, postgres::types::INT4, postgres::types::INT8,
+         postgres::types::OID, postgres::types::FLOAT4, postgres::types::FLOAT8, postgres::types::BYTEA };
+export { Query, pg, addOptional };
+
+// A statement to run and its parameters: SQL text with $1, $2, …, or a prepared Statement, and one value for each.
+// A value goes in through Serializable, the contract std's types, this package's and every @generate type share:
+//
+//   Query q = Query.make(sql: "insert into account (id, name, nick) values ($1, $2, $3)");
+//   q.add(value: id);
+//   q.add(value: name);
+//   addOptional::<string>(query: ref q, value: nick);      // None is NULL
+//
+// or through the `pg` tag, which makes each hole a parameter (never text spliced into the SQL):
+//
+//   Query q = pg"select * from account where org = ${org} and name = ${name}";
+//
+// Each value is sent as the type the server inferred for its parameter: binary when the value is that type's own
+// kind (an integer for int2, int4, int8 and oid that fits; a float for float4 and float8; a bool for bool; bytes
+// for bytea), and otherwise as text, which the server reads with the type's input function. So a Uuid, a
+// Timestamp or a Numeric, which serialize as their text, go as text, and an integer can be given for a numeric.
+// The server reports a value its type does not accept, in its own words.
+
+// One parameter's value, as it was serialized.
+type enum Param implements Sendable {
+    Null,
+    Int(int64 value),
+    Unsigned(uint64 value),            // a uint64 past int64's range
+    Float(float64 value, int32 bits),
+    Bool(bool value),
+    Text(string text),
+    Bytes(DynamicArray<uint8> bytes),  // a DynamicArray<uint8>: bytea
+    // An array: `count` elements from `first` in the query's element list.
+    Array(isize first, isize count)
+}
+
+// Captures one value through the Serializer contract: a scalar, a bytea, or an array of either.
+type resource ParamSerializer implements Serializer {
+    DynamicArray<Param> values;     // the value, once written
+    DynamicArray<Param> elements;   // an array's elements
+    DynamicArray<uint8> bytes;      // a bytea's bytes, at the top or as an element
+    int32 depth = 0;                // 0 the value, 1 an array's elements, 2 a bytea inside an array
+    bool onlyBytes = true;          // every element of the array so far was a uint8
+    bool err = false;
+    string why;
+
+    public ctor make() {
+        this.values = DynamicArray.empty(); this.elements = DynamicArray.empty(); this.bytes = DynamicArray.empty();
+        this.depth = 0; this.onlyBytes = true; this.err = false; this.why = "";
+    }
+    fn void refuse(const ref string what) { if (!this.err) { this.err = true; this.why = copy what; } }
+    fn void put(Param p) {
+        if (this.depth == 0) { this.values.add(item: give p); return; }
+        if (this.depth == 1) { this.onlyBytes = false; this.elements.add(item: give p); return; }
+        string w = "a value inside a bytea: an array's element is one value";
+        this.refuse(what: w);
+    }
+
+    public fn void beginObject(usize count) { string w = "a struct is not a parameter value; add its fields one by one"; this.refuse(what: w); }
+    public fn void endObject() { }
+    public fn void field(string name, uint32 id) { }
+    // A payload-less enum is its variant's name: a PostgreSQL enum's label.
+    public fn void variant(string name, uint32 index) { this.put(p: Param::Text(text: give name)); }
+    public fn void beginArray(usize count) {
+        if (this.depth == 0) { this.depth = 1; this.onlyBytes = true; this.bytes = DynamicArray.empty(); return; }
+        if (this.depth == 1) { this.depth = 2; this.bytes = DynamicArray.empty(); return; }
+        string w = "an array of more than one dimension";
+        this.refuse(what: w);
+    }
+    public fn void endArray() {
+        if (this.depth == 2) {
+            // A bytea element, of a bytea[].
+            this.depth = 1;
+            DynamicArray<uint8> b = copy this.bytes;
+            this.bytes = DynamicArray.empty();
+            this.elements.add(item: Param::Bytes(bytes: give b));
+            this.onlyBytes = false;
+            return;
+        }
+        if (this.depth != 1) { return; }
+        this.depth = 0;
+        if (this.onlyBytes && this.elements.length() == 0) {
+            // Nothing but uint8s (or nothing at all): a DynamicArray<uint8>, which is bytea.
+            DynamicArray<uint8> b = copy this.bytes;
+            this.bytes = DynamicArray.empty();
+            this.values.add(item: Param::Bytes(bytes: give b));
+            return;
+        }
+        this.values.add(item: Param::Array(first: 0, count: this.elements.length()));
+    }
+    public fn void writeI8(int8 v) { this.put(p: Param::Int(value: cast<int64>(v))); }
+    public fn void writeI16(int16 v) { this.put(p: Param::Int(value: cast<int64>(v))); }
+    public fn void writeI32(int32 v) { this.put(p: Param::Int(value: cast<int64>(v))); }
+    public fn void writeI64(int64 v) { this.put(p: Param::Int(value: v)); }
+    public fn void writeU8(uint8 v) {
+        if (this.depth == 2) { this.bytes.add(item: v); return; }
+        if (this.depth == 1 && this.onlyBytes) { this.bytes.add(item: v); return; }
+        this.put(p: Param::Int(value: cast<int64>(v)));
+    }
+    public fn void writeU16(uint16 v) { this.put(p: Param::Int(value: cast<int64>(v))); }
+    public fn void writeU32(uint32 v) { this.put(p: Param::Int(value: cast<int64>(v))); }
+    public fn void writeU64(uint64 v) {
+        if (v > 9223372036854775807ui64) { this.put(p: Param::Unsigned(value: v)); return; }
+        this.put(p: Param::Int(value: cast<int64>(v)));
+    }
+    public fn void writeF32(float32 v) { this.put(p: Param::Float(value: cast<float64>(v), bits: 32)); }
+    public fn void writeF64(float64 v) { this.put(p: Param::Float(value: v, bits: 64)); }
+    public fn void writeBool(bool v) { this.put(p: Param::Bool(value: v)); }
+    public fn void writeChar(char v) { this.put(p: Param::Text(text: "${v}")); }
+    public fn void writeString(const ref string v) { this.put(p: Param::Text(text: copy v)); }
+    public fn void writeSome() { }
+    public fn void writeNull() { this.put(p: Param::Null); }
+    public const fn bool failed() { return this.err; }
+    public fn void fail() { string w = "the value refused to serialize"; this.refuse(what: w); }
+    public fn void failWith(SerError e) { string w = e.message(); this.refuse(what: w); }
+    public const fn SerError errorCode() { return SerError::NotRepresentable; }
+    friend Query::add[err, why, values, elements];
+}
+
+type resource Query implements Sendable {
+    string text;
+    string statementName;   // "" for SQL the connection parses
+    bool prepared = false;
+    DynamicArray<uint32> types;                // a prepared statement's parameter types
+    DynamicArray<FieldDescription> fields;     // and its result columns
+    DynamicArray<Param> values;
+    DynamicArray<Param> elements;
+    string trouble;         // the first value that could not be taken, reported when the query runs
+
+    // SQL with $1, $2, … for its parameters, run as one statement (the extended protocol takes one).
+    public ctor make(string sql) {
+        this.text = give sql; this.statementName = ""; this.prepared = false;
+        this.types = DynamicArray.empty(); this.fields = DynamicArray.empty();
+        this.values = DynamicArray.empty(); this.elements = DynamicArray.empty(); this.trouble = "";
+    }
+    // A prepared statement, which the connection runs without parsing or describing it again.
+    public ctor of(const ref Statement statement) {
+        this.text = copy statement.sql(); this.statementName = copy statement.name(); this.prepared = true;
+        this.types = copy statement.parameterTypes(); this.fields = copy statement.columns();
+        this.values = DynamicArray.empty(); this.elements = DynamicArray.empty(); this.trouble = "";
+    }
+
+    // The next parameter's value. A value that cannot be a parameter (a struct, an array of arrays) is reported
+    // when the query runs, as PgError::Value.
+    public fn void add(Serializable value) {
+        ParamSerializer p = ParamSerializer.make();
+        Serializer s = p;
+        Result<Unit, Owned<Error>> r = value.serialize(w: ref s);
+        isize at = this.values.length();
+        if (p.err || p.values.length() != 1) {
+            int64 n = cast<int64>(at) + 1i64;
+            string why = copy p.why;
+            if (why.length() == 0) { why = "it did not serialize as one value"; }
+            this.refuse(detail: "parameter $${n} cannot be sent: ".concat(other: why));
+            this.values.add(item: Param::Null);
+            return;
+        }
+        isize offset = this.elements.length();
+        Param v = p.values.remove(index: 0);
+        bool isArray = match (v) { case Array(first: f, count: c): true; case _: false; };
+        if (isArray) {
+            isize count = p.elements.length();
+            while (p.elements.length() > 0) { this.elements.add(item: p.elements.remove(index: 0)); }
+            this.values.add(item: Param::Array(first: offset, count: count));
+            return;
+        }
+        this.values.add(item: give v);
+    }
+    // NULL for the next parameter.
+    public fn void addNull() { this.values.add(item: Param::Null); }
+    // The text of the next parameter, sent as text for the server to read as the parameter's type.
+    public fn void addText(const ref string text) { this.values.add(item: Param::Text(text: copy text)); }
+
+    public const fn const ref string sql() { return this.text; }
+    public const fn isize parameterCount() { return this.values.length(); }
+    public const fn bool isPrepared() { return this.prepared; }
+
+    fn void refuse(const ref string detail) { if (this.trouble.length() == 0) { this.trouble = copy detail; } }
+    friend pg[refuse];
+    friend addOptional[refuse];
+
+    const fn const ref string problem() { return this.trouble; }
+    const fn const ref string statement() { return this.statementName; }
+    const fn const ref DynamicArray<uint32> parameterTypes() { return this.types; }
+    const fn const ref DynamicArray<FieldDescription> columns() { return this.fields; }
+    friend postgres::Connection::describe[problem, statement, parameterTypes, columns];
+    friend postgres::Connection::bindAndExecute[encoded];
+
+    // Every parameter, each as the type in `types` (0 where the server described none). A value goes binary when
+    // it is the type's own kind, else as text.
+    unsafe const fn BindValues encoded(const ref DynamicArray<uint32> types) {
+        BindValues bound = BindValues.make();
+        isize i = 0;
+        while (i < this.values.length()) {
+            uint32 oid = 0ui32;
+            if (i < types.length()) { oid = types[i]; }
+            encodeOne(into: ref bound, elements: this.elements, value: this.values[i], oid: oid);
+            i = i + 1;
+        }
+        return bound;
+    }
+}
+
+// An Optional value: Some's value, or NULL. (Optional is not Serializable itself, so it has a function of its
+// own; methods cannot be generic.)
+fn void addOptional<T: Serializable>(ref Query query, const ref Optional<T> value) {
+    match (value) {
+        case Some(value: v): { query.add(value: v); }
+        case None: { query.addNull(); }
+    };
+}
+
+// The `pg` tag: `pg"… ${x} …"` is a Query whose every hole is a parameter, $1 for the first, never text spliced
+// into the SQL. A hole is its text (kama renders every hole to a string before the tag sees it), sent as text for
+// the server to read as the parameter's type, so a number, a Uuid or a timestamp works where the server expects
+// one. NULL and bytes cannot be holes; add them with Query.add or addOptional. Write no $n of your own in it.
+//
+// An Optional hole would be rendered "Some { value: … }" or "None" and sent as that text (KPG-25). Until holes keep
+// their type, a hole that reads exactly so is refused.
+fn Query pg(ref Template t) {
+    string sql = "";
+    int32 n = t.holeCount();
+    DynamicArray<string> holes = DynamicArray.withCapacity(capacity: cast<isize>(n));
+    int32 i = 0;
+    while (i < n) {
+        sql = sql.concat(other: t.part(at: i));
+        int32 number = i + 1;
+        sql = sql.concat(other: "$${number}");
+        holes.add(item: t.hole(at: i));
+        i = i + 1;
+    }
+    sql = sql.concat(other: t.part(at: n));
+    Query q = Query.make(sql: give sql);
+    isize k = 0;
+    while (k < holes.length()) {
+        if (holes[k].equals(other: "None") || holes[k].startsWith(prefix: "Some { value: ")) {
+            int64 number = cast<int64>(k) + 1i64;
+            q.refuse(detail: "parameter $${number} of a pg string is an Optional, which a hole would send as the text \"None\" or \"Some { … }\": add it with addOptional (KPG-25)");
+        }
+        q.addText(text: holes[k]);
+        k = k + 1;
+    }
+    return q;
+}
+
+// The text of a scalar value, as PostgreSQL's input functions read it.
+unsafe fn string scalarText(const ref Param p) {
+    return match (p) {
+        case Int(value: v): "${v}";
+        case Unsigned(value: v): "${v}";
+        case Float(value: v, bits: b): floatInput(v: v, bits: b);
+        case Bool(value: v): formatBool(v: v);
+        case Text(text: t): copy t;
+        case Bytes(bytes: b): formatBytea(v: b.view());
+        case _: "";
+    };
+}
+
+fn string floatInput(float64 v, int32 bits) {
+    if (v != v) { return "NaN"; }
+    if (v > 0.0 && v * 0.5 == v) { return "Infinity"; }
+    if (v < 0.0 && v * 0.5 == v) { return "-Infinity"; }
+    if (bits == 32) { float32 narrow = cast<float32>(v); return "${narrow}"; }
+    return "${v}";
+}
+
+unsafe fn void encodeOne(ref BindValues into, const ref DynamicArray<Param> elements, const ref Param value, uint32 oid) {
+    bool isNull = match (value) { case Null: true; case _: false; };
+    if (isNull) { into.addNull(oid: oid); return; }
+    // Bytes are a bytea's, or the binary form of a type read as text; given for an array, they are its elements.
+    bool isBytes = match (value) { case Bytes(bytes: x): true; case _: false; };
+    if (isBytes && elementType(arrayOid: oid) == 0ui32) {
+        match (value) { case Bytes(bytes: x): { into.add(oid: oid, format: FORMAT_BINARY, value: x.view()); } case _: { } };
+        return;
+    }
+    DynamicArray<uint8> b = DynamicArray.empty();
+    bool binary = false;
+    bool isInt = match (value) { case Int(value: x): true; case _: false; };
+    if (isInt) {
+        int64 v = match (value) { case Int(value: x): x; case _: 0i64; };
+        if (oid == INT8) { encodeInt8(to: ref b, v: v); binary = true; }
+        else if (oid == INT4 && v >= -2147483648i64 && v <= 2147483647i64) { encodeInt4(to: ref b, v: cast<int32>(v)); binary = true; }
+        else if (oid == INT2 && v >= -32768i64 && v <= 32767i64) { encodeInt2(to: ref b, v: cast<int16>(v)); binary = true; }
+        else if (oid == OID && v >= 0i64 && v <= 4294967295i64) { encodeOid(to: ref b, v: cast<uint32>(v)); binary = true; }
+    }
+    bool isFloat = match (value) { case Float(value: x, bits: w): true; case _: false; };
+    if (isFloat) {
+        float64 v = match (value) { case Float(value: x, bits: w): x; case _: 0.0; };
+        int32 bits = match (value) { case Float(value: x, bits: w): w; case _: 0; };
+        if (oid == FLOAT8) { encodeFloat8(to: ref b, v: v); binary = true; }
+        else if (oid == FLOAT4 && bits == 32) { encodeFloat4(to: ref b, v: cast<float32>(v)); binary = true; }
+    }
+    bool isBool = match (value) { case Bool(value: x): true; case _: false; };
+    if (isBool && oid == BOOL) {
+        bool v = match (value) { case Bool(value: x): x; case _: false; };
+        encodeBool(to: ref b, v: v);
+        binary = true;
+    }
+    if (binary) { into.add(oid: oid, format: FORMAT_BINARY, value: b.view()); return; }
+    // Everything else as text, for the server to read as the parameter's type.
+    bool isArray = match (value) { case Array(first: f, count: c): true; case _: false; };
+    if (isArray) {
+        isize first = match (value) { case Array(first: f, count: c): f; case _: 0; };
+        isize count = match (value) { case Array(first: f, count: c): c; case _: 0; };
+        into.addText(oid: oid, text: arrayText(elements: elements, first: first, count: count, oid: oid));
+        return;
+    }
+    if (isBytes) {
+        match (value) { case Bytes(bytes: x): { into.addText(oid: oid, text: bytesAsArray(bytes: x)); } case _: { } };
+        return;
+    }
+    into.addText(oid: oid, text: scalarText(p: value));
+}
+
+// An array value as array_in reads it: each element's text, quoted as array_out quotes it.
+unsafe fn string arrayText(const ref DynamicArray<Param> elements, isize first, isize count, uint32 oid) {
+    DynamicArray<string> texts = DynamicArray.withCapacity(capacity: count);
+    DynamicArray<bool> nulls = DynamicArray.withCapacity(capacity: count);
+    isize i = first;
+    while (i < first + count) {
+        bool isNull = match (elements[i]) { case Null: true; case _: false; };
+        nulls.add(item: isNull);
+        texts.add(item: scalarText(p: elements[i]));
+        i = i + 1;
+    }
+    return formatArray(texts: texts, nulls: nulls, lowerBound: 1, delimiter: arrayDelimiter(elementOid: elementType(arrayOid: oid)));
+}
+
+// A DynamicArray<uint8> given for an array of integers: its bytes as the elements.
+fn string bytesAsArray(const ref DynamicArray<uint8> bytes) {
+    string s = "{";
+    isize i = 0;
+    while (i < bytes.length()) { if (i > 0) { s = s.concat(other: ","); } uint8 v = bytes[i]; s = s.concat(other: "${v}"); i = i + 1; }
+    return s.concat(other: "}");
+}

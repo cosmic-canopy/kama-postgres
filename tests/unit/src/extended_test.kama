@@ -1,0 +1,345 @@
+// The extended protocol against a scripted server (fake_server.kama): the exact bytes of every Parse, Bind,
+// Execute and Close this client sends, how each parameter is encoded for the type the server described, and what
+// it makes of every reply, including the ones a broken or hostile server would send. Replies arrive a byte at a
+// time and writes go three bytes at a time.
+import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::Query, postgres::Statement,
+         postgres::Portal, postgres::pg, postgres::column, postgres::columnOpt,
+         postgres::sqlstate::SYNTAX_ERROR, postgres::sqlstate::DIVISION_BY_ZERO,
+         postgres_unit_tests::check, postgres_unit_tests::Step, postgres_unit_tests::Wire,
+         postgres_unit_tests::over, postgres_unit_tests::welcome };
+export { extendedTests };
+
+comptime uint8 PARSE = 80ui8;      // 'P'
+comptime uint8 BIND = 66ui8;       // 'B'
+comptime uint8 DESCRIBE = 68ui8;   // 'D'
+comptime uint8 EXECUTE = 69ui8;    // 'E'
+comptime uint8 SYNC = 83ui8;       // 'S'
+comptime uint8 CLOSE = 67ui8;      // 'C'
+comptime uint8 QUERY = 81ui8;      // 'Q'
+
+unsafe fn string hexOf(const ref string s) { return hexEncode(bytes: s.bytes()); }
+
+// The next message must be of type `tag` (with exactly `body`, in hex, unless it is ""), and gets no reply.
+fn Step quiet(uint8 tag, const ref string body) { return Step::Expect(tag: tag, body: copy body, then: DynamicArray.empty()); }
+fn Step answer(uint8 tag, Wire reply) { return Step::Expect(tag: tag, body: "", then: reply.bytes()); }
+
+fn DynamicArray<uint32> oids(uint32 a) { DynamicArray<uint32> v = DynamicArray.empty(); v.add(item: a); return v; }
+fn DynamicArray<string> names(const ref string a) { DynamicArray<string> v = DynamicArray.empty(); v.add(item: copy a); return v; }
+fn DynamicArray<int32> ints(int32 a) { DynamicArray<int32> v = DynamicArray.empty(); v.add(item: a); return v; }
+
+// Parse of the unnamed statement with no parameter types, then Describe of it, and the server's description:
+// one int4 parameter and one int4 column, or the reply given.
+unsafe fn void describeSteps(ref DynamicArray<Step> s, const ref string sql, Wire reply) {
+    s.add(item: quiet(tag: PARSE, body: "00".concat(other: hexOf(s: sql)).concat(other: "000000")));
+    s.add(item: quiet(tag: DESCRIBE, body: "5300"));
+    s.add(item: answer(tag: SYNC, reply: give reply));
+}
+
+fn Wire intDescription() {
+    Wire d = Wire.make();
+    d.parseComplete();
+    d.parameterTypes(oids: oids(a: 23ui32));
+    d.typedColumns(names: names(a: "n"), oids: oids(a: 23ui32));
+    d.ready(status: 73ui8);
+    return d;
+}
+
+unsafe fn DynamicArray<Step> opening() {
+    DynamicArray<Step> s = DynamicArray.empty();
+    s.add(item: Step::Send(bytes: welcome()));
+    return s;
+}
+
+unsafe fn Result<Connection, PgError> connected(DynamicArray<Step> s) {
+    string none = "";
+    return over(script: give s, conninfo: none);
+}
+
+fn int32 unconnected(const ref PgError e) { string m = e.message(); return check(ok: false, what: "extended: connect: ".concat(other: m)); }
+
+fn string errorText(const ref Result<Rows, PgError> r) { return match (r) { case Ok(value: v): "ok"; case Err(error: e): e.message(); }; }
+
+unsafe fn int32 queryTests() {
+    int32 f = 0;
+    string sql = "select $1 + 1";
+
+    // Describe first, then an int4 parameter and an int4 column, both in binary.
+    DynamicArray<Step> s = opening();
+    describeSteps(s: ref s, sql: sql, reply: intDescription());
+    s.add(item: quiet(tag: BIND, body: "00 00 0001 0001 0001 00000004 00000007 0001 0001"));
+    s.add(item: quiet(tag: EXECUTE, body: "00 00000000"));
+    Wire e = Wire.make(); e.bindComplete(); e.intRow(values: ints(a: 8)); e.complete(tag: "SELECT 1"); e.ready(status: 73ui8);
+    s.add(item: answer(tag: SYNC, reply: give e));
+    Result<Connection, PgError> cMade = connected(s: give s);
+    Connection c = match (give cMade) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Query q = Query.make(sql: copy sql);
+    q.add(value: 7);
+    Result<Rows, PgError> r = c.query(q: q);
+    match (give r) {
+        case Ok(value: rows): {
+            Result<int32, PgError> v = column::<int32>(rows: rows, row: 0, index: 0);
+            bool eight = match (v) { case Ok(value: n): n == 8; case Err(error: x): false; };
+            f = f + check(ok: eight && rows.field(index: 0).format() == 1i16 && rows.commandTag().equals(other: "SELECT 1"),
+                          what: "extended: describe, bind a binary int4, read a binary int4");
+        }
+        case Err(error: x): { string m = x.message(); f = f + check(ok: false, what: "extended: query: ".concat(other: m)); }
+    };
+
+    // Each parameter as its described type: text for a uuid, binary for a bool, text for an int4 out of int2's
+    // range (the server says it is out of range), NULL; no columns, so no result formats.
+    string insert = "insert into t values ($1, $2, $3, $4)";
+    DynamicArray<Step> s2 = opening();
+    Wire d2 = Wire.make();
+    d2.parseComplete();
+    DynamicArray<uint32> four = DynamicArray.empty(); four.add(item: 2950ui32); four.add(item: 16ui32); four.add(item: 21ui32); four.add(item: 25ui32);
+    d2.parameterTypes(oids: four);
+    d2.noData();
+    d2.ready(status: 73ui8);
+    describeSteps(s: ref s2, sql: insert, reply: give d2);
+    string uuidText = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+    string body = "00 00 0004 0000 0001 0000 0000 0004 00000024 ".concat(other: hexOf(s: uuidText)).concat(other: " 00000001 01 00000005 3730303030 ffffffff 0000");
+    s2.add(item: quiet(tag: BIND, body: body));
+    s2.add(item: quiet(tag: EXECUTE, body: ""));
+    Wire e2 = Wire.make(); e2.bindComplete(); e2.complete(tag: "INSERT 0 1"); e2.ready(status: 73ui8);
+    s2.add(item: answer(tag: SYNC, reply: give e2));
+    Result<Connection, PgError> c2Made = connected(s: give s2);
+    Connection c2 = match (give c2Made) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Query q2 = Query.make(sql: copy insert);
+    q2.addText(text: uuidText);
+    q2.add(value: true);
+    q2.add(value: 70000);
+    q2.addNull();
+    Result<Optional<int64>, PgError> n2 = c2.execute(q: q2);
+    f = f + check(ok: match (n2) { case Ok(value: o): match (o) { case Some(value: k): k == 1i64; case None: false; }; case Err(error: x): false; },
+                  what: "extended: parameters encoded for their described types, and execute's count");
+
+    // An error at Parse: returned once the server is ready, and the session goes on.
+    DynamicArray<Step> s3 = opening();
+    Wire bad = Wire.make(); bad.report(tag: 69ui8, severity: "ERROR", code: "42601", message: "syntax error at or near \"selec\""); bad.ready(status: 73ui8);
+    string wrong = "selec 1";
+    describeSteps(s: ref s3, sql: wrong, reply: give bad);
+    Wire after = Wire.make(); after.columns(names: names(a: "x")); DynamicArray<string> one = DynamicArray.empty(); one.add(item: "1"); after.row(values: one); after.complete(tag: "SELECT 1"); after.ready(status: 73ui8);
+    s3.add(item: answer(tag: QUERY, reply: give after));
+    Result<Connection, PgError> c3Made = connected(s: give s3);
+    Connection c3 = match (give c3Made) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Result<Rows, PgError> r3 = c3.query(q: Query.make(sql: copy wrong));
+    bool syntax = match (r3) { case Ok(value: v): false; case Err(error: x): x.sqlstate() == SYNTAX_ERROR; };
+    f = f + check(ok: syntax && !c3.isClosed(), what: "extended: an error at Parse");
+    Result<DynamicArray<Rows>, PgError> next = c3.simpleQuery(sql: "select 1");
+    f = f + check(ok: match (next) { case Ok(value: v): v.length() == 1; case Err(error: x): false; }, what: "extended: the session goes on after it");
+
+    // An error after a row: the rows so far are not the result.
+    DynamicArray<Step> s4 = opening();
+    describeSteps(s: ref s4, sql: sql, reply: intDescription());
+    s4.add(item: quiet(tag: BIND, body: ""));
+    s4.add(item: quiet(tag: EXECUTE, body: ""));
+    Wire e4 = Wire.make(); e4.bindComplete(); e4.intRow(values: ints(a: 1)); e4.report(tag: 69ui8, severity: "ERROR", code: "22012", message: "division by zero"); e4.ready(status: 73ui8);
+    s4.add(item: answer(tag: SYNC, reply: give e4));
+    Result<Connection, PgError> c4Made = connected(s: give s4);
+    Connection c4 = match (give c4Made) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Query q4 = Query.make(sql: copy sql); q4.add(value: 1);
+    Result<Rows, PgError> r4 = c4.query(q: q4);
+    bool zero = match (r4) { case Ok(value: v): false; case Err(error: x): x.sqlstate() == DIVISION_BY_ZERO; };
+    f = f + check(ok: zero && !c4.isClosed(), what: "extended: an error after a row");
+
+    // FATAL ends the session.
+    DynamicArray<Step> s5 = opening();
+    describeSteps(s: ref s5, sql: sql, reply: intDescription());
+    s5.add(item: quiet(tag: BIND, body: ""));
+    s5.add(item: quiet(tag: EXECUTE, body: ""));
+    Wire e5 = Wire.make(); e5.report(tag: 69ui8, severity: "FATAL", code: "57P01", message: "terminating connection due to administrator command");
+    s5.add(item: answer(tag: SYNC, reply: give e5));
+    s5.add(item: Step::Hangup);
+    Result<Connection, PgError> c5Made = connected(s: give s5);
+    Connection c5 = match (give c5Made) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Query q5 = Query.make(sql: copy sql); q5.add(value: 1);
+    Result<Rows, PgError> r5 = c5.query(q: q5);
+    bool fatal = match (r5) { case Ok(value: v): false; case Err(error: x): x.message().contains(substring: "administrator command"); };
+    f = f + check(ok: fatal && c5.isClosed(), what: "extended: FATAL closes the session");
+    return f;
+}
+
+// A server that breaks the protocol: the session ends with a protocol error, never a panic.
+unsafe fn string hostile(Wire description, Wire result) {
+    string sql = "select $1 + 1";
+    DynamicArray<Step> s = opening();
+    describeSteps(s: ref s, sql: sql, reply: give description);
+    s.add(item: quiet(tag: BIND, body: ""));
+    s.add(item: quiet(tag: EXECUTE, body: ""));
+    s.add(item: answer(tag: SYNC, reply: give result));
+    Result<Connection, PgError> cMade = connected(s: give s);
+    Connection c = match (give cMade) { case Ok(value: x): give x; case Err(error: failure): { return failure.message(); } };
+    Query q = Query.make(sql: copy sql); q.add(value: 1);
+    Result<Rows, PgError> r = c.query(q: q);
+    string m = match (r) { case Ok(value: v): "accepted"; case Err(error: e): match (e) { case Protocol(error: p): e.message(); case _: "not a protocol error: ".concat(other: e.message()); }; };
+    if (!c.isClosed()) { return "still open: ".concat(other: m); }
+    return m;
+}
+
+unsafe fn int32 hostileTests() {
+    int32 f = 0;
+    Wire early = Wire.make(); early.parameterTypes(oids: oids(a: 23ui32)); early.parseComplete(); early.noData(); early.ready(status: 73ui8);
+    string m1 = hostile(description: give early, result: Wire.make());
+    f = f + check(ok: m1.contains(substring: "unexpected response from server"), what: "hostile: ParameterDescription before ParseComplete: ".concat(other: m1));
+
+    Wire rowFirst = Wire.make(); rowFirst.intRow(values: ints(a: 1)); rowFirst.bindComplete(); rowFirst.complete(tag: "SELECT 1"); rowFirst.ready(status: 73ui8);
+    string m2 = hostile(description: intDescription(), result: give rowFirst);
+    f = f + check(ok: m2.contains(substring: "first received character was \"D\""), what: "hostile: a DataRow before BindComplete: ".concat(other: m2));
+
+    DynamicArray<int32> two = DynamicArray.empty(); two.add(item: 1); two.add(item: 2);
+    Wire wide = Wire.make(); wide.bindComplete(); wide.intRow(values: two); wide.complete(tag: "SELECT 1"); wide.ready(status: 73ui8);
+    string m3 = hostile(description: intDescription(), result: give wide);
+    f = f + check(ok: m3.contains(substring: "unexpected field count in \"D\" message"), what: "hostile: a row with more columns than described: ".concat(other: m3));
+
+    Wire suspended = Wire.make(); suspended.bindComplete(); suspended.portalSuspended(); suspended.ready(status: 73ui8);
+    string m4 = hostile(description: intDescription(), result: give suspended);
+    f = f + check(ok: m4.contains(substring: "first received character was \"s\""), what: "hostile: PortalSuspended for an Execute with no row limit: ".concat(other: m4));
+
+    Wire unbound = Wire.make(); unbound.ready(status: 73ui8);
+    string m5 = hostile(description: intDescription(), result: give unbound);
+    f = f + check(ok: m5.contains(substring: "first received character was \"Z\""), what: "hostile: ready before BindComplete: ".concat(other: m5));
+
+    // A text column (a type read as text) whose bytes are not UTF-8.
+    Wire textual = Wire.make(); textual.parseComplete(); textual.parameterTypes(oids: oids(a: 23ui32)); textual.typedColumns(names: names(a: "t"), oids: oids(a: 1111ui32)); textual.ready(status: 73ui8);
+    Wire badText = Wire.make(); badText.bindComplete(); DynamicArray<uint8> ff = DynamicArray.empty(); ff.add(item: 255ui8); badText.rawRow(value: ff.view()); badText.complete(tag: "SELECT 1"); badText.ready(status: 73ui8);
+    string m6 = hostile(description: give textual, result: give badText);
+    f = f + check(ok: m6.contains(substring: "UTF-8"), what: "hostile: a text value that is not UTF-8: ".concat(other: m6));
+
+    Wire noRows = Wire.make(); noRows.parseComplete(); noRows.parameterTypes(oids: oids(a: 23ui32)); noRows.noData(); noRows.ready(status: 73ui8);
+    Wire rowAnyway = Wire.make(); rowAnyway.bindComplete(); rowAnyway.intRow(values: ints(a: 1)); rowAnyway.complete(tag: "INSERT 0 1"); rowAnyway.ready(status: 73ui8);
+    string m7 = hostile(description: give noRows, result: give rowAnyway);
+    f = f + check(ok: m7.contains(substring: "unexpected field count"), what: "hostile: NoData, then a row: ".concat(other: m7));
+    return f;
+}
+
+unsafe fn int32 streamTests() {
+    int32 f = 0;
+    string sql = "select $1 + 1";
+    DynamicArray<Step> s = opening();
+    describeSteps(s: ref s, sql: sql, reply: intDescription());
+    s.add(item: quiet(tag: BIND, body: ""));
+    s.add(item: quiet(tag: EXECUTE, body: ""));
+    Wire e = Wire.make(); e.bindComplete();
+    int32 i = 1;
+    while (i <= 5) { e.intRow(values: ints(a: i)); i = i + 1; }
+    e.complete(tag: "SELECT 5"); e.ready(status: 73ui8);
+    s.add(item: answer(tag: SYNC, reply: give e));
+    Result<Connection, PgError> cMade = connected(s: give s);
+    Connection c = match (give cMade) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Query q = Query.make(sql: copy sql); q.add(value: 1);
+    Result<Unit, PgError> started = c.startRows(q: q);
+    Result<Rows, PgError> busy = c.query(q: Query.make(sql: "select 1"));
+    f = f + check(ok: errorText(r: busy).equals(other: "another command is already in progress"), what: "stream: refused while busy");
+    DynamicArray<isize> sizes = DynamicArray.empty();
+    string tag = "";
+    isize guard = 0;
+    while (c.isStreaming() && guard < 10) {
+        Result<Rows, PgError> chunk = c.nextRows(maxRows: 2);
+        match (give chunk) { case Ok(value: rows): { sizes.add(item: rows.rowCount()); tag = copy rows.commandTag(); } case Err(error: x): { guard = 100; } };
+        guard = guard + 1;
+    }
+    f = f + check(ok: sizes.length() == 3 && sizes[0] == 2 && sizes[1] == 2 && sizes[2] == 1 && tag.equals(other: "SELECT 5"), what: "stream: five rows in chunks of 2, 2 and 1, the tag on the last");
+    return f;
+}
+
+unsafe fn int32 portalTests() {
+    int32 f = 0;
+    DynamicArray<Step> s0 = opening();
+    Result<Connection, PgError> idleMade = connected(s: give s0);
+    Connection idle = match (give idleMade) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Result<Portal, PgError> refused = idle.openPortal(q: Query.make(sql: "select 1"));
+    f = f + check(ok: match (refused) { case Ok(value: p): false; case Err(error: e): e.message().contains(substring: "transaction block"); }, what: "portal: refused outside a transaction block");
+
+    string sql = "select g from t";
+    DynamicArray<Step> s = opening();
+    Wire begun = Wire.make(); begun.complete(tag: "BEGIN"); begun.ready(status: 84ui8);
+    s.add(item: answer(tag: QUERY, reply: give begun));
+    Wire d = Wire.make(); d.parseComplete(); d.parameterTypes(oids: DynamicArray.empty()); d.typedColumns(names: names(a: "g"), oids: oids(a: 23ui32)); d.ready(status: 84ui8);
+    describeSteps(s: ref s, sql: sql, reply: give d);
+    s.add(item: quiet(tag: BIND, body: "703000 00 0000 0000 0001 0001"));
+    Wire bound = Wire.make(); bound.bindComplete(); bound.ready(status: 84ui8);
+    s.add(item: answer(tag: SYNC, reply: give bound));
+    s.add(item: quiet(tag: EXECUTE, body: "703000 00000002"));
+    Wire part = Wire.make(); part.intRow(values: ints(a: 1)); part.intRow(values: ints(a: 2)); part.portalSuspended(); part.ready(status: 84ui8);
+    s.add(item: answer(tag: SYNC, reply: give part));
+    s.add(item: quiet(tag: EXECUTE, body: "703000 00000002"));
+    Wire rest = Wire.make(); rest.intRow(values: ints(a: 3)); rest.complete(tag: "SELECT 1"); rest.ready(status: 84ui8);
+    s.add(item: answer(tag: SYNC, reply: give rest));
+    s.add(item: quiet(tag: CLOSE, body: "50 703000"));
+    Wire closed = Wire.make(); closed.closeComplete(); closed.ready(status: 84ui8);
+    s.add(item: answer(tag: SYNC, reply: give closed));
+    Result<Connection, PgError> cMade = connected(s: give s);
+    Connection c = match (give cMade) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Result<DynamicArray<Rows>, PgError> b = c.simpleQuery(sql: "begin");
+    Result<Portal, PgError> opened = c.openPortal(q: Query.make(sql: copy sql));
+    Portal p = match (give opened) { case Ok(value: x): give x; case Err(error: e): { string m = e.message(); return check(ok: false, what: "portal: open: ".concat(other: m)); } };
+    Result<Rows, PgError> first = c.fetch(portal: ref p, maxRows: 2);
+    bool firstOk = match (first) { case Ok(value: rows): rows.rowCount() == 2 && rows.suspended(); case Err(error: e): false; };
+    f = f + check(ok: firstOk && !p.isFinished(), what: "portal: two rows, suspended");
+    Result<Rows, PgError> second = c.fetch(portal: ref p, maxRows: 2);
+    bool secondOk = match (second) { case Ok(value: rows): rows.rowCount() == 1 && !rows.suspended(); case Err(error: e): false; };
+    f = f + check(ok: secondOk && p.isFinished(), what: "portal: the last row, finished");
+    Result<Unit, PgError> c2 = c.closePortal(portal: give p);
+    f = f + check(ok: match (c2) { case Ok(value: u): true; case Err(error: e): false; }, what: "portal: closed");
+    return f;
+}
+
+unsafe fn int32 preparedTests() {
+    int32 f = 0;
+    string sql = "select $1 + 1";
+    DynamicArray<Step> s = opening();
+    s.add(item: quiet(tag: PARSE, body: "733000".concat(other: hexOf(s: sql)).concat(other: "000000")));
+    s.add(item: quiet(tag: DESCRIBE, body: "53 733000"));
+    s.add(item: answer(tag: SYNC, reply: intDescription()));
+    s.add(item: quiet(tag: BIND, body: "00 733000 0001 0001 0001 00000004 00000002 0001 0001"));
+    s.add(item: quiet(tag: EXECUTE, body: ""));
+    Wire e = Wire.make(); e.bindComplete(); e.intRow(values: ints(a: 3)); e.complete(tag: "SELECT 1"); e.ready(status: 73ui8);
+    s.add(item: answer(tag: SYNC, reply: give e));
+    s.add(item: quiet(tag: CLOSE, body: "53 733000"));
+    Wire closed = Wire.make(); closed.closeComplete(); closed.ready(status: 73ui8);
+    s.add(item: answer(tag: SYNC, reply: give closed));
+    Result<Connection, PgError> cMade = connected(s: give s);
+    Connection c = match (give cMade) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Result<Statement, PgError> made = c.prepare(sql: sql);
+    Statement st = match (give made) { case Ok(value: x): give x; case Err(error: why): { string m = why.message(); return check(ok: false, what: "prepare: ".concat(other: m)); } };
+    f = f + check(ok: st.name().equals(other: "s0") && st.parameterCount() == 1 && st.columnCount() == 1, what: "prepare: s0, described");
+    Query q = Query.of(statement: st);
+    q.add(value: 2);
+    Result<Rows, PgError> r = c.query(q: q);
+    f = f + check(ok: match (r) { case Ok(value: rows): rows.rowCount() == 1; case Err(error: why): false; }, what: "prepare: run with no Parse or Describe");
+    Result<Unit, PgError> closedStatement = c.closeStatement(statement: give st);
+    f = f + check(ok: match (closedStatement) { case Ok(value: u): true; case Err(error: why): false; }, what: "prepare: closed");
+    return f;
+}
+
+unsafe fn int32 refusalTests() {
+    int32 f = 0;
+    DynamicArray<Step> s = opening();
+    Result<Connection, PgError> cMade = connected(s: give s);
+    Connection c = match (give cMade) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Query many = Query.make(sql: "select 1");
+    int32 i = 0;
+    while (i < 65536) { many.addNull(); i = i + 1; }
+    Result<Rows, PgError> r = c.query(q: many);
+    f = f + check(ok: errorText(r: r).equals(other: "number of parameters must be between 0 and 65535"), what: "refused: 65536 parameters, in libpq's words");
+    Optional<int32> maybe = Optional::None;
+    Query tagged = pg"select ${maybe}";
+    Result<Rows, PgError> t = c.query(q: tagged);
+    f = f + check(ok: errorText(r: t).contains(substring: "is an Optional"), what: "refused: an Optional hole in a pg string (KPG-25)");
+    Query nul = Query.make(sql: "select '\0'");
+    Result<Rows, PgError> n = c.query(q: nul);
+    f = f + check(ok: errorText(r: n).contains(substring: "NUL byte") && !c.isClosed(), what: "refused: a NUL in the SQL, before anything is sent");
+    return f;
+}
+
+unsafe fn int32 extendedTests() {
+    int32 f = 0;
+    f = f + queryTests();
+    f = f + hostileTests();
+    f = f + streamTests();
+    f = f + portalTests();
+    f = f + preparedTests();
+    f = f + refusalTests();
+    return f;
+}

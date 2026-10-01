@@ -1,0 +1,52 @@
+import { std::collections::DynamicArray, postgres::protocol::FieldDescription };
+export { Statement, Portal };
+
+// A statement prepared on a connection (Connection.prepare): its name on the server, its SQL, and what the
+// server said about it, as libpq's PQdescribePrepared gives it: the parameter types it inferred and the columns
+// it returns. Run it with `Query.of(statement:)`, any number of times, until `Connection.closeStatement`. It
+// belongs to the connection that prepared it.
+type resource Statement implements Sendable {
+    string label;
+    string text;
+    DynamicArray<uint32> types;
+    DynamicArray<FieldDescription> fields;
+
+    ctor make(string name, string sql, DynamicArray<uint32> types, DynamicArray<FieldDescription> fields) {
+        this.label = give name; this.text = give sql; this.types = give types; this.fields = give fields;
+    }
+    friend postgres::Connection::prepare[make];
+
+    // The name the server knows it by: "s0", "s1", … in the order the connection prepared them.
+    public const fn const ref string name() { return this.label; }
+    public const fn const ref string sql() { return this.text; }
+    // Its parameters: how many, and the type the server inferred for each ($1 is index 0).
+    public const fn isize parameterCount() { return this.types.length(); }
+    public const fn uint32 parameterType(isize index) { return this.types[index]; }
+    // The columns it returns; none for a statement that returns no rows.
+    public const fn isize columnCount() { return this.fields.length(); }
+    public const fn const ref FieldDescription field(isize index) { return this.fields[index]; }
+
+    const fn const ref DynamicArray<uint32> parameterTypes() { return this.types; }
+    const fn const ref DynamicArray<FieldDescription> columns() { return this.fields; }
+    friend postgres::Query::of[parameterTypes, columns];
+}
+
+// A portal: a statement bound to its parameters inside a transaction block, read a part at a time with
+// Connection.fetch (a cursor, in the protocol's terms). It lives until Connection.closePortal or the end of the
+// transaction.
+type resource Portal implements Sendable {
+    string label;
+    DynamicArray<FieldDescription> fields;
+    bool finished = false;
+
+    ctor make(string name, DynamicArray<FieldDescription> fields) { this.label = give name; this.fields = give fields; this.finished = false; }
+    fn void finish() { this.finished = true; }
+    const fn const ref DynamicArray<FieldDescription> columns() { return this.fields; }
+    friend postgres::Connection::openPortal[make];
+    friend postgres::Connection::fetch[finish, columns];
+
+    // The name the server knows it by: "p0", "p1", …
+    public const fn const ref string name() { return this.label; }
+    // Every row has been fetched: the portal's command completed.
+    public const fn bool isFinished() { return this.finished; }
+}

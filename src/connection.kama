@@ -15,7 +15,12 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::protocol::startup as sendStartup, postgres::protocol::password as sendPassword,
          postgres::protocol::saslInitialResponse, postgres::protocol::saslResponse,
          postgres::protocol::query as sendQuery, postgres::protocol::terminate as sendTerminate,
-         postgres::protocol::copyFail as sendCopyFail };
+         postgres::protocol::copyFail as sendCopyFail, postgres::protocol::parse as sendParse,
+         postgres::protocol::bind as sendBind, postgres::protocol::describeStatement as sendDescribeStatement,
+         postgres::protocol::execute as sendExecute, postgres::protocol::closeStatement as sendCloseStatement,
+         postgres::protocol::closePortal as sendClosePortal, postgres::protocol::sync as sendSync,
+         postgres::protocol::BindValues,
+         postgres::Query, postgres::Statement, postgres::Portal, postgres::hasBinaryCodec };
 export { Connection, TransactionStatus };
 
 // postgres::Connection — one session with a server: connecting as libpq connects (every host and address in
@@ -45,6 +50,15 @@ type resource Connection implements Sendable {
     DynamicArray<string> paramValues;
     Optional<Owned<NoticeHandler>> handler;
     DynamicArray<Notification> pending;
+    // A result being read: its columns as they arrive, and whether its BindComplete is still to come. While
+    // `busy`, every other call is refused, as libpq refuses one while a query is in progress.
+    bool busy = false;
+    bool streaming = false;   // the result is read a chunk at a time (startRows)
+    bool bindPending = false;
+    bool rowLimited = false;  // its Execute had a row limit, so it may end in PortalSuspended
+    DynamicArray<FieldDescription> openFields;
+    int64 statements = 0i64;  // the names given so far: s0, s1, …
+    int64 portals = 0i64;     // p0, p1, …
 
     ctor over(Owned<Transport> transport) {
         this.wire = Wire.over(transport: give transport);
@@ -58,6 +72,13 @@ type resource Connection implements Sendable {
         this.paramValues = DynamicArray.empty();
         this.handler = Optional::None;
         this.pending = DynamicArray.empty();
+        this.busy = false;
+        this.streaming = false;
+        this.bindPending = false;
+        this.rowLimited = false;
+        this.openFields = DynamicArray.empty();
+        this.statements = 0i64;
+        this.portals = 0i64;
     }
 
     // Connect as `config` says: each host in order, each of its addresses in turn. A failure to reach an address,
@@ -234,7 +255,8 @@ type resource Connection implements Sendable {
     // (an empty statement gives none). Values arrive as text. If a statement fails, the server runs none after
     // it, and the error is returned in place of every result.
     public unsafe fn Result<DynamicArray<Rows>, PgError> simpleQuery(const ref string sql) {
-        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         this.outbox.clear();
         if (!sendQuery(w: this.outbox, sql: sql)) {
             return Result::Err(error: PgError::Usage(detail: "the query text holds a NUL byte, which the protocol cannot carry"));
@@ -320,6 +342,384 @@ type resource Connection implements Sendable {
         }
         if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
         return Result::Ok(value: give results);
+    }
+
+    // ---- the extended protocol ----
+
+    // Run `q`, one statement, and give its result. SQL text is parsed and described, then bound and executed: two
+    // round trips (a prepared Statement's query takes one). Each parameter is sent as the type the server inferred
+    // for it; each column of a type this client reads in binary comes in binary, every other one as text. A server
+    // error is returned once the server is ready again, and the session goes on.
+    public unsafe fn Result<Rows, PgError> query(const ref Query q) {
+        Result<Unit, PgError> started = this.start(q: q, portal: "", run: true);
+        match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.readRows(limit: -1, keep: true);
+    }
+
+    // Run `q`, one statement, for its effect: the rows it affected or returned, as PQcmdTuples reads the command
+    // tag (None for a command that reports no count). Any rows are read and dropped as they arrive.
+    public unsafe fn Result<Optional<int64>, PgError> execute(const ref Query q) {
+        Result<Unit, PgError> started = this.start(q: q, portal: "", run: true);
+        match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: false);
+        return match (give r) { case Ok(value: rows): Result::Ok(value: rows.rowsAffected()); case Err(error: e): Result::Err(error: give e); };
+    }
+
+    // Prepare `sql` as a named statement ("s0", "s1", … on this connection), with the parameter types and columns
+    // the server describes, to run with `Query.of(statement:)` as often as needed.
+    public unsafe fn Result<Statement, PgError> prepare(const ref string sql) {
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        int64 n = this.statements;
+        this.statements = this.statements + 1i64;
+        string name = "s${n}";
+        Result<Described, PgError> d = this.parseAndDescribe(name: name, sql: sql);
+        Described shape = match (give d) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        return Result::Ok(value: Statement.make(name: give name, sql: copy sql, types: copy shape.types(), fields: copy shape.fields()));
+    }
+
+    // Close a prepared statement on the server.
+    public unsafe fn Result<Unit, PgError> closeStatement(Statement statement) {
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.outbox.clear();
+        bool framed = sendCloseStatement(w: this.outbox, name: statement.name());
+        sendSync(w: this.outbox);
+        return this.closeExchange();
+    }
+
+    // ---- chunked rows ----
+
+    // Run `q`, and read its rows a chunk at a time with `nextRows` rather than holding them all (libpq 17's chunked
+    // rows mode). Until the last chunk has been read, or `discardRows` is called, the connection is busy: any other
+    // call is refused with libpq's "another command is already in progress".
+    public unsafe fn Result<Unit, PgError> startRows(const ref Query q) {
+        Result<Unit, PgError> started = this.start(q: q, portal: "", run: true);
+        match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.streaming = true;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The next chunk: up to `maxRows` rows (1 or more), as they arrive. The last chunk, which may have fewer rows or
+    // none, carries the command tag, and after it `isStreaming()` is false. An error ends the stream.
+    public unsafe fn Result<Rows, PgError> nextRows(isize maxRows) {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (!this.streaming) { return Result::Err(error: PgError::Usage(detail: "no rows are being read: startRows begins")); }
+        if (maxRows < 1) { return Result::Err(error: PgError::Usage(detail: "nextRows needs maxRows of 1 or more")); }
+        return this.readRows(limit: maxRows, keep: true);
+    }
+
+    // Read the rest of the rows and drop them, so the connection is free again.
+    public unsafe fn Result<Unit, PgError> discardRows() {
+        if (!this.streaming) { return Result::Ok(value: Unit::Unit); }
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: false);
+        return match (give r) { case Ok(value: rows): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
+    }
+
+    // A result is being read a chunk at a time.
+    public const fn bool isStreaming() { return this.streaming; }
+
+    // ---- portals ----
+
+    // Bind `q` into a named portal ("p0", "p1", …), to read a part at a time with `fetch`. A portal lasts until the
+    // transaction ends, so this needs a transaction block: outside one, each Sync ends the implicit transaction and
+    // the portal with it.
+    public unsafe fn Result<Portal, PgError> openPortal(const ref Query q) {
+        if (this.live && !this.busy && this.txStatus != 84ui8) {   // 'T'
+            return Result::Err(error: PgError::Usage(detail: "a portal needs a transaction block: begin one first, since outside a block each Sync ends the implicit transaction and closes the portal"));
+        }
+        int64 n = this.portals;
+        string name = "p${n}";
+        Result<Unit, PgError> started = this.start(q: q, portal: name, run: false);
+        match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.portals = this.portals + 1i64;
+        DynamicArray<FieldDescription> fields = copy this.openFields;
+        Result<Rows, PgError> bound = this.readRows(limit: -1, keep: false);
+        match (give bound) { case Ok(value: r): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return Result::Ok(value: Portal.make(name: give name, fields: give fields));
+    }
+
+    // The next `maxRows` rows of `portal` (0 for all that remain). The result is `suspended()` while rows remain;
+    // once the portal's command completes, `portal.isFinished()`.
+    public unsafe fn Result<Rows, PgError> fetch(ref Portal portal, int32 maxRows) {
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        if (maxRows < 0) { return Result::Err(error: PgError::Usage(detail: "fetch needs maxRows of 0 (every row) or more")); }
+        this.outbox.clear();
+        bool framed = sendExecute(w: this.outbox, portal: portal.name(), maxRows: maxRows);
+        sendSync(w: this.outbox);
+        Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.openFields = copy portal.columns();
+        this.bindPending = false;
+        this.rowLimited = maxRows > 0;
+        this.busy = true;
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true);
+        bool finished = match (r) { case Ok(value: rows): !rows.suspended(); case Err(error: e): false; };
+        if (finished) { portal.finish(); }
+        return r;
+    }
+
+    // Close a portal on the server, before its transaction ends.
+    public unsafe fn Result<Unit, PgError> closePortal(Portal portal) {
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.outbox.clear();
+        bool framed = sendClosePortal(w: this.outbox, name: portal.name());
+        sendSync(w: this.outbox);
+        return this.closeExchange();
+    }
+
+    // ---- the extended protocol's steps ----
+
+    // Ready for a command: open, and not reading another's result.
+    fn Result<Unit, PgError> idle() {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.busy) { return Result::Err(error: PgError::Usage(detail: "another command is already in progress")); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Describe `q` if it is SQL, then bind it into `portal`, and execute it there unless `run` is false. After
+    // this the result is open: `openFields` are its columns, and readRows reads it.
+    unsafe fn Result<Unit, PgError> start(const ref Query q, const ref string portal, bool run) {
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Described, PgError> d = this.describe(q: q);
+        Described shape = match (give d) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        return this.bindAndExecute(q: q, shape: shape, portal: portal, run: run);
+    }
+
+    // What the server says about `q`: for SQL, by Parse and Describe of the unnamed statement; for a prepared
+    // statement, what it said when it was prepared.
+    unsafe fn Result<Described, PgError> describe(const ref Query q) {
+        if (q.problem().length() > 0) { return Result::Err(error: PgError::Value(detail: copy q.problem())); }
+        if (q.parameterCount() > 65535) { return Result::Err(error: PgError::Usage(detail: "number of parameters must be between 0 and 65535")); }
+        if (q.isPrepared()) {
+            return Result::Ok(value: Described.make(name: copy q.statement(), types: copy q.parameterTypes(), fields: copy q.columns()));
+        }
+        string unnamed = "";
+        return this.parseAndDescribe(name: unnamed, sql: q.sql());
+    }
+
+    // Parse `sql` as statement `name`, and describe it: ParseComplete, ParameterDescription, then RowDescription
+    // or NoData, then ReadyForQuery.
+    unsafe fn Result<Described, PgError> parseAndDescribe(const ref string name, const ref string sql) {
+        this.outbox.clear();
+        BindValues none = BindValues.make();
+        if (!sendParse(w: this.outbox, name: name, sql: sql, params: none)) {
+            return Result::Err(error: PgError::Usage(detail: "the query text holds a NUL byte, which the protocol cannot carry"));
+        }
+        bool framed = sendDescribeStatement(w: this.outbox, name: name);
+        sendSync(w: this.outbox);
+        Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+
+        bool parsed = false;
+        bool described = false;
+        bool shaped = false;   // RowDescription or NoData
+        DynamicArray<uint32> types = DynamicArray.empty();
+        DynamicArray<FieldDescription> fields = DynamicArray.empty();
+        DynamicArray<PgError> failed = DynamicArray.empty();
+        bool done = false;
+        while (!done) {
+            Result<BackendMessage, PgError> received = this.wire.receive(deadline: Deadline.none());
+            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            if (background(m: m)) { this.absorb(m: give m); continue; }
+            match (give m) {
+                case ParseComplete: {
+                    if (parsed || failed.length() > 0) { return Result::Err(error: this.broken(detail: unexpected(tag: 49ui8))); }
+                    parsed = true;
+                }
+                case ParameterDescription(oids: o): {
+                    if (!parsed || described) { return Result::Err(error: this.broken(detail: unexpected(tag: 116ui8))); }
+                    types = give o;
+                    described = true;
+                }
+                case RowDescription(fields: f): {
+                    if (!described || shaped) { return Result::Err(error: this.broken(detail: unexpected(tag: 84ui8))); }
+                    fields = give f;
+                    shaped = true;
+                }
+                case NoData: {
+                    if (!described || shaped) { return Result::Err(error: this.broken(detail: unexpected(tag: 110ui8))); }
+                    shaped = true;
+                }
+                case ErrorResponse(fields: f): {
+                    ServerError e = ServerError.make(fields: give f);
+                    if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
+                    failed.add(item: PgError::Server(error: give e));
+                }
+                case ReadyForQuery(status: s): { this.txStatus = s; done = true; }
+                case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place while describing a statement")); }
+            };
+        }
+        if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
+        if (!shaped) { return Result::Err(error: this.broken(detail: "the server did not describe the statement before it was ready")); }
+        return Result::Ok(value: Described.make(name: copy name, types: give types, fields: give fields));
+    }
+
+    // Bind `q`'s parameters, each encoded as the type described for it, into `portal`, asking for each column in
+    // binary when this client reads its type that way; then Execute it there unless `run` is false; then Sync.
+    unsafe fn Result<Unit, PgError> bindAndExecute(const ref Query q, const ref Described shape, const ref string portal, bool run) {
+        BindValues params = q.encoded(types: shape.types());
+        DynamicArray<int16> formats = DynamicArray.withCapacity(capacity: shape.fields().length());
+        DynamicArray<FieldDescription> columns = DynamicArray.withCapacity(capacity: shape.fields().length());
+        isize i = 0;
+        while (i < shape.fields().length()) {
+            int16 format = 0i16;
+            if (hasBinaryCodec(oid: shape.fields()[i].typeOid())) { format = 1i16; }
+            formats.add(item: format);
+            columns.add(item: shape.fields()[i].withFormat(format: format));
+            i = i + 1;
+        }
+        this.outbox.clear();
+        if (!sendBind(w: this.outbox, portal: portal, statement: shape.name(), params: params, resultFormats: formats)) {
+            return Result::Err(error: PgError::Usage(detail: "a portal or statement name holds a NUL byte"));
+        }
+        if (run) { bool framed = sendExecute(w: this.outbox, portal: portal, maxRows: 0); }
+        sendSync(w: this.outbox);
+        Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.openFields = give columns;
+        this.bindPending = true;
+        this.rowLimited = false;
+        this.busy = true;
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Read the open result: BindComplete (when a Bind was sent), DataRows, the command's end (CommandComplete,
+    // EmptyQueryResponse or PortalSuspended), then ReadyForQuery. With `limit` > 0, return once that many rows have
+    // come and leave the rest open for the next call. A server error ends the result and is returned once the
+    // server is ready; `keep` false drops the rows as they arrive.
+    unsafe fn Result<Rows, PgError> readRows(isize limit, bool keep) {
+        DynamicArray<RowValues> rows = DynamicArray.empty();
+        DynamicArray<int16> formats = DynamicArray.withCapacity(capacity: this.openFields.length());
+        isize k = 0;
+        while (k < this.openFields.length()) { formats.add(item: this.openFields[k].format()); k = k + 1; }
+        string tag = "";
+        bool suspended = false;
+        bool ended = false;   // the command's end, or its error, has come
+        DynamicArray<PgError> failed = DynamicArray.empty();
+        bool copyRefused = false;
+        bool copying = false;
+        bool chunk = false;   // `limit` rows have come: the result stays open
+        bool done = false;
+        while (!done) {
+            if (!ended && limit > 0 && rows.length() >= limit) { chunk = true; break; }
+            Result<BackendMessage, PgError> received = this.wire.receive(deadline: Deadline.none());
+            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            if (background(m: m)) { this.absorb(m: give m); continue; }
+            match (give m) {
+                case BindComplete: {
+                    if (!this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 50ui8))); }
+                    this.bindPending = false;
+                }
+                case DataRow(row: r): {
+                    if (this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 68ui8))); }
+                    if (r.columnCount() != this.openFields.length()) { return Result::Err(error: this.broken(detail: "unexpected field count in \"D\" message")); }
+                    if (!textValid(row: r, formats: formats)) {
+                        this.lose();
+                        return Result::Err(error: PgError::Protocol(error: ProtocolError::NotUtf8(tag: 68ui8)));
+                    }
+                    if (keep) { rows.add(item: give r); } else { RowValues dropped = give r; }
+                }
+                case CommandComplete(commandTag: t): {
+                    if (this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 67ui8))); }
+                    tag = give t;
+                    ended = true;
+                }
+                case EmptyQueryResponse: {
+                    if (this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 73ui8))); }
+                    ended = true;
+                }
+                case PortalSuspended: {
+                    if (this.bindPending || ended || !this.rowLimited) { return Result::Err(error: this.broken(detail: unexpected(tag: 115ui8))); }
+                    suspended = true;
+                    ended = true;
+                }
+                case ErrorResponse(fields: f): {
+                    ServerError e = ServerError.make(fields: give f);
+                    if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
+                    failed.add(item: PgError::Server(error: give e));
+                    ended = true;
+                }
+                case CopyInResponse(formats: cf): {
+                    // COPY has its own interface; refusing it here keeps the session usable.
+                    this.outbox.clear();
+                    bool framed = sendCopyFail(w: this.outbox, reason: "COPY FROM STDIN is not supported by the extended protocol's query");
+                    Result<Unit, PgError> refusal = this.flush(deadline: Deadline.none());
+                    match (give refusal) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                    copyRefused = true;
+                }
+                case CopyOutResponse(formats: cf): { copyRefused = true; copying = true; }
+                case CopyData(data: d): { if (!copying) { return Result::Err(error: this.broken(detail: unexpected(tag: 100ui8))); } }
+                case CopyDone: {
+                    if (!copying) { return Result::Err(error: this.broken(detail: unexpected(tag: 99ui8))); }
+                    copying = false;
+                }
+                case ReadyForQuery(status: s): {
+                    if (this.bindPending && failed.length() == 0) { return Result::Err(error: this.broken(detail: unexpected(tag: 90ui8))); }
+                    this.txStatus = s;
+                    done = true;
+                }
+                case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place in a query's result")); }
+            };
+        }
+        if (chunk) { return Result::Ok(value: Rows.make(fields: copy this.openFields, rows: give rows, tag: "")); }
+        this.busy = false;
+        this.streaming = false;
+        this.bindPending = false;
+        if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
+        if (copyRefused) { return Result::Err(error: PgError::Usage(detail: "COPY is not supported by query; the statement was not run, or its output was discarded")); }
+        Rows result = Rows.make(fields: copy this.openFields, rows: give rows, tag: give tag);
+        if (suspended) { result.suspend(); }
+        return Result::Ok(value: give result);
+    }
+
+    // Close (statement or portal) and Sync: CloseComplete, then ReadyForQuery.
+    unsafe fn Result<Unit, PgError> closeExchange() {
+        Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        bool closed = false;
+        DynamicArray<PgError> failed = DynamicArray.empty();
+        bool done = false;
+        while (!done) {
+            Result<BackendMessage, PgError> received = this.wire.receive(deadline: Deadline.none());
+            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            if (background(m: m)) { this.absorb(m: give m); continue; }
+            match (give m) {
+                case CloseComplete: {
+                    if (closed) { return Result::Err(error: this.broken(detail: unexpected(tag: 51ui8))); }
+                    closed = true;
+                }
+                case ErrorResponse(fields: f): {
+                    ServerError e = ServerError.make(fields: give f);
+                    if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
+                    failed.add(item: PgError::Server(error: give e));
+                }
+                case ReadyForQuery(status: s): { this.txStatus = s; done = true; }
+                case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place after a Close")); }
+            };
+        }
+        if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
+        if (!closed) { return Result::Err(error: this.broken(detail: "the server was ready before it confirmed the Close")); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // What the server sends outside any result: a notice, a parameter's new value, a notification.
+    fn void absorb(BackendMessage m) {
+        match (give m) {
+            case NoticeResponse(fields: f): { this.deliver(fields: give f); }
+            case ParameterStatus(name: n, value: v): { this.setParameter(name: give n, value: give v); }
+            case NotificationResponse(processId: p, channel: c, payload: x): { this.pending.add(item: Notification.make(processId: p, channel: give c, payload: give x)); }
+            case _: { }
+        };
+    }
+
+    // A message the protocol does not allow here: the session cannot recover its place, so it ends.
+    unsafe fn PgError broken(const ref string detail) {
+        this.lose();
+        return PgError::Protocol(error: ProtocolError::Violation(detail: copy detail));
     }
 
     // Send Terminate and close the transport. Every later call returns `Closed`. Closing a closed connection does
@@ -638,12 +1038,38 @@ type resource Connection implements Sendable {
 
     // The session is over: the transport is shut and every later call is `Closed`.
     unsafe fn void lose() {
+        this.busy = false;
+        this.streaming = false;
+        this.bindPending = false;
         if (!this.live) { return; }
         this.live = false;
         this.wire.shutdown();
     }
 
     unsafe ~Connection() { this.close(); }
+}
+
+// What the server said about a statement it parsed: its name, its parameters' types, its result columns.
+type resource Described {
+    string label;
+    DynamicArray<uint32> paramTypes;
+    DynamicArray<FieldDescription> columns;
+    public ctor make(string name, DynamicArray<uint32> types, DynamicArray<FieldDescription> fields) {
+        this.label = give name; this.paramTypes = give types; this.columns = give fields;
+    }
+    public const fn const ref string name() { return this.label; }
+    public const fn const ref DynamicArray<uint32> types() { return this.paramTypes; }
+    public const fn const ref DynamicArray<FieldDescription> fields() { return this.columns; }
+}
+
+// A message that can come at any point of an exchange: a notice, a parameter's new value, a notification.
+fn bool background(const ref BackendMessage m) {
+    return match (m) {
+        case NoticeResponse(fields: f): true;
+        case ParameterStatus(name: n, value: v): true;
+        case NotificationResponse(processId: p, channel: c, payload: x): true;
+        case _: false;
+    };
 }
 
 // libpq's requirepeer refusal, or "" when the server runs as the account required.

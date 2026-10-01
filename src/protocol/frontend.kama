@@ -141,10 +141,10 @@ fn bool parse(ref MessageWriter w, const ref string name, const ref string sql, 
     return true;
 }
 
-// Bind: statement `statement` with `params` into portal `portal` ("" for the unnamed one), asking for every
-// result column in `resultFormat` (0 text, 1 binary).
+// Bind: statement `statement` with `params` into portal `portal` ("" for the unnamed one). `resultFormats` is the
+// result columns' formats (0 text, 1 binary): none for all text, one for every column, or one per column.
 fn bool bind(ref MessageWriter w, const ref string portal, const ref string statement,
-             const ref BindValues params, int16 resultFormat) {
+             const ref BindValues params, const ref DynamicArray<int16> resultFormats) {
     MessageWriter body = MessageWriter.make();
     if (!body.putCString(s: portal) || !body.putCString(s: statement)) { return false; }
     w.begin(tag: 66ui8);    // 'B'
@@ -165,8 +165,9 @@ fn bool bind(ref MessageWriter w, const ref string portal, const ref string stat
         }
         i = i + 1;
     }
-    w.putI16(v: 1i16);      // one result format, applied to every column
-    w.putI16(v: resultFormat);
+    w.putI16(v: cast<int16>(resultFormats.length()));
+    i = 0;
+    while (i < resultFormats.length()) { w.putI16(v: resultFormats[i]); i = i + 1; }
     w.end();
     return true;
 }

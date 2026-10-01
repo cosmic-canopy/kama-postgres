@@ -1,7 +1,10 @@
 # Roadmap
 
-Where this is, 2026-09-30: the scaffold and the test server are done. Every compiler gap this package filed
-is fixed upstream, as of kama 0.9.486 (see [KAMA_GAPS.md](../KAMA_GAPS.md)). The client is next.
+Where this is, 2026-09-30: phases 0–3 are done. Every layer that needs no server is written and tested: the
+protocol, password authentication, connection strings, the SQLSTATE and type tables, and the type codecs. Each
+is checked against vectors from the RFCs, from libpq's own tests, or from a live server. Phase 4, the first live
+connection, is next. Four new compiler gaps are open in [KAMA_GAPS.md](../KAMA_GAPS.md) (KPG-11–14); none
+blocks.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -9,10 +12,10 @@ matrix.
 | # | phase | state |
 |---|---|---|
 | 0 | Scaffold; `tools/pg.sh` + server config + test PKI; language probes | **done** |
-| 1 | `@kama/tls`: vendor Mbed TLS 4.1.1 LTS, `tls::version()` | next (in `../kama-tls`) |
-| 2 | `@kama/tls`: `TlsStream<S>` over a memory BIO; in-memory and TCP loopback handshake matrix | |
-| 3 | Pure layers: `protocol/` buffers + every message (golden bytes, malformed input); SCRAM/md5 over `std::digest` (RFC vectors); connection strings + `.pgpass` (libpq's URI regression cases); type codecs; generated SQLSTATE and OID tables | |
-| 4 | Plain connection: startup, trust / password / md5 / SCRAM, simple query, errors, notices — first integration run | |
+| 1 | `@kama/tls`: vendor Mbed TLS 4.1.1 LTS, `tls::version()` | **done** (`../kama-tls`) |
+| 2 | `@kama/tls`: `TlsStream<S>` over a memory BIO; in-memory and TCP loopback handshake matrix | **done** (`../kama-tls`) |
+| 3 | Pure layers: `protocol/` buffers + every message (golden bytes, malformed input); SCRAM/md5 over `std::digest` (RFC vectors); connection strings + `.pgpass` (libpq's URI regression cases); type codecs; generated SQLSTATE and OID tables | **done** |
+| 4 | Plain connection: startup, trust / password / md5 / SCRAM, simple query, errors, notices — first integration run | next |
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates | |
 | 7 | Statement cache, transactions and savepoints, COPY, LISTEN/NOTIFY, pipelining, cancel and timeouts, Unix sockets, multi-host and `target_session_attrs`, keepalive | |

@@ -4,9 +4,9 @@ The PostgreSQL client for [kama](https://kama-lang.org). It speaks the PostgreSQ
 in kama, over `std::net`, the way pgx, tokio-postgres, pgjdbc and Npgsql do. There is no libpq and nothing to
 install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
-> **Status: under construction, not yet published.** The scaffold, the test server and the compiler
-> prerequisites are in place. The client itself is being built in the order in
-> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.486**.
+> **Status: under construction, not yet published.** Everything that needs no server is done and tested:
+> the wire protocol, SCRAM and md5 authentication, libpq-compatible connection strings, and the type codecs.
+> Live connections are next; see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.486**.
 
 ## What it will cover
 

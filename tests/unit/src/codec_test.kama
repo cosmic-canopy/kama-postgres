@@ -1,0 +1,266 @@
+// Every type codec against bytes a live PostgreSQL produced (tests/unit/src/codec_vectors.kama, written by
+// tools/gen-codec-vectors.sh). For each case: decode the server's text and the server's binary — they must agree;
+// re-encode the value — it must be the server's binary, byte for byte; format it — it must be the server's text.
+// No expected value here is typed by hand. Floats compare bit for bit (shortest-digit text is the server's
+// concern). A value of infinity must be refused as OutOfRange, in both formats.
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::hex::encode as hexEncode,
+         std::time::Date, std::time::Timestamp, std::uuid::Uuid,
+         postgres::types::DecodeError, postgres::types::FORMAT_TEXT, postgres::types::FORMAT_BINARY,
+         postgres::types::decodeBool, postgres::types::encodeBool, postgres::types::formatBool,
+         postgres::types::decodeInt2, postgres::types::encodeInt2, postgres::types::decodeInt4,
+         postgres::types::encodeInt4, postgres::types::decodeInt8, postgres::types::encodeInt8,
+         postgres::types::decodeOid, postgres::types::encodeOid, postgres::types::decodeFloat4,
+         postgres::types::encodeFloat4, postgres::types::decodeFloat8, postgres::types::encodeFloat8,
+         postgres::types::decodeText, postgres::types::encodeText, postgres::types::decodeJsonb,
+         postgres::types::encodeJsonb, postgres::types::decodeBytea, postgres::types::encodeBytea,
+         postgres::types::formatBytea, postgres::types::decodeUuid, postgres::types::encodeUuid,
+         postgres::types::decodeDate, postgres::types::encodeDate, postgres::types::formatDate,
+         postgres::types::decodeTimestamp, postgres::types::encodeTimestamp, postgres::types::formatTimestamp,
+         postgres::types::decodeTimestampTz, postgres::types::encodeTimestampTz, postgres::types::formatTimestampTz,
+         postgres::types::decodeTime, postgres::types::encodeTime, postgres::types::decodeTimeTz,
+         postgres::types::encodeTimeTz, postgres::types::decodeInterval, postgres::types::encodeInterval,
+         postgres::types::decodeNumeric, postgres::types::encodeNumeric,
+         postgres::types::LocalDateTime, postgres::types::TimeOfDay, postgres::types::TimeTz,
+         postgres::types::Interval, postgres::types::Numeric,
+         postgres_unit_tests::check, postgres_unit_tests::unhex,
+         postgres_unit_tests::codecTypes, postgres_unit_tests::codecLiterals, postgres_unit_tests::codecTexts,
+         postgres_unit_tests::codecBinaries };
+export { codecTests };
+
+fn bool hexIs(const ref DynamicArray<uint8> bytes, const ref string want) { string h = hexEncode(bytes: bytes.view()); return h.equals(other: want); }
+
+fn bool isOutOfRange(const ref DecodeError e) { return match (e) { case OutOfRange(type: t): true; case _: false; }; }
+
+// One case: decode text and binary, compare, re-encode, re-format. Answers "" when it all holds, or what broke.
+fn string checkCase(const ref string type, const ref string literal, const ref string text, ConstView<uint8> t, const ref string hex) {
+    DynamicArray<uint8> bin = unhex(text: hex);
+    DynamicArray<uint8> enc = DynamicArray.empty();
+    if (type.equals(other: "bool")) {
+        Result<bool, DecodeError> a = decodeBool(format: FORMAT_TEXT, raw: t);
+        Result<bool, DecodeError> b = decodeBool(format: FORMAT_BINARY, raw: bin.view());
+        bool av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        bool bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeBool(to: ref enc, v: bv);
+        if (av != bv) { return "text and binary disagree"; }
+        if (!hexIs(bytes: enc, want: hex)) { return "re-encoded bytes differ"; }
+        if (!formatBool(v: av).equals(other: text)) { return "formatted text differs"; }
+        return "";
+    }
+    if (type.equals(other: "int2")) {
+        Result<int16, DecodeError> a = decodeInt2(format: FORMAT_TEXT, raw: t);
+        Result<int16, DecodeError> b = decodeInt2(format: FORMAT_BINARY, raw: bin.view());
+        int16 av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        int16 bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeInt2(to: ref enc, v: bv);
+        string f = "${av}";
+        if (av != bv || !hexIs(bytes: enc, want: hex) || !f.equals(other: text)) { return "int2 mismatch"; }
+        return "";
+    }
+    if (type.equals(other: "int4")) {
+        Result<int32, DecodeError> a = decodeInt4(format: FORMAT_TEXT, raw: t);
+        Result<int32, DecodeError> b = decodeInt4(format: FORMAT_BINARY, raw: bin.view());
+        int32 av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        int32 bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeInt4(to: ref enc, v: bv);
+        string f = "${av}";
+        if (av != bv || !hexIs(bytes: enc, want: hex) || !f.equals(other: text)) { return "int4 mismatch"; }
+        return "";
+    }
+    if (type.equals(other: "int8")) {
+        Result<int64, DecodeError> a = decodeInt8(format: FORMAT_TEXT, raw: t);
+        Result<int64, DecodeError> b = decodeInt8(format: FORMAT_BINARY, raw: bin.view());
+        int64 av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        int64 bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeInt8(to: ref enc, v: bv);
+        string f = "${av}";
+        if (av != bv || !hexIs(bytes: enc, want: hex) || !f.equals(other: text)) { return "int8 mismatch"; }
+        return "";
+    }
+    if (type.equals(other: "oid")) {
+        Result<uint32, DecodeError> a = decodeOid(format: FORMAT_TEXT, raw: t);
+        Result<uint32, DecodeError> b = decodeOid(format: FORMAT_BINARY, raw: bin.view());
+        uint32 av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        uint32 bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeOid(to: ref enc, v: bv);
+        string f = "${av}";
+        if (av != bv || !hexIs(bytes: enc, want: hex) || !f.equals(other: text)) { return "oid mismatch"; }
+        return "";
+    }
+    if (type.equals(other: "float4")) {
+        Result<float32, DecodeError> a = decodeFloat4(format: FORMAT_TEXT, raw: t);
+        Result<float32, DecodeError> b = decodeFloat4(format: FORMAT_BINARY, raw: bin.view());
+        float32 av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        float32 bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeFloat4(to: ref enc, v: av);
+        if (bitcast<uint32>(av) != bitcast<uint32>(bv)) { return "float4 text and binary differ in bits"; }
+        if (!hexIs(bytes: enc, want: hex)) { return "float4 re-encoded bytes differ"; }
+        return "";
+    }
+    if (type.equals(other: "float8")) {
+        Result<float64, DecodeError> a = decodeFloat8(format: FORMAT_TEXT, raw: t);
+        Result<float64, DecodeError> b = decodeFloat8(format: FORMAT_BINARY, raw: bin.view());
+        float64 av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        float64 bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeFloat8(to: ref enc, v: av);
+        if (bitcast<uint64>(av) != bitcast<uint64>(bv)) { return "float8 text and binary differ in bits"; }
+        if (!hexIs(bytes: enc, want: hex)) { return "float8 re-encoded bytes differ"; }
+        return "";
+    }
+    if (type.equals(other: "text") || type.equals(other: "varchar") || type.equals(other: "bpchar")
+        || type.equals(other: "name") || type.equals(other: "json")) {
+        Result<string, DecodeError> a = decodeText(format: FORMAT_TEXT, raw: t);
+        Result<string, DecodeError> b = decodeText(format: FORMAT_BINARY, raw: bin.view());
+        string av = match (give a) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+        string bv = match (give b) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+        encodeText(to: ref enc, v: bv);
+        if (!av.equals(other: bv) || !hexIs(bytes: enc, want: hex) || !av.equals(other: text)) { return "text mismatch"; }
+        return "";
+    }
+    if (type.equals(other: "jsonb")) {
+        Result<string, DecodeError> a = decodeJsonb(format: FORMAT_TEXT, raw: t);
+        Result<string, DecodeError> b = decodeJsonb(format: FORMAT_BINARY, raw: bin.view());
+        string av = match (give a) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+        string bv = match (give b) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+        encodeJsonb(to: ref enc, json: bv);
+        if (!av.equals(other: bv) || !hexIs(bytes: enc, want: hex)) { return "jsonb mismatch"; }
+        return "";
+    }
+    if (type.equals(other: "bytea")) {
+        Result<DynamicArray<uint8>, DecodeError> a = decodeBytea(format: FORMAT_TEXT, raw: t);
+        Result<DynamicArray<uint8>, DecodeError> b = decodeBytea(format: FORMAT_BINARY, raw: bin.view());
+        DynamicArray<uint8> av = match (give a) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+        DynamicArray<uint8> bv = match (give b) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+        encodeBytea(to: ref enc, v: av.view());
+        string f = formatBytea(v: bv.view());
+        if (!hexIs(bytes: enc, want: hex)) { return "bytea text decodes to other bytes"; }
+        if (!f.equals(other: text)) { return "bytea formatted text differs"; }
+        return "";
+    }
+    if (type.equals(other: "uuid")) {
+        Result<Uuid, DecodeError> a = decodeUuid(format: FORMAT_TEXT, raw: t);
+        Result<Uuid, DecodeError> b = decodeUuid(format: FORMAT_BINARY, raw: bin.view());
+        Uuid av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        Uuid bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeUuid(to: ref enc, v: av);
+        string f = "${bv}";
+        if (!av.equals(other: bv) || !hexIs(bytes: enc, want: hex) || !f.equals(other: text)) { return "uuid mismatch"; }
+        return "";
+    }
+    if (type.equals(other: "date")) {
+        Result<Date, DecodeError> a = decodeDate(format: FORMAT_TEXT, raw: t);
+        Result<Date, DecodeError> b = decodeDate(format: FORMAT_BINARY, raw: bin.view());
+        if (literal.contains(substring: "infinity")) {
+            bool ta = match (give a) { case Ok(value: v): false; case Err(error: e): isOutOfRange(e: e); };
+            bool tb = match (give b) { case Ok(value: v): false; case Err(error: e): isOutOfRange(e: e); };
+            if (!ta || !tb) { return "infinity was not refused as OutOfRange"; }
+            return "";
+        }
+        Date av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        Date bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeDate(to: ref enc, d: av);
+        if (!av.equals(other: bv)) { return "date text and binary differ"; }
+        if (!hexIs(bytes: enc, want: hex)) { return "date re-encoded bytes differ"; }
+        if (!formatDate(d: bv).equals(other: text)) { return "date formatted as ".concat(other: formatDate(d: bv)); }
+        return "";
+    }
+    if (type.equals(other: "timestamp")) {
+        Result<LocalDateTime, DecodeError> a = decodeTimestamp(format: FORMAT_TEXT, raw: t);
+        Result<LocalDateTime, DecodeError> b = decodeTimestamp(format: FORMAT_BINARY, raw: bin.view());
+        if (literal.contains(substring: "infinity")) {
+            bool ta = match (give a) { case Ok(value: v): false; case Err(error: e): isOutOfRange(e: e); };
+            bool tb = match (give b) { case Ok(value: v): false; case Err(error: e): isOutOfRange(e: e); };
+            if (!ta || !tb) { return "infinity was not refused as OutOfRange"; }
+            return "";
+        }
+        LocalDateTime av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        LocalDateTime bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeTimestamp(to: ref enc, v: av);
+        if (!av.equals(other: bv)) { return "timestamp text and binary differ"; }
+        if (!hexIs(bytes: enc, want: hex)) { return "timestamp re-encoded bytes differ"; }
+        if (!formatTimestamp(v: bv).equals(other: text)) { return "timestamp formatted as ".concat(other: formatTimestamp(v: bv)); }
+        return "";
+    }
+    if (type.equals(other: "timestamptz")) {
+        Result<Timestamp, DecodeError> a = decodeTimestampTz(format: FORMAT_TEXT, raw: t);
+        Result<Timestamp, DecodeError> b = decodeTimestampTz(format: FORMAT_BINARY, raw: bin.view());
+        if (literal.contains(substring: "infinity")) {
+            bool ta = match (give a) { case Ok(value: v): false; case Err(error: e): isOutOfRange(e: e); };
+            bool tb = match (give b) { case Ok(value: v): false; case Err(error: e): isOutOfRange(e: e); };
+            if (!ta || !tb) { return "infinity was not refused as OutOfRange"; }
+            return "";
+        }
+        Timestamp av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        Timestamp bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeTimestampTz(to: ref enc, v: av);
+        if (!av.equals(other: bv)) { return "timestamptz text and binary differ"; }
+        if (!hexIs(bytes: enc, want: hex)) { return "timestamptz re-encoded bytes differ"; }
+        if (!formatTimestampTz(v: bv).equals(other: text)) { return "timestamptz formatted as ".concat(other: formatTimestampTz(v: bv)); }
+        return "";
+    }
+    if (type.equals(other: "time")) {
+        Result<TimeOfDay, DecodeError> a = decodeTime(format: FORMAT_TEXT, raw: t);
+        Result<TimeOfDay, DecodeError> b = decodeTime(format: FORMAT_BINARY, raw: bin.view());
+        TimeOfDay av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        TimeOfDay bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeTime(to: ref enc, v: av);
+        string f = "${bv}";
+        if (!av.equals(other: bv)) { return "time text and binary differ"; }
+        if (!hexIs(bytes: enc, want: hex)) { return "time re-encoded bytes differ"; }
+        if (!f.equals(other: text)) { return "time formatted as ".concat(other: f); }
+        return "";
+    }
+    if (type.equals(other: "timetz")) {
+        Result<TimeTz, DecodeError> a = decodeTimeTz(format: FORMAT_TEXT, raw: t);
+        Result<TimeTz, DecodeError> b = decodeTimeTz(format: FORMAT_BINARY, raw: bin.view());
+        TimeTz av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        TimeTz bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeTimeTz(to: ref enc, v: av);
+        string f = "${bv}";
+        if (!av.equals(other: bv)) { return "timetz text and binary differ"; }
+        if (!hexIs(bytes: enc, want: hex)) { return "timetz re-encoded bytes differ"; }
+        if (!f.equals(other: text)) { return "timetz formatted as ".concat(other: f); }
+        return "";
+    }
+    if (type.equals(other: "interval")) {
+        Result<Interval, DecodeError> a = decodeInterval(format: FORMAT_TEXT, raw: t);
+        Result<Interval, DecodeError> b = decodeInterval(format: FORMAT_BINARY, raw: bin.view());
+        Interval av = match (give a) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        Interval bv = match (give b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        encodeInterval(to: ref enc, v: av);
+        string f = "${bv}";
+        if (!av.equals(other: bv)) { return "interval text and binary differ"; }
+        if (!hexIs(bytes: enc, want: hex)) { return "interval re-encoded bytes differ"; }
+        if (!f.equals(other: text)) { return "interval formatted as ".concat(other: f); }
+        return "";
+    }
+    if (type.equals(other: "numeric")) {
+        Result<Numeric, DecodeError> a = decodeNumeric(format: FORMAT_TEXT, raw: t);
+        Result<Numeric, DecodeError> b = decodeNumeric(format: FORMAT_BINARY, raw: bin.view());
+        Numeric av = match (give a) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+        Numeric bv = match (give b) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+        encodeNumeric(to: ref enc, n: av);
+        string f = bv.text();
+        if (!av.equals(other: bv)) { return "numeric text and binary differ"; }
+        if (!hexIs(bytes: enc, want: hex)) { string h = hexEncode(bytes: enc.view()); return "numeric re-encoded as ".concat(other: h); }
+        if (!f.equals(other: text)) { return "numeric formatted as ".concat(other: f); }
+        return "";
+    }
+    return "no codec for ".concat(other: type);
+}
+
+fn int32 codecTests() {
+    int32 f = 0;
+    DynamicArray<string> types = codecTypes();
+    DynamicArray<string> literals = codecLiterals();
+    DynamicArray<string> texts = codecTexts();
+    DynamicArray<string> binaries = codecBinaries();
+    isize i = 0;
+    while (i < types.length()) {
+        string problem = checkCase(type: types[i], literal: literals[i], text: texts[i], t: texts[i].bytes(), hex: binaries[i]);
+        string label = "codec: ".concat(other: copy types[i]).concat(other: " '").concat(other: copy literals[i]).concat(other: "'");
+        if (problem.length() > 0) { label = label.concat(other: " — ").concat(other: problem); }
+        f = f + check(ok: problem.length() == 0, what: give label);
+        i = i + 1;
+    }
+    return f;
+}

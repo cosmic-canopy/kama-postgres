@@ -1,0 +1,469 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::parse, std::fmt::ParseError,
+         std::time::Date, std::time::Timestamp, std::time::TimeError,
+         postgres::types::DecodeError, postgres::types::FORMAT_BINARY, postgres::types::utf8Text };
+export { LocalDateTime, TimeOfDay, TimeTz, Interval,
+         decodeDate, encodeDate, formatDate, decodeTimestamp, encodeTimestamp, formatTimestamp,
+         decodeTimestampTz, encodeTimestampTz, formatTimestampTz, decodeTime, encodeTime, decodeTimeTz,
+         encodeTimeTz, decodeInterval, encodeInterval };
+
+// Dates and times. PostgreSQL counts from 2000-01-01: a date is days since then (int32), a timestamp
+// microseconds since then (int64), and both reserve their extreme values for -infinity and infinity.
+//
+//   date          std::time::Date
+//   timestamptz   std::time::Timestamp (an instant; its nanoseconds reach 1677–2262, so a value outside is
+//                 OutOfRange)
+//   timestamp     LocalDateTime — a wall-clock reading with no zone, PostgreSQL's full range
+//   time          TimeOfDay       timetz  TimeTz       interval  Interval
+//
+// Text is what PostgreSQL prints with DateStyle ISO and IntervalStyle postgres, the defaults this client sets.
+
+comptime int64 MICROS_PER_SECOND = 1000000i64;
+comptime int64 MICROS_PER_DAY = 86400000000i64;
+comptime int64 PG_EPOCH_UNIX_DAYS = 10957i64;              // 2000-01-01 - 1970-01-01
+comptime int64 PG_EPOCH_UNIX_MICROS = 946684800000000i64;
+comptime int32 DATE_END = 2147483647;                      // DATEVAL_NOEND: infinity
+comptime int32 DATE_BEGIN = -2147483648;                   // DATEVAL_NOBEGIN: -infinity
+comptime int64 TIMESTAMP_END = 9223372036854775807i64;
+// -infinity for timestamps is int64's minimum. A function, not a `comptime`: that constant is emitted as an
+// out-of-range C literal (KPG-14), while the same value in an expression is not.
+fn int64 timestampBegin() { return -9223372036854775808i64; }
+
+fn uint64 be(ConstView<uint8> b, isize from, isize count) {
+    uint64 v = 0ui64;
+    isize i = from;
+    while (i < from + count) { v = (v << 8ui64) | cast<uint64>(b[i]); i = i + 1; }
+    return v;
+}
+
+fn void putBe(ref DynamicArray<uint8> to, uint64 v, isize bytes) {
+    isize i = bytes - 1;
+    while (i >= 0) { to.add(item: truncate<uint8>(v >> cast<uint64>(i * 8))); i = i - 1; }
+}
+
+fn Result<string, DecodeError> textOf(ConstView<uint8> raw) { return utf8Text(raw: raw); }
+
+fn DecodeError badText(const ref string type, const ref string text) { return DecodeError::BadText(type: copy type, text: copy text); }
+
+// ---- formatting pieces ------------------------------------------------------------------------------------
+
+fn string zeroPad(int64 v, isize width) {
+    string digits = "${v}";
+    while (digits.length() < width) { digits = "0".concat(other: digits); }
+    return digits;
+}
+
+// ".ffffff" with trailing zeros removed, or "" for a whole second — as PostgreSQL prints fractions.
+fn string fraction(int64 micros) {
+    if (micros == 0i64) { return ""; }
+    string f = zeroPad(v: micros, width: 6);
+    while (f.endsWith(suffix: "0")) { f = f.substring(start: 0, end: f.length() - 1); }
+    return ".".concat(other: f);
+}
+
+// HH:MM:SS[.ffffff] for microseconds into a day (24:00:00 included).
+fn string clock(int64 micros) {
+    int64 seconds = micros / MICROS_PER_SECOND;
+    int64 rest = micros % MICROS_PER_SECOND;
+    string h = zeroPad(v: seconds / 3600i64, width: 2);
+    string m = zeroPad(v: (seconds / 60i64) % 60i64, width: 2);
+    string s = zeroPad(v: seconds % 60i64, width: 2);
+    return h.concat(other: ":").concat(other: m).concat(other: ":").concat(other: s).concat(other: fraction(micros: rest));
+}
+
+// Microseconds since the PostgreSQL epoch, split into a day number and the microseconds into it.
+fn int64 floorDiv(int64 a, int64 b) {
+    int64 q = a / b;
+    if ((a % b != 0i64) && ((a < 0i64) != (b < 0i64))) { q = q - 1i64; }
+    return q;
+}
+
+// ---- parsing pieces -----------------------------------------------------------------------------------------
+
+// Digits from `at` while they last: the value and how many there were.
+fn int64 digitsValue(ConstView<uint8> b, isize at, ref isize count) {
+    int64 v = 0i64;
+    isize i = at;
+    while (i < b.length() && b[i] >= 48ui8 && b[i] <= 57ui8 && i - at < 18) {
+        v = v * 10i64 + cast<int64>(b[i] - 48ui8);
+        i = i + 1;
+    }
+    count = i - at;
+    return v;
+}
+
+// HH:MM:SS[.ffffff] at `at` (hours may exceed 23, as an interval's do): the microseconds, and where it ended.
+// -1 if it is not one.
+fn int64 parseClock(ConstView<uint8> b, isize at, ref isize end) {
+    isize n = 0;
+    int64 h = digitsValue(b: b, at: at, count: ref n);
+    if (n < 1) { return -1i64; }
+    isize i = at + n;
+    if (i >= b.length() || b[i] != 58ui8) { return -1i64; }
+    int64 m = digitsValue(b: b, at: i + 1, count: ref n);
+    if (n != 2 || m > 59i64) { return -1i64; }
+    i = i + 1 + n;
+    int64 s = 0i64;
+    if (i < b.length() && b[i] == 58ui8) {
+        s = digitsValue(b: b, at: i + 1, count: ref n);
+        if (n != 2 || s > 60i64) { return -1i64; }
+        i = i + 1 + n;
+    }
+    int64 frac = 0i64;
+    if (i < b.length() && b[i] == 46ui8) {
+        isize start = i + 1;
+        int64 scale = 100000i64;
+        i = start;
+        while (i < b.length() && b[i] >= 48ui8 && b[i] <= 57ui8) {
+            if (i - start < 6) { frac = frac + cast<int64>(b[i] - 48ui8) * scale; scale = scale / 10i64; }
+            i = i + 1;
+        }
+        if (i == start) { return -1i64; }
+    }
+    end = i;
+    return ((h * 60i64 + m) * 60i64 + s) * MICROS_PER_SECOND + frac;
+}
+
+// YYYY-MM-DD at the start of `b`, with an optional " BC" anywhere after: the PostgreSQL day number.
+fn Result<int64, DecodeError> parseDateDays(ConstView<uint8> b, const ref string text, const ref string type, ref isize end) {
+    isize n = 0;
+    int64 y = digitsValue(b: b, at: 0, count: ref n);
+    if (n < 4) { return Result::Err(error: badText(type: type, text: text)); }
+    isize i = n;
+    if (i >= b.length() || b[i] != 45ui8) { return Result::Err(error: badText(type: type, text: text)); }
+    int64 mo = digitsValue(b: b, at: i + 1, count: ref n);
+    if (n != 2) { return Result::Err(error: badText(type: type, text: text)); }
+    i = i + 3;
+    if (i >= b.length() || b[i] != 45ui8) { return Result::Err(error: badText(type: type, text: text)); }
+    int64 d = digitsValue(b: b, at: i + 1, count: ref n);
+    if (n != 2) { return Result::Err(error: badText(type: type, text: text)); }
+    i = i + 3;
+    if (text.endsWith(suffix: " BC")) { y = 1i64 - y; }
+    if (y < -2147483647i64 || y > 2147483647i64) { return Result::Err(error: DecodeError::OutOfRange(type: copy type)); }
+    Result<Date, TimeError> date = Date.make(year: cast<int32>(y), month: truncate<uint8>(mo), day: truncate<uint8>(d));
+    int64 unixDays = match (date) { case Ok(value: x): x.unixDays(); case Err(error: e): { return Result::Err(error: badText(type: type, text: text)); } };
+    end = i;
+    return Result::Ok(value: unixDays - PG_EPOCH_UNIX_DAYS);
+}
+
+// ---- date ---------------------------------------------------------------------------------------------------
+
+unsafe fn Result<Date, DecodeError> decodeDate(int16 format, ConstView<uint8> raw) {
+    int64 days = 0i64;
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 4) { return Result::Err(error: DecodeError::BadLength(type: "date", got: raw.length())); }
+        int32 v = truncate<int32>(be(b: raw, from: 0, count: 4));
+        if (v == DATE_END || v == DATE_BEGIN) { return Result::Err(error: DecodeError::OutOfRange(type: "date")); }
+        days = cast<int64>(v);
+    } else {
+        Result<string, DecodeError> t = textOf(raw: raw);
+        string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+        if (text.equals(other: "infinity") || text.equals(other: "-infinity")) { return Result::Err(error: DecodeError::OutOfRange(type: "date")); }
+        isize end = 0;
+        string type = "date";
+        Result<int64, DecodeError> parsed = parseDateDays(b: raw, text: text, type: type, end: ref end);
+        days = match (give parsed) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+    }
+    Result<Date, TimeError> d = Date.fromUnixDays(days: days + PG_EPOCH_UNIX_DAYS);
+    return match (d) { case Ok(value: x): Result::Ok(value: x); case Err(error: e): Result::Err(error: DecodeError::OutOfRange(type: "date")); };
+}
+
+fn void encodeDate(ref DynamicArray<uint8> to, const ref Date d) {
+    int64 days = d.unixDays() - PG_EPOCH_UNIX_DAYS;
+    putBe(to: ref to, v: cast<uint64>(truncate<uint32>(cast<int32>(days))), bytes: 4);
+}
+
+// YYYY-MM-DD, with " BC" for a year before 1 (DateStyle ISO).
+fn string formatDate(const ref Date d) {
+    int32 y = d.year();
+    string day = zeroPad(v: cast<int64>(d.month()), width: 2).concat(other: "-").concat(other: zeroPad(v: cast<int64>(d.day()), width: 2));
+    if (y <= 0) { return zeroPad(v: cast<int64>(1 - y), width: 4).concat(other: "-").concat(other: day).concat(other: " BC"); }
+    return zeroPad(v: cast<int64>(y), width: 4).concat(other: "-").concat(other: day);
+}
+
+// ---- timestamp without time zone ----------------------------------------------------------------------------
+
+// A wall-clock reading with no zone: microseconds since 2000-01-01 00:00:00, PostgreSQL's own representation and
+// range.
+type value LocalDateTime {
+    int64 us = 0i64;
+    public ctor fromPgMicros(int64 micros) { this.us = micros; }
+    public ctor Result<LocalDateTime, TimeError> make(const ref Date date, int64 microsOfDay) {
+        if (microsOfDay < 0i64 || microsOfDay >= MICROS_PER_DAY) { return Result::Err(error: TimeError::OutOfRange); }
+        return Result::Ok(value: LocalDateTime.fromPgMicros(micros: (date.unixDays() - PG_EPOCH_UNIX_DAYS) * MICROS_PER_DAY + microsOfDay));
+    }
+    public const fn int64 pgMicros() { return this.us; }
+    public const fn Result<Date, TimeError> date() { return Date.fromUnixDays(days: floorDiv(a: this.us, b: MICROS_PER_DAY) + PG_EPOCH_UNIX_DAYS); }
+    public const fn int64 microsOfDay() { return this.us - floorDiv(a: this.us, b: MICROS_PER_DAY) * MICROS_PER_DAY; }
+    public const fn bool equals(const ref LocalDateTime other) { return this.us == other.us; }
+}
+
+unsafe fn Result<LocalDateTime, DecodeError> decodeTimestamp(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 8) { return Result::Err(error: DecodeError::BadLength(type: "timestamp", got: raw.length())); }
+        int64 v = truncate<int64>(be(b: raw, from: 0, count: 8));
+        if (v == TIMESTAMP_END || v == timestampBegin()) { return Result::Err(error: DecodeError::OutOfRange(type: "timestamp")); }
+        return Result::Ok(value: LocalDateTime.fromPgMicros(micros: v));
+    }
+    Result<string, DecodeError> t = textOf(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    if (text.equals(other: "infinity") || text.equals(other: "-infinity")) { return Result::Err(error: DecodeError::OutOfRange(type: "timestamp")); }
+    string type = "timestamp";
+    isize end = 0;
+    Result<int64, DecodeError> parsed = parseDateDays(b: raw, text: text, type: type, end: ref end);
+    int64 days = match (give parsed) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+    if (end >= raw.length() || raw[end] != 32ui8) { return Result::Err(error: badText(type: type, text: text)); }
+    isize clockEnd = 0;
+    int64 micros = parseClock(b: raw, at: end + 1, end: ref clockEnd);
+    if (micros < 0i64) { return Result::Err(error: badText(type: type, text: text)); }
+    return Result::Ok(value: LocalDateTime.fromPgMicros(micros: days * MICROS_PER_DAY + micros));
+}
+
+fn void encodeTimestamp(ref DynamicArray<uint8> to, const ref LocalDateTime v) { putBe(to: ref to, v: truncate<uint64>(v.pgMicros()), bytes: 8); }
+
+fn Result<string, DecodeError> formatPgMicros(int64 micros) {
+    int64 days = floorDiv(a: micros, b: MICROS_PER_DAY);
+    Result<Date, TimeError> dv = Date.fromUnixDays(days: days + PG_EPOCH_UNIX_DAYS);
+    string formatted = match (dv) { case Ok(value: x): formatDate(d: x); case Err(error: e): { return Result::Err(error: DecodeError::OutOfRange(type: "timestamp")); } };
+    return Result::Ok(value: formatted.concat(other: " ").concat(other: clock(micros: micros - days * MICROS_PER_DAY)));
+}
+
+// YYYY-MM-DD HH:MM:SS[.ffffff] (with " BC" placed as PostgreSQL places it, after the time).
+fn string formatTimestamp(const ref LocalDateTime v) {
+    Result<string, DecodeError> s = formatPgMicros(micros: v.pgMicros());
+    string text = match (give s) { case Ok(value: t): give t; case Err(error: e): "out of range"; };
+    if (text.contains(substring: " BC ")) { text = text.replace(old: " BC ", with: " ").concat(other: " BC"); }
+    return text;
+}
+
+// ---- timestamp with time zone -------------------------------------------------------------------------------
+
+unsafe fn Result<Timestamp, DecodeError> decodeTimestampTz(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 8) { return Result::Err(error: DecodeError::BadLength(type: "timestamptz", got: raw.length())); }
+        int64 v = truncate<int64>(be(b: raw, from: 0, count: 8));
+        if (v == TIMESTAMP_END || v == timestampBegin()) { return Result::Err(error: DecodeError::OutOfRange(type: "timestamptz")); }
+        // std::time::Timestamp holds int64 nanoseconds since 1970: about ±292 years.
+        if (v > 8276687363854775i64 || v < -10169680836854775i64) { return Result::Err(error: DecodeError::OutOfRange(type: "timestamptz")); }
+        return Result::Ok(value: Timestamp.fromUnixMicros(us: v + PG_EPOCH_UNIX_MICROS));
+    }
+    Result<string, DecodeError> t = textOf(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    if (text.equals(other: "infinity") || text.equals(other: "-infinity")) { return Result::Err(error: DecodeError::OutOfRange(type: "timestamptz")); }
+    Result<Timestamp, TimeError> parsed = Timestamp.parse(text: text);
+    return match (parsed) {
+        case Ok(value: x): Result::Ok(value: x);
+        case Err(error: e): Result::Err(error: badText(type: "timestamptz", text: text));
+    };
+}
+
+fn void encodeTimestampTz(ref DynamicArray<uint8> to, const ref Timestamp v) {
+    putBe(to: ref to, v: truncate<uint64>(v.asUnixMicros() - PG_EPOCH_UNIX_MICROS), bytes: 8);
+}
+
+// In UTC, as PostgreSQL prints it with TimeZone UTC: YYYY-MM-DD HH:MM:SS[.ffffff]+00.
+fn string formatTimestampTz(const ref Timestamp v) {
+    Result<string, DecodeError> s = formatPgMicros(micros: v.asUnixMicros() - PG_EPOCH_UNIX_MICROS);
+    string text = match (give s) { case Ok(value: t): give t; case Err(error: e): "out of range"; };
+    return text.concat(other: "+00");
+}
+
+// ---- time and timetz ----------------------------------------------------------------------------------------
+
+// A time of day without a date: microseconds since midnight, 00:00:00 through 24:00:00.
+type value TimeOfDay implements Formattable {
+    int64 us = 0i64;
+    public ctor Result<TimeOfDay, TimeError> fromMicros(int64 micros) {
+        if (micros < 0i64 || micros > MICROS_PER_DAY) { return Result::Err(error: TimeError::OutOfRange); }
+        return Result::Ok(value: TimeOfDay.raw(micros: micros));
+    }
+    ctor raw(int64 micros) { this.us = micros; }
+    public const fn int64 micros() { return this.us; }
+    public const fn bool equals(const ref TimeOfDay other) { return this.us == other.us; }
+    public const fn void format(ref Formatter f) { string s = clock(micros: this.us); f.writeStr(s: ref s); }
+    friend postgres::types::decodeTime[raw];
+}
+
+unsafe fn Result<TimeOfDay, DecodeError> decodeTime(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 8) { return Result::Err(error: DecodeError::BadLength(type: "time", got: raw.length())); }
+        int64 v = truncate<int64>(be(b: raw, from: 0, count: 8));
+        if (v < 0i64 || v > MICROS_PER_DAY) { return Result::Err(error: DecodeError::OutOfRange(type: "time")); }
+        return Result::Ok(value: TimeOfDay.raw(micros: v));
+    }
+    Result<string, DecodeError> t = textOf(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    isize end = 0;
+    int64 v = parseClock(b: raw, at: 0, end: ref end);
+    if (v < 0i64 || end != raw.length() || v > MICROS_PER_DAY) { return Result::Err(error: badText(type: "time", text: text)); }
+    return Result::Ok(value: TimeOfDay.raw(micros: v));
+}
+
+fn void encodeTime(ref DynamicArray<uint8> to, const ref TimeOfDay v) { putBe(to: ref to, v: truncate<uint64>(v.micros()), bytes: 8); }
+
+// A time of day with a UTC offset. PostgreSQL stores the zone as seconds WEST of UTC; `offsetSeconds()` answers
+// it the usual way round (east positive: +05:30 is 19800).
+type value TimeTz implements Formattable {
+    int64 us = 0i64;
+    int32 zoneWest = 0;
+    public ctor Result<TimeTz, TimeError> make(int64 micros, int32 offsetSeconds) {
+        if (micros < 0i64 || micros > MICROS_PER_DAY || offsetSeconds > 57599 || offsetSeconds < -57599) { return Result::Err(error: TimeError::OutOfRange); }
+        return Result::Ok(value: TimeTz.raw(micros: micros, zoneWest: -offsetSeconds));
+    }
+    ctor raw(int64 micros, int32 zoneWest) { this.us = micros; this.zoneWest = zoneWest; }
+    public const fn int64 micros() { return this.us; }
+    public const fn int32 offsetSeconds() { return -this.zoneWest; }
+    public const fn bool equals(const ref TimeTz other) { return this.us == other.us && this.zoneWest == other.zoneWest; }
+    public const fn void format(ref Formatter f) {
+        int32 east = -this.zoneWest;
+        string sign = "+";
+        if (east < 0) { sign = "-"; east = -east; }
+        string s = clock(micros: this.us).concat(other: sign).concat(other: zeroPad(v: cast<int64>(east / 3600), width: 2));
+        if ((east / 60) % 60 != 0 || east % 60 != 0) { s = s.concat(other: ":").concat(other: zeroPad(v: cast<int64>((east / 60) % 60), width: 2)); }
+        if (east % 60 != 0) { s = s.concat(other: ":").concat(other: zeroPad(v: cast<int64>(east % 60), width: 2)); }
+        f.writeStr(s: ref s);
+    }
+    friend postgres::types::decodeTimeTz[raw];
+}
+
+unsafe fn Result<TimeTz, DecodeError> decodeTimeTz(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 12) { return Result::Err(error: DecodeError::BadLength(type: "timetz", got: raw.length())); }
+        int64 v = truncate<int64>(be(b: raw, from: 0, count: 8));
+        int32 zone = truncate<int32>(be(b: raw, from: 8, count: 4));
+        if (v < 0i64 || v > MICROS_PER_DAY) { return Result::Err(error: DecodeError::OutOfRange(type: "timetz")); }
+        return Result::Ok(value: TimeTz.raw(micros: v, zoneWest: zone));
+    }
+    Result<string, DecodeError> t = textOf(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    isize end = 0;
+    int64 v = parseClock(b: raw, at: 0, end: ref end);
+    if (v < 0i64 || end >= raw.length() || (raw[end] != 43ui8 && raw[end] != 45ui8)) { return Result::Err(error: badText(type: "timetz", text: text)); }
+    bool negative = raw[end] == 45ui8;
+    isize n = 0;
+    int64 hh = digitsValue(b: raw, at: end + 1, count: ref n);
+    if (n != 2) { return Result::Err(error: badText(type: "timetz", text: text)); }
+    isize i = end + 1 + n;
+    int64 mm = 0i64;
+    int64 ss = 0i64;
+    if (i < raw.length() && raw[i] == 58ui8) { mm = digitsValue(b: raw, at: i + 1, count: ref n); i = i + 1 + n; }
+    if (i < raw.length() && raw[i] == 58ui8) { ss = digitsValue(b: raw, at: i + 1, count: ref n); i = i + 1 + n; }
+    if (i != raw.length()) { return Result::Err(error: badText(type: "timetz", text: text)); }
+    int64 east = hh * 3600i64 + mm * 60i64 + ss;
+    if (negative) { east = -east; }
+    return Result::Ok(value: TimeTz.raw(micros: v, zoneWest: cast<int32>(-east)));
+}
+
+fn void encodeTimeTz(ref DynamicArray<uint8> to, const ref TimeTz v) {
+    putBe(to: ref to, v: truncate<uint64>(v.micros()), bytes: 8);
+    putBe(to: ref to, v: cast<uint64>(truncate<uint32>(-v.offsetSeconds())), bytes: 4);
+}
+
+// ---- interval -----------------------------------------------------------------------------------------------
+
+// An interval as PostgreSQL keeps it: months, days and microseconds, each signed and independent (a month is
+// not a fixed number of days, nor a day a fixed number of microseconds, across a DST change).
+type value Interval implements Formattable {
+    int64 us = 0i64;
+    int32 d = 0;
+    int32 m = 0;
+    public ctor make(int32 months, int32 days, int64 micros) { this.m = months; this.d = days; this.us = micros; }
+    public const fn int32 months() { return this.m; }
+    public const fn int32 days() { return this.d; }
+    public const fn int64 micros() { return this.us; }
+    public const fn bool equals(const ref Interval other) { return this.m == other.m && this.d == other.d && this.us == other.us; }
+
+    // IntervalStyle postgres, exactly as PostgreSQL's EncodeInterval writes it: "1 year 2 mons 3 days 04:05:06.789",
+    // "-1 days", "1 mon -1 days +00:00:00.5", "00:00:00".
+    public const fn void format(ref Formatter f) {
+        string s = "";
+        bool zero = true;
+        bool before = false;
+        int32 years = this.m / 12;
+        int32 mons = this.m % 12;
+        s = intervalPart(s: s, value: cast<int64>(years), unit: "year", zero: ref zero, before: ref before);
+        s = intervalPart(s: s, value: cast<int64>(mons), unit: "mon", zero: ref zero, before: ref before);
+        s = intervalPart(s: s, value: cast<int64>(this.d), unit: "day", zero: ref zero, before: ref before);
+        if (zero || this.us != 0i64) {
+            bool minus = this.us < 0i64;
+            uint64 magnitude = 0ui64;
+            if (minus) { magnitude = cast<uint64>(-(this.us + 1i64)) + 1ui64; } else { magnitude = cast<uint64>(this.us); }
+            int64 hours = cast<int64>(magnitude / 3600000000ui64);
+            int64 rest = cast<int64>(magnitude % 3600000000ui64);
+            if (!zero) { s = s.concat(other: " "); }
+            if (minus) { s = s.concat(other: "-"); } else if (before) { s = s.concat(other: "+"); }
+            s = s.concat(other: zeroPad(v: hours, width: 2)).concat(other: ":").concat(other: zeroPad(v: rest / 60000000i64, width: 2));
+            s = s.concat(other: ":").concat(other: zeroPad(v: (rest / MICROS_PER_SECOND) % 60i64, width: 2)).concat(other: fraction(micros: rest % MICROS_PER_SECOND));
+        }
+        f.writeStr(s: ref s);
+    }
+}
+
+// One "N unit[s]" field. Each nonzero field sets `before` for the next, which decides whether a positive time
+// part carries an explicit "+" — PostgreSQL's AddPostgresIntPart, quirk included.
+fn string intervalPart(const ref string s, int64 value, const ref string unit, ref bool zero, ref bool before) {
+    if (value == 0i64) { return copy s; }
+    string acc = copy s;
+    if (!zero) { acc = acc.concat(other: " "); }
+    if (before && value > 0i64) { acc = acc.concat(other: "+"); }
+    acc = acc.concat(other: "${value} ").concat(other: unit);
+    if (value != 1i64) { acc = acc.concat(other: "s"); }
+    before = value < 0i64;
+    zero = false;
+    return acc;
+}
+
+unsafe fn Result<Interval, DecodeError> decodeInterval(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 16) { return Result::Err(error: DecodeError::BadLength(type: "interval", got: raw.length())); }
+        int64 us = truncate<int64>(be(b: raw, from: 0, count: 8));
+        int32 days = truncate<int32>(be(b: raw, from: 8, count: 4));
+        int32 months = truncate<int32>(be(b: raw, from: 12, count: 4));
+        return Result::Ok(value: Interval.make(months: months, days: days, micros: us));
+    }
+    // IntervalStyle postgres: "[+-]N year[s]", "mon[s]", "day[s]", and an optional "[+-]HH:MM:SS[.ffffff]".
+    Result<string, DecodeError> t = textOf(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    int64 months = 0i64;
+    int64 days = 0i64;
+    int64 micros = 0i64;
+    isize i = 0;
+    isize n = raw.length();
+    while (i < n) {
+        if (raw[i] == 32ui8) { i = i + 1; continue; }
+        bool negative = false;
+        if (raw[i] == 45ui8 || raw[i] == 43ui8) { negative = raw[i] == 45ui8; i = i + 1; }
+        isize count = 0;
+        int64 v = digitsValue(b: raw, at: i, count: ref count);
+        if (count == 0) { return Result::Err(error: badText(type: "interval", text: text)); }
+        if (i + count < n && raw[i + count] == 58ui8) {
+            isize end = 0;
+            int64 c = parseClock(b: raw, at: i, end: ref end);
+            if (c < 0i64) { return Result::Err(error: badText(type: "interval", text: text)); }
+            if (negative) { c = -c; }
+            micros = micros + c;
+            i = end;
+            continue;
+        }
+        i = i + count;
+        if (i >= n || raw[i] != 32ui8) { return Result::Err(error: badText(type: "interval", text: text)); }
+        i = i + 1;
+        isize unitStart = i;
+        while (i < n && raw[i] != 32ui8) { i = i + 1; }
+        string unit = text.substring(start: unitStart, end: i);
+        if (negative) { v = -v; }
+        if (unit.equals(other: "year") || unit.equals(other: "years")) { months = months + v * 12i64; }
+        else if (unit.equals(other: "mon") || unit.equals(other: "mons")) { months = months + v; }
+        else if (unit.equals(other: "day") || unit.equals(other: "days")) { days = days + v; }
+        else { return Result::Err(error: badText(type: "interval", text: text)); }
+    }
+    if (months > 2147483647i64 || months < -2147483648i64 || days > 2147483647i64 || days < -2147483648i64) {
+        return Result::Err(error: DecodeError::OutOfRange(type: "interval"));
+    }
+    return Result::Ok(value: Interval.make(months: cast<int32>(months), days: cast<int32>(days), micros: micros));
+}
+
+fn void encodeInterval(ref DynamicArray<uint8> to, const ref Interval v) {
+    putBe(to: ref to, v: truncate<uint64>(v.micros()), bytes: 8);
+    putBe(to: ref to, v: cast<uint64>(truncate<uint32>(v.days())), bytes: 4);
+    putBe(to: ref to, v: cast<uint64>(truncate<uint32>(v.months())), bytes: 4);
+}

@@ -15,7 +15,7 @@ aarch64 inside `localhost/kama-dev`), and the first report against `0.9.470` and
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** KPG-11 and KPG-12, found building the protocol layer. Every earlier gap is fixed, except KPG-8,
+**Open now:** KPG-11 to KPG-14, found building the protocol and type layers. Every earlier gap is fixed, except KPG-8,
 which is closed as a non-goal (see below).
 
 **Priorities:**
@@ -92,6 +92,70 @@ float64 magnitude = abs(x: sine);
 (`floor(|sin(i + 1)| · 2^32)`) is written that way.
 
 **Suggested fix.** Infer a generic argument from a call whose return type is already known.
+
+### KPG-13 · MED · `parse::<float64>` refuses a subnormal it read exactly
+
+**Status:** open. Reproduces on 0.9.486.
+
+```kama
+import { core::println, std::fmt::parse, std::fmt::ParseError };
+fn int32 main() {
+    string tiny = "5e-324";                       // the smallest positive float64
+    string small = "2.2250738585072014e-308";     // DBL_MIN, normal
+    string sub = "1e-310";                        // subnormal
+    Result<float64, ParseError> a = parse::<float64>(s: tiny);
+    Result<float64, ParseError> b = parse::<float64>(s: small);
+    Result<float64, ParseError> c = parse::<float64>(s: sub);
+    string ra = match (a) { case Ok(value: v): "ok"; case Err(error: e): e.message(); };
+    string rb = match (b) { case Ok(value: v): "ok"; case Err(error: e): e.message(); };
+    string rc = match (c) { case Ok(value: v): "ok"; case Err(error: e): e.message(); };
+    println(s: "5e-324: ${ra}; DBL_MIN: ${rb}; 1e-310: ${rc}");
+    return 0;
+}
+```
+
+```
+5e-324: number out of range for this type; DBL_MIN: ok; 1e-310: number out of range for this type
+```
+
+**Evidence.** `include/kama_fmt.h:35`: `if (errno == ERANGE) return 3;`. strtod sets ERANGE on underflow even
+when it returns the correctly rounded subnormal, so every subnormal is refused although each is a valid
+float64.
+
+**Impact.** A `float8` column holding a subnormal fails to decode from text, and PostgreSQL's own output of
+`5e-324` is one of this package's server vectors. JSON numbers would hit the same refusal.
+
+**Workaround here.** `postgres::types` retries an out-of-range parse with libc `strtod` directly (an `extern`
+in `src/types/codec.kama`), and accepts any finite answer.
+
+**Suggested fix.** Report ERANGE as out of range only for an overflow (the result is ±HUGE_VAL). An underflow
+returns a value that is exactly what was written, or the nearest representable one, and should be accepted.
+
+### KPG-14 · LOW · A `comptime int64` at int64's minimum is emitted as an out-of-range C literal
+
+**Status:** open. Reproduces on 0.9.486.
+
+```kama
+// The minimum int64, spelled the only way a literal can reach it.
+comptime int64 LOWEST = -9223372036854775807i64 - 1i64;
+fn int32 main() { int64 x = LOWEST; if (x < 0i64) { return 0; } return 1; }
+```
+
+```
+int64min.kama:2:45: warning: integer literal is too large to be represented in a signed integer type,
+interpreting as unsigned [-Wimplicitly-unsigned-literal]
+```
+
+The emitted C is `static const int64_t … = -9223372036854775808;`, the same text whether the constant is
+written `-9223372036854775808i64` or folded from `-9223372036854775807i64 - 1i64`. The program still runs
+correctly: the unsigned value converts back. The same literal inside an expression in a function body
+(`int64 x = -9223372036854775808i64;`) builds without a warning, so only the `comptime` emission has it.
+
+**Impact.** A warning in every build of every consumer: `timestamp`'s -infinity is int64's minimum.
+
+**Workaround here.** `src/types/datetime.kama` returns it from a function instead of declaring a `comptime`.
+
+**Suggested fix.** Emit `INT64_MIN`, or `(-9223372036854775807LL - 1)`, for that value.
 
 ---
 

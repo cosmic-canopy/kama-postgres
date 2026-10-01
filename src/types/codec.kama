@@ -1,0 +1,282 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::parse, std::fmt::ParseError,
+         std::encoding::utf8::decode, std::encoding::utf8::Utf8Error, std::encoding::hex::encode as hexEncode,
+         std::uuid::Uuid, std::uuid::UuidError };
+export { DecodeError, FORMAT_TEXT, FORMAT_BINARY,
+         decodeBool, decodeInt2, decodeInt4, decodeInt8, decodeFloat4, decodeFloat8, decodeOid, decodeText,
+         decodeJsonb, decodeBytea, decodeUuid,
+         encodeBool, encodeInt2, encodeInt4, encodeInt8, encodeFloat4, encodeFloat8, encodeOid, encodeText,
+         encodeJsonb, encodeBytea, encodeUuid,
+         formatBool, formatBytea, utf8Text };
+
+// postgres::types — PostgreSQL values in kama: decoding a column's bytes in either wire format (text, the
+// type's output function; binary, its send function), encoding a parameter in binary, and formatting the
+// text PostgreSQL itself would print. Every codec is tested against bytes a live server produced
+// (tools/gen-codec-vectors.sh).
+//
+// A value PostgreSQL can hold but the kama type cannot (a date of infinity, a timestamp past 2262) is
+// `DecodeError::OutOfRange`. It is never clamped or wrapped.
+
+// The wire formats, as Bind and RowDescription number them.
+comptime int16 FORMAT_TEXT = 0i16;
+comptime int16 FORMAT_BINARY = 1i16;
+
+type enum DecodeError implements Error {
+    // A binary value of the wrong size for its type.
+    BadLength(string type, isize got),
+    // Text that is not a value of the type.
+    BadText(string type, string text),
+    // A value PostgreSQL holds that the kama type cannot: infinity, NaN for an integer, a year out of range.
+    OutOfRange(string type),
+    // Text that is not UTF-8.
+    NotUtf8,
+    // A binary layout this client does not know (a jsonb version other than 1).
+    Unsupported(string type, string what);
+
+    public const fn string message() {
+        return match (this) {
+            case BadLength(type: t, got: n): "a binary ".concat(other: t).concat(other: " of ${n} bytes");
+            case BadText(type: t, text: x): "\"".concat(other: x).concat(other: "\" is not a valid ").concat(other: t);
+            case OutOfRange(type: t): "the ".concat(other: t).concat(other: " value is out of range for its kama type");
+            case NotUtf8: "text that is not UTF-8";
+            case Unsupported(type: t, what: w): "unsupported ".concat(other: t).concat(other: ": ").concat(other: w);
+        };
+    }
+}
+
+unsafe fn Result<string, DecodeError> utf8Text(ConstView<uint8> raw) {
+    Result<string, Utf8Error> s = decode(bytes: raw);
+    return match (give s) { case Ok(value: t): Result::Ok(value: give t); case Err(error: e): Result::Err(error: DecodeError::NotUtf8); };
+}
+
+fn Result<string, DecodeError> badText(const ref string type, const ref string text) {
+    return Result::Err(error: DecodeError::BadText(type: copy type, text: copy text));
+}
+
+fn uint64 bigEndian(ConstView<uint8> b) {
+    uint64 v = 0ui64;
+    isize i = 0;
+    while (i < b.length()) { v = (v << 8ui64) | cast<uint64>(b[i]); i = i + 1; }
+    return v;
+}
+
+fn void putBigEndian(ref DynamicArray<uint8> to, uint64 v, isize bytes) {
+    isize i = bytes - 1;
+    while (i >= 0) { to.add(item: truncate<uint8>(v >> cast<uint64>(i * 8))); i = i - 1; }
+}
+
+// ---- bool ---------------------------------------------------------------------------------------------------
+
+unsafe fn Result<bool, DecodeError> decodeBool(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 1) { return Result::Err(error: DecodeError::BadLength(type: "bool", got: raw.length())); }
+        return Result::Ok(value: raw[0] != 0ui8);
+    }
+    if (raw.length() == 1 && raw[0] == 116ui8) { return Result::Ok(value: true); }    // 't'
+    if (raw.length() == 1 && raw[0] == 102ui8) { return Result::Ok(value: false); }   // 'f'
+    Result<string, DecodeError> t = utf8Text(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    return Result::Err(error: DecodeError::BadText(type: "bool", text: copy text));
+}
+
+fn void encodeBool(ref DynamicArray<uint8> to, bool v) { if (v) { to.add(item: 1ui8); } else { to.add(item: 0ui8); } }
+
+fn string formatBool(bool v) { if (v) { return "t"; } return "f"; }
+
+// ---- integers -----------------------------------------------------------------------------------------------
+
+unsafe fn Result<int16, DecodeError> decodeInt2(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 2) { return Result::Err(error: DecodeError::BadLength(type: "int2", got: raw.length())); }
+        return Result::Ok(value: truncate<int16>(bigEndian(b: raw)));
+    }
+    Result<string, DecodeError> t = utf8Text(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    Result<int16, ParseError> v = parse::<int16>(s: text);
+    return match (v) { case Ok(value: x): Result::Ok(value: x); case Err(error: e): Result::Err(error: DecodeError::BadText(type: "int2", text: copy text)); };
+}
+
+unsafe fn Result<int32, DecodeError> decodeInt4(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 4) { return Result::Err(error: DecodeError::BadLength(type: "int4", got: raw.length())); }
+        return Result::Ok(value: truncate<int32>(bigEndian(b: raw)));
+    }
+    Result<string, DecodeError> t = utf8Text(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    Result<int32, ParseError> v = parse::<int32>(s: text);
+    return match (v) { case Ok(value: x): Result::Ok(value: x); case Err(error: e): Result::Err(error: DecodeError::BadText(type: "int4", text: copy text)); };
+}
+
+unsafe fn Result<int64, DecodeError> decodeInt8(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 8) { return Result::Err(error: DecodeError::BadLength(type: "int8", got: raw.length())); }
+        return Result::Ok(value: truncate<int64>(bigEndian(b: raw)));
+    }
+    Result<string, DecodeError> t = utf8Text(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    Result<int64, ParseError> v = parse::<int64>(s: text);
+    return match (v) { case Ok(value: x): Result::Ok(value: x); case Err(error: e): Result::Err(error: DecodeError::BadText(type: "int8", text: copy text)); };
+}
+
+unsafe fn Result<uint32, DecodeError> decodeOid(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 4) { return Result::Err(error: DecodeError::BadLength(type: "oid", got: raw.length())); }
+        return Result::Ok(value: truncate<uint32>(bigEndian(b: raw)));
+    }
+    Result<string, DecodeError> t = utf8Text(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    Result<uint32, ParseError> v = parse::<uint32>(s: text);
+    return match (v) { case Ok(value: x): Result::Ok(value: x); case Err(error: e): Result::Err(error: DecodeError::BadText(type: "oid", text: copy text)); };
+}
+
+fn void encodeInt2(ref DynamicArray<uint8> to, int16 v) { putBigEndian(to: ref to, v: cast<uint64>(truncate<uint16>(v)), bytes: 2); }
+fn void encodeInt4(ref DynamicArray<uint8> to, int32 v) { putBigEndian(to: ref to, v: cast<uint64>(truncate<uint32>(v)), bytes: 4); }
+fn void encodeInt8(ref DynamicArray<uint8> to, int64 v) { putBigEndian(to: ref to, v: truncate<uint64>(v), bytes: 8); }
+fn void encodeOid(ref DynamicArray<uint8> to, uint32 v) { putBigEndian(to: ref to, v: cast<uint64>(v), bytes: 4); }
+
+// ---- floats -------------------------------------------------------------------------------------------------
+
+// PostgreSQL's text: shortest round-trip digits (extra_float_digits 1, the default since 12), and Infinity,
+// -Infinity and NaN spelled out. strtod reads all of them.
+unsafe fn Result<float64, DecodeError> floatText(ConstView<uint8> raw, const ref string type) {
+    Result<string, DecodeError> t = utf8Text(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    Result<float64, ParseError> v = parse::<float64>(s: text);
+    bool outOfRange = match (v) { case Ok(value: x): false; case Err(error: e): match (e) { case OutOfRange: true; case _: false; }; };
+    if (outOfRange) {
+        // std reports strtod's ERANGE as an error even for a subnormal it read exactly (KPG-13). Ask strtod
+        // directly: a finite answer is the value; only an overflow (±HUGE_VAL) is out of range.
+        float64 direct = strtod(nptr: text.cstr(), endptr: null);
+        if (direct != direct * 2.0 || direct == 0.0) { return Result::Ok(value: direct); }
+        return Result::Err(error: DecodeError::OutOfRange(type: copy type));
+    }
+    return match (v) { case Ok(value: x): Result::Ok(value: x); case Err(error: e): Result::Err(error: DecodeError::BadText(type: copy type, text: copy text)); };
+}
+
+extern "<stdlib.h>";
+extern fn float64 strtod(UnsafeConstPtr<cchar> nptr, UnsafePtr endptr);
+
+unsafe fn Result<float32, DecodeError> decodeFloat4(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 4) { return Result::Err(error: DecodeError::BadLength(type: "float4", got: raw.length())); }
+        uint32 bits = truncate<uint32>(bigEndian(b: raw));
+        return Result::Ok(value: bitcast<float32>(bits));
+    }
+    string type = "float4";
+    Result<float64, DecodeError> d = floatText(raw: raw, type: type);
+    return match (give d) { case Ok(value: x): Result::Ok(value: cast<float32>(x)); case Err(error: e): Result::Err(error: give e); };
+}
+
+unsafe fn Result<float64, DecodeError> decodeFloat8(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 8) { return Result::Err(error: DecodeError::BadLength(type: "float8", got: raw.length())); }
+        uint64 bits = bigEndian(b: raw);
+        return Result::Ok(value: bitcast<float64>(bits));
+    }
+    string type = "float8";
+    return floatText(raw: raw, type: type);
+}
+
+fn void encodeFloat4(ref DynamicArray<uint8> to, float32 v) { uint32 bits = bitcast<uint32>(v); putBigEndian(to: ref to, v: cast<uint64>(bits), bytes: 4); }
+fn void encodeFloat8(ref DynamicArray<uint8> to, float64 v) { uint64 bits = bitcast<uint64>(v); putBigEndian(to: ref to, v: bits, bytes: 8); }
+
+// ---- text, varchar, bpchar, name, json, xml, and every type read as text ------------------------------------
+
+// Both formats carry the same UTF-8 bytes for these types (with client_encoding UTF8, which this client sets).
+unsafe fn Result<string, DecodeError> decodeText(int16 format, ConstView<uint8> raw) { return utf8Text(raw: raw); }
+
+fn void encodeText(ref DynamicArray<uint8> to, const ref string v) { appendView(to: ref to, from: v.bytes()); }
+
+// jsonb's binary form is a version byte (1) and the JSON text; its text form is the text alone.
+unsafe fn Result<string, DecodeError> decodeJsonb(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() < 1) { return Result::Err(error: DecodeError::BadLength(type: "jsonb", got: raw.length())); }
+        if (raw[0] != 1ui8) { return Result::Err(error: DecodeError::Unsupported(type: "jsonb", what: "a binary version other than 1")); }
+        return utf8Text(raw: raw.slice(from: 1, count: raw.length() - 1));
+    }
+    return utf8Text(raw: raw);
+}
+
+fn void encodeJsonb(ref DynamicArray<uint8> to, const ref string json) { to.add(item: 1ui8); appendView(to: ref to, from: json.bytes()); }
+
+fn void appendView(ref DynamicArray<uint8> to, ConstView<uint8> from) {
+    isize i = 0;
+    while (i < from.length()) { to.add(item: from[i]); i = i + 1; }
+}
+
+// ---- bytea --------------------------------------------------------------------------------------------------
+
+fn int32 nibble(uint8 c) {
+    if (c >= 48ui8 && c <= 57ui8) { return cast<int32>(c - 48ui8); }
+    if (c >= 97ui8 && c <= 102ui8) { return cast<int32>(c - 87ui8); }
+    if (c >= 65ui8 && c <= 70ui8) { return cast<int32>(c - 55ui8); }
+    return -1;
+}
+
+// Binary: the bytes. Text: the hex format (\x…, bytea_output = hex, the default since 9.0), or the older escape
+// format (printable bytes as themselves, \\ for a backslash, \nnn octal for the rest).
+unsafe fn Result<DynamicArray<uint8>, DecodeError> decodeBytea(int16 format, ConstView<uint8> raw) {
+    DynamicArray<uint8> bytes = DynamicArray.withCapacity(capacity: raw.length());
+    if (format == FORMAT_BINARY) { appendView(to: ref bytes, from: raw); return Result::Ok(value: give bytes); }
+    if (raw.length() >= 2 && raw[0] == 92ui8 && raw[1] == 120ui8) {     // \x
+        isize i = 2;
+        while (i < raw.length()) {
+            if (raw[i] == 32ui8 || raw[i] == 10ui8 || raw[i] == 9ui8 || raw[i] == 13ui8) { i = i + 1; continue; }
+            if (i + 1 >= raw.length()) { return byteaError(raw: raw); }
+            int32 hi = nibble(c: raw[i]);
+            int32 lo = nibble(c: raw[i + 1]);
+            if (hi < 0 || lo < 0) { return byteaError(raw: raw); }
+            bytes.add(item: cast<uint8>(hi * 16 + lo));
+            i = i + 2;
+        }
+        return Result::Ok(value: give bytes);
+    }
+    isize i = 0;
+    while (i < raw.length()) {
+        if (raw[i] != 92ui8) { bytes.add(item: raw[i]); i = i + 1; continue; }
+        if (i + 1 < raw.length() && raw[i + 1] == 92ui8) { bytes.add(item: 92ui8); i = i + 2; continue; }
+        if (i + 3 < raw.length()) {
+            int32 a = cast<int32>(raw[i + 1]) - 48;
+            int32 b = cast<int32>(raw[i + 2]) - 48;
+            int32 c = cast<int32>(raw[i + 3]) - 48;
+            if (a >= 0 && a <= 3 && b >= 0 && b <= 7 && c >= 0 && c <= 7) {
+                bytes.add(item: cast<uint8>(a * 64 + b * 8 + c));
+                i = i + 4;
+                continue;
+            }
+        }
+        return byteaError(raw: raw);
+    }
+    return Result::Ok(value: give bytes);
+}
+
+unsafe fn Result<DynamicArray<uint8>, DecodeError> byteaError(ConstView<uint8> raw) {
+    Result<string, DecodeError> t = utf8Text(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): "(not UTF-8)"; };
+    return Result::Err(error: DecodeError::BadText(type: "bytea", text: copy text));
+}
+
+fn void encodeBytea(ref DynamicArray<uint8> to, ConstView<uint8> v) { appendView(to: ref to, from: v); }
+
+// The hex text format, as PostgreSQL prints it: \x and two lowercase digits a byte.
+unsafe fn string formatBytea(ConstView<uint8> v) { return "\\x".concat(other: hexEncode(bytes: v)); }
+
+// ---- uuid ---------------------------------------------------------------------------------------------------
+
+unsafe fn Result<Uuid, DecodeError> decodeUuid(int16 format, ConstView<uint8> raw) {
+    if (format == FORMAT_BINARY) {
+        if (raw.length() != 16) { return Result::Err(error: DecodeError::BadLength(type: "uuid", got: raw.length())); }
+        InlineArray<uint8>#(16) b = [0ui8; 16];
+        isize i = 0;
+        while (i < 16) { b[cast<usize>(i)] = raw[i]; i = i + 1; }
+        return Result::Ok(value: Uuid.fromBytes(bytes: b));
+    }
+    Result<string, DecodeError> t = utf8Text(raw: raw);
+    string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+    Result<Uuid, UuidError> u = Uuid.parse(text: text);
+    return match (u) { case Ok(value: x): Result::Ok(value: x); case Err(error: e): Result::Err(error: DecodeError::BadText(type: "uuid", text: copy text)); };
+}
+
+fn void encodeUuid(ref DynamicArray<uint8> to, const ref Uuid v) {
+    InlineArray<uint8>#(16) b = v.bytes();
+    appendView(to: ref to, from: b.view());
+}

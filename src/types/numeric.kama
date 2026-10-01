@@ -1,0 +1,293 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::parse, std::fmt::ParseError,
+         postgres::types::DecodeError, postgres::types::FORMAT_BINARY, postgres::types::utf8Text };
+export { Numeric, decodeNumeric, encodeNumeric };
+
+// numeric: PostgreSQL's arbitrary-precision decimal, held exactly as the server holds it — base-10000 digits, the
+// weight of the first, a display scale, and a sign that may also be NaN or ±Infinity. Text and binary both
+// round-trip byte for byte with the server: parsing is a port of numeric.c's set_var_from_str, printing of
+// get_str_from_var, and the binary layout is numeric_send's.
+//
+// Arithmetic is not offered; this is a lossless carrier. `toInt64` and `toFloat64` convert when asked.
+
+comptime int16 SIGN_POSITIVE = 0i16;          // NUMERIC_POS
+comptime int16 SIGN_NEGATIVE = 16384i16;      // NUMERIC_NEG, 0x4000
+comptime int16 SIGN_NAN = -16384i16;          // NUMERIC_NAN, 0xC000
+comptime int16 SIGN_PLUS_INFINITY = -12288i16;    // NUMERIC_PINF, 0xD000
+comptime int16 SIGN_MINUS_INFINITY = -4096i16;    // NUMERIC_NINF, 0xF000
+
+type resource Numeric implements Formattable {
+    int16 sign = 0i16;
+    int16 weight = 0i16;      // the power of 10000 of the first digit
+    int16 dscale = 0i16;      // digits shown after the decimal point
+    DynamicArray<int16> digits;   // base 10000, most significant first, no leading or trailing zeros
+
+    ctor raw(int16 sign, int16 weight, int16 dscale, DynamicArray<int16> digits) {
+        this.sign = sign; this.weight = weight; this.dscale = dscale; this.digits = give digits;
+    }
+
+    public ctor zero() { this.sign = SIGN_POSITIVE; this.weight = 0i16; this.dscale = 0i16; this.digits = DynamicArray.empty(); }
+    public ctor nan() { this.sign = SIGN_NAN; this.weight = 0i16; this.dscale = 0i16; this.digits = DynamicArray.empty(); }
+
+    public ctor fromInt64(int64 v) {
+        string text = "${v}";
+        Result<Numeric, DecodeError> n = Numeric.parse(text: text);
+        Numeric parsed = match (give n) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "Numeric.fromInt64"); return Numeric.zero(); } };
+        this.sign = parsed.sign; this.weight = parsed.weight; this.dscale = parsed.dscale; this.digits = copy parsed.digits;
+    }
+
+    // numeric_in: optional sign, digits with an optional point, an optional exponent; or NaN, Infinity, inf.
+    public ctor Result<Numeric, DecodeError> parse(const ref string text) { return parseNumeric(text: text, all: text.bytes()); }
+
+    public const fn bool isNaN() { return this.sign == SIGN_NAN; }
+    public const fn bool isInfinite() { return this.sign == SIGN_PLUS_INFINITY || this.sign == SIGN_MINUS_INFINITY; }
+    public const fn bool isNegative() { return this.sign == SIGN_NEGATIVE || this.sign == SIGN_MINUS_INFINITY; }
+    public const fn int16 scale() { return this.dscale; }
+    public const fn int16 weightValue() { return this.weight; }
+    public const fn DynamicArray<int16> digitsCopy() { return copy this.digits; }
+
+    // The value as an int64, if it is a finite integer that fits (a fractional part must be zero).
+    public const fn Optional<int64> toInt64() {
+        if (this.sign != SIGN_POSITIVE && this.sign != SIGN_NEGATIVE) { return Optional::None; }
+        int64 v = 0i64;
+        isize k = 0;
+        while (k <= cast<isize>(this.weight)) {
+            int64 d = 0i64;
+            if (k < this.digits.length()) { d = cast<int64>(this.digits[k]); }
+            if (v > 922337203685477i64) { return Optional::None; }
+            v = v * 10000i64 + d;
+            if (v < 0i64) { return Optional::None; }
+            k = k + 1;
+        }
+        if (this.digits.length() > cast<isize>(this.weight) + 1) { return Optional::None; }   // a nonzero fraction
+        if (this.sign == SIGN_NEGATIVE) { v = -v; }
+        return Optional::Some(value: v);
+    }
+
+    // The nearest float64 (through the decimal text, so it rounds once, correctly).
+    public unsafe const fn float64 toFloat64() {
+        if (this.sign == SIGN_NAN) { return 0.0 / 0.0; }
+        if (this.sign == SIGN_PLUS_INFINITY) { return 1.0 / 0.0; }
+        if (this.sign == SIGN_MINUS_INFINITY) { return -1.0 / 0.0; }
+        string text = this.text();
+        Result<float64, ParseError> v = parse::<float64>(s: text);
+        return match (v) { case Ok(value: x): x; case Err(error: e): 0.0; };
+    }
+
+    public const fn bool equals(const ref Numeric other) {
+        if (this.sign != other.sign || this.weight != other.weight || this.dscale != other.dscale) { return false; }
+        if (this.digits.length() != other.digits.length()) { return false; }
+        isize i = 0;
+        while (i < this.digits.length()) { if (this.digits[i] != other.digits[i]) { return false; } i = i + 1; }
+        return true;
+    }
+
+    // numeric_out's text.
+    public const fn string text() {
+        if (this.sign == SIGN_NAN) { return "NaN"; }
+        if (this.sign == SIGN_PLUS_INFINITY) { return "Infinity"; }
+        if (this.sign == SIGN_MINUS_INFINITY) { return "-Infinity"; }
+        string s = "";
+        if (this.sign == SIGN_NEGATIVE) { s = "-"; }
+        isize w = cast<isize>(this.weight);
+        if (w < 0) {
+            s = s.concat(other: "0");
+        } else {
+            isize k = 0;
+            while (k <= w) {
+                int16 dig = 0i16;
+                if (k < this.digits.length()) { dig = this.digits[k]; }
+                if (k == 0) { s = s.concat(other: "${dig}"); } else { s = s.concat(other: group(d: dig)); }
+                k = k + 1;
+            }
+        }
+        if (this.dscale > 0i16) {
+            string frac = "";
+            isize k = w + 1;
+            while (frac.length() < cast<isize>(this.dscale)) {
+                int16 dig = 0i16;
+                if (k >= 0 && k < this.digits.length()) { dig = this.digits[k]; }
+                frac = frac.concat(other: group(d: dig));
+                k = k + 1;
+            }
+            s = s.concat(other: ".").concat(other: frac.substring(start: 0, end: cast<isize>(this.dscale)));
+        }
+        return s;
+    }
+
+    public const fn void format(ref Formatter f) { string s = this.text(); f.writeStr(s: ref s); }
+
+    friend decodeNumeric[raw];
+    friend parseNumeric[raw];
+}
+
+// Four digits, zero-padded: one base-10000 digit after the first.
+fn string group(int16 d) {
+    string s = "${d}";
+    while (s.length() < 4) { s = "0".concat(other: s); }
+    return s;
+}
+
+fn bool equalsIgnoringCase(ConstView<uint8> b, const ref string word) { return sameLetters(b: b, w: word.bytes()); }
+
+fn bool sameLetters(ConstView<uint8> b, ConstView<uint8> w) {
+    if (b.length() != w.length()) { return false; }
+    isize i = 0;
+    while (i < b.length()) {
+        uint8 c = b[i];
+        if (c >= 65ui8 && c <= 90ui8) { c = c + 32ui8; }
+        uint8 d = w[i];
+        if (d >= 65ui8 && d <= 90ui8) { d = d + 32ui8; }
+        if (c != d) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn Result<Numeric, DecodeError> bad(const ref string text) { return Result::Err(error: DecodeError::BadText(type: "numeric", text: copy text)); }
+
+fn Result<Numeric, DecodeError> parseNumeric(const ref string text, ConstView<uint8> all) {
+    // Surrounding whitespace is allowed, as numeric_in allows it.
+    isize start = 0;
+    isize end = all.length();
+    while (start < end && (all[start] == 32ui8 || (all[start] >= 9ui8 && all[start] <= 13ui8))) { start = start + 1; }
+    while (end > start && (all[end - 1] == 32ui8 || (all[end - 1] >= 9ui8 && all[end - 1] <= 13ui8))) { end = end - 1; }
+    ConstView<uint8> b = all.slice(from: start, count: end - start);
+    if (equalsIgnoringCase(b: b, word: "NaN")) { return Result::Ok(value: Numeric.nan()); }
+    bool negative = false;
+    isize i = 0;
+    if (b.length() > 0 && (b[0] == 43ui8 || b[0] == 45ui8)) { negative = b[0] == 45ui8; i = 1; }
+    ConstView<uint8> rest = b.slice(from: i, count: b.length() - i);
+    if (equalsIgnoringCase(b: rest, word: "Infinity") || equalsIgnoringCase(b: rest, word: "inf")) {
+        int16 s = SIGN_PLUS_INFINITY;
+        if (negative) { s = SIGN_MINUS_INFINITY; }
+        return Result::Ok(value: Numeric.raw(sign: s, weight: 0i16, dscale: 0i16, digits: DynamicArray.empty()));
+    }
+    // Decimal digits, and where the point is.
+    DynamicArray<uint8> dec = DynamicArray.empty();
+    int64 dweight = -1i64;
+    int64 dscale = 0i64;
+    bool point = false;
+    bool any = false;
+    while (i < b.length()) {
+        uint8 c = b[i];
+        if (c >= 48ui8 && c <= 57ui8) {
+            dec.add(item: c - 48ui8);
+            any = true;
+            if (point) { dscale = dscale + 1i64; } else { dweight = dweight + 1i64; }
+        } else if (c == 46ui8 && !point) {
+            point = true;
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+    if (!any) { return bad(text: text); }
+    if (i < b.length() && (b[i] == 101ui8 || b[i] == 69ui8)) {
+        i = i + 1;
+        bool expNegative = false;
+        if (i < b.length() && (b[i] == 43ui8 || b[i] == 45ui8)) { expNegative = b[i] == 45ui8; i = i + 1; }
+        isize expStart = i;
+        int64 exponent = 0i64;
+        while (i < b.length() && b[i] >= 48ui8 && b[i] <= 57ui8) {
+            exponent = exponent * 10i64 + cast<int64>(b[i] - 48ui8);
+            if (exponent > 1000000i64) { return Result::Err(error: DecodeError::OutOfRange(type: "numeric")); }
+            i = i + 1;
+        }
+        if (i == expStart) { return bad(text: text); }
+        if (expNegative) { exponent = -exponent; }
+        dweight = dweight + exponent;
+        dscale = dscale - exponent;
+        if (dscale < 0i64) { dscale = 0i64; }
+    }
+    if (i != b.length()) { return bad(text: text); }
+    if (dscale > 16383i64) { return Result::Err(error: DecodeError::OutOfRange(type: "numeric")); }
+
+    // Base 10 to base 10000, aligned on the decimal point (set_var_from_str).
+    int64 weight = 0i64;
+    if (dweight >= 0i64) { weight = (dweight + 1i64 + 3i64) / 4i64 - 1i64; } else { weight = -((-dweight - 1i64) / 4i64 + 1i64); }
+    int64 offset = (weight + 1i64) * 4i64 - (dweight + 1i64);
+    int64 ndigits = (cast<int64>(dec.length()) + offset + 3i64) / 4i64;
+    DynamicArray<int16> digits = DynamicArray.withCapacity(capacity: cast<isize>(ndigits));
+    int64 k = -offset;
+    int64 g = 0i64;
+    while (g < ndigits) {
+        int64 v = 0i64;
+        int64 j = 0i64;
+        while (j < 4i64) {
+            int64 at = k + j;
+            int64 d = 0i64;
+            if (at >= 0i64 && at < cast<int64>(dec.length())) { d = cast<int64>(dec[cast<isize>(at)]); }
+            v = v * 10i64 + d;
+            j = j + 1i64;
+        }
+        digits.add(item: cast<int16>(v));
+        k = k + 4i64;
+        g = g + 1i64;
+    }
+    // strip_var: leading zeros move the weight; trailing zeros go; nothing left is zero.
+    isize lead = 0;
+    while (lead < digits.length() && digits[lead] == 0i16) { lead = lead + 1; }
+    isize trail = digits.length();
+    while (trail > lead && digits[trail - 1] == 0i16) { trail = trail - 1; }
+    DynamicArray<int16> kept = DynamicArray.withCapacity(capacity: trail - lead);
+    isize p = lead;
+    while (p < trail) { kept.add(item: digits[p]); p = p + 1; }
+    weight = weight - cast<int64>(lead);
+    int16 sign = SIGN_POSITIVE;
+    if (negative) { sign = SIGN_NEGATIVE; }
+    if (kept.length() == 0) { weight = 0i64; sign = SIGN_POSITIVE; }
+    if (weight > 32767i64 || weight < -32768i64) { return Result::Err(error: DecodeError::OutOfRange(type: "numeric")); }
+    return Result::Ok(value: Numeric.raw(sign: sign, weight: cast<int16>(weight), dscale: cast<int16>(dscale), digits: give kept));
+}
+
+unsafe fn Result<Numeric, DecodeError> decodeNumeric(int16 format, ConstView<uint8> raw) {
+    if (format != FORMAT_BINARY) {
+        Result<string, DecodeError> t = utf8Text(raw: raw);
+        string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+        return Numeric.parse(text: text);
+    }
+    if (raw.length() < 8) { return Result::Err(error: DecodeError::BadLength(type: "numeric", got: raw.length())); }
+    int16 ndigits = i16At(b: raw, at: 0);
+    int16 weight = i16At(b: raw, at: 2);
+    int16 sign = i16At(b: raw, at: 4);
+    int16 dscale = i16At(b: raw, at: 6);
+    if (ndigits < 0i16 || raw.length() != 8 + cast<isize>(ndigits) * 2) { return Result::Err(error: DecodeError::BadLength(type: "numeric", got: raw.length())); }
+    if (sign == SIGN_NAN || sign == SIGN_PLUS_INFINITY || sign == SIGN_MINUS_INFINITY) {
+        return Result::Ok(value: Numeric.raw(sign: sign, weight: 0i16, dscale: 0i16, digits: DynamicArray.empty()));
+    }
+    if (sign != SIGN_POSITIVE && sign != SIGN_NEGATIVE) { return Result::Err(error: DecodeError::Unsupported(type: "numeric", what: "an unknown sign")); }
+    if (dscale < 0i16) { return Result::Err(error: DecodeError::Unsupported(type: "numeric", what: "a negative display scale")); }
+    DynamicArray<int16> digits = DynamicArray.withCapacity(capacity: cast<isize>(ndigits));
+    isize i = 0;
+    while (i < cast<isize>(ndigits)) {
+        int16 d = i16At(b: raw, at: 8 + i * 2);
+        if (d < 0i16 || d > 9999i16) { return Result::Err(error: DecodeError::Unsupported(type: "numeric", what: "a digit outside 0–9999")); }
+        digits.add(item: d);
+        i = i + 1;
+    }
+    return Result::Ok(value: Numeric.raw(sign: sign, weight: weight, dscale: dscale, digits: give digits));
+}
+
+fn int16 i16At(ConstView<uint8> b, isize at) { return truncate<int16>((cast<uint16>(b[at]) << 8ui16) | cast<uint16>(b[at + 1])); }
+
+fn void putI16(ref DynamicArray<uint8> to, int16 v) {
+    to.add(item: truncate<uint8>(v >> 8));
+    to.add(item: truncate<uint8>(v));
+}
+
+// numeric_send's layout. For ±Infinity the server sends a display scale of 32 (an artifact of reading the scale
+// out of the special value's header); it is reproduced so the bytes match, and ignored on receipt.
+fn void encodeNumeric(ref DynamicArray<uint8> to, const ref Numeric n) {
+    int16 dscale = n.scale();
+    int16 sign = SIGN_POSITIVE;
+    if (n.isNaN()) { sign = SIGN_NAN; dscale = 0i16; }
+    else if (n.isInfinite()) { sign = SIGN_PLUS_INFINITY; if (n.isNegative()) { sign = SIGN_MINUS_INFINITY; } dscale = 32i16; }
+    else if (n.isNegative()) { sign = SIGN_NEGATIVE; }
+    DynamicArray<int16> digits = n.digitsCopy();
+    putI16(to: ref to, v: cast<int16>(digits.length()));
+    putI16(to: ref to, v: n.weightValue());
+    putI16(to: ref to, v: sign);
+    putI16(to: ref to, v: dscale);
+    isize i = 0;
+    while (i < digits.length()) { putI16(to: ref to, v: digits[i]); i = i + 1; }
+}

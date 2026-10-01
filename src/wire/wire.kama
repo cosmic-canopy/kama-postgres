@@ -1,4 +1,4 @@
-import { std::collections::FixedArray, std::collections::ConstView, std::io::IoError, std::memory::Owned,
+import { std::collections::FixedArray, std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::memory::Owned,
          std::net::Interest, std::net::Ready, std::time::Instant, std::time::Duration, std::time::monotonicNow,
          postgres::Transport, postgres::PgError,
          postgres::protocol::Frame, postgres::protocol::frame, postgres::protocol::decode,
@@ -82,7 +82,7 @@ type resource Wire implements Sendable {
             match (w) {
                 case Ok(value: n): { if (n > 0) { sent = sent + n; } else { wait = true; } }
                 case Err(error: e): {
-                    match (e) { case WouldBlock: { wait = true; } case _: { return Result::Err(error: PgError::Io(error: e)); } };
+                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: PgError::Io(error: e)); } };
                 }
             };
             if (wait) {
@@ -108,11 +108,11 @@ type resource Wire implements Sendable {
             bool wait = false;
             match (r) {
                 case Ok(value: n): {
-                    if (n == 0) { return Result::Err(error: PgError::Io(error: IoError::UnexpectedEof)); }
+                    if (n == 0) { return Result::Err(error: PgError::Io(error: IoError.of(kind: IoErrorKind::UnexpectedEof))); }
                     this.end = this.end + n;
                 }
                 case Err(error: e): {
-                    match (e) { case WouldBlock: { wait = true; } case _: { return Result::Err(error: PgError::Io(error: e)); } };
+                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: PgError::Io(error: e)); } };
                 }
             };
             if (wait) {

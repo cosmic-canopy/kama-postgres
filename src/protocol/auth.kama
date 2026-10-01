@@ -39,10 +39,7 @@ fn InlineArray<uint32>#(64) md5Table() {
     isize i = 0;
     while (i < 64) {
         float64 angle = cast<float64>(i + 1);
-        float64 sine = sin(x: angle);
-        float64 magnitude = abs(x: sine);
-        float64 scaled = magnitude * 4294967296.0;
-        float64 whole = floor(x: scaled);
+        float64 whole = floor(x: abs(x: sin(x: angle)) * 4294967296.0);
         t[cast<usize>(i)] = cast<uint32>(whole);
         i = i + 1;
     }

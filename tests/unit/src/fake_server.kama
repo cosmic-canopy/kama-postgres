@@ -6,7 +6,7 @@
 // When the script has nothing more to say, a read reports WouldBlock and `wait` reports a timeout (a silent
 // server), or, after `Hangup`, a read reports the end of the stream.
 import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView,
-         std::collections::FixedArray, std::io::IoError, std::net::Interest, std::net::Ready,
+         std::collections::FixedArray, std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready,
          std::encoding::base64::encode as b64encode, std::encoding::base64::decode as b64decode,
          std::encoding::base64::DecodeError, std::encoding::utf8::decode as utf8Decode,
          std::encoding::utf8::Utf8Error, std::digest::pbkdf2, std::digest::sha256::Sha256,
@@ -155,7 +155,7 @@ type resource FakeServer implements Transport, Sendable {
         isize available = this.toClient.length() - this.readAt;
         if (available == 0) {
             if (this.hungUp) { return Result::Ok(value: 0); }
-            return Result::Err(error: IoError::WouldBlock);
+            return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock));
         }
         isize n = available;
         if (n > this.chunk) { n = this.chunk; }
@@ -167,7 +167,7 @@ type resource FakeServer implements Transport, Sendable {
     }
 
     public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
-        if (this.hungUp) { return Result::Err(error: IoError::BrokenPipe); }
+        if (this.hungUp) { return Result::Err(error: IoError.of(kind: IoErrorKind::BrokenPipe)); }
         isize n = bytes.length();
         if (n > this.writeLimit) { n = this.writeLimit; }
         isize i = 0;

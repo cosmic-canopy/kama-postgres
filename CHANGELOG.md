@@ -6,9 +6,16 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
-Needs **kama ≥ 0.9.486**.
+Needs **kama ≥ 0.9.506**.
 
 ### Changed
+- **Needs kama ≥ 0.9.506**, which fixed every compiler gap phases 3 and 4 filed (KPG-11 to KPG-22). Ported to
+  its `IoError`, a kind and the OS's code: an I/O failure's message now quotes the operating system's words.
+- The password file is checked on the file opened, as libpq checks it. One that is not a regular file
+  (`/dev/null`, a FIFO, a directory) gets libpq's "is not a plain file" warning.
+- With `HOME` unset or empty, the home directory is the account's, from its passwd entry, as libpq finds it.
+- A Unix-domain socket connects without blocking, so `connect_timeout` bounds the connect too. A full listen
+  queue fails that host at once, as in libpq.
 - `postgres::protocol`: `AuthError` messages are libpq's. `NegotiateProtocolVersion` carries `newestVersion`,
   the full version the server sends (it was misnamed `newestMinor`). `ProtocolError::Violation` covers a
   well-formed message out of place. `MessageWriter` is `Sendable`.

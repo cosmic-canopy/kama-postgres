@@ -10,8 +10,9 @@ Where this is, 2026-10-01: phases 0–4 are done. The client connects and querie
 - **Querying.** The simple protocol works, with libpq's error and notice formatting.
 
 Expected values come from libpq itself: PostgreSQL's own TAP tests, and a live libpq asked case by case. Phase 5,
-the extended protocol and typed rows, is next. New compiler gaps are open in [KAMA_GAPS.md](../KAMA_GAPS.md)
-(KPG-15 to KPG-22); none blocks.
+the extended protocol and typed rows, is next. It starts on kama 0.9.506, which fixed every gap phases 3 and 4
+filed (KPG-11 to KPG-22; see [KAMA_GAPS.md](../KAMA_GAPS.md)); the package was ported to it, and the
+workarounds those gaps needed are gone.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.

@@ -175,6 +175,19 @@ unsafe fn int32 passfileTests() {
     f = f + check(ok: loose.contains(substring: "fe_sendauth: no password supplied") && warningsLogged() == before + 1,
                   what: "pgpass: a file others can read is ignored, with a warning: ".concat(other: loose));
 
+    // passwordFromFile checks the file it opened: /dev/null and a directory are not plain files, and are ignored
+    // with libpq's warning (PGPASSFILE=/dev/null is the usual way to turn the file off).
+    before = warningsLogged();
+    env.set(name: "PGPASSFILE", value: "/dev/null");
+    string devnull = attempt(conninfo: conninfoFor(user: "kp_scram"), env: env);
+    f = f + check(ok: devnull.contains(substring: "fe_sendauth: no password supplied") && warningsLogged() == before + 1,
+                  what: "pgpass: /dev/null is not a plain file, with a warning: ".concat(other: devnull));
+    before = warningsLogged();
+    env.set(name: "PGPASSFILE", value: copy dir);
+    string directory = attempt(conninfo: conninfoFor(user: "kp_scram"), env: env);
+    f = f + check(ok: directory.contains(substring: "fe_sendauth: no password supplied") && warningsLogged() == before + 1,
+                  what: "pgpass: a directory is not a plain file, with a warning: ".concat(other: directory));
+
     Environment keyword = quietEnvironment();
     string passfile = attempt(conninfo: conninfoFor(user: "kp_scram").concat(other: " passfile=").concat(other: good), env: keyword);
     f = f + check(ok: passfile.length() == 0, what: "pgpass: the passfile keyword: ".concat(other: passfile));

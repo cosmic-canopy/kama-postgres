@@ -24,9 +24,7 @@ comptime int64 PG_EPOCH_UNIX_MICROS = 946684800000000i64;
 comptime int32 DATE_END = 2147483647;                      // DATEVAL_NOEND: infinity
 comptime int32 DATE_BEGIN = -2147483648;                   // DATEVAL_NOBEGIN: -infinity
 comptime int64 TIMESTAMP_END = 9223372036854775807i64;
-// -infinity for timestamps is int64's minimum. A function, not a `comptime`: that constant is emitted as an
-// out-of-range C literal (KPG-14), while the same value in an expression is not.
-fn int64 timestampBegin() { return -9223372036854775808i64; }
+comptime int64 TIMESTAMP_BEGIN = -9223372036854775808i64;   // -infinity: int64's minimum
 
 fn uint64 be(ConstView<uint8> b, isize from, isize count) {
     uint64 v = 0ui64;
@@ -201,7 +199,7 @@ unsafe fn Result<LocalDateTime, DecodeError> decodeTimestamp(int16 format, Const
     if (format == FORMAT_BINARY) {
         if (raw.length() != 8) { return Result::Err(error: DecodeError::BadLength(type: "timestamp", got: raw.length())); }
         int64 v = truncate<int64>(be(b: raw, from: 0, count: 8));
-        if (v == TIMESTAMP_END || v == timestampBegin()) { return Result::Err(error: DecodeError::OutOfRange(type: "timestamp")); }
+        if (v == TIMESTAMP_END || v == TIMESTAMP_BEGIN) { return Result::Err(error: DecodeError::OutOfRange(type: "timestamp")); }
         return Result::Ok(value: LocalDateTime.fromPgMicros(micros: v));
     }
     Result<string, DecodeError> t = textOf(raw: raw);
@@ -241,7 +239,7 @@ unsafe fn Result<Timestamp, DecodeError> decodeTimestampTz(int16 format, ConstVi
     if (format == FORMAT_BINARY) {
         if (raw.length() != 8) { return Result::Err(error: DecodeError::BadLength(type: "timestamptz", got: raw.length())); }
         int64 v = truncate<int64>(be(b: raw, from: 0, count: 8));
-        if (v == TIMESTAMP_END || v == timestampBegin()) { return Result::Err(error: DecodeError::OutOfRange(type: "timestamptz")); }
+        if (v == TIMESTAMP_END || v == TIMESTAMP_BEGIN) { return Result::Err(error: DecodeError::OutOfRange(type: "timestamptz")); }
         // std::time::Timestamp holds int64 nanoseconds since 1970: about ±292 years.
         if (v > 8276687363854775i64 || v < -10169680836854775i64) { return Result::Err(error: DecodeError::OutOfRange(type: "timestamptz")); }
         return Result::Ok(value: Timestamp.fromUnixMicros(us: v + PG_EPOCH_UNIX_MICROS));

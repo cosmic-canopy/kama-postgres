@@ -136,24 +136,20 @@ fn void encodeOid(ref DynamicArray<uint8> to, uint32 v) { putBigEndian(to: ref t
 // ---- floats -------------------------------------------------------------------------------------------------
 
 // PostgreSQL's text: shortest round-trip digits (extra_float_digits 1, the default since 12), and Infinity,
-// -Infinity and NaN spelled out. strtod reads all of them.
+// -Infinity and NaN spelled out. std's parse reads all of them, subnormals included; only an overflow is out of
+// range.
 unsafe fn Result<float64, DecodeError> floatText(ConstView<uint8> raw, const ref string type) {
     Result<string, DecodeError> t = utf8Text(raw: raw);
     string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
     Result<float64, ParseError> v = parse::<float64>(s: text);
-    bool outOfRange = match (v) { case Ok(value: x): false; case Err(error: e): match (e) { case OutOfRange: true; case _: false; }; };
-    if (outOfRange) {
-        // std reports strtod's ERANGE as an error even for a subnormal it read exactly (KPG-13). Ask strtod
-        // directly: a finite answer is the value; only an overflow (±HUGE_VAL) is out of range.
-        float64 direct = strtod(nptr: text.cstr(), endptr: null);
-        if (direct != direct * 2.0 || direct == 0.0) { return Result::Ok(value: direct); }
-        return Result::Err(error: DecodeError::OutOfRange(type: copy type));
-    }
-    return match (v) { case Ok(value: x): Result::Ok(value: x); case Err(error: e): Result::Err(error: DecodeError::BadText(type: copy type, text: copy text)); };
+    return match (v) {
+        case Ok(value: x): Result::Ok(value: x);
+        case Err(error: e): match (e) {
+            case OutOfRange: Result::Err(error: DecodeError::OutOfRange(type: copy type));
+            case _: Result::Err(error: DecodeError::BadText(type: copy type, text: copy text));
+        };
+    };
 }
-
-extern "<stdlib.h>";
-extern fn float64 strtod(UnsafeConstPtr<cchar> nptr, UnsafePtr endptr);
 
 unsafe fn Result<float32, DecodeError> decodeFloat4(int16 format, ConstView<uint8> raw) {
     if (format == FORMAT_BINARY) {

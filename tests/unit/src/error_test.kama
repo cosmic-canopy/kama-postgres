@@ -1,6 +1,6 @@
 // postgres's errors, rendered as libpq renders them: pqBuildErrorMessage3 at the default verbosity for a server's
 // fields, emitHostIdentityInfo for a connect attempt, pgpassfileWarning for a password that came from the file.
-import { std::collections::DynamicArray, std::io::IoError,
+import { std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind,
          postgres::PgError, postgres::ServerError, postgres::ConnectError, postgres::ConnectAttempt,
          postgres::protocol::ErrorFields, postgres::sqlstate::UNIQUE_VIOLATION, postgres::sqlstate::INVALID_PASSWORD,
          postgres_unit_tests::check };
@@ -57,7 +57,7 @@ fn int32 serverErrorTests() {
 
 fn int32 pgErrorTests() {
     int32 f = 0;
-    PgError eof = PgError::Io(error: IoError::UnexpectedEof);
+    PgError eof = PgError::Io(error: IoError.of(kind: IoErrorKind::UnexpectedEof));
     string em = eof.message();
     f = f + check(ok: em.equals(other: "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request."), what: "error: EOF is libpq's message");
     PgError timeout = PgError::Timeout;
@@ -68,7 +68,7 @@ fn int32 pgErrorTests() {
     f = f + check(ok: clm.equals(other: "no connection to the server"), what: "error: closed");
 
     ConnectError ce = ConnectError.make();
-    ce.add(attempt: ConnectAttempt.make(host: "localhost", address: "::1", port: "5432", lead: "connection to server at \"localhost\" (::1), port 5432 failed: ", error: PgError::Io(error: IoError::ConnectionRefused), passfile: "", note: "\tIs the server running on that host and accepting TCP/IP connections?"));
+    ce.add(attempt: ConnectAttempt.make(host: "localhost", address: "::1", port: "5432", lead: "connection to server at \"localhost\" (::1), port 5432 failed: ", error: PgError::Io(error: IoError.of(kind: IoErrorKind::ConnectionRefused)), passfile: "", note: "\tIs the server running on that host and accepting TCP/IP connections?"));
     ce.add(attempt: ConnectAttempt.make(host: "127.0.0.1", address: "127.0.0.1", port: "5432",
         lead: "connection to server at \"127.0.0.1\", port 5432 failed: ", error: PgError::Server(error: serverError(spec: "S=FATAL;V=FATAL;C=28P01;M=password authentication failed for user \"kp_scram\"")),
         passfile: "/home/u/.pgpass", note: ""));

@@ -217,6 +217,23 @@ fn int32 environmentTests() {
     string nm = errorOf(r: n);
     f = f + check(ok: nm.equals(other: "the local user name is not known"), what: "config: no user anywhere is an error");
 
+    // pqGetHomeDirectory: HOME when it is set and not empty, else the account's home from its passwd entry.
+    Environment homeless = testEnvironment();
+    homeless.setAccountHome(path: "/home/account");
+    Optional<string> fromAccount = homeless.homeDirectory();
+    f = f + check(ok: match (fromAccount) { case Some(value: h): h.equals(other: "/home/account"); case None: false; }, what: "config: no HOME, the account's home");
+    homeless.set(name: "HOME", value: "");
+    Optional<string> emptyHome = homeless.homeDirectory();
+    f = f + check(ok: match (emptyHome) { case Some(value: h): h.equals(other: "/home/account"); case None: false; }, what: "config: an empty HOME, the account's home");
+    Result<Config, PgError> viaAccount = resolveWith(text: "host=h", env: homeless);
+    f = f + check(ok: match (viaAccount) { case Ok(value: c): c.passfile().equals(other: "/home/account/.pgpass"); case Err(error: e): false; }, what: "config: the password file is in the account's home");
+    homeless.set(name: "HOME", value: "/home/env");
+    Optional<string> fromEnv = homeless.homeDirectory();
+    f = f + check(ok: match (fromEnv) { case Some(value: h): h.equals(other: "/home/env"); case None: false; }, what: "config: HOME comes first");
+    Environment neither = testEnvironment();
+    Optional<string> none = neither.homeDirectory();
+    f = f + check(ok: match (none) { case Some(value: h): false; case None: true; }, what: "config: no HOME and no account home, no home directory");
+
     Environment requiressl = testEnvironment();
     requiressl.set(name: "PGREQUIRESSL", value: "1");
     Result<Config, PgError> rq = resolveWith(text: "host=h", env: requiressl);

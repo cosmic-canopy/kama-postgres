@@ -1,6 +1,6 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode as utf8Decode,
          std::encoding::utf8::Utf8Error, std::encoding::base64::decode as b64decode,
-         std::encoding::base64::DecodeError, std::fs::readFile, std::fs::stat, std::fs::Metadata,
+         std::encoding::base64::DecodeError, std::fs::readFile, std::fs::File, std::fs::OpenMode, std::fs::Metadata,
          std::fs::Permissions, std::io::IoError, std::process::currentUser, std::process::UserId,
          std::log::logWarn, core::env,
          postgres::PgError, postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
@@ -24,19 +24,21 @@ export { Config, Environment, Host, HostKind, SslMode, ChannelBindingMode, Requi
 
 // The process environment, as far as a connection reads it: every keyword's PG* variable, PGSERVICEFILE,
 // PGSYSCONFDIR, PGREQUIRESSL, the variables libpq sends as run-time settings (PGTZ, PGDATESTYLE, PGGEQO), the
-// home directory (HOME, and APPDATA on Windows), and the local user name. `process()` reads it; a test, or a
-// program that keeps settings elsewhere, builds one.
+// home directory (HOME, the account's home from the passwd entry, and APPDATA on Windows), and the local user name.
+// `process()` reads it; a test, or a program that keeps settings elsewhere, builds one.
 type resource Environment implements Sendable {
     DynamicArray<string> names;
     DynamicArray<string> values;
     string user;
     string userProblem;   // why `user` is "", in libpq's words
+    string accountHome;   // the passwd entry's home directory, "" when unknown
 
     public ctor empty() {
         this.names = DynamicArray.empty();
         this.values = DynamicArray.empty();
         this.user = "";
         this.userProblem = "the local user name is not known";
+        this.accountHome = "";
     }
 
     public unsafe ctor process() {
@@ -61,6 +63,7 @@ type resource Environment implements Sendable {
             case Ok(value: n): { this.user = give n; this.userProblem = ""; }
             case Err(error: e): { this.user = ""; this.userProblem = e.message(); }
         };
+        this.accountHome = accountHomeDirectory();
     }
 
     unsafe fn void capture(const ref string name) {
@@ -95,8 +98,13 @@ type resource Environment implements Sendable {
     public const fn const ref string localUser() { return this.user; }
     public const fn const ref string localUserProblem() { return this.userProblem; }
 
-    // libpq's pqGetHomeDirectory: $HOME, or on Windows %APPDATA%\postgresql. None when it is not set (libpq would
-    // then ask the passwd entry, which std cannot yet: KPG-16).
+    // The home directory of the account this process runs as, from its passwd entry: what pqGetHomeDirectory
+    // falls back to when HOME is unset or empty. Not used on Windows.
+    public fn void setAccountHome(string path) { this.accountHome = give path; }
+    public const fn const ref string accountHomeDirectory() { return this.accountHome; }
+
+    // libpq's pqGetHomeDirectory: $HOME, else the passwd entry's home; on Windows %APPDATA%\postgresql. None when
+    // there is none.
     public const fn Optional<string> homeDirectory() { return homeFrom(vars: this); }
 }
 
@@ -108,12 +116,25 @@ unsafe fn Result<string, ConnInfoError> localUserName() {
     uint32 raw = id.raw();
     return match (give name) {
         case Ok(value: n): Result::Ok(value: give n);
-        case Err(error: e): match (e) {
+        case Err(error: e): match (e.kind()) {
             case NotFound: Result::Err(error: fail(detail: "local user with ID ${raw} does not exist"));
             case _: Result::Err(error: fail(detail: "could not look up local user ID ${raw}: ".concat(other: e.message())));
         };
     };
 }
+
+// The passwd entry's home directory for the account this process runs as (getpwuid_r's pw_dir), "" if it cannot
+// be read.
+@compileFor(!OS_WINDOWS)
+unsafe fn string accountHomeDirectory() {
+    Result<UserId, IoError> who = currentUser();
+    UserId id = match (who) { case Ok(value: u): u; case Err(error: e): { return ""; } };
+    Result<string, IoError> home = id.homeDirectory();
+    return match (give home) { case Ok(value: h): give h; case Err(error: e): ""; };
+}
+
+@compileFor(OS_WINDOWS)
+unsafe fn string accountHomeDirectory() { return ""; }
 
 @compileFor(OS_WINDOWS)
 unsafe fn Result<string, ConnInfoError> localUserName() {
@@ -129,7 +150,10 @@ unsafe fn Result<string, ConnInfoError> localUserName() {
 @compileFor(!OS_WINDOWS)
 fn Optional<string> homeFrom(const ref Environment vars) {
     Optional<string> home = vars.get(name: "HOME");
-    return match (give home) { case Some(value: h): nonEmpty(s: give h); case None: Optional::None; };
+    Optional<string> set = match (give home) { case Some(value: h): nonEmpty(s: give h); case None: Optional::None; };
+    bool found = match (set) { case Some(value: h): true; case None: false; };
+    if (found) { return set; }
+    return nonEmpty(s: copy vars.accountHomeDirectory());
 }
 
 @compileFor(OS_WINDOWS)
@@ -522,7 +546,7 @@ type resource Config implements Sendable {
             case Ok(value: b): give b;
             case Err(error: e): {
                 if (!mustExist) {
-                    match (e) { case NotFound: { return Result::Ok(value: false); } case _: { } };
+                    match (e.kind()) { case NotFound: { return Result::Ok(value: false); } case _: { } };
                 }
                 return Result::Err(error: fail(detail: "service file \"".concat(other: path).concat(other: "\" not found")));
             }
@@ -713,10 +737,11 @@ type resource Config implements Sendable {
         string db = this.dbname();
         string who = this.user();
         if (db.length() == 0 || who.length() == 0) { return; }
-        Result<Metadata, IoError> meta = stat(path: path);
-        Metadata m = match (meta) { case Ok(value: x): x; case Err(error: e): { return; } };
-        if (!passfileUsable(path: path, meta: m)) { return; }
-        Result<DynamicArray<uint8>, IoError> read = readFile(path: path);
+        // passwordFromFile: open the file, then check what was opened, so the check and the read are one file.
+        Result<File, IoError> opened = File.open(path: path, mode: OpenMode::Read);
+        File file = match (give opened) { case Ok(value: f): give f; case Err(error: e): { return; } };
+        if (!passfileUsable(path: path, file: ref file)) { return; }
+        Result<DynamicArray<uint8>, IoError> read = file.readAll();
         DynamicArray<uint8> bytes = match (give read) { case Ok(value: b): give b; case Err(error: e): { return; } };
         isize i = 0;
         while (i < this.hostList.length()) {
@@ -876,24 +901,29 @@ fn bool isSocketPath(const ref string path) {
     return false;
 }
 
-// passwordFromFile's checks: a file with group or world access is ignored with libpq's warning. A directory is
-// "not a plain file"; std cannot tell a FIFO or a device from a plain file yet (KPG-18).
+// passwordFromFile's checks, on the open file: one that is not a regular file (`/dev/null`, a FIFO, a directory)
+// is not a plain file, and one with group or world access is ignored with libpq's warning.
 @compileFor(!OS_WINDOWS)
-unsafe fn bool passfileUsable(const ref string path, const ref Metadata meta) {
-    if (meta.isDir) {
+unsafe fn bool passfileUsable(const ref string path, ref File file) {
+    Result<Metadata, IoError> meta = file.metadata();
+    Metadata m = match (meta) { case Ok(value: x): x; case Err(error: e): { return false; } };
+    if (!m.isFile()) {
         logWarn(tag: "postgres", msg: "password file \"".concat(other: path).concat(other: "\" is not a plain file"));
         return false;
     }
-    if ((meta.permissions.mode() & 63ui32) != 0ui32) {   // S_IRWXG | S_IRWXO
+    if ((m.permissions.mode() & 63ui32) != 0ui32) {   // S_IRWXG | S_IRWXO
         logWarn(tag: "postgres", msg: "password file \"".concat(other: path).concat(other: "\" has group or world access; permissions should be u=rw (0600) or less"));
         return false;
     }
     return true;
 }
 
-// On Windows the directory is protected, and libpq checks nothing.
+// On Windows the directory is protected, and libpq checks nothing; a directory cannot be read as a file.
 @compileFor(OS_WINDOWS)
-unsafe fn bool passfileUsable(const ref string path, const ref Metadata meta) { return !meta.isDir; }
+unsafe fn bool passfileUsable(const ref string path, ref File file) {
+    Result<Metadata, IoError> meta = file.metadata();
+    return match (meta) { case Ok(value: m): !m.isDir(); case Err(error: e): false; };
+}
 
 // pqParseIntParam: strtol in base 10, surrounding whitespace allowed, the whole value an int.
 fn Optional<int32> parseIntParam(const ref string text) { return parseIntBytes(b: text.bytes()); }

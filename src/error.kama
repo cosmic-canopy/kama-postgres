@@ -56,7 +56,7 @@ type enum PgError implements Error {
 }
 
 fn string ioMessage(const ref IoError e) {
-    return match (e) {
+    return match (e.kind()) {
         case UnexpectedEof: "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request.";
         case _: e.message();
     };

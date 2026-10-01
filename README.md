@@ -6,7 +6,7 @@ install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls)
 
 > **Status: under construction, not yet published.** It connects, authenticates and runs simple queries on
 > PostgreSQL 14–18 and 19 beta, over TCP or a Unix-domain socket. TLS, the extended protocol and typed rows come next; see
-> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.486**.
+> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.506**.
 
 ## Using it
 

@@ -1,5 +1,5 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::validate,
-         std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error, std::io::IoError,
+         std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error, std::io::IoError, std::io::IoErrorKind,
          std::memory::Owned, std::net::SocketAddr, std::net::IpAddr, std::net::resolve, std::net::parseIp,
          std::time::Duration,
          postgres::PgError, postgres::ServerError, postgres::ConnectError, postgres::ConnectAttempt,
@@ -102,12 +102,16 @@ type resource Connection implements Sendable {
                 string lead = "connection to server on socket \"".concat(other: path).concat(other: "\" failed: ");
                 Deadline deadline = Deadline.none();
                 if (config.connectTimeout() > 0) { deadline = Deadline.after(span: Duration.fromSecs(s: cast<int64>(config.connectTimeout()))); }
-                Result<Owned<UnixTransport>, IoError> made = new UnixTransport.connect(path: target, linuxAbstract: linuxAbstract);
+                Result<Owned<UnixTransport>, IoError> made = new UnixTransport.connect(path: target, linuxAbstract: linuxAbstract, timeoutMs: deadline.remainingMs());
                 Owned<UnixTransport> local = match (give made) {
                     case Ok(value: t): give t;
                     case Err(error: e): {
-                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: copy lead, error: PgError::Io(error: e),
-                            passfile: "", note: "\tIs the server running locally and accepting connections on that socket?"));
+                        // As for TCP: the reason and libpq's hint, or for connect_timeout just that.
+                        PgError cause = PgError::Io(error: e);
+                        string hint = "\tIs the server running locally and accepting connections on that socket?";
+                        match (e.kind()) { case TimedOut: { cause = PgError::Timeout; hint = ""; } case _: { } };
+                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: copy lead, error: give cause,
+                            passfile: "", note: give hint));
                         h = h + 1;
                         continue;
                     }
@@ -147,7 +151,7 @@ type resource Connection implements Sendable {
                     case None: {
                         failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText,
                             lead: "could not parse network address \"".concat(other: config.host(index: h).address()).concat(other: "\": "),
-                            error: PgError::Io(error: IoError::InvalidInput), passfile: "", note: ""));
+                            error: PgError::Io(error: IoError.of(kind: IoErrorKind::InvalidInput)), passfile: "", note: ""));
                     }
                 };
             } else {
@@ -175,7 +179,7 @@ type resource Connection implements Sendable {
                         // libpq's connectFailureMessage: the reason, and a hint; a connect_timeout is just that.
                         PgError cause = PgError::Io(error: e);
                         string hint = "\tIs the server running on that host and accepting TCP/IP connections?";
-                        match (e) { case TimedOut: { cause = PgError::Timeout; hint = ""; } case _: { } };
+                        match (e.kind()) { case TimedOut: { cause = PgError::Timeout; hint = ""; } case _: { } };
                         failures.add(attempt: ConnectAttempt.make(host: copy shown, address: copy addressText, port: copy portText, lead: copy lead, error: give cause, passfile: "", note: give hint));
                         a = a + 1;
                         continue;

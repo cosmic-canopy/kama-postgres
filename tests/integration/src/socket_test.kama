@@ -20,7 +20,7 @@ unsafe fn bool forward(ref UnixStream unix, ref TcpStream tcp, bool fromUnix, Vi
     isize n = 0;
     match (r) {
         case Ok(value: k): { n = k; }
-        case Err(error: e): { match (e) { case WouldBlock: { return true; } case _: { return false; } }; }
+        case Err(error: e): { match (e.kind()) { case WouldBlock: { return true; } case _: { return false; } }; }
     };
     if (n <= 0) { return false; }
     Result<Poller, IoError> made = Poller.create();
@@ -33,7 +33,7 @@ unsafe fn bool forward(ref UnixStream unix, ref TcpStream tcp, bool fromUnix, Vi
         isize m = 0;
         match (w) {
             case Ok(value: k): { m = k; }
-            case Err(error: e): { match (e) { case WouldBlock: { m = 0; } case _: { return false; } }; }
+            case Err(error: e): { match (e.kind()) { case WouldBlock: { m = 0; } case _: { return false; } }; }
         };
         if (m == 0) { Result<int32, IoError> ready = waiter.wait(timeoutMs: 5000); }
         sent = sent + m;
@@ -164,9 +164,12 @@ unsafe fn int32 socketTests() {
     Environment env = quietEnvironment();
     string missingDir = dir.concat(other: "/nowhere");
     string missing = attempt(conninfo: "host=".concat(other: missingDir).concat(other: " port=").concat(other: port).concat(other: " dbname=x user=kp_trust"), env: env);
-    string wantMissing = "connection to server on socket \"".concat(other: missingDir).concat(other: "/.s.PGSQL.").concat(other: port)
-        .concat(other: "\" failed: not found\n\tIs the server running locally and accepting connections on that socket?");
-    f = f + check(ok: missing.equals(other: wantMissing), what: "socket: no server at the path: ".concat(other: missing));
+    // The reason is IoError's message until std exposes the OS's words alone (KPG-23): libpq prints "No such file or
+    // directory".
+    string wantLead = "connection to server on socket \"".concat(other: missingDir).concat(other: "/.s.PGSQL.").concat(other: port)
+        .concat(other: "\" failed: not found (os error ");
+    string wantTail = ": No such file or directory)\n\tIs the server running locally and accepting connections on that socket?";
+    f = f + check(ok: missing.startsWith(prefix: wantLead) && missing.contains(substring: wantTail), what: "socket: no server at the path: ".concat(other: missing));
 
     // A directory too long for a socket path.
     string longDir = "/tmp/d";

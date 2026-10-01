@@ -6,9 +6,9 @@ it. Every entry with a repro was **run** on the version named. Nothing is inferr
 spec. An entry that is an absence cites the cstar files that show it instead. This file is excluded from
 the published package, as it is in `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.490+g9a69fc30`, the dev build at `../cstar/out/Darwin-arm64/kama`, built
-from cstar HEAD (`9a69fc30`). KPG-11 to KPG-14 were re-run on it and all four still reproduce. Earlier rounds:
-`0.9.486` (KPG-11 to KPG-14 first filed), `0.9.477` (KPG-1 also on Linux aarch64 inside
+**Current compiler:** `kama 0.9.506+g1d11fb05`, the dev build at `../cstar/out/Darwin-arm64/kama`. Every entry from
+KPG-11 to KPG-22 was re-run on it, with the repro as filed, before it moved to FIXED. Earlier rounds: `0.9.490`
+(KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to KPG-14 filed), `0.9.477` (KPG-1 also on Linux aarch64 inside
 `localhost/kama-dev`), and the first report against `0.9.470` and the public `0.9.440`.
 
 **Reporter:** the `@kama/postgres` repo. Each open entry names the workaround this package uses, so the
@@ -16,10 +16,10 @@ workaround can be deleted when the gap closes. **We are not attached to any work
 changes the right design here, say so and we will follow it.
 
 **Open now:**
-- KPG-11 to KPG-14, found building the protocol and type layers.
-- KPG-15 to KPG-22, found planning and building the first live connection (phase 4).
+- KPG-15: fixed upstream in 0.9.506; this package adopts it next (SASLprep).
+- KPG-23, found porting to 0.9.506.
 
-Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -29,6 +29,40 @@ Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see bel
 ---
 
 ## OPEN
+
+### KPG-23 · LOW · `IoError` gives the OS's words only inside its message, never alone
+
+**Status:** open. An absence, checked on 0.9.506.
+
+KPG-22's fix keeps the OS's code and quotes its text: `IoError.message()` is `"connection refused (os error 61:
+Connection refused)"`. The text alone comes from a private `osText(code:)` (`lib/std/io/io.kama:114`). The module
+exports `IoError, IoErrorKind, lastError` and nothing else (`:3`). `IoError` has `kind()`, `rawOsError()` and
+`message()` (`:94-110`).
+
+```kama
+import { core::println, std::io::IoError, std::net::TcpStream };
+fn int32 main() {
+    // Port 1 on loopback: nothing listens, so the OS refuses the connect.
+    Result<TcpStream, IoError> r = TcpStream.connect(host: "127.0.0.1", port: 1ui16);
+    string m = match (r) { case Ok(value: s): "connected"; case Err(error: e): e.message(); };
+    println(s: give m);
+    return 0;
+}
+```
+
+```
+connection refused (os error 61: Connection refused)
+```
+
+**Why it matters here.** libpq prints `strerror` and nothing else. psql says `… port 1 failed: Connection
+refused`, so this client cannot say exactly that. It can say the kind (`connection refused`) or the whole message.
+
+**Workaround here.** None to delete later. The client prints `IoError.message()`, which carries more than libpq's
+text but not libpq's text. The two integration checks that compare an I/O failure match its kind and the OS's
+words separately (`session_test.kama`, `socket_test.kama`).
+
+**Suggested fix.** A public `osMessage()` (or `description()`) on `IoError`, returning `Optional<string>`: the OS's
+text for the code, `None` for an error kama raised itself.
 
 ### KPG-15 · MED · std has no Unicode normalization, so SASLprep (and SCRAM with a non-ASCII password) cannot be done right
 
@@ -60,335 +94,70 @@ NFD, NFKC and NFKD, with tables generated from the UCD at a pinned Unicode versi
 (`unicode-normalization`) and Go in `x/text`, but kama has no package for it. A std module is the place where
 one implementation can be tested against the UCD's `NormalizationTest.txt`.
 
-### KPG-16 · LOW · No home-directory lookup in std
-
-**Status:** open. An absence, checked on 0.9.490.
-
-`std::process::identity` exports `UserId, GroupId, AccessToken, currentUser, currentGroup, currentProcessId`
-(`lib/std/process/identity.kama:18`). A `UserId` gives `raw()` and `name()` (`:59-61`) but not its home
-directory, and nothing in `lib/std` or `lib/core` reads `getpwuid_r`'s `pw_dir`.
-
-**Why it matters here.** libpq finds `~/.pgpass` and `~/.pg_service.conf` through `$HOME`. When `HOME` is unset it
-falls back to the passwd entry (`pqGetHomeDirectory` in `fe-connect.c`); this is common under a service manager
-or in a container. On Windows it uses `%APPDATA%`, which an environment variable already gives.
-
-**Workaround here.** None. When `HOME` is unset, this package uses no user file, and says so in its docs.
-
-**Suggested fix.** `UserId.homeDirectory()` returning `Result<string, IoError>` from `getpwuid_r`. Optionally
-also `std::process::homeDirectory()`, which reads `$HOME` first and then the passwd entry, as Rust's
-`std::env::home_dir` does on Unix.
-
-### KPG-17 · MED · An interrupted system call is `IoError::Other(4)`, indistinguishable from a real failure
-
-**Status:** open. An absence, checked on 0.9.490.
-
-`lastError()` (`lib/std/io/io.kama:68-86`) classifies errno into named variants, but EINTR is not one of them,
-so it falls through to `IoError::Other(code: e)`. The runtime's poll returns -1 with errno EINTR to the kama
-layer as it is:
-- `kama_poller_wait` (`include/kama_os.h:1910-1913`) is `return poll(...)`.
-- `recv` and `send` are the same (`:1742`).
-
-`Poller.wait`'s own comment says "EINTR surfaces as Err(Other) — the caller may retry". But the caller cannot
-tell EINTR from any other `Other` without comparing a raw, platform-specific errno. The runtime knows the value
-(`kama_EINTR()`, `include/kama_os.h:1333`) and does not expose it.
-
-**Why it matters here.** This package's connection is a non-blocking socket driven by `Poller.wait` with a
-deadline, which is libpq's design. A signal handled anywhere in the application wakes `poll` with EINTR, whatever
-`SA_RESTART` says. Examples: SIGCHLD from a child process, SIGWINCH, or a profiler's SIGPROF.
-- The right response is to recompute the remaining time and wait again.
-- As things stand, the connection must either fail, which is wrong, or test `code == 4`, which is a magic
-  number.
-
-**Workaround here.** None. EINTR is reported as an I/O error, and the connection closes. That is wrong, but
-honest, until this is fixed.
-
-**Suggested fix.** Either one would do. The first is the general fix, and Rust has both.
-- Add `IoError::Interrupted` (Rust's `ErrorKind::Interrupted`), classified in `lastError()`.
-- Have `Poller.wait` retry EINTR internally, with the remaining time recomputed against the monotonic clock.
-
-### KPG-18 · LOW · `Metadata` has no file type, and an open `File` cannot be asked for its metadata
-
-**Status:** open. An absence, checked on 0.9.490.
-
-`std::fs::Metadata` (`lib/std/fs/fs.kama:124-130`) has `size`, `isDir`, `modified` and `permissions`, and nothing
-else. The runtime drops the rest of `st_mode`: `kama_path_meta` keeps `S_ISDIR` and `st_mode & 0777`
-(`include/kama_os.h:1390-1392`), so nothing says whether a path is a regular file, a FIFO, a device or a socket.
-`File` has no `metadata()` (no `fstat`), so the only check is by path, before the open.
-
-**Why it matters here.** libpq reads `~/.pgpass` by opening it and then calling `fstat` on that descriptor
-(`passwordFromFile` in `fe-connect.c`):
-- A file that is not regular is refused with `WARNING: password file "…" is not a plain file`. This is the usual
-  way to turn the file off (`PGPASSFILE=/dev/null`). A FIFO would otherwise block the connect.
-- Only then is it refused for group or world access.
-- Both checks are on the descriptor, so there is no time-of-check race.
-
-**Workaround here.** None. This package calls `stat` by path and treats a directory as "not a plain file". Any
-other non-regular file goes on to the permission check: `/dev/null` (mode 0666) gets the "group or world access"
-warning instead of libpq's, and a FIFO would be opened. Both are documented.
-
-**Suggested fix.** A file type on `Metadata`, such as `FileKind { File, Dir, Symlink, Fifo, CharDevice,
-BlockDevice, Socket }` from `st_mode`, where `isDir` becomes `kind == Dir`. Also `File.metadata()` through
-`fstat`, so a check and a read can share one descriptor.
-
-### KPG-19 · MED · A field default naming an enum variant breaks when the type is a std generic's element
-
-**Status:** open. Reproduces on 0.9.490.
-
-A field whose default initializer names an enum variant is resolved in std's scope, not in the type's own, once
-the type is an argument of a std generic such as `DynamicArray`. The error points into std's source. The fix it
-suggests, importing the enum, does not help.
-
-```kama
-import { core::println, std::collections::DynamicArray };
-type enum Kind { First, Second }
-type resource Item {
-    string name;
-    Kind kind = Kind::First;          // the default that breaks it
-    public ctor make(string name, Kind kind) { this.name = give name; this.kind = kind; }
-}
-fn int32 main() {
-    DynamicArray<Item> list = DynamicArray.empty();
-    list.add(item: Item.make(name: "a", kind: Kind::Second));
-    println(s: "ok");
-    return 0;
-}
-```
-
-```
-loose.kama:9:0: error: cannot resolve `Kind::First` — `Kind` is not a type or module in reach here (in
-`DynamicArray<Item, GlobalAllocator>`, instantiated here; raised at …/lib/std/collections/dynamic_array.kama:5)
-…/lib/std/collections/view.kama:5:0: error: cannot resolve `Kind::First` — `Kind` is not a type or module in reach here
-```
-
-The same code in a library module reports `type 'Kind' is not imported — it lives in 'gapdef'; add import {
-gapdef::Kind };`. Adding that import (to the file that declares `Kind`) changes nothing. Without the default
-(`Kind kind;`, set in the constructor), both check clean. A default of a number or a bool does not trigger it
-(`isize start = 0;` is used in a `DynamicArray` element type elsewhere in this package).
-
-**Impact.** It cost a debugging round. In `postgres::Config`, the error pointed at the `DynamicArray<Host>` field,
-naming a type declared ten lines above it.
-
-**Workaround here.** `Host.hostKind` (`src/config.kama`) has no default. Every constructor sets it, which they did
-anyway.
-
-**Suggested fix.** Resolve a field's default initializer in the scope of the type that declares it, wherever the
-type is instantiated.
-
-### KPG-20 · MED · `kama check` accepts `Optional<E> x = <an E>` for a user enum, and clang rejects it
-
-**Status:** open. Reproduces on 0.9.490.
-
-The checker types by kind. Assigning a plain enum value to a local declared `Optional` of that enum passes the
-check, because both sides are enums. `kama build` then fails in clang, with the mangled C names and nothing that
-points at the kama line's mistake. A number is caught (`a local is declared 'Optional', so it cannot be
-initialized with a number`), so this is specific to enum, and resource, element types.
-
-```kama
-import { core::println, std::collections::DynamicArray };
-type enum Step { Go(int32 n), Stop }
-fn int32 main() {
-    DynamicArray<Step> xs = DynamicArray.empty();
-    xs.add(item: Step::Go(n: 7));
-    Optional<Step> first = xs.remove(index: 0);     // remove returns Step, not Optional<Step>
-    int32 v = match (first) { case Some(value: x): 1; case None: -1; };
-    println(s: "${v}");
-    return 0;
-}
-```
-
-```
-$ kama check g.kama
-kama: g.kama OK (4 units analyzed)
-$ kama build g.kama
-g.kama:6:13: error: assigning to 'kama__Optional_k_Fg__Step' (aka 'struct kama__Optional_k_Fg__Step') from
-incompatible type 'k_Fg__Step' (aka 'struct k_Fg__Step')
-```
-
-The same happens with a resource payload (`Go(string n)`).
-
-**Impact.** It cost a build round in this package's test fake server. `remove` and `pop` are easy to confuse,
-since one returns `T` and the other `Optional<T>`.
-
-**Workaround here.** None needed: the code was wrong, and is fixed. The gap is that only clang said so.
-
-**Suggested fix.** Check `Optional<T>` against `T` (and `Result<T, E>` against its arms) by type, not only by
-kind, at every crossing.
-
-### KPG-21 · LOW · `UnixStream` has no non-blocking connect
-
-**Status:** open. An absence, checked on 0.9.490.
-
-`TcpStream` has `connectNonBlocking` / `connectToNonBlocking` and `checkConnected`, so a connect can be bounded
-by a `Poller` deadline. `UnixStream` has only the blocking `connect` and `connectTo`
-(`lib/std/net/unix.kama:237-257`). Their C side is a plain `connect()` on a blocking socket
-(`include/kama_os.h:2072-2076`).
-
-**Why it matters here.** libpq makes every socket non-blocking before `connect()`, and `connect_timeout` bounds
-the connect too (`PQconnectPoll`). A local connect usually returns at once. But one to a server whose listen
-queue is full blocks on Linux until there is room, and `connect_timeout` cannot end that wait.
-
-**Workaround here.** None. `postgres::UnixTransport` connects blocking, then makes the socket non-blocking, so
-connect_timeout bounds everything after the connect. That is documented on the type.
-
-**Suggested fix.** `UnixStream.connectNonBlocking(path:)` / `connectToNonBlocking(address:)` and
-`checkConnected()`, mirroring `TcpStream`: EAGAIN or EINPROGRESS from `connect()` becomes a pending stream that a
-`Poller` reports writable.
-
-### KPG-22 · LOW · `IoError` carries no operating-system text, and `Other` says only "i/o error"
-
-**Status:** open. An absence, checked on 0.9.490.
-
-`IoError.message()` (`lib/std/io/io.kama:47-63`) is a fixed English word per variant ("connection refused", "not
-found"). For `Other(code)` it is "i/o error", whatever the code. Nothing gives the platform's own description,
-the `strerror(errno)` or `FormatMessage` text.
-
-**Why it matters here.** libpq reports a failed connect, a failed read and a failed socket option with
-`strerror`. psql prints `Connection refused` and `No such file or directory`, where this client can only print
-`connection refused` and `not found`. An unclassified errno, such as EINTR (KPG-17), ENETDOWN or EMFILE, reaches
-the user as "i/o error", which hides the cause.
-
-**Workaround here.** None: the client prints `IoError.message()`. Every other part of a libpq message (the host
-identity, the hint lines) is reproduced.
-
-**Suggested fix.** A `description()` (or `osMessage()`) on `IoError` with the platform's text, captured when
-`lastError()` classifies errno, so a log line can say what the OS said. `Other(code)` could carry it too.
-
-### KPG-11 · MED · A generic-inference error is reported against the wrong file, and `kama query --diagnostics` misses it
-
-**Status:** open. Reproduces on 0.9.486 and 0.9.490.
-
-**Symptom.** One error, reported three different ways:
-- `kama check` reports it, but names the package's **root** file (or, from a consumer, the **consumer's**
-  entry file) with the **right line number from the real file**.
-- `kama query <kama.json> <the real file> --diagnostics` reports nothing at all.
-- The error message itself is accurate.
-
-So the error points at a file where that line holds unrelated code, and the per-file diagnostics an agent or
-an editor asks for say the file is clean.
-
-**Repro.** A library with a submodule:
-
-```kama
-// src/slib.kama — the root module
-export { one };
-fn int32 one() { return 1; }
-```
-
-```kama
-// src/sub/broken.kama  (kama.json lists "sub")
-import { std::math::sin, std::math::abs };
-export { Table };
-fn float64 helper(float64 t) { return abs(x: sin(x: t)); }
-type value Table { float64 v = 0.0; public ctor make() { this.v = helper(t: 1.0); } }
-```
-
-```
-$ kama check kama.json
-src/slib.kama:3:0: error: cannot infer generic type parameter 'T' — argument 'x' is not a literal or a locally-typed value
-$ kama query kama.json src/sub/broken.kama --diagnostics
-no diagnostics
-```
-
-Line 3 is `helper`'s line in `src/sub/broken.kama`; `src/slib.kama` has no line 3. A consumer of a library
-with the same code gets the error against its own `src/main.kama`, at the library's line number. A plain type
-error in the same submodule file is reported correctly, by `check` and by `query` both, so this is specific
-to the generic-inference diagnostic.
-
-**Impact.** In this package the error pointed at a unit-test file whose line 41 is unrelated. Finding the
-real site meant recognising the parameter name (`x`, which the test file never uses) as `std::math`'s.
-
-**Suggested fix.** Carry the call's own file through to the inference diagnostic, and have `query
---diagnostics` include the diagnostics `check` raises for that file.
-
-### KPG-12 · LOW · A generic call cannot take another generic call's result as its argument
-
-**Status:** open. Reproduces on 0.9.486 and 0.9.490. It may be a deliberate limit of local inference; recorded as a
-consumer data point.
-
-`abs(x: sin(x: t))` with `t` a `float64` local is refused ("argument 'x' is not a literal or a locally-typed
-value"). The inner call's type is fully determined (`sin<float64>` returns `float64`), but the outer call
-will not infer from it. The workaround is a typed local per step:
-
-```kama
-float64 sine = sin(x: t);
-float64 magnitude = abs(x: sine);
-```
-
-**Impact.** Small: a few lines of ceremony wherever math nests. `postgres::protocol`'s MD5 table
-(`floor(|sin(i + 1)| · 2^32)`) is written that way.
-
-**Suggested fix.** Infer a generic argument from a call whose return type is already known.
-
-### KPG-13 · MED · `parse::<float64>` refuses a subnormal it read exactly
-
-**Status:** open. Reproduces on 0.9.486 and 0.9.490.
-
-```kama
-import { core::println, std::fmt::parse, std::fmt::ParseError };
-fn int32 main() {
-    string tiny = "5e-324";                       // the smallest positive float64
-    string small = "2.2250738585072014e-308";     // DBL_MIN, normal
-    string sub = "1e-310";                        // subnormal
-    Result<float64, ParseError> a = parse::<float64>(s: tiny);
-    Result<float64, ParseError> b = parse::<float64>(s: small);
-    Result<float64, ParseError> c = parse::<float64>(s: sub);
-    string ra = match (a) { case Ok(value: v): "ok"; case Err(error: e): e.message(); };
-    string rb = match (b) { case Ok(value: v): "ok"; case Err(error: e): e.message(); };
-    string rc = match (c) { case Ok(value: v): "ok"; case Err(error: e): e.message(); };
-    println(s: "5e-324: ${ra}; DBL_MIN: ${rb}; 1e-310: ${rc}");
-    return 0;
-}
-```
-
-```
-5e-324: number out of range for this type; DBL_MIN: ok; 1e-310: number out of range for this type
-```
-
-**Evidence.** `include/kama_fmt.h:35`: `if (errno == ERANGE) return 3;`. strtod sets ERANGE on underflow even
-when it returns the correctly rounded subnormal, so every subnormal is refused although each is a valid
-float64.
-
-**Impact.** A `float8` column holding a subnormal fails to decode from text, and PostgreSQL's own output of
-`5e-324` is one of this package's server vectors. JSON numbers would hit the same refusal.
-
-**Workaround here.** `postgres::types` retries an out-of-range parse with libc `strtod` directly (an `extern`
-in `src/types/codec.kama`), and accepts any finite answer.
-
-**Suggested fix.** Report ERANGE as out of range only for an overflow (the result is ±HUGE_VAL). An underflow
-returns a value that is exactly what was written, or the nearest representable one, and should be accepted.
-
-### KPG-14 · LOW · A `comptime int64` at int64's minimum is emitted as an out-of-range C literal
-
-**Status:** open. Reproduces on 0.9.486 and 0.9.490.
-
-```kama
-// The minimum int64, spelled the only way a literal can reach it.
-comptime int64 LOWEST = -9223372036854775807i64 - 1i64;
-fn int32 main() { int64 x = LOWEST; if (x < 0i64) { return 0; } return 1; }
-```
-
-```
-int64min.kama:2:45: warning: integer literal is too large to be represented in a signed integer type,
-interpreting as unsigned [-Wimplicitly-unsigned-literal]
-```
-
-The emitted C is `static const int64_t … = -9223372036854775808;`, the same text whether the constant is
-written `-9223372036854775808i64` or folded from `-9223372036854775807i64 - 1i64`. The program still runs
-correctly: the unsigned value converts back. The same literal inside an expression in a function body
-(`int64 x = -9223372036854775808i64;`) builds without a warning, so only the `comptime` emission has it.
-
-**Impact.** A warning in every build of every consumer: `timestamp`'s -infinity is int64's minimum.
-
-**Workaround here.** `src/types/datetime.kama` returns it from a function instead of declaring a `comptime`.
-
-**Suggested fix.** Emit `INT64_MIN`, or `(-9223372036854775807LL - 1)`, for that value.
-
 ---
 
 ## FIXED — kept for the record
 
-KPG-4 and KPG-6 were verified on 0.9.486. The rest were re-run on 0.9.477 with the same repro as the
-original report.
+KPG-11 to KPG-22 were verified on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
+same repro as the original report.
+
+### KPG-11 · MED · A generic-inference error was reported against the wrong file — FIXED in 0.9.493
+
+Fixed by `31c1a943`. The repro as filed now checks clean, because KPG-12's fix lets that call infer. An
+inference failure that remains (`pick(a: t, b: n)` with a `float64` and an `int32`, in the same submodule file) is
+reported as `src/sub/broken.kama:3:0: error: cannot unify type parameter 'T'` by `kama check`. `kama query kama.json
+src/sub/broken.kama --diagnostics` reports it too, and the root file reports nothing.
+
+### KPG-12 · LOW · A generic call could not take another generic call's result — FIXED in 0.9.497
+
+Fixed by `3af6dc0e`. `abs(x: sin(x: t))` builds and runs, and `postgres::protocol`'s MD5 table is written that way again.
+
+### KPG-13 · MED · `parse::<float64>` refused a subnormal — FIXED in 0.9.499
+
+Fixed by `f4a84e46`: only an overflow is out of range. The repro prints `5e-324: ok; DBL_MIN: ok; 1e-310: ok`. The
+`strtod` extern in `src/types/codec.kama` is gone, and the codec vectors (with `5e-324`) pass.
+
+### KPG-14 · LOW · A `comptime int64` at int64's minimum was an out-of-range C literal — FIXED in 0.9.492
+
+Fixed by `312c8c34`. The repro builds with no warning. `src/types/datetime.kama`'s `timestampBegin()` is the
+`comptime` `TIMESTAMP_BEGIN` again.
+
+### KPG-16 · LOW · No home-directory lookup in std — FIXED in 0.9.504
+
+Fixed by `67b7d03c`: `UserId.homeDirectory()`. With `HOME` unset or empty, `Environment` falls back to the passwd
+entry's home, as libpq's `pqGetHomeDirectory` does. `process()` captures it, and a test can set it
+(`setAccountHome`).
+
+### KPG-17 · MED · An interrupted system call was `IoError::Other(4)` — FIXED in 0.9.502
+
+Fixed by `176aca2f`: `IoErrorKind::Interrupted`, and `Poller.wait` waits out a signal with the time left. `Wire`
+retries a read or write that reports `Interrupted`.
+
+### KPG-18 · LOW · `Metadata` had no file type, and an open `File` no metadata — FIXED in 0.9.505
+
+Fixed by `1d11fb05`: `FileKind` on `Metadata`, and `File.metadata()` through the descriptor. The password file is
+checked as libpq checks it, on the file it opened: one that is not a regular file is "not a plain file", for
+`/dev/null` and a FIFO too, and only then is it checked for group or world access.
+
+### KPG-19 · MED · A field default naming an enum variant broke in a std generic — FIXED in 0.9.494
+
+Fixed by `af43308e`, with `f7629f7c`. The repro builds and prints `ok`.
+
+### KPG-20 · MED · `kama check` accepted `Optional<E> x = <an E>` — FIXED in 0.9.496
+
+Fixed by `5f4ca87a`. The repro is refused by `kama check`: "a local is declared `Optional<Step>`, and a `Step` is
+not one — wrap it: `Optional::Some(value: …)`".
+
+### KPG-21 · LOW · `UnixStream` had no non-blocking connect — FIXED in 0.9.500
+
+Fixed by `fb13db8f`. `UnixTransport.connect` is non-blocking, and connect_timeout bounds it. A full listen queue
+fails that host at once, as it does in libpq (EAGAIN on Linux, ECONNREFUSED on macOS). The socket integration
+tests pass on 14 to 19.
+
+### KPG-22 · LOW · `IoError` carried no operating-system text — FIXED in 0.9.502
+
+Fixed by `176aca2f` (and `a412ce0a` for wasm): `IoError` is a kind and the OS's code, and `message()` quotes the
+OS's words. KPG-23 is what remains: those words alone, for libpq's message.
 
 ### KPG-4 · MED · No Unix-domain sockets — FIXED in 0.9.483 (KR-104)
 

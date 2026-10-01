@@ -12,15 +12,18 @@ edit.
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.486**, declared as `"kama"` in every manifest here. That is the first
+**The package needs kama ≥ 0.9.506**, declared as `"kama"` in every manifest here. That is the first
 compiler with everything this package relies on:
 - a non-fatal write to a closed socket;
 - a `Sendable` `TcpStream`;
 - `recvTimeout`;
 - `std::digest` HMAC/PBKDF2;
-- Unix sockets;
+- Unix sockets, connected without blocking;
 - TCP keepalive;
-- `std::process::currentUser`.
+- `std::process::currentUser` and the account's home directory;
+- `IoError` as a kind and the OS's code (`match (e.kind())`), with `Interrupted`;
+- `FileKind`, and `File.metadata()` on an open file;
+- `std::unicode` normalization, for SASLprep.
 
 ## What is true here and nowhere else
 
@@ -77,8 +80,8 @@ compiler with everything this package relies on:
 - **I/O is a `Transport`:** non-blocking `read`/`write` and `wait(interest:, timeoutMs:)`.
   - `TcpTransport` is a non-blocking `TcpStream` plus a `std::net::Poller`. The internal module
     `postgres::wire` frames messages over any transport, with deadlines.
-  - `UnixTransport` is the same for a socket host (a directory, or `@name` on Linux). Its connect blocks
-    (KPG-21).
+  - `UnixTransport` is the same for a socket host (a directory, or `@name` on Linux). Its connect is
+    non-blocking too, bounded by connect_timeout.
   - Phase 6 adds a TLS transport, after the SSLRequest exchange on the concrete `TcpStream`. `Connection` does
     not change.
   - The integration tests reach the server's socket through a relay of their own (`socket_test.kama`).
@@ -110,9 +113,8 @@ compiler with everything this package relies on:
     the loop, then give.
   - A field cannot be moved out (`give this.x`). Build values in place, or drain a `DynamicArray` with `pop()`.
   - A `ref` parameter cannot name an `Owned<T>`. Pass the `Owned` by value and hand it back.
-  - `DynamicArray.remove` returns `T` and `pop` returns `Optional<T>`. Mixing them up passes `check` (KPG-20).
-  - No field default may name an enum variant if the type will be a std generic's element (KPG-19). Set it in
-    the constructor.
+  - `DynamicArray.remove` returns `T` and `pop` returns `Optional<T>`.
+  - An `IoError` is a value: branch on `e.kind()`, and make one with `IoError.of(kind: IoErrorKind::…)`.
 
 - **Nothing from the server is trusted.**
   - Every length is bounded before it is used.

@@ -1,0 +1,397 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
+         std::encoding::utf8::Utf8Error, postgres::conninfo::Keyword, postgres::conninfo::libpqKeywords };
+export { ConnInfo, ConnInfoError, parseConnInfo, isConnectionString };
+
+// postgres::conninfo — connection strings exactly as libpq reads them: the `keyword=value` form and the
+// `postgresql://` URI form, every keyword libpq knows (src/conninfo/keywords.kama is generated from libpq's own
+// table), and libpq's own error wording. The parser is a port of conninfo_parse and conninfo_uri_parse_options
+// in libpq's fe-connect.c, and it is tested against libpq's URI regression cases. So a connection string written
+// for psql means the same thing here.
+//
+// Parsing only records what the string says. Environment variables, defaults, the password file and the service
+// file are applied when a connection is configured from it (postgres::Config).
+
+// A connection string that does not parse. The message is libpq's, word for word where libpq has one.
+type enum ConnInfoError implements Error {
+    Invalid(string detail);
+    public const fn string message() { return match (this) { case Invalid(detail: d): copy d; }; }
+}
+
+// What a connection string set: libpq keywords and their values, in the order first set. A keyword set twice
+// keeps the last value, as libpq does.
+type resource ConnInfo {
+    DynamicArray<string> keys;
+    DynamicArray<string> values;
+
+    public ctor empty() { this.keys = DynamicArray.empty(); this.values = DynamicArray.empty(); }
+
+    public fn void set(const ref string keyword, string value) {
+        isize found = -1;
+        isize i = 0;
+        while (i < this.keys.length() && found < 0) {
+            if (this.keys[i].equals(other: keyword)) { found = i; }
+            i = i + 1;
+        }
+        if (found >= 0) { this.values[found] = give value; return; }
+        this.keys.add(item: copy keyword);
+        this.values.add(item: give value);
+    }
+
+    public const fn Optional<string> get(const ref string keyword) {
+        isize i = 0;
+        while (i < this.keys.length()) {
+            if (this.keys[i].equals(other: keyword)) { return Optional::Some(value: copy this.values[i]); }
+            i = i + 1;
+        }
+        return Optional::None;
+    }
+
+    public const fn bool has(const ref string keyword) {
+        isize i = 0;
+        while (i < this.keys.length()) { if (this.keys[i].equals(other: keyword)) { return true; } i = i + 1; }
+        return false;
+    }
+
+    public const fn isize count() { return this.keys.length(); }
+    public const fn const ref string keyAt(isize i) { return this.keys[i]; }
+    public const fn const ref string valueAt(isize i) { return this.values[i]; }
+}
+
+// The prefixes that make a connection string a URI.
+fn isize uriPrefixLength(ConstView<uint8> s) {
+    if (startsWithAscii(s: s, prefix: "postgresql://")) { return 13; }
+    if (startsWithAscii(s: s, prefix: "postgres://")) { return 11; }
+    return 0;
+}
+
+fn bool startsWithAscii(ConstView<uint8> s, const ref string prefix) { return startsWithBytes(s: s, p: prefix.bytes()); }
+
+fn bool startsWithBytes(ConstView<uint8> s, ConstView<uint8> p) {
+    if (s.length() < p.length()) { return false; }
+    isize i = 0;
+    while (i < p.length()) { if (s[i] != p[i]) { return false; } i = i + 1; }
+    return true;
+}
+
+// Whether `text` is a connection string rather than a plain value: a URI, or something holding '='. libpq's
+// recognized_connection_string, which decides whether a dbname is expanded as one.
+fn bool isConnectionString(const ref string text) {
+    if (uriPrefixLength(s: text.bytes()) > 0) { return true; }
+    return text.contains(substring: "=");
+}
+
+fn Result<ConnInfo, ConnInfoError> parseConnInfo(const ref string text) {
+    isize prefix = uriPrefixLength(s: text.bytes());
+    if (prefix > 0) { return parseUri(uri: text, b: text.bytes(), prefix: prefix); }
+    return parseKeywordValue(b: text.bytes());
+}
+
+fn ConnInfoError invalid(const ref string message) { return ConnInfoError::Invalid(detail: copy message); }
+
+fn bool isSpace(uint8 c) { return c == 32ui8 || (c >= 9ui8 && c <= 13ui8); }
+
+fn Result<string, ConnInfoError> textOf(const ref DynamicArray<uint8> bytes) {
+    Result<string, Utf8Error> s = decode(bytes: bytes.view());
+    return match (give s) {
+        case Ok(value: t): Result::Ok(value: give t);
+        case Err(error: e): Result::Err(error: invalid(message: "connection string text is not valid UTF-8"));
+    };
+}
+
+fn DynamicArray<uint8> bytesBetween(ConstView<uint8> b, isize from, isize to) {
+    DynamicArray<uint8> acc = DynamicArray.withCapacity(capacity: to - from);
+    isize i = from;
+    while (i < to) { acc.add(item: b[i]); i = i + 1; }
+    return acc;
+}
+
+fn bool knownKeyword(const ref DynamicArray<Keyword> known, const ref string keyword) {
+    isize i = 0;
+    while (i < known.length()) { if (known[i].name().equals(other: keyword)) { return true; } i = i + 1; }
+    return false;
+}
+
+// conninfo_storeval: requiressl is translated to sslmode, and an unknown keyword is refused (`missing` says how
+// the caller reports it). Answers false for an unknown keyword.
+fn bool store(ref ConnInfo info, const ref DynamicArray<Keyword> known, string keyword, string value) {
+    if (keyword.equals(other: "requiressl")) {
+        string mode = "prefer";
+        if (value.startsWith(prefix: "1")) { mode = "require"; }
+        string sslmode = "sslmode";
+        info.set(keyword: sslmode, value: give mode);
+        return true;
+    }
+    if (!knownKeyword(known: known, keyword: keyword)) { return false; }
+    info.set(keyword: keyword, value: give value);
+    return true;
+}
+
+// ---- keyword = value --------------------------------------------------------------------------------------
+
+fn Result<ConnInfo, ConnInfoError> parseKeywordValue(ConstView<uint8> b) {
+    ConnInfo info = ConnInfo.empty();
+    DynamicArray<Keyword> known = libpqKeywords();
+    isize i = 0;
+    while (i < b.length()) {
+        if (isSpace(c: b[i])) { i = i + 1; continue; }
+        // The keyword runs to '=' or whitespace.
+        isize start = i;
+        while (i < b.length() && b[i] != 61ui8 && !isSpace(c: b[i])) { i = i + 1; }
+        DynamicArray<uint8> nameBytes = bytesBetween(b: b, from: start, to: i);
+        while (i < b.length() && isSpace(c: b[i])) { i = i + 1; }
+        Result<string, ConnInfoError> nameText = textOf(bytes: nameBytes);
+        string name = match (give nameText) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+        if (i >= b.length() || b[i] != 61ui8) {
+            return Result::Err(error: invalid(message: "missing \"=\" after \"".concat(other: name).concat(other: "\" in connection info string")));
+        }
+        i = i + 1;
+        while (i < b.length() && isSpace(c: b[i])) { i = i + 1; }
+        // The value: bare up to whitespace, or single-quoted; a backslash takes the next byte literally.
+        DynamicArray<uint8> valueBytes = DynamicArray.empty();
+        if (i < b.length() && b[i] == 39ui8) {
+            i = i + 1;
+            bool closed = false;
+            while (!closed) {
+                if (i >= b.length()) { return Result::Err(error: invalid(message: "unterminated quoted string in connection info string")); }
+                if (b[i] == 92ui8) {
+                    i = i + 1;
+                    if (i < b.length()) { valueBytes.add(item: b[i]); i = i + 1; }
+                } else if (b[i] == 39ui8) {
+                    i = i + 1;
+                    closed = true;
+                } else {
+                    valueBytes.add(item: b[i]);
+                    i = i + 1;
+                }
+            }
+        } else {
+            while (i < b.length() && !isSpace(c: b[i])) {
+                if (b[i] == 92ui8) {
+                    i = i + 1;
+                    if (i < b.length()) { valueBytes.add(item: b[i]); i = i + 1; }
+                } else {
+                    valueBytes.add(item: b[i]);
+                    i = i + 1;
+                }
+            }
+        }
+        Result<string, ConnInfoError> valueText = textOf(bytes: valueBytes);
+        string value = match (give valueText) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+        string keyword = copy name;
+        if (!store(info: ref info, known: known, keyword: give keyword, value: give value)) {
+            return Result::Err(error: invalid(message: "invalid connection option \"".concat(other: name).concat(other: "\"")));
+        }
+    }
+    return Result::Ok(value: give info);
+}
+
+// ---- URI ----------------------------------------------------------------------------------------------------
+
+fn int32 hexDigit(uint8 c) {
+    if (c >= 48ui8 && c <= 57ui8) { return cast<int32>(c - 48ui8); }
+    if (c >= 65ui8 && c <= 70ui8) { return cast<int32>(c - 55ui8); }
+    if (c >= 97ui8 && c <= 102ui8) { return cast<int32>(c - 87ui8); }
+    return -1;
+}
+
+// conninfo_uri_decode: leading and trailing spaces are dropped, a space inside is an error, %XX is a byte, and
+// %00 is refused. `raw` names the undecoded text in libpq's messages.
+fn Result<string, ConnInfoError> uriDecode(ConstView<uint8> b, const ref string raw) {
+    DynamicArray<uint8> acc = DynamicArray.withCapacity(capacity: b.length());
+    isize i = 0;
+    while (i < b.length() && b[i] == 32ui8) { i = i + 1; }
+    bool ended = false;
+    while (i < b.length() && !ended) {
+        if (b[i] == 37ui8) {
+            if (i + 2 >= b.length()) { return Result::Err(error: invalid(message: "invalid percent-encoded token: \"".concat(other: raw).concat(other: "\""))); }
+            int32 hi = hexDigit(c: b[i + 1]);
+            int32 lo = hexDigit(c: b[i + 2]);
+            if (hi < 0 || lo < 0) { return Result::Err(error: invalid(message: "invalid percent-encoded token: \"".concat(other: raw).concat(other: "\""))); }
+            int32 v = hi * 16 + lo;
+            if (v == 0) { return Result::Err(error: invalid(message: "forbidden value %00 in percent-encoded value: \"".concat(other: raw).concat(other: "\""))); }
+            acc.add(item: cast<uint8>(v));
+            i = i + 3;
+        } else if (b[i] == 32ui8) {
+            ended = true;
+        } else {
+            acc.add(item: b[i]);
+            i = i + 1;
+        }
+    }
+    while (i < b.length() && b[i] == 32ui8) { i = i + 1; }
+    if (i < b.length()) {
+        return Result::Err(error: invalid(message: "unexpected spaces found in \"".concat(other: raw).concat(other: "\", use percent-encoded spaces (%20) instead")));
+    }
+    return textOf(bytes: acc);
+}
+
+fn Result<string, ConnInfoError> decodeRange(ConstView<uint8> b, isize from, isize to) {
+    DynamicArray<uint8> raw = bytesBetween(b: b, from: from, to: to);
+    Result<string, ConnInfoError> rawText = textOf(bytes: raw);
+    string r = match (give rawText) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+    return uriDecode(b: raw.view(), raw: r);
+}
+
+fn Result<ConnInfo, ConnInfoError> parseUri(const ref string uri, ConstView<uint8> b, isize prefix) {
+    ConnInfo info = ConnInfo.empty();
+    DynamicArray<Keyword> known = libpqKeywords();
+    isize n = b.length();
+    isize i = prefix;
+
+    // [user[:password]@] — only if an '@' comes before the first '/'.
+    isize look = i;
+    while (look < n && b[look] != 64ui8 && b[look] != 47ui8) { look = look + 1; }
+    if (look < n && b[look] == 64ui8) {
+        isize userEnd = i;
+        while (b[userEnd] != 58ui8 && b[userEnd] != 64ui8) { userEnd = userEnd + 1; }
+        if (userEnd > i) {
+            Result<string, ConnInfoError> u = decodeRange(b: b, from: i, to: userEnd);
+            string user = match (give u) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+            string kw = "user";
+            bool ok = store(info: ref info, known: known, keyword: give kw, value: give user);
+        }
+        if (b[userEnd] == 58ui8) {
+            isize pwStart = userEnd + 1;
+            isize pwEnd = pwStart;
+            while (b[pwEnd] != 64ui8) { pwEnd = pwEnd + 1; }
+            Result<string, ConnInfoError> p = decodeRange(b: b, from: pwStart, to: pwEnd);
+            string password = match (give p) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+            string kw = "password";
+            bool ok = store(info: ref info, known: known, keyword: give kw, value: give password);
+            userEnd = pwEnd;
+        }
+        i = userEnd + 1;
+    }
+
+    // host[:port][,host[:port]]… — an IPv6 address in brackets.
+    DynamicArray<uint8> hosts = DynamicArray.empty();
+    DynamicArray<uint8> ports = DynamicArray.empty();
+    uint8 stop = 0ui8;   // the byte that ended the netloc: 0 (end), '/', or '?'
+    bool more = true;
+    while (more) {
+        isize hostStart = i;
+        isize hostEnd = i;
+        if (i < n && b[i] == 91ui8) {
+            hostStart = i + 1;
+            i = hostStart;
+            while (i < n && b[i] != 93ui8) { i = i + 1; }
+            if (i >= n) {
+                return Result::Err(error: invalid(message: "end of string reached when looking for matching \"]\" in IPv6 host address in URI: \"".concat(other: uri).concat(other: "\"")));
+            }
+            if (i == hostStart) {
+                return Result::Err(error: invalid(message: "IPv6 host address may not be empty in URI: \"".concat(other: uri).concat(other: "\"")));
+            }
+            hostEnd = i;
+            i = i + 1;
+            if (i < n && b[i] != 58ui8 && b[i] != 47ui8 && b[i] != 63ui8 && b[i] != 44ui8) {
+                DynamicArray<uint8> ch = bytesBetween(b: b, from: i, to: i + 1);
+                Result<string, ConnInfoError> chText = textOf(bytes: ch);
+                string c = match (give chText) { case Ok(value: t): give t; case Err(error: e): "?"; };
+                isize position = i + 1;
+                return Result::Err(error: invalid(message: "unexpected character \"".concat(other: c).concat(other: "\" at position ${position} in URI (expected \":\" or \"/\"): \"").concat(other: uri).concat(other: "\"")));
+            }
+        } else {
+            while (i < n && b[i] != 58ui8 && b[i] != 47ui8 && b[i] != 63ui8 && b[i] != 44ui8) { i = i + 1; }
+            hostEnd = i;
+        }
+        isize h = hostStart;
+        while (h < hostEnd) { hosts.add(item: b[h]); h = h + 1; }
+        uint8 term = 0ui8;
+        if (i < n) { term = b[i]; }
+        if (term == 58ui8) {
+            i = i + 1;
+            isize portStart = i;
+            while (i < n && b[i] != 47ui8 && b[i] != 63ui8 && b[i] != 44ui8) { i = i + 1; }
+            isize q = portStart;
+            while (q < i) { ports.add(item: b[q]); q = q + 1; }
+            term = 0ui8;
+            if (i < n) { term = b[i]; }
+        }
+        if (term == 44ui8) {
+            i = i + 1;
+            hosts.add(item: 44ui8);
+            ports.add(item: 44ui8);
+        } else {
+            stop = term;
+            more = false;
+        }
+    }
+    if (hosts.length() > 0) {
+        Result<string, ConnInfoError> rawHosts = textOf(bytes: hosts);
+        string raw = match (give rawHosts) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+        Result<string, ConnInfoError> decodedHosts = uriDecode(b: hosts.view(), raw: raw);
+        string hostValue = match (give decodedHosts) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+        string kw = "host";
+        bool ok = store(info: ref info, known: known, keyword: give kw, value: give hostValue);
+    }
+    if (ports.length() > 0) {
+        Result<string, ConnInfoError> rawPorts = textOf(bytes: ports);
+        string raw = match (give rawPorts) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+        Result<string, ConnInfoError> decodedPorts = uriDecode(b: ports.view(), raw: raw);
+        string portValue = match (give decodedPorts) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+        string kw = "port";
+        bool ok = store(info: ref info, known: known, keyword: give kw, value: give portValue);
+    }
+
+    // /dbname — an empty one is not set, so $PGDATABASE still applies.
+    if (stop == 47ui8) {
+        i = i + 1;
+        isize dbStart = i;
+        while (i < n && b[i] != 63ui8) { i = i + 1; }
+        if (i > dbStart) {
+            Result<string, ConnInfoError> d = decodeRange(b: b, from: dbStart, to: i);
+            string db = match (give d) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+            string kw = "dbname";
+            bool ok = store(info: ref info, known: known, keyword: give kw, value: give db);
+        }
+        stop = 0ui8;
+        if (i < n) { stop = b[i]; }
+    }
+
+    // ?keyword=value&…
+    if (stop == 63ui8) {
+        i = i + 1;
+        while (i < n) {
+            isize kwStart = i;
+            isize kwEnd = -1;
+            isize valStart = -1;
+            bool done = false;
+            while (!done) {
+                if (i < n && b[i] == 61ui8) {
+                    if (valStart >= 0) {
+                        Result<string, ConnInfoError> k = textOf(bytes: bytesBetween(b: b, from: kwStart, to: kwEnd));
+                        string kwText = match (give k) { case Ok(value: t): give t; case Err(error: e): "?"; };
+                        return Result::Err(error: invalid(message: "extra key/value separator \"=\" in URI query parameter: \"".concat(other: kwText).concat(other: "\"")));
+                    }
+                    kwEnd = i;
+                    i = i + 1;
+                    valStart = i;
+                } else if (i >= n || b[i] == 38ui8) {
+                    if (valStart < 0) {
+                        Result<string, ConnInfoError> k = textOf(bytes: bytesBetween(b: b, from: kwStart, to: i));
+                        string kwText = match (give k) { case Ok(value: t): give t; case Err(error: e): "?"; };
+                        return Result::Err(error: invalid(message: "missing key/value separator \"=\" in URI query parameter: \"".concat(other: kwText).concat(other: "\"")));
+                    }
+                    done = true;
+                } else {
+                    i = i + 1;
+                }
+            }
+            Result<string, ConnInfoError> kd = decodeRange(b: b, from: kwStart, to: kwEnd);
+            string keyword = match (give kd) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+            Result<string, ConnInfoError> vd = decodeRange(b: b, from: valStart, to: i);
+            string value = match (give vd) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+            if (i < n) { i = i + 1; }   // past '&'
+            // JDBC compatibility, as libpq has it: ssl=true means sslmode=require.
+            if (keyword.equals(other: "ssl") && value.equals(other: "true")) {
+                keyword = "sslmode";
+                value = "require";
+            }
+            string reported = copy keyword;
+            if (!store(info: ref info, known: known, keyword: give keyword, value: give value)) {
+                return Result::Err(error: invalid(message: "invalid URI query parameter: \"".concat(other: reported).concat(other: "\"")));
+            }
+        }
+    }
+    return Result::Ok(value: give info);
+}

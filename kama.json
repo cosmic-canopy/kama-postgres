@@ -12,6 +12,7 @@
   },
   "modules": {
     ".":        { "visibility": "public" },
-    "protocol": { "visibility": "public" }
+    "protocol": { "visibility": "public" },
+    "conninfo": { "visibility": "public" }
   }
 }

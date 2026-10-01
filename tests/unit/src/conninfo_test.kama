@@ -1,0 +1,141 @@
+// Connection strings against libpq's own URI regression cases (tests/unit/src/uri_vectors.kama, extracted from
+// src/interfaces/libpq/t/001_uri.pl by tools/gen-libpq-tables.sh). Each parse is printed the way
+// libpq_uri_regress prints it — every option set and not at its default, in libpq's keyword order, then
+// "(local)" or "(inet)" — and compared with libpq's output, or its error with libpq's message.
+import { std::collections::DynamicArray, postgres::conninfo::ConnInfo, postgres::conninfo::ConnInfoError,
+         postgres::conninfo::parseConnInfo, postgres::conninfo::Keyword, postgres::conninfo::libpqKeywords,
+         postgres::conninfo::isConnectionString,
+         postgres_unit_tests::check, postgres_unit_tests::uriInputs, postgres_unit_tests::uriOutputs,
+         postgres_unit_tests::uriErrors, postgres_unit_tests::uriEnvironments };
+export { conninfoTests };
+
+// The value NAME has in a case's environment ("NAME=value;…"), or None.
+fn Optional<string> envValue(const ref string env, const ref string name) {
+    string prefix = name.concat(other: "=");
+    foreach (string pair in env.split(separator: ";")) {
+        if (pair.startsWith(prefix: prefix)) { return Optional::Some(value: pair.substring(start: prefix.length(), end: pair.length())); }
+    }
+    return Optional::None;
+}
+
+// PQconndefaults' value for a keyword under `env`: its environment variable, else its compiled default — and,
+// as libpq does, sslmode defaults to verify-full when the root certificate is the system store.
+fn Optional<string> defaultFor(const ref Keyword k, const ref string env) {
+    if (k.environment().length() > 0) {
+        Optional<string> fromEnv = envValue(env: env, name: k.environment());
+        if (match (fromEnv) { case Some(value: v): true; case None: false; }) { return fromEnv; }
+    }
+    if (k.name().equals(other: "sslmode")) {
+        Optional<string> root = envValue(env: env, name: "PGSSLROOTCERT");
+        bool system = match (give root) { case Some(value: v): v.equals(other: "system"); case None: false; };
+        if (system) { return Optional::Some(value: "verify-full"); }
+    }
+    if (k.hasDefault()) { return Optional::Some(value: copy k.defaultValue()); }
+    return Optional::None;
+}
+
+fn string describe(const ref ConnInfo info, const ref string env) {
+    DynamicArray<Keyword> keywords = libpqKeywords();
+    string line = "";
+    bool local = true;
+    isize i = 0;
+    while (i < keywords.length()) {
+        Optional<string> v = info.get(keyword: keywords[i].name());
+        match (give v) {
+            case Some(value: val): {
+                Optional<string> d = defaultFor(k: keywords[i], env: env);
+                bool atDefault = match (give d) { case Some(value: dv): dv.equals(other: val); case None: false; };
+                if (!atDefault) {
+                    line = line.concat(other: keywords[i].name()).concat(other: "='").concat(other: val).concat(other: "' ");
+                }
+                if (val.length() > 0 && (keywords[i].name().equals(other: "hostaddr")
+                                         || (keywords[i].name().equals(other: "host") && !val.startsWith(prefix: "/")))) {
+                    local = false;
+                }
+            }
+            case None: { }
+        };
+        i = i + 1;
+    }
+    if (local) { return line.concat(other: "(local)"); }
+    return line.concat(other: "(inet)");
+}
+
+fn int32 libpqCases() {
+    int32 f = 0;
+    DynamicArray<string> inputs = uriInputs();
+    DynamicArray<string> outputs = uriOutputs();
+    DynamicArray<string> errors = uriErrors();
+    DynamicArray<string> envs = uriEnvironments();
+    isize i = 0;
+    while (i < inputs.length()) {
+        Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: inputs[i]);
+        string got = match (give parsed) {
+            case Ok(value: info): describe(info: info, env: envs[i]);
+            case Err(error: e): "error: ".concat(other: e.message());
+        };
+        string want = "";
+        if (errors[i].length() > 0) { want = "error: ".concat(other: errors[i]); } else { want = copy outputs[i]; }
+        f = f + check(ok: got.equals(other: want), what: "conninfo: libpq case ".concat(other: inputs[i]).concat(other: "\n      want: ").concat(other: want).concat(other: "\n      got:  ").concat(other: got));
+        i = i + 1;
+    }
+    return f;
+}
+
+fn string valueOf(const ref string text, const ref string keyword) {
+    Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: text);
+    return match (give parsed) {
+        case Ok(value: info): match (info.get(keyword: keyword)) { case Some(value: v): copy v; case None: "<unset>"; };
+        case Err(error: e): "error: ".concat(other: e.message());
+    };
+}
+
+// Keyword/value strings, and the parts of the URI form libpq's suite does not exercise, written from libpq's
+// conninfo_parse and conninfo_uri_parse_options.
+fn int32 keywordValueCases() {
+    int32 f = 0;
+    string basic = "host=db.example.com port=5433 dbname=app user=alice connect_timeout=10";
+    f = f + check(ok: valueOf(text: basic, keyword: "host").equals(other: "db.example.com") && valueOf(text: basic, keyword: "port").equals(other: "5433"), what: "conninfo: keyword=value pairs");
+    string spaced = "  host = localhost   dbname =  app ";
+    f = f + check(ok: valueOf(text: spaced, keyword: "dbname").equals(other: "app"), what: "conninfo: blanks around '=' and between pairs");
+    string quoted = "password='a b\\'c\\\\d' user=bob";
+    f = f + check(ok: valueOf(text: quoted, keyword: "password").equals(other: "a b'c\\d"), what: "conninfo: a quoted value with an escaped quote and backslash");
+    string escaped = "options=-c\\ search_path=x";
+    f = f + check(ok: valueOf(text: escaped, keyword: "options").equals(other: "-c search_path=x"), what: "conninfo: a backslash-escaped space in a bare value");
+    string empty = "password=''";
+    f = f + check(ok: valueOf(text: empty, keyword: "password").equals(other: ""), what: "conninfo: an empty quoted value");
+    string twice = "dbname=a dbname=b";
+    f = f + check(ok: valueOf(text: twice, keyword: "dbname").equals(other: "b"), what: "conninfo: the last of a repeated keyword wins");
+    string requiressl = "requiressl=1";
+    f = f + check(ok: valueOf(text: requiressl, keyword: "sslmode").equals(other: "require"), what: "conninfo: requiressl=1 is sslmode=require");
+    string unknown = "host=x foo=bar";
+    f = f + check(ok: valueOf(text: unknown, keyword: "host").equals(other: "error: invalid connection option \"foo\""), what: "conninfo: an unknown keyword is refused with libpq's message");
+    string unterminated = "password='abc";
+    f = f + check(ok: valueOf(text: unterminated, keyword: "password").equals(other: "error: unterminated quoted string in connection info string"), what: "conninfo: an unterminated quote");
+    string noEquals = "host";
+    f = f + check(ok: valueOf(text: noEquals, keyword: "host").equals(other: "error: missing \"=\" after \"host\" in connection info string"), what: "conninfo: a keyword with no '='");
+    string blank = "";
+    Result<ConnInfo, ConnInfoError> nothing = parseConnInfo(text: blank);
+    f = f + check(ok: match (give nothing) { case Ok(value: i): i.count() == 0; case Err(error: e): false; }, what: "conninfo: an empty string sets nothing");
+
+    string multi = "postgresql://h1:5433,h2,[::1]:5435/db?target_session_attrs=read-write";
+    f = f + check(ok: valueOf(text: multi, keyword: "host").equals(other: "h1,h2,::1") && valueOf(text: multi, keyword: "port").equals(other: "5433,,5435"), what: "conninfo: a multi-host URI keeps hosts and ports in step");
+    f = f + check(ok: valueOf(text: multi, keyword: "target_session_attrs").equals(other: "read-write"), what: "conninfo: a URI query parameter");
+    string jdbc = "postgresql://h/db?ssl=true";
+    f = f + check(ok: valueOf(text: jdbc, keyword: "sslmode").equals(other: "require"), what: "conninfo: URI ssl=true is sslmode=require (JDBC compatibility)");
+    string encodedPassword = "postgresql://u:p%40ss%3Aw@h/db";
+    f = f + check(ok: valueOf(text: encodedPassword, keyword: "password").equals(other: "p@ss:w"), what: "conninfo: a percent-encoded password");
+
+    string uri = "postgres://h";
+    string kv = "dbname=x";
+    string plain = "mydb";
+    f = f + check(ok: isConnectionString(text: uri) && isConnectionString(text: kv) && !isConnectionString(text: plain), what: "conninfo: which dbname values are connection strings themselves");
+    return f;
+}
+
+fn int32 conninfoTests() {
+    int32 f = 0;
+    f = f + libpqCases();
+    f = f + keywordValueCases();
+    return f;
+}

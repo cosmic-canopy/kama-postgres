@@ -1,6 +1,6 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::parse, std::fmt::ParseError,
-         std::time::Date, std::time::Timestamp, std::time::TimeError,
-         postgres::types::DecodeError, postgres::types::FORMAT_BINARY, postgres::types::utf8Text };
+         std::time::Date, std::time::Timestamp, std::time::TimeError, std::memory::Owned,
+         postgres::types::DecodeError, postgres::types::FORMAT_TEXT, postgres::types::FORMAT_BINARY, postgres::types::utf8Text };
 export { LocalDateTime, TimeOfDay, TimeTz, Interval,
          decodeDate, encodeDate, formatDate, decodeTimestamp, encodeTimestamp, formatTimestamp,
          decodeTimestampTz, encodeTimestampTz, formatTimestampTz, decodeTime, encodeTime, decodeTimeTz,
@@ -182,7 +182,7 @@ fn string formatDate(const ref Date d) {
 
 // A wall-clock reading with no zone: microseconds since 2000-01-01 00:00:00, PostgreSQL's own representation and
 // range.
-type value LocalDateTime {
+type value LocalDateTime implements Formattable, Serializable, Deserializable<This> {
     int64 us = 0i64;
     public ctor fromPgMicros(int64 micros) { this.us = micros; }
     public ctor Result<LocalDateTime, TimeError> make(const ref Date date, int64 microsOfDay) {
@@ -193,6 +193,25 @@ type value LocalDateTime {
     public const fn Result<Date, TimeError> date() { return Date.fromUnixDays(days: floorDiv(a: this.us, b: MICROS_PER_DAY) + PG_EPOCH_UNIX_DAYS); }
     public const fn int64 microsOfDay() { return this.us - floorDiv(a: this.us, b: MICROS_PER_DAY) * MICROS_PER_DAY; }
     public const fn bool equals(const ref LocalDateTime other) { return this.us == other.us; }
+    // PostgreSQL's text for a timestamp: "2026-09-30 12:34:56.789012", " BC" for a year before 1.
+    public unsafe ctor Result<LocalDateTime, DecodeError> parse(const ref string text) { return decodeTimestamp(format: FORMAT_TEXT, raw: text.bytes()); }
+    public const fn void format(ref Formatter f) { string s = formatTimestamp(v: this); f.writeStr(s: ref s); }
+    // Serialized as PostgreSQL's text, the form a parameter, JSON and every other backend carry.
+    public const fn Result<Unit, Owned<Error>> serialize(ref Serializer w) {
+        string text = formatTimestamp(v: this);
+        w.writeString(v: ref text);
+        if (w.failed()) { SerError e = w.errorCode(); return Result::Err(error: e); }
+        return Result::Ok(value: Unit::Unit);
+    }
+    public ctor Result<LocalDateTime, Owned<Error>> deserialize(Deserializer r) {
+        string text = r.readString();
+        if (r.failed()) { DeError e = r.errorCode(); return Result::Err(error: e); }
+        Result<LocalDateTime, DecodeError> v = LocalDateTime.parse(text: text);
+        return match (v) {
+            case Ok(value: x): Result::Ok(value: x);
+            case Err(error: pe): { r.failWith(e: DeError::Malformed); return Result::Err(error: DeError::Malformed); }
+        };
+    }
 }
 
 unsafe fn Result<LocalDateTime, DecodeError> decodeTimestamp(int16 format, ConstView<uint8> raw) {
@@ -292,7 +311,7 @@ unsafe fn Result<string, DecodeError> timestampText(ConstView<uint8> raw, bool z
 // ---- time and timetz ----------------------------------------------------------------------------------------
 
 // A time of day without a date: microseconds since midnight, 00:00:00 through 24:00:00.
-type value TimeOfDay implements Formattable {
+type value TimeOfDay implements Formattable, Serializable, Deserializable<This> {
     int64 us = 0i64;
     public ctor Result<TimeOfDay, TimeError> fromMicros(int64 micros) {
         if (micros < 0i64 || micros > MICROS_PER_DAY) { return Result::Err(error: TimeError::OutOfRange); }
@@ -302,7 +321,25 @@ type value TimeOfDay implements Formattable {
     public const fn int64 micros() { return this.us; }
     public const fn bool equals(const ref TimeOfDay other) { return this.us == other.us; }
     public const fn void format(ref Formatter f) { string s = clock(micros: this.us); f.writeStr(s: ref s); }
+    // PostgreSQL's text for a time: "12:34:56.789", "24:00:00".
+    public unsafe ctor Result<TimeOfDay, DecodeError> parse(const ref string text) { return decodeTime(format: FORMAT_TEXT, raw: text.bytes()); }
     friend postgres::types::decodeTime[raw];
+    // Serialized as PostgreSQL's text, the form a parameter, JSON and every other backend carry.
+    public const fn Result<Unit, Owned<Error>> serialize(ref Serializer w) {
+        string text = clock(micros: this.us);
+        w.writeString(v: ref text);
+        if (w.failed()) { SerError e = w.errorCode(); return Result::Err(error: e); }
+        return Result::Ok(value: Unit::Unit);
+    }
+    public ctor Result<TimeOfDay, Owned<Error>> deserialize(Deserializer r) {
+        string text = r.readString();
+        if (r.failed()) { DeError e = r.errorCode(); return Result::Err(error: e); }
+        Result<TimeOfDay, DecodeError> v = TimeOfDay.parse(text: text);
+        return match (v) {
+            case Ok(value: x): Result::Ok(value: x);
+            case Err(error: pe): { r.failWith(e: DeError::Malformed); return Result::Err(error: DeError::Malformed); }
+        };
+    }
 }
 
 unsafe fn Result<TimeOfDay, DecodeError> decodeTime(int16 format, ConstView<uint8> raw) {
@@ -324,7 +361,7 @@ fn void encodeTime(ref DynamicArray<uint8> to, const ref TimeOfDay v) { putBe(to
 
 // A time of day with a UTC offset. PostgreSQL stores the zone as seconds WEST of UTC; `offsetSeconds()` answers
 // it the usual way round (east positive: +05:30 is 19800).
-type value TimeTz implements Formattable {
+type value TimeTz implements Formattable, Serializable, Deserializable<This> {
     int64 us = 0i64;
     int32 zoneWest = 0;
     public ctor Result<TimeTz, TimeError> make(int64 micros, int32 offsetSeconds) {
@@ -345,6 +382,24 @@ type value TimeTz implements Formattable {
         f.writeStr(s: ref s);
     }
     friend postgres::types::decodeTimeTz[raw];
+    // PostgreSQL's text for a timetz: "12:34:56+05:30".
+    public unsafe ctor Result<TimeTz, DecodeError> parse(const ref string text) { return decodeTimeTz(format: FORMAT_TEXT, raw: text.bytes()); }
+    // Serialized as PostgreSQL's text, the form a parameter, JSON and every other backend carry.
+    public const fn Result<Unit, Owned<Error>> serialize(ref Serializer w) {
+        Formatter f = Formatter.make(); this.format(f: ref f); string text = f.finish();
+        w.writeString(v: ref text);
+        if (w.failed()) { SerError e = w.errorCode(); return Result::Err(error: e); }
+        return Result::Ok(value: Unit::Unit);
+    }
+    public ctor Result<TimeTz, Owned<Error>> deserialize(Deserializer r) {
+        string text = r.readString();
+        if (r.failed()) { DeError e = r.errorCode(); return Result::Err(error: e); }
+        Result<TimeTz, DecodeError> v = TimeTz.parse(text: text);
+        return match (v) {
+            case Ok(value: x): Result::Ok(value: x);
+            case Err(error: pe): { r.failWith(e: DeError::Malformed); return Result::Err(error: DeError::Malformed); }
+        };
+    }
 }
 
 unsafe fn Result<TimeTz, DecodeError> decodeTimeTz(int16 format, ConstView<uint8> raw) {
@@ -384,7 +439,7 @@ fn void encodeTimeTz(ref DynamicArray<uint8> to, const ref TimeTz v) {
 
 // An interval as PostgreSQL keeps it: months, days and microseconds, each signed and independent (a month is
 // not a fixed number of days, nor a day a fixed number of microseconds, across a DST change).
-type value Interval implements Formattable {
+type value Interval implements Formattable, Serializable, Deserializable<This> {
     int64 us = 0i64;
     int32 d = 0;
     int32 m = 0;
@@ -417,6 +472,24 @@ type value Interval implements Formattable {
             s = s.concat(other: ":").concat(other: zeroPad(v: (rest / MICROS_PER_SECOND) % 60i64, width: 2)).concat(other: fraction(micros: rest % MICROS_PER_SECOND));
         }
         f.writeStr(s: ref s);
+    }
+    // PostgreSQL's text for an interval, IntervalStyle postgres: "1 year 2 mons 3 days 04:05:06.789".
+    public unsafe ctor Result<Interval, DecodeError> parse(const ref string text) { return decodeInterval(format: FORMAT_TEXT, raw: text.bytes()); }
+    // Serialized as PostgreSQL's text, the form a parameter, JSON and every other backend carry.
+    public const fn Result<Unit, Owned<Error>> serialize(ref Serializer w) {
+        Formatter f = Formatter.make(); this.format(f: ref f); string text = f.finish();
+        w.writeString(v: ref text);
+        if (w.failed()) { SerError e = w.errorCode(); return Result::Err(error: e); }
+        return Result::Ok(value: Unit::Unit);
+    }
+    public ctor Result<Interval, Owned<Error>> deserialize(Deserializer r) {
+        string text = r.readString();
+        if (r.failed()) { DeError e = r.errorCode(); return Result::Err(error: e); }
+        Result<Interval, DecodeError> v = Interval.parse(text: text);
+        return match (v) {
+            case Ok(value: x): Result::Ok(value: x);
+            case Err(error: pe): { r.failWith(e: DeError::Malformed); return Result::Err(error: DeError::Malformed); }
+        };
     }
 }
 

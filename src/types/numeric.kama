@@ -1,4 +1,5 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::parse, std::fmt::ParseError,
+         std::memory::Owned,
          postgres::types::DecodeError, postgres::types::FORMAT_BINARY, postgres::types::utf8Text };
 export { Numeric, decodeNumeric, encodeNumeric };
 
@@ -15,7 +16,7 @@ comptime int16 SIGN_NAN = -16384i16;          // NUMERIC_NAN, 0xC000
 comptime int16 SIGN_PLUS_INFINITY = -12288i16;    // NUMERIC_PINF, 0xD000
 comptime int16 SIGN_MINUS_INFINITY = -4096i16;    // NUMERIC_NINF, 0xF000
 
-type resource Numeric implements Formattable {
+type resource Numeric implements Formattable, Serializable, Deserializable<This> {
     int16 sign = 0i16;
     int16 weight = 0i16;      // the power of 10000 of the first digit
     int16 dscale = 0i16;      // digits shown after the decimal point
@@ -115,6 +116,23 @@ type resource Numeric implements Formattable {
     }
 
     public const fn void format(ref Formatter f) { string s = this.text(); f.writeStr(s: ref s); }
+
+    // Serialized as PostgreSQL's text, exact: the form a parameter, JSON and every other backend carry.
+    public const fn Result<Unit, Owned<Error>> serialize(ref Serializer w) {
+        string text = this.text();
+        w.writeString(v: ref text);
+        if (w.failed()) { SerError e = w.errorCode(); return Result::Err(error: e); }
+        return Result::Ok(value: Unit::Unit);
+    }
+    public ctor Result<Numeric, Owned<Error>> deserialize(Deserializer r) {
+        string text = r.readString();
+        if (r.failed()) { DeError e = r.errorCode(); return Result::Err(error: e); }
+        Result<Numeric, DecodeError> v = Numeric.parse(text: text);
+        return match (give v) {
+            case Ok(value: x): Result::Ok(value: give x);
+            case Err(error: pe): { r.failWith(e: DeError::Malformed); return Result::Err(error: DeError::Malformed); }
+        };
+    }
 
     friend decodeNumeric[raw];
     friend parseNumeric[raw];

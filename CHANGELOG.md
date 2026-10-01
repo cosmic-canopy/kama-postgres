@@ -23,6 +23,9 @@ Needs **kama ≥ 0.9.506**.
     its PostgreSQL text. NULL reads only into an Optional.
   - `rowAs` refuses a row with no column for a field, and a row whose columns share a name.
   - `PgError::Value` names the column, its type, and what was asked.
+- `postgres::types`: `Numeric`, `LocalDateTime`, `TimeOfDay`, `TimeTz` and `Interval` are `Serializable` and
+  `Deserializable` as PostgreSQL's text, so each reads from a column and travels through any serde backend.
+  `LocalDateTime` is `Formattable`, and each has a `parse` constructor for that text.
 - **SASLprep** is PostgreSQL's `pg_saslprep`, step for step, so a SCRAM password with non-ASCII characters
   (full-width letters, a no-break space, a ligature) logs in as it does with psql. `postgres::protocol` has
   `saslPrep` and `scramPassword`. The stringprep tables are generated from PostgreSQL's source

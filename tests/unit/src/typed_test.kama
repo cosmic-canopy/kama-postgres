@@ -5,6 +5,8 @@
 // that has a column for each of its fields.
 import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::parse, std::fmt::ParseError,
          std::time::Date, std::time::Timestamp, std::uuid::Uuid,
+         postgres::types::Numeric, postgres::types::LocalDateTime, postgres::types::TimeOfDay,
+         postgres::types::TimeTz, postgres::types::Interval,
          postgres::Rows, postgres::PgError, postgres::column, postgres::columnOpt, postgres::rowAs,
          postgres::protocol::FieldDescription, postgres::protocol::RowValues,
          postgres::types::FORMAT_TEXT, postgres::types::FORMAT_BINARY,
@@ -176,6 +178,26 @@ unsafe fn int32 nativeTests() {
             Result<Date, PgError> a = column::<Date>(rows: rt, row: 0, index: 0);
             Result<Date, PgError> b = column::<Date>(rows: rb, row: 0, index: 0);
             f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.unixDays() == y.unixDays(); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "numeric")) {
+            Result<Numeric, PgError> a = column::<Numeric>(rows: rt, row: 0, index: 0);
+            Result<Numeric, PgError> b = column::<Numeric>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.equals(other: y) && x.text().equals(other: text); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "timestamp") && !text.contains(substring: "infinity")) {
+            Result<LocalDateTime, PgError> a = column::<LocalDateTime>(rows: rt, row: 0, index: 0);
+            Result<LocalDateTime, PgError> b = column::<LocalDateTime>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.equals(other: y) && "${x}".equals(other: text); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "time")) {
+            Result<TimeOfDay, PgError> a = column::<TimeOfDay>(rows: rt, row: 0, index: 0);
+            Result<TimeOfDay, PgError> b = column::<TimeOfDay>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.equals(other: y); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "timetz")) {
+            Result<TimeTz, PgError> a = column::<TimeTz>(rows: rt, row: 0, index: 0);
+            Result<TimeTz, PgError> b = column::<TimeTz>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.equals(other: y); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "interval")) {
+            Result<Interval, PgError> a = column::<Interval>(rows: rt, row: 0, index: 0);
+            Result<Interval, PgError> b = column::<Interval>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.equals(other: y) && "${x}".equals(other: text); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
         } else if (type.equals(other: "timestamptz") && !text.contains(substring: "infinity")) {
             Result<Timestamp, PgError> a = column::<Timestamp>(rows: rt, row: 0, index: 0);
             Result<Timestamp, PgError> b = column::<Timestamp>(rows: rb, row: 0, index: 0);

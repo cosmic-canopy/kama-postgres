@@ -15,7 +15,8 @@ aarch64 inside `localhost/kama-dev`), and the first report against `0.9.470` and
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** nothing. Every gap is fixed except KPG-8, which is closed as a non-goal (see below).
+**Open now:** KPG-11 and KPG-12, found building the protocol layer. Every earlier gap is fixed, except KPG-8,
+which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -26,7 +27,71 @@ changes the right design here, say so and we will follow it.
 
 ## OPEN
 
-Nothing. Every gap this package filed is fixed upstream or closed by decision.
+### KPG-11 · MED · A generic-inference error is reported against the wrong file, and `kama query --diagnostics` misses it
+
+**Status:** open. Reproduces on 0.9.486.
+
+**Symptom.** One error, reported three different ways:
+- `kama check` reports it, but names the package's **root** file (or, from a consumer, the **consumer's**
+  entry file) with the **right line number from the real file**.
+- `kama query <kama.json> <the real file> --diagnostics` reports nothing at all.
+- The error message itself is accurate.
+
+So the error points at a file where that line holds unrelated code, and the per-file diagnostics an agent or
+an editor asks for say the file is clean.
+
+**Repro.** A library with a submodule:
+
+```kama
+// src/slib.kama — the root module
+export { one };
+fn int32 one() { return 1; }
+```
+
+```kama
+// src/sub/broken.kama  (kama.json lists "sub")
+import { std::math::sin, std::math::abs };
+export { Table };
+fn float64 helper(float64 t) { return abs(x: sin(x: t)); }
+type value Table { float64 v = 0.0; public ctor make() { this.v = helper(t: 1.0); } }
+```
+
+```
+$ kama check kama.json
+src/slib.kama:3:0: error: cannot infer generic type parameter 'T' — argument 'x' is not a literal or a locally-typed value
+$ kama query kama.json src/sub/broken.kama --diagnostics
+no diagnostics
+```
+
+Line 3 is `helper`'s line in `src/sub/broken.kama`; `src/slib.kama` has no line 3. A consumer of a library
+with the same code gets the error against its own `src/main.kama`, at the library's line number. A plain type
+error in the same submodule file is reported correctly, by `check` and by `query` both, so this is specific
+to the generic-inference diagnostic.
+
+**Impact.** In this package the error pointed at a unit-test file whose line 41 is unrelated. Finding the
+real site meant recognising the parameter name (`x`, which the test file never uses) as `std::math`'s.
+
+**Suggested fix.** Carry the call's own file through to the inference diagnostic, and have `query
+--diagnostics` include the diagnostics `check` raises for that file.
+
+### KPG-12 · LOW · A generic call cannot take another generic call's result as its argument
+
+**Status:** open. Reproduces on 0.9.486. It may be a deliberate limit of local inference; recorded as a
+consumer data point.
+
+`abs(x: sin(x: t))` with `t` a `float64` local is refused ("argument 'x' is not a literal or a locally-typed
+value"). The inner call's type is fully determined (`sin<float64>` returns `float64`), but the outer call
+will not infer from it. The workaround is a typed local per step:
+
+```kama
+float64 sine = sin(x: t);
+float64 magnitude = abs(x: sine);
+```
+
+**Impact.** Small: a few lines of ceremony wherever math nests. `postgres::protocol`'s MD5 table
+(`floor(|sin(i + 1)| · 2^32)`) is written that way.
+
+**Suggested fix.** Infer a generic argument from a call whose return type is already known.
 
 ---
 

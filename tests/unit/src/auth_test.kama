@@ -1,0 +1,124 @@
+// Password authentication against vectors extracted by tools/gen-auth-vectors.sh: RFC 1321's MD5 suite, RFC
+// 7677's SCRAM-SHA-256 exchange, and an md5 response computed by OpenSSL.
+import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode,
+         postgres::protocol::md5, postgres::protocol::md5Password, postgres::protocol::ScramClient,
+         postgres::protocol::ChannelBinding, postgres::protocol::AuthError,
+         postgres_unit_tests::check, postgres_unit_tests::unhex,
+         postgres_unit_tests::md5Inputs, postgres_unit_tests::md5Digests, postgres_unit_tests::scramUser,
+         postgres_unit_tests::scramPassword, postgres_unit_tests::scramClientNonce,
+         postgres_unit_tests::scramClientFirst, postgres_unit_tests::scramServerFirst,
+         postgres_unit_tests::scramClientFinal, postgres_unit_tests::scramServerFinal,
+         postgres_unit_tests::md5User, postgres_unit_tests::md5PasswordText, postgres_unit_tests::md5Inner,
+         postgres_unit_tests::md5Response };
+export { authTests };
+
+fn int32 md5Tests() {
+    int32 f = 0;
+    DynamicArray<string> inputs = md5Inputs();
+    DynamicArray<string> digests = md5Digests();
+    isize i = 0;
+    while (i < inputs.length()) {
+        InlineArray<uint8>#(16) d = md5(bytes: inputs[i].bytes());
+        string got = hexEncode(bytes: d.view());
+        f = f + check(ok: got.equals(other: digests[i]), what: "md5: RFC 1321 vector ".concat(other: digests[i]));
+        i = i + 1;
+    }
+    string user = md5User();
+    string password = md5PasswordText();
+    string joined = password.concat(other: user);
+    InlineArray<uint8>#(16) inner = md5(bytes: joined.bytes());
+    string innerHex = hexEncode(bytes: inner.view());
+    f = f + check(ok: innerHex.equals(other: md5Inner()), what: "md5: md5(password ‖ user), as pg_authid stores it");
+    InlineArray<uint8>#(4) salt = [1ui8, 2ui8, 3ui8, 4ui8];
+    string response = md5Password(user: user, password: password, salt: salt);
+    f = f + check(ok: response.equals(other: md5Response()), what: "md5: the PasswordMessage response to a salt matches OpenSSL");
+    return f;
+}
+
+fn bool isAuthError(Result<string, AuthError> r, int32 kind) {
+    AuthError e = match (give r) { case Ok(value: s): { return false; } case Err(error: x): give x; };
+    int32 k = match (e) { case NonceMismatch: 1; case BadServerMessage(what: w): 2; case ServerRejected(reason: why): 3; case SignatureMismatch: 4; };
+    return k == kind;
+}
+
+fn ScramClient rfcClient() {
+    string user = scramUser();
+    string password = scramPassword();
+    return ScramClient.withNonce(user: user, password: password, binding: ChannelBinding::NotSupported, nonce: scramClientNonce());
+}
+
+fn int32 scramTests() {
+    int32 f = 0;
+    // The whole RFC 7677 exchange, byte for byte.
+    ScramClient c = rfcClient();
+    f = f + check(ok: c.mechanism().equals(other: "SCRAM-SHA-256"), what: "scram: an unbound client speaks SCRAM-SHA-256");
+    string first = c.clientFirst();
+    f = f + check(ok: first.equals(other: scramClientFirst()), what: "scram: client-first-message is RFC 7677's");
+    string serverFirst = scramServerFirst();
+    Result<string, AuthError> fin = c.clientFinal(serverFirst: serverFirst);
+    string clientFinal = match (give fin) { case Ok(value: s): give s; case Err(error: e): e.message(); };
+    f = f + check(ok: clientFinal.equals(other: scramClientFinal()), what: "scram: client-final-message (the proof) is RFC 7677's");
+    string serverFinal = scramServerFinal();
+    Result<Unit, AuthError> verified = c.verifyServerFinal(serverFinal: serverFinal);
+    f = f + check(ok: match (give verified) { case Ok(value: u): true; case Err(error: e): false; }, what: "scram: RFC 7677's server signature verifies");
+
+    // A server signature off by one character is not the server that knows the password.
+    ScramClient c2 = rfcClient();
+    string f2 = c2.clientFirst();
+    Result<string, AuthError> fin2 = c2.clientFinal(serverFirst: serverFirst);
+    string forged = serverFinal.replace(old: "v=6", with: "v=7");
+    Result<Unit, AuthError> rejected = c2.verifyServerFinal(serverFinal: forged);
+    bool mismatch = match (give rejected) { case Ok(value: u): false; case Err(error: e): match (e) { case SignatureMismatch: true; case _: false; }; };
+    f = f + check(ok: mismatch, what: "scram: a wrong server signature is SignatureMismatch");
+
+    // A server error attribute ends the exchange with its reason.
+    ScramClient c3 = rfcClient();
+    string f3 = c3.clientFirst();
+    Result<string, AuthError> fin3 = c3.clientFinal(serverFirst: serverFirst);
+    string refusal = "e=invalid-proof";
+    Result<Unit, AuthError> refused = c3.verifyServerFinal(serverFinal: refusal);
+    bool rejectedByServer = match (give refused) { case Ok(value: u): false; case Err(error: e): match (e) { case ServerRejected(reason: r): r.equals(other: "invalid-proof"); case _: false; }; };
+    f = f + check(ok: rejectedByServer, what: "scram: e= from the server is ServerRejected with its reason");
+
+    // A server nonce that does not extend the client's is refused before anything is computed.
+    ScramClient c4 = rfcClient();
+    string f4 = c4.clientFirst();
+    string replay = "r=someoneElsesNonce,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    f = f + check(ok: isAuthError(r: c4.clientFinal(serverFirst: replay), kind: 1), what: "scram: a server nonce that does not extend ours is NonceMismatch");
+    ScramClient c5 = rfcClient();
+    string f5 = c5.clientFirst();
+    string same = "r=".concat(other: scramClientNonce()).concat(other: ",s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
+    f = f + check(ok: isAuthError(r: c5.clientFinal(serverFirst: same), kind: 1), what: "scram: a server nonce equal to ours (adding nothing) is NonceMismatch");
+    ScramClient c6 = rfcClient();
+    string f6 = c6.clientFirst();
+    string noIter = serverFirst.replace(old: ",i=4096", with: ",i=0");
+    f = f + check(ok: isAuthError(r: c6.clientFinal(serverFirst: noIter), kind: 2), what: "scram: an iteration count of 0 is refused");
+    ScramClient c7 = rfcClient();
+    string f7 = c7.clientFirst();
+    string ext = "m=ext,".concat(other: serverFirst);
+    f = f + check(ok: isAuthError(r: c7.clientFinal(serverFirst: ext), kind: 2), what: "scram: a mandatory extension is refused");
+
+    // Channel binding: the header says so, the mechanism is -PLUS, and c= carries header + binding data.
+    DynamicArray<uint8> hash = unhex(text: "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    string user = scramUser();
+    string password = scramPassword();
+    ScramClient bound = ScramClient.withNonce(user: user, password: password, binding: ChannelBinding::TlsServerEndPoint(hash: give hash), nonce: scramClientNonce());
+    f = f + check(ok: bound.mechanism().equals(other: "SCRAM-SHA-256-PLUS"), what: "scram: a bound client speaks SCRAM-SHA-256-PLUS");
+    string boundFirst = bound.clientFirst();
+    f = f + check(ok: boundFirst.startsWith(prefix: "p=tls-server-end-point,,n=user,r="), what: "scram: a bound client-first starts with the p= header");
+    Result<string, AuthError> boundFinal = bound.clientFinal(serverFirst: serverFirst);
+    string bf = match (give boundFinal) { case Ok(value: s): give s; case Err(error: e): ""; };
+    // base64("p=tls-server-end-point,," + 00 01 … 1f)
+    f = f + check(ok: bf.startsWith(prefix: "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCwsAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=,r="), what: "scram: c= carries the header and the binding data");
+    ScramClient yes = ScramClient.withNonce(user: user, password: password, binding: ChannelBinding::NotOffered, nonce: scramClientNonce());
+    string yFirst = yes.clientFirst();
+    f = f + check(ok: yFirst.startsWith(prefix: "y,,"), what: "scram: a client that could bind but was not offered -PLUS says y");
+    return f;
+}
+
+fn int32 authTests() {
+    int32 f = 0;
+    f = f + md5Tests();
+    f = f + scramTests();
+    return f;
+}

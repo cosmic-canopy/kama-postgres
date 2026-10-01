@@ -17,7 +17,7 @@ changes the right design here, say so and we will follow it.
 
 **Open now:**
 - KPG-11 to KPG-14, found building the protocol and type layers.
-- KPG-15 to KPG-20, found planning and building the first live connection (phase 4).
+- KPG-15 to KPG-22, found planning and building the first live connection (phase 4).
 
 Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
@@ -213,6 +213,45 @@ since one returns `T` and the other `Optional<T>`.
 
 **Suggested fix.** Check `Optional<T>` against `T` (and `Result<T, E>` against its arms) by type, not only by
 kind, at every crossing.
+
+### KPG-21 · LOW · `UnixStream` has no non-blocking connect
+
+**Status:** open. An absence, checked on 0.9.490.
+
+`TcpStream` has `connectNonBlocking` / `connectToNonBlocking` and `checkConnected`, so a connect can be bounded
+by a `Poller` deadline. `UnixStream` has only the blocking `connect` and `connectTo`
+(`lib/std/net/unix.kama:237-257`). Their C side is a plain `connect()` on a blocking socket
+(`include/kama_os.h:2072-2076`).
+
+**Why it matters here.** libpq makes every socket non-blocking before `connect()`, and `connect_timeout` bounds
+the connect too (`PQconnectPoll`). A local connect usually returns at once. But one to a server whose listen
+queue is full blocks on Linux until there is room, and `connect_timeout` cannot end that wait.
+
+**Workaround here.** None. `postgres::UnixTransport` connects blocking, then makes the socket non-blocking, so
+connect_timeout bounds everything after the connect. That is documented on the type.
+
+**Suggested fix.** `UnixStream.connectNonBlocking(path:)` / `connectToNonBlocking(address:)` and
+`checkConnected()`, mirroring `TcpStream`: EAGAIN or EINPROGRESS from `connect()` becomes a pending stream that a
+`Poller` reports writable.
+
+### KPG-22 · LOW · `IoError` carries no operating-system text, and `Other` says only "i/o error"
+
+**Status:** open. An absence, checked on 0.9.490.
+
+`IoError.message()` (`lib/std/io/io.kama:47-63`) is a fixed English word per variant ("connection refused", "not
+found"). For `Other(code)` it is "i/o error", whatever the code. Nothing gives the platform's own description,
+the `strerror(errno)` or `FormatMessage` text.
+
+**Why it matters here.** libpq reports a failed connect, a failed read and a failed socket option with
+`strerror`. psql prints `Connection refused` and `No such file or directory`, where this client can only print
+`connection refused` and `not found`. An unclassified errno, such as EINTR (KPG-17), ENETDOWN or EMFILE, reaches
+the user as "i/o error", which hides the cause.
+
+**Workaround here.** None: the client prints `IoError.message()`. Every other part of a libpq message (the host
+identity, the hint lines) is reproduced.
+
+**Suggested fix.** A `description()` (or `osMessage()`) on `IoError` with the platform's text, captured when
+`lastError()` classifies errno, so a log line can say what the OS said. `Other(code)` could carry it too.
 
 ### KPG-11 · MED · A generic-inference error is reported against the wrong file, and `kama query --diagnostics` misses it
 

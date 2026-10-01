@@ -1,15 +1,16 @@
 import { std::collections::View, std::collections::ConstView, std::io::IoError, std::net::TcpStream,
          std::net::SocketAddr, std::net::Poller, std::net::Interest, std::net::Ready, std::net::Shutdown,
+         std::net::UnixStream, std::net::UnixAddr, std::net::PeerCredentials, std::process::UserId,
          std::time::Duration };
-export { Transport, TcpTransport };
+export { Transport, TcpTransport, UnixTransport, socketPathMax };
 
 // The byte stream a connection runs over. It is non-blocking: `read` and `write` move what they can now, or say
 // `WouldBlock`, and `wait` blocks until one of them can proceed or a timeout passes. This is libpq's own shape
 // (a non-blocking socket and poll with a deadline), and it is what lets one connection honour a deadline on
 // every step, and later write and read at once for a pipeline.
 //
-// A connection made with `Connection.connect` runs over TCP. `Connection.connectOver` takes any transport: a
-// tunnel, a proxy, or a test's scripted server.
+// A connection made with `Connection.connect` runs over TCP, or over a Unix-domain socket for a host that is a
+// directory. `Connection.connectOver` takes any transport: a tunnel, a proxy, or a test's scripted server.
 type contract Transport for resource implements Sendable {
     // The bytes available now, up to `into`'s length: the count, or 0 when the peer has closed its side.
     // `WouldBlock` when none are available.
@@ -79,3 +80,75 @@ type resource TcpTransport implements Transport, Sendable {
         Result<Unit, IoError> r = this.stream.shutdown(how: Shutdown::Both);
     }
 }
+
+// A Unix-domain socket, as `Connection.connect` makes it for a host that is a directory: a `UnixStream` made
+// non-blocking once connected, and its own `Poller`.
+//
+// The connect itself blocks: std has no non-blocking connect for a Unix socket (KPG-21), so connect_timeout
+// bounds everything after it. A local connect returns at once unless the server's listen queue is full.
+type resource UnixTransport implements Transport, Sendable {
+    UnixStream stream;
+    Poller poller;
+    isize handle = 0;
+
+    unsafe ctor make(UnixStream stream, Poller poller) {
+        this.handle = stream.rawHandle();
+        this.stream = give stream;
+        this.poller = give poller;
+    }
+
+    // Connect to the socket at `path`, or, on Linux, to the abstract name `path` names when `linuxAbstract` is set.
+    public unsafe ctor Result<UnixTransport, IoError> connect(const ref string path, bool linuxAbstract) {
+        Result<UnixAddr, IoError> address = unixAddress(path: path, linuxAbstract: linuxAbstract);
+        UnixAddr target = match (address) { case Ok(value: a): a; case Err(error: e): { return Result::Err(error: e); } };
+        Result<UnixStream, IoError> connected = UnixStream.connectTo(address: target);
+        UnixStream stream = match (give connected) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: e); } };
+        Result<Unit, IoError> nb = stream.setNonBlocking(on: true);
+        match (nb) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        Result<Poller, IoError> made = Poller.create();
+        Poller poller = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
+        return Result::Ok(value: UnixTransport.make(stream: give stream, poller: give poller));
+    }
+
+    // The name of the account the server process runs as, from the socket's peer credentials: what libpq's
+    // `requirepeer` compares.
+    public unsafe fn Result<string, IoError> peerUserName() {
+        Result<PeerCredentials, IoError> creds = this.stream.peerCredentials();
+        PeerCredentials peer = match (give creds) { case Ok(value: c): give c; case Err(error: e): { return Result::Err(error: e); } };
+        UserId who = peer.user();
+        return who.name();
+    }
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) { return this.stream.read(into: into); }
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) { return this.stream.write(bytes: bytes); }
+
+    public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        this.poller.add(fd: this.handle, interest: interest);
+        Result<int32, IoError> waited = this.poller.wait(timeoutMs: timeoutMs);
+        int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): { return Result::Err(error: e); } };
+        if (n == 0) { return Result::Ok(value: Ready.of(readable: false, writable: false)); }
+        return Result::Ok(value: this.poller.readyFor(fd: this.handle));
+    }
+
+    public unsafe fn void shutdown() {
+        Result<Unit, IoError> r = this.stream.shutdown(how: Shutdown::Both);
+    }
+}
+
+// Linux reaches its abstract namespace through a name; everywhere else a socket is a path.
+@compileFor(OS_LINUX)
+fn Result<UnixAddr, IoError> unixAddress(const ref string path, bool linuxAbstract) {
+    if (linuxAbstract) { return UnixAddr.fromAbstract(name: path); }
+    return UnixAddr.fromPath(path: path);
+}
+
+@compileFor(!OS_LINUX)
+fn Result<UnixAddr, IoError> unixAddress(const ref string path, bool linuxAbstract) {
+    if (linuxAbstract) { return Result::Err(error: IoError::InvalidInput); }
+    return UnixAddr.fromPath(path: path);
+}
+
+// The longest socket path the platform takes: sizeof(sun_path) less its terminator, as libpq's
+// UNIXSOCK_PATH_BUFLEN check counts it.
+@compileFor(OS_MACOS) fn isize socketPathMax() { return 103; }
+@compileFor(!OS_MACOS) fn isize socketPathMax() { return 107; }

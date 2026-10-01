@@ -425,6 +425,8 @@ type resource Config implements Sendable {
     // password file).
     public const fn string password() { return this.text(keyword: "password"); }
     public const fn const ref string passfile() { return this.passfilePath; }
+    // requirepeer: the account a Unix-socket server must run as; "" for no check.
+    public const fn string requirePeer() { return this.text(keyword: "requirepeer"); }
     public const fn isize hostCount() { return this.hostList.length(); }
     public const fn const ref Host host(isize index) { return this.hostList[index]; }
     public const fn SslMode sslMode() { return this.ssl; }

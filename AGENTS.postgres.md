@@ -77,8 +77,13 @@ compiler with everything this package relies on:
 - **I/O is a `Transport`:** non-blocking `read`/`write` and `wait(interest:, timeoutMs:)`.
   - `TcpTransport` is a non-blocking `TcpStream` plus a `std::net::Poller`. The internal module
     `postgres::wire` frames messages over any transport, with deadlines.
-  - Phase 6 adds a TLS transport, after the SSLRequest exchange on the concrete `TcpStream`. Phase 7 adds a
-    Unix one. `Connection` does not change.
+  - `UnixTransport` is the same for a socket host (a directory, or `@name` on Linux). Its connect blocks
+    (KPG-21).
+  - Phase 6 adds a TLS transport, after the SSLRequest exchange on the concrete `TcpStream`. `Connection` does
+    not change.
+  - The integration tests reach the server's socket through a relay of their own (`socket_test.kama`).
+    `PGTEST_SOCKDIR` is a short directory under /tmp, made by the runner, since a socket path is at most 103
+    bytes on macOS.
 - **Connections move between isolates.** A `Connection` is `Sendable`, which means every field must be:
   - Handlers are `Owned<Contract>`, where the contract `implements Sendable`.
   - Never put a `Shared` in a `Connection`; it is a non-atomic count.

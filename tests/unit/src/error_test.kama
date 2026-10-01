@@ -68,13 +68,13 @@ fn int32 pgErrorTests() {
     f = f + check(ok: clm.equals(other: "no connection to the server"), what: "error: closed");
 
     ConnectError ce = ConnectError.make();
-    ce.add(attempt: ConnectAttempt.make(host: "localhost", address: "::1", port: "5432", lead: "connection to server at \"localhost\" (::1), port 5432 failed: ", error: PgError::Io(error: IoError::ConnectionRefused), passfile: ""));
+    ce.add(attempt: ConnectAttempt.make(host: "localhost", address: "::1", port: "5432", lead: "connection to server at \"localhost\" (::1), port 5432 failed: ", error: PgError::Io(error: IoError::ConnectionRefused), passfile: "", note: "\tIs the server running on that host and accepting TCP/IP connections?"));
     ce.add(attempt: ConnectAttempt.make(host: "127.0.0.1", address: "127.0.0.1", port: "5432",
         lead: "connection to server at \"127.0.0.1\", port 5432 failed: ", error: PgError::Server(error: serverError(spec: "S=FATAL;V=FATAL;C=28P01;M=password authentication failed for user \"kp_scram\"")),
-        passfile: "/home/u/.pgpass"));
+        passfile: "/home/u/.pgpass", note: ""));
     PgError connect = PgError::Connect(error: give ce);
     string cm = connect.message();
-    f = f + check(ok: cm.equals(other: "connection to server at \"localhost\" (::1), port 5432 failed: connection refused\nconnection to server at \"127.0.0.1\", port 5432 failed: FATAL:  password authentication failed for user \"kp_scram\"\npassword retrieved from file \"/home/u/.pgpass\""), what: "error: every attempt, libpq's host identity, the password file hint");
+    f = f + check(ok: cm.equals(other: "connection to server at \"localhost\" (::1), port 5432 failed: connection refused\n\tIs the server running on that host and accepting TCP/IP connections?\nconnection to server at \"127.0.0.1\", port 5432 failed: FATAL:  password authentication failed for user \"kp_scram\"\npassword retrieved from file \"/home/u/.pgpass\""), what: "error: every attempt, libpq's host identity, the password file hint");
     f = f + check(ok: connect.sqlstate() == INVALID_PASSWORD, what: "error: a failed connect's sqlstate is its last attempt's");
     return f;
 }

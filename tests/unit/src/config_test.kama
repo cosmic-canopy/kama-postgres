@@ -254,6 +254,14 @@ fn int32 environmentTests() {
         }
         case Err(error: e): { f = f + check(ok: false, what: "config: hostaddr with host"); }
     };
+    Result<Config, PgError> sockets = resolveWith(text: "host=/var/run/postgresql,@abstract,db port=5433", env: testEnvironment());
+    match (sockets) {
+        case Ok(value: c): {
+            f = f + check(ok: c.host(index: 0).kind() == HostKind::Socket && c.host(index: 1).kind() == HostKind::Socket && c.host(index: 2).kind() == HostKind::Name,
+                          what: "config: a path and an @name are socket hosts, a name is not");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "config: socket hosts"); }
+    };
     Result<Config, PgError> latest = resolveWith(text: "host=h min_protocol_version=3.2", env: testEnvironment());
     match (latest) {
         case Ok(value: c): { f = f + check(ok: c.maxProtocolVersion() == PROTOCOL_3_2, what: "config: a minimum above 3.0 raises the default maximum to the latest"); }

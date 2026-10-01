@@ -21,7 +21,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$VERSIONS" ] || VERSIONS="14 15 16 17 18 19"
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d)
+# Unix sockets get a directory of their own under /tmp: a socket path is at most 103 bytes on macOS.
+sockets=$(mktemp -d /tmp/kpg.XXXXXX)
+trap 'rm -rf "$tmp" "$sockets"' EXIT
 
 "$KAMA" pkg install "$ROOT/tests/integration/kama.json" >/dev/null
 for mode in --debug --release; do
@@ -34,7 +37,7 @@ for v in $VERSIONS; do
     for mode in --debug --release; do
         work="$tmp/work-$v$mode"; mkdir -p "$work/home"
         echo "== PostgreSQL $v ($mode)"
-        if ( set -a; . "$ROOT/out/pgtest-$v.env"; set +a; PGTEST_TMP="$work" "$tmp/integration$mode" ); then :; else failed="$failed $v$mode"; fi
+        if ( set -a; . "$ROOT/out/pgtest-$v.env"; set +a; PGTEST_TMP="$work" PGTEST_SOCKDIR="$sockets" "$tmp/integration$mode" ); then :; else failed="$failed $v$mode"; fi
     done
     [ "$DOWN" = 1 ] && "$ROOT/tools/pg.sh" down --version "$v" >/dev/null
 done

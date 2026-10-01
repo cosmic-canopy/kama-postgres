@@ -1,0 +1,183 @@
+// Unix-domain sockets, live. The server runs in a container whose socket a macOS host cannot reach, so the test
+// listens on a socket of its own and relays each connection to the server's TCP port: the client runs its real
+// Unix transport (connect, peer credentials, non-blocking I/O) against a real PostgreSQL.
+import { std::collections::DynamicArray, std::collections::FixedArray, std::collections::View,
+         std::collections::ConstView, std::io::IoError, std::net::UnixListener, std::net::UnixStream,
+         std::net::TcpStream, std::net::Poller, std::net::Interest, std::net::Ready,
+         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::SendResult,
+         std::process::currentUser, std::process::UserId,
+         postgres::Connection, postgres::PgError, postgres::Environment,
+         postgres_integration_tests::check, postgres_integration_tests::setting,
+         postgres_integration_tests::quietEnvironment, postgres_integration_tests::openWith,
+         postgres_integration_tests::scalar, postgres_integration_tests::passwordFor,
+         postgres_integration_tests::writePrivate, postgres_integration_tests::scratchDir };
+export { socketTests };
+
+// Copy what `from` has to `to`: false once `from` has closed or failed.
+unsafe fn bool forward(ref UnixStream unix, ref TcpStream tcp, bool fromUnix, View<uint8> buf, isize toFd) {
+    Result<isize, IoError> r = Result::Ok(value: 0);
+    if (fromUnix) { r = unix.read(into: buf); } else { r = tcp.read(into: buf); }
+    isize n = 0;
+    match (r) {
+        case Ok(value: k): { n = k; }
+        case Err(error: e): { match (e) { case WouldBlock: { return true; } case _: { return false; } }; }
+    };
+    if (n <= 0) { return false; }
+    Result<Poller, IoError> made = Poller.create();
+    Poller waiter = match (give made) { case Ok(value: p): give p; case Err(error: e): { return false; } };
+    waiter.add(fd: toFd, interest: Interest::Write);
+    isize sent = 0;
+    while (sent < n) {
+        Result<isize, IoError> w = Result::Ok(value: 0);
+        if (fromUnix) { w = tcp.write(bytes: buf.slice(from: sent, count: n - sent)); } else { w = unix.write(bytes: buf.slice(from: sent, count: n - sent)); }
+        isize m = 0;
+        match (w) {
+            case Ok(value: k): { m = k; }
+            case Err(error: e): { match (e) { case WouldBlock: { m = 0; } case _: { return false; } }; }
+        };
+        if (m == 0) { Result<int32, IoError> ready = waiter.wait(timeoutMs: 5000); }
+        sent = sent + m;
+    }
+    return true;
+}
+
+// Relay one connection until either side closes.
+unsafe fn void pump(UnixStream unix, TcpStream tcp) {
+    Result<Unit, IoError> a = unix.setNonBlocking(on: true);
+    Result<Unit, IoError> b = tcp.setNonBlocking(on: true);
+    Result<Poller, IoError> made = Poller.create();
+    Poller p = match (give made) { case Ok(value: x): give x; case Err(error: e): { return; } };
+    isize uf = unix.rawHandle();
+    isize tf = tcp.rawHandle();
+    p.add(fd: uf, interest: Interest::Read);
+    p.add(fd: tf, interest: Interest::Read);
+    FixedArray<uint8> buf = FixedArray.make(size: 65536);
+    bool open = true;
+    while (open) {
+        Result<int32, IoError> waited = p.wait(timeoutMs: 30000);
+        int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): 0; };
+        if (n == 0) { open = false; }
+        if (open && p.readyFor(fd: uf).readable) { open = forward(unix: ref unix, tcp: ref tcp, fromUnix: true, buf: buf.viewMut(), toFd: tf); }
+        if (open && p.readyFor(fd: tf).readable) { open = forward(unix: ref unix, tcp: ref tcp, fromUnix: false, buf: buf.viewMut(), toFd: uf); }
+    }
+}
+
+type resource Relay implements Sendable {
+    UnixListener listener;
+    string host;
+    uint16 port = 0ui16;
+    int32 count = 0;
+    Sender<int32> done;
+    public ctor make(UnixListener listener, string host, uint16 port, int32 count, Sender<int32> done) {
+        this.listener = give listener; this.host = give host; this.port = port; this.count = count; this.done = give done;
+    }
+    // Relay `count` connections, one after another, then report how many arrived. A connection that never comes
+    // ends the relay after 10 seconds, so a failing test cannot hang the run.
+    public unsafe fn void run() {
+        Result<Unit, IoError> nb = this.listener.setNonBlocking(on: true);
+        Result<Poller, IoError> made = Poller.create();
+        Poller p = match (give made) { case Ok(value: x): give x; case Err(error: e): { SendResult<int32> r = this.done.send(item: -1); return; } };
+        p.add(fd: this.listener.rawHandle(), interest: Interest::Read);
+        int32 served = 0;
+        bool waiting = true;
+        while (served < this.count && waiting) {
+            Result<int32, IoError> w = p.wait(timeoutMs: 10000);
+            int32 ready = match (w) { case Ok(value: k): k; case Err(error: e): 0; };
+            if (ready == 0) { waiting = false; continue; }
+            Result<UnixStream, IoError> accepted = this.listener.accept();
+            match (give accepted) {
+                case Ok(value: client): {
+                    Result<TcpStream, IoError> upstream = TcpStream.connect(host: this.host, port: this.port);
+                    match (give upstream) {
+                        case Ok(value: server): { pump(unix: give client, tcp: give server); }
+                        case Err(error: e): { UnixStream unanswered = give client; }
+                    };
+                    served = served + 1;
+                }
+                case Err(error: e): { }
+            };
+        }
+        SendResult<int32> r = this.done.send(item: served);
+    }
+}
+
+fn void relay(Relay job) { job.run(); }
+
+unsafe fn string attempt(const ref string conninfo, const ref Environment env) {
+    Result<Connection, PgError> r = openWith(conninfo: conninfo, env: env);
+    Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+    string who = scalar(c: c, sql: "select current_user");
+    c.close();
+    return "connected as ".concat(other: who);
+}
+
+unsafe fn string myName() {
+    Result<UserId, IoError> me = currentUser();
+    UserId id = match (me) { case Ok(value: u): u; case Err(error: e): { return "?"; } };
+    Result<string, IoError> name = id.name();
+    return match (give name) { case Ok(value: n): give n; case Err(error: e): "?"; };
+}
+
+unsafe fn int32 socketTests() {
+    int32 f = 0;
+    string dir = setting(name: "PGTEST_SOCKDIR");
+    string port = setting(name: "PGTEST_PORT");
+    string db = setting(name: "PGTEST_DATABASE");
+    string path = dir.concat(other: "/.s.PGSQL.").concat(other: port);
+    Result<UnixListener, IoError> bound = UnixListener.bind(path: path);
+    UnixListener listener = match (give bound) { case Ok(value: l): give l; case Err(error: e): { return check(ok: false, what: "socket: bind ".concat(other: path)); } };
+    uint16 portNumber = 0ui16;
+    foreach (uint8 b in port) { portNumber = portNumber * 10ui16 + cast<uint16>(b - 48ui8); }
+    string me = myName();
+    string through = "host=".concat(other: dir).concat(other: " port=").concat(other: port).concat(other: " dbname=").concat(other: db).concat(other: " user=");
+
+    // A password file whose host field is the socket directory: it matches the path, as libpq matches it.
+    string passfile = scratchDir().concat(other: "/pgpass_socket");
+    bool written = writePrivate(path: passfile, text: dir.concat(other: ":").concat(other: port).concat(other: ":").concat(other: db).concat(other: ":kp_scram:").concat(other: passwordFor(user: "kp_scram")).concat(other: "\n"));
+
+    Channel<int32> results = Channel.bounded(capacity: 1);
+    Receiver<int32> rx = results.receiver();
+    Relay job = Relay.make(listener: give listener, host: "127.0.0.1", port: portNumber, count: 4, done: results.sender());
+    string plain = "";
+    string peerOk = "";
+    string peerWrong = "";
+    string viaFile = "";
+    scope {
+        spawn relay(job: give job);
+        Environment env = quietEnvironment();
+        plain = attempt(conninfo: through.concat(other: "kp_trust"), env: env);
+        peerOk = attempt(conninfo: through.concat(other: "kp_trust requirepeer=").concat(other: me), env: env);
+        peerWrong = attempt(conninfo: through.concat(other: "kp_trust requirepeer=kp_nobody"), env: env);
+        Environment withFile = quietEnvironment();
+        withFile.set(name: "PGPASSFILE", value: copy passfile);
+        viaFile = attempt(conninfo: through.concat(other: "kp_scram"), env: withFile);
+    }
+    Optional<int32> served = rx.recv();
+    f = f + check(ok: plain.equals(other: "connected as kp_trust"), what: "socket: a query over a Unix-domain socket: ".concat(other: plain));
+    f = f + check(ok: peerOk.equals(other: "connected as kp_trust"), what: "socket: requirepeer names the server's account: ".concat(other: peerOk));
+    string wantPeer = "connection to server on socket \"".concat(other: path).concat(other: "\" failed: requirepeer specifies \"kp_nobody\", but actual peer user name is \"").concat(other: me).concat(other: "\"");
+    f = f + check(ok: peerWrong.equals(other: wantPeer), what: "socket: requirepeer refuses another account: ".concat(other: peerWrong));
+    f = f + check(ok: written && viaFile.equals(other: "connected as kp_scram"), what: "socket: a password file entry for the socket directory: ".concat(other: viaFile));
+    f = f + check(ok: match (served) { case Some(value: n): n == 4; case None: false; }, what: "socket: every connection went through the socket");
+
+    // No server at the path: libpq's message, and its hint.
+    Environment env = quietEnvironment();
+    string missingDir = dir.concat(other: "/nowhere");
+    string missing = attempt(conninfo: "host=".concat(other: missingDir).concat(other: " port=").concat(other: port).concat(other: " dbname=x user=kp_trust"), env: env);
+    string wantMissing = "connection to server on socket \"".concat(other: missingDir).concat(other: "/.s.PGSQL.").concat(other: port)
+        .concat(other: "\" failed: not found\n\tIs the server running locally and accepting connections on that socket?");
+    f = f + check(ok: missing.equals(other: wantMissing), what: "socket: no server at the path: ".concat(other: missing));
+
+    // A directory too long for a socket path.
+    string longDir = "/tmp/d";
+    int32 k = 0;
+    while (k < 12) { longDir = longDir.concat(other: "0123456789"); k = k + 1; }
+    string tooLong = attempt(conninfo: "host=".concat(other: longDir).concat(other: " port=5432 dbname=x user=kp_trust"), env: env);
+    f = f + check(ok: tooLong.startsWith(prefix: "Unix-domain socket path \"".concat(other: longDir)) && tooLong.contains(substring: "is too long (maximum "),
+                  what: "socket: a path too long for sun_path: ".concat(other: tooLong));
+
+    // A missing socket, then a TCP host: the next host is tried, as libpq tries it.
+    string fallback = attempt(conninfo: "host=".concat(other: missingDir).concat(other: ",127.0.0.1 port=").concat(other: port).concat(other: " dbname=").concat(other: db).concat(other: " user=kp_trust"), env: env);
+    f = f + check(ok: fallback.equals(other: "connected as kp_trust"), what: "socket: a missing socket falls through to the next host: ".concat(other: fallback));
+    return f;
+}

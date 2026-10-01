@@ -166,16 +166,19 @@ type resource ConnectAttempt {
     string lead;                   // what libpq prints before the error
     DynamicArray<PgError> cause;   // exactly one
     string passfile;               // the password file the password came from; "" if none
+    string note;                   // a line libpq adds after the error; "" if none
 
     // `lead` is the text libpq puts before the error. For an address that was tried, that is libpq's host
     // identity ("connection to server at \"h\" (a), port p failed: "). For a host that never got that far, it is
-    // empty, or names the step that failed ("could not translate host name \"h\" to address: ").
-    public ctor make(string host, string address, string port, string lead, PgError error, string passfile) {
+    // empty, or names the step that failed ("could not translate host name \"h\" to address: "). `note` is the
+    // line libpq adds when the connect itself fails ("\tIs the server running on that host…").
+    public ctor make(string host, string address, string port, string lead, PgError error, string passfile, string note) {
         this.hostText = give host; this.addressText = give address; this.portText = give port;
         this.lead = give lead;
         this.cause = DynamicArray.empty();
         this.cause.add(item: give error);
         this.passfile = give passfile;
+        this.note = give note;
     }
 
     // The host as configured: a name, or the `hostaddr` when one was given.
@@ -185,10 +188,11 @@ type resource ConnectAttempt {
     public const fn const ref string port() { return this.portText; }
     public const fn const ref PgError error() { return this.cause[0]; }
 
-    // The lead, the error, and libpq's pgpassfileWarning: the password file is named on a wrong password that
-    // came from it.
+    // The lead, the error, libpq's hint for a failed connect, and its pgpassfileWarning: the password file is
+    // named on a wrong password that came from it.
     public const fn string message() {
         string text = this.lead.concat(other: this.cause[0].message());
+        if (this.note.length() > 0) { text = text.concat(other: "\n").concat(other: this.note); }
         if (this.passfile.length() > 0 && this.cause[0].sqlstate() == sqlstateCode(text: "28P01")) {
             text = text.concat(other: "\npassword retrieved from file \"").concat(other: this.passfile).concat(other: "\"");
         }

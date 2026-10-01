@@ -3,7 +3,7 @@
 // `tools/pg.sh smoke` first: it tells a misconfigured server from a wrong client.
 import { core::println, core::env, std::log::setLogSink, postgres_integration_tests::capture,
          postgres_integration_tests::authTests, postgres_integration_tests::queryTests,
-         postgres_integration_tests::sessionTests };
+         postgres_integration_tests::sessionTests, postgres_integration_tests::socketTests };
 export { check, setting };
 
 fn int32 check(bool ok, string what) {
@@ -26,6 +26,7 @@ fn int32 main() {
     failed = failed + authTests();
     failed = failed + queryTests();
     failed = failed + sessionTests();
+    failed = failed + socketTests();
     if (failed != 0) { println(s: "postgres integration tests: ${failed} failed"); return 1; }
     println(s: "postgres integration tests: OK");
     return 0;

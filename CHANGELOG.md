@@ -41,6 +41,9 @@ Needs **kama ≥ 0.9.486**.
 - **`Connection`.**
   - Each host and each address is tried in turn, `connect_timeout` per address, with TCP keepalive and
     `tcp_user_timeout`.
+  - A host that is a directory is a Unix-domain socket, and on Linux `@name` is the abstract namespace.
+    `requirepeer` is checked against the socket's peer credentials, and libpq's path-length limit applies.
+  - A failed connect carries libpq's hint line ("Is the server running…").
   - Authentication: trust, cleartext, md5, and SCRAM-SHA-256, including `scram_client_key` /
     `scram_server_key`. AuthenticationOk before the server proves its SCRAM signature is refused.
   - Protocol 3.0 or 3.2, with NegotiateProtocolVersion handled as libpq handles it.
@@ -56,14 +59,18 @@ Needs **kama ≥ 0.9.486**.
   - `ServerError` has every ErrorResponse field, rendered as libpq's pqBuildErrorMessage3 renders them.
   - Notices go to a `NoticeHandler`, else to `std::log` under the tag `postgres`.
 - **`Transport` and `Connection.connectOver`**: a session over a stream the caller opened (tokio-postgres's
-  connect_raw). The built-in one is a non-blocking TCP socket with a poller and deadlines.
+  connect_raw). The built-in ones, `TcpTransport` and `UnixTransport`, are non-blocking sockets with a poller
+  and deadlines.
 - **`postgres::conninfo`**: `pgpassLookup` and `parseServiceFile`, ports of libpq's.
 - **`tests/integration`, run by `tools/test-integration.sh` on PostgreSQL 14, 15, 16, 17, 18 and 19beta4,
   debug and release.** It covers:
   - every authentication method and refusal, and the 48 `require_auth` cases of PostgreSQL's 001_password.pl;
   - the service-file scenarios of 006_service.pl, `.pgpass`, and the environment;
   - queries, errors and their fields, notices, notifications and COPY refusal;
-  - protocol negotiation, server-side termination, `connect_timeout`, and a connection moved between isolates.
+  - protocol negotiation, server-side termination, `connect_timeout`, and a connection moved between isolates;
+  - Unix-domain sockets, through a relay the test runs, since a macOS host cannot reach a container's socket.
+    It checks a query, `requirepeer` either way, a password-file entry for the socket directory, a missing
+    socket, a path too long, and falling through to the next host.
 - **Unit tests drive `Connection` against a scripted server** that sends a byte at a time: every auth path and
   its misbehaving variants, negotiation, hostile and truncated messages, and silence.
 - `tools/gen-libpq-test-cases.sh`: the cases of PostgreSQL's TAP tests, extracted, and libpq's own verdicts

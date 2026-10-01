@@ -48,4 +48,15 @@ generated into `out/` and never committed. See `tests/integration/server/`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+`@kama/postgres` is licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. It vendors nothing; its TLS comes from `@kama/tls`, whose README says what that bundles.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+`@kama/postgres` by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.

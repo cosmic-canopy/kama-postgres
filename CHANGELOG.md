@@ -8,6 +8,10 @@ All notable changes to this package are recorded here. The format follows
 
 Needs **kama ≥ 0.9.486**.
 
+### Changed
+- **Licensed under MIT OR Apache-2.0**, at your option, like kama itself (`LICENSE-MIT`, `LICENSE-APACHE`).
+  Copyright is Cosmic Canopy LLC and the kama contributors.
+
 ### Added
 - The package scaffold: manifest, agent files, hermetic unit-test program (`tools/test.sh`).
 - The integration server: `tools/pg.sh` runs the official PostgreSQL image (14–18, 19 beta) under podman or

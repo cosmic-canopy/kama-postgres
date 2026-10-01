@@ -116,6 +116,10 @@ Needs **kama ≥ 0.9.506**.
   - Unix-domain sockets, through a relay the test runs, since a macOS host cannot reach a container's socket.
     It checks a query, `requirepeer` either way, a password-file entry for the socket directory, a missing
     socket, a path too long, and falling through to the next host.
+- **Every built-in type this client reads round-trips on PostgreSQL 14–19**, debug and release
+  (`tests/integration/src/types_test.kama`): 114 values from `tools/gen-codec-vectors.sh`, arrays included. For
+  each, the binary bytes the server sends must be the vector's, it must read as the server's text from either
+  protocol, and its kama value sent back must equal it, by the server's comparison.
 - **Unit tests drive `Connection` against a scripted server** that sends a byte at a time: every auth path and
   its misbehaving variants, negotiation, hostile and truncated messages, and silence.
 - `tools/gen-libpq-test-cases.sh`: the cases of PostgreSQL's TAP tests, extracted, and libpq's own verdicts

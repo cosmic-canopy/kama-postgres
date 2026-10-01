@@ -38,11 +38,13 @@ compiler with everything this package relies on:
     It includes a scripted fake server (`fake_server.kama`) that drives `Connection` through every startup and
     query path, hostile ones included: a reply a byte at a time, writes three bytes at a time, silence, hangups.
   - `tests/integration` needs a live server. `tools/test-integration.sh` starts each version itself (all of
-    14–19 by default, `--version N` for one) and runs the suite debug and release.
+    14–19 by default, `--version N` for one) and runs the suite debug and release. `types_test.kama` reads every
+    codec vector on each version: its binary bytes, its text both ways, and its kama value sent back.
   - Vectors come from upstream by script:
     - RFCs for the crypto;
     - libpq's own URI regression file for connection strings;
-    - a live server's `*_send()` functions for binary codecs;
+    - a live server's `*_send()` functions for binary codecs (`tools/gen-codec-vectors.sh`, which writes the same
+      file for both test programs);
     - for configuration and authentication, libpq itself (`tools/gen-libpq-test-cases.sh`): the cases of
       PostgreSQL's `001_password.pl` and `006_service.pl`, and the container's libpq asked live about
       `.pgpass` files, service files and settings.
@@ -81,6 +83,13 @@ compiler with everything this package relies on:
     why the functions take the result and a row index rather than a row.
   - The non-generic `valueReader`/`rowReader` do the work and hold the `friend` grants. A grant to a generic
     function is refused in a library (KPG-28), and a small generic body is better anyway.
+
+- **The extended protocol describes first** (Parse and Describe, then Bind, Execute and Sync). One reader
+  (`Connection.readRows`) reads every result and checks each message's place. A server error is returned once
+  the server is ready, and FATAL or a message out of place ends the session. While a result is open
+  (`busy`), every other call is refused with libpq's "another command is already in progress".
+- **Parameters go through `Serializable`** (`src/query.kama`): binary when a value is its type's own kind, and
+  text for the server's input function otherwise.
 
 - **A connection is libpq's, step for step.**
   - `Config` resolves settings in libpq's order, and every setting is either honoured or refused with a clear

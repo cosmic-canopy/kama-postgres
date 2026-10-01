@@ -21,6 +21,7 @@ changes the right design here, say so and we will follow it.
 - KPG-25 and KPG-26, found probing phase 5's typed parameters and rows.
 - KPG-27 and KPG-28, found building phase 5's typed rows.
 - KPG-29, found building phase 5's arrays.
+- KPG-30, found building phase 5's type round-trips.
 
 Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
@@ -32,6 +33,67 @@ Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below
 ---
 
 ## OPEN
+
+### KPG-30 · MED · A conditional conformance (`Serializable when [T: Serializable]`) is seen or not depending on imports, and a generic site never gets its vtable
+
+**Status:** open. Reproduces on 0.9.506.
+
+`DynamicArray<T>` declares `Serializable when [T: Serializable]` (`lib/std/collections/dynamic_array.kama:39`).
+Handing one to a contract parameter `Serializable value` behaves three ways:
+
+1. In a program that imports nothing from `std::serialization`, `kama check` refuses it, even for
+   `DynamicArray<int32>`: "argument `value` expects the contract `Serializable`, and
+   `std::collections::DynamicArray<int32>` does not implement it". A generic bound `<T: Serializable>` with
+   `T = DynamicArray<…>` is refused the same way: "does not satisfy bound `Serializable`".
+2. Add one unused import, `std::serialization::text::json::serializeJsonBuffer`, and the same call checks, builds
+   and runs.
+3. From a generic function, `fn void put<T: Serializable>(ref Sink s, const ref T v) { s.add(value: v); }` with
+   `T = DynamicArray<Uuid>`, `kama check` passes and clang fails. The vtable is never emitted, even when the same
+   conversion also appears outside generic code:
+
+```kama
+import { core::println, std::collections::DynamicArray, std::uuid::Uuid,
+         std::serialization::text::json::serializeJsonBuffer };
+type resource Sink {
+    isize n = 0;
+    public ctor make() { this.n = 0; }
+    public fn void add(Serializable value) { this.n = this.n + 1; }
+    public const fn isize count() { return this.n; }
+}
+// A generic function handing its T to a contract parameter.
+fn void put<T: Serializable>(ref Sink s, const ref T v) { s.add(value: v); }
+fn int32 main() {
+    Sink s = Sink.make();
+    DynamicArray<Uuid> ids = DynamicArray.empty(); ids.add(item: Uuid.fromBytes(bytes: [1ui8; 16]));
+    put::<DynamicArray<Uuid>>(s: ref s, v: ids);
+    isize n = s.count();
+    println(s: "${n}");
+    return 0;
+}
+```
+
+```
+$ kama check g.kama
+kama: g.kama OK (18 units analyzed)
+$ kama build g.kama
+g.kama:10:86: error: use of undeclared identifier
+'std__collections__DynamicArray_std__uuid__Uuid_kama__GlobalAllocator__as_kama__Serializable'
+```
+
+Remove the import and case 1 applies. Pass `ids` straight to `s.add` (not through `put`) and, with the import,
+it builds and runs.
+
+**Why it matters here.** `Query.add(value: Serializable)` is how a parameter goes in, and an array parameter
+is a `DynamicArray`. The type round-trip test reads each vector into its kama type with one generic function
+and sends it back.
+
+**Workaround here.** The package needs none: an application's own non-generic `q.add(value: list)` works. Its
+array parameters are tested from non-generic code. `tests/integration/src/types_test.kama` sends arrays back
+through one non-generic block per element type, and names this gap.
+
+**Suggested fix.** Decide a conditional conformance per instantiation from its own type arguments, never from
+what else is imported. Emit the `as_<Contract>` vtable for every instantiation that is converted to the
+contract, generic sites included.
 
 ### KPG-29 · HIGH · Matching on a method's `const ref` result destroys the value it refers to (a double free in safe code)
 

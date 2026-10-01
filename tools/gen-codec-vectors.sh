@@ -8,7 +8,9 @@
 #   binary   the type's own send function (pg_type.typsend), hex: exactly what a binary-format column carries
 #
 # So the unit tests decode real server bytes in both formats, re-encode them, and compare — with no server, and
-# with no expected value typed by hand. The generated file is committed. Regenerate it against a running server:
+# with no expected value typed by hand. The integration tests get the same file, and check each value live on every
+# server version: its bytes, its text, and its kama value sent back. Both copies are committed. Regenerate them
+# against a running server:
 #
 #   tools/pg.sh up --version 18 && tools/gen-codec-vectors.sh [--version 18]
 #
@@ -188,4 +190,6 @@ perl -e '
     }
 ' "$tmp/rows.tsv" "$server" > "$OUT"
 
-echo "gen-codec-vectors: $got cases from PostgreSQL $server into $(basename "$OUT")"
+# The integration tests read the same vectors, on every server version.
+cp "$OUT" "$ROOT/tests/integration/src/codec_vectors.kama"
+echo "gen-codec-vectors: $got cases from PostgreSQL $server into $(basename "$OUT"), for the unit and integration tests"

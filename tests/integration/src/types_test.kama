@@ -1,0 +1,187 @@
+// Every codec vector (codec_vectors.kama, from tools/gen-codec-vectors.sh), on this server version, three ways:
+//   - the extended protocol: the binary bytes this server sends must be the vector's, and the value read as a
+//     string must be the server's text (a float may differ in digits only, KPG-27);
+//   - the simple protocol: the value read as a string must be the server's text;
+//   - the value read into its kama type and sent back as a parameter must equal the literal, compared by the
+//     server.
+// So the binary formats are proved stable across 14–19, and each type survives the round trip both ways.
+import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode, std::fmt::parse,
+         std::fmt::ParseError, std::uuid::Uuid, std::time::Timestamp, std::time::Date,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::Query, postgres::column,
+         postgres::types::Numeric, postgres::types::LocalDateTime, postgres::types::TimeOfDay,
+         postgres::types::TimeTz, postgres::types::Interval,
+         postgres_integration_tests::check, postgres_integration_tests::conninfoFor,
+         postgres_integration_tests::open, postgres_integration_tests::codecTypes,
+         postgres_integration_tests::codecLiterals, postgres_integration_tests::codecTexts,
+         postgres_integration_tests::codecBinaries };
+export { typesTests };
+
+// The server's comparison of $1, sent as a kama value, with $2, the literal. json has no equality operator, so its
+// text is compared.
+fn Query comparison(const ref string type) {
+    string shown = copy type;
+    if (type.equals(other: "json")) { shown = "json::text"; }
+    return Query.make(sql: "select $1::".concat(other: type).concat(other: "::").concat(other: shown).concat(other: " = $2::").concat(other: type).concat(other: "::").concat(other: shown));
+}
+
+// "" when the value, read as T from `rows` and sent back as a parameter, equals the literal; else what failed.
+unsafe fn string roundTrip<T: Deserializable<T> + Serializable>(ref Connection c, const ref Rows rows, const ref string type, const ref string literal) {
+    Result<T, PgError> read = column::<T>(rows: rows, row: 0, index: 0);
+    T value = match (give read) { case Ok(value: v): give v; case Err(error: e): { return "read: ".concat(other: e.message()); } };
+    Query q = comparison(type: type);
+    q.add(value: value);
+    return compared(c: ref c, q: give q, literal: literal);
+}
+
+// Send `q`, with the literal as its last parameter, and read the server's verdict.
+unsafe fn string compared(ref Connection c, Query q, const ref string literal) {
+    q.addText(text: literal);
+    Result<Rows, PgError> r = c.query(q: q);
+    Rows back = match (give r) { case Ok(value: v): give v; case Err(error: e): { return "sent back: ".concat(other: e.message()); } };
+    Result<bool, PgError> same = column::<bool>(rows: back, row: 0, index: 0);
+    return match (give same) { case Ok(value: b): { if (b) { return ""; } := "the server says the value sent back differs"; } case Err(error: e): e.message(); };
+}
+
+// The kama type each vector's PostgreSQL type reads into, and whether the vector holds a value it can hold.
+unsafe fn string typed(ref Connection c, const ref Rows rows, const ref string type, const ref string literal, const ref string text) {
+    if (text.contains(substring: "infinity")) { return ""; }      // no kama date or time type holds it
+    if (type.endsWith(suffix: "[]") && (text.contains(substring: "NULL,") || text.contains(substring: ",NULL") || text.startsWith(prefix: "{{") || text.startsWith(prefix: "["))) {
+        return "";   // a DynamicArray holds no NULL, one dimension, and no lower bound
+    }
+    if (type.equals(other: "bool")) { return roundTrip::<bool>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "int2")) { return roundTrip::<int16>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "int4")) { return roundTrip::<int32>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "int8")) { return roundTrip::<int64>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "float4")) { return roundTrip::<float32>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "float8")) { return roundTrip::<float64>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "oid")) { return roundTrip::<uint32>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "text") || type.equals(other: "varchar") || type.equals(other: "bpchar") || type.equals(other: "name")
+        || type.equals(other: "json") || type.equals(other: "jsonb")) { return roundTrip::<string>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "bytea")) { return arrayTrip(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "uuid")) { return roundTrip::<Uuid>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "date")) { return roundTrip::<Date>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "time")) { return roundTrip::<TimeOfDay>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "timetz")) { return roundTrip::<TimeTz>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "timestamp")) { return roundTrip::<LocalDateTime>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "timestamptz")) { return roundTrip::<Timestamp>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "interval")) { return roundTrip::<Interval>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.equals(other: "numeric")) { return roundTrip::<Numeric>(c: ref c, rows: rows, type: type, literal: literal); }
+    if (type.endsWith(suffix: "[]")) { return arrayTrip(c: ref c, rows: rows, type: type, literal: literal); }
+    return "no kama type for ".concat(other: type);
+}
+
+// A bytea or an array, read into its DynamicArray and sent back. Not through the generic roundTrip: a generic site
+// handing a DynamicArray to the Serializable parameter gets no vtable (KPG-30), so each type has a block of its own.
+unsafe fn string arrayTrip(ref Connection c, const ref Rows rows, const ref string type, const ref string literal) {
+    Query q = comparison(type: type);
+    if (type.equals(other: "int4[]")) {
+        Result<DynamicArray<int32>, PgError> r = column::<DynamicArray<int32>>(rows: rows, row: 0, index: 0);
+        DynamicArray<int32> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "int2[]")) {
+        Result<DynamicArray<int16>, PgError> r = column::<DynamicArray<int16>>(rows: rows, row: 0, index: 0);
+        DynamicArray<int16> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "int8[]")) {
+        Result<DynamicArray<int64>, PgError> r = column::<DynamicArray<int64>>(rows: rows, row: 0, index: 0);
+        DynamicArray<int64> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "text[]") || type.equals(other: "jsonb[]")) {
+        Result<DynamicArray<string>, PgError> r = column::<DynamicArray<string>>(rows: rows, row: 0, index: 0);
+        DynamicArray<string> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "bool[]")) {
+        Result<DynamicArray<bool>, PgError> r = column::<DynamicArray<bool>>(rows: rows, row: 0, index: 0);
+        DynamicArray<bool> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "float8[]")) {
+        Result<DynamicArray<float64>, PgError> r = column::<DynamicArray<float64>>(rows: rows, row: 0, index: 0);
+        DynamicArray<float64> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "uuid[]")) {
+        Result<DynamicArray<Uuid>, PgError> r = column::<DynamicArray<Uuid>>(rows: rows, row: 0, index: 0);
+        DynamicArray<Uuid> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "date[]")) {
+        Result<DynamicArray<Date>, PgError> r = column::<DynamicArray<Date>>(rows: rows, row: 0, index: 0);
+        DynamicArray<Date> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "timestamptz[]")) {
+        Result<DynamicArray<Timestamp>, PgError> r = column::<DynamicArray<Timestamp>>(rows: rows, row: 0, index: 0);
+        DynamicArray<Timestamp> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "numeric[]")) {
+        Result<DynamicArray<Numeric>, PgError> r = column::<DynamicArray<Numeric>>(rows: rows, row: 0, index: 0);
+        DynamicArray<Numeric> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "bytea")) {
+        Result<DynamicArray<uint8>, PgError> r = column::<DynamicArray<uint8>>(rows: rows, row: 0, index: 0);
+        DynamicArray<uint8> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else if (type.equals(other: "bytea[]")) {
+        Result<DynamicArray<DynamicArray<uint8>>, PgError> r = column::<DynamicArray<DynamicArray<uint8>>>(rows: rows, row: 0, index: 0);
+        DynamicArray<DynamicArray<uint8>> v = match (give r) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        q.add(value: v);
+    } else {
+        return "no kama type for ".concat(other: type);
+    }
+    return compared(c: ref c, q: give q, literal: literal);
+}
+
+// The same number, if the texts differ only in the digits a float is printed with.
+fn bool sameFloat(const ref string a, const ref string b) {
+    Result<float64, ParseError> x = parse::<float64>(s: a);
+    Result<float64, ParseError> y = parse::<float64>(s: b);
+    float64 xv = match (x) { case Ok(value: v): v; case Err(error: e): { return false; } };
+    float64 yv = match (y) { case Ok(value: v): v; case Err(error: e): { return false; } };
+    return xv == yv || cast<float32>(xv) == cast<float32>(yv);
+}
+
+unsafe fn int32 typesTests() {
+    int32 f = 0;
+    Result<Connection, PgError> opened = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection c = match (give opened) { case Ok(value: v): give v; case Err(error: e): { string m = e.message(); return check(ok: false, what: "types: connect: ".concat(other: m)); } };
+    // The settings the vectors were made under.
+    Result<DynamicArray<Rows>, PgError> set = c.simpleQuery(sql: "set TimeZone = 'UTC'; set DateStyle = 'ISO, MDY'; set IntervalStyle = 'postgres'; set extra_float_digits = 1");
+    DynamicArray<string> types = codecTypes();
+    DynamicArray<string> literals = codecLiterals();
+    DynamicArray<string> texts = codecTexts();
+    DynamicArray<string> binaries = codecBinaries();
+    isize i = 0;
+    while (i < types.length()) {
+        string type = copy types[i];
+        string literal = copy literals[i];
+        string text = copy texts[i];
+        string label = "types: ".concat(other: type).concat(other: " ").concat(other: literal).concat(other: ": ");
+
+        // The extended protocol: binary bytes, and the value as text.
+        Query q = Query.make(sql: "select $1::".concat(other: type));
+        q.addText(text: literal);
+        Result<Rows, PgError> r = c.query(q: q);
+        Rows rows = match (give r) { case Ok(value: v): give v; case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: label.concat(other: m)); i = i + 1; continue; } };
+        string hex = hexEncode(bytes: rows.bytes(row: 0, column: 0));
+        f = f + check(ok: rows.field(index: 0).format() == 1i16 && hex.equals(other: binaries[i]), what: label.concat(other: "this server's binary is ").concat(other: hex));
+        Result<string, PgError> asText = column::<string>(rows: rows, row: 0, index: 0);
+        string got = match (give asText) { case Ok(value: s): give s; case Err(error: e): e.message(); };
+        bool textMatches = got.equals(other: text);
+        if (!textMatches && (type.equals(other: "float4") || type.equals(other: "float8"))) { textMatches = sameFloat(a: got, b: text); }
+        if (!textMatches && text.startsWith(prefix: "{{")) { textMatches = got.contains(substring: "2 dimensions"); }
+        f = f + check(ok: textMatches, what: label.concat(other: "read from binary as ").concat(other: got));
+
+        // The simple protocol: the server's own text.
+        string sql = "select $lit$".concat(other: literal).concat(other: "$lit$::").concat(other: type);
+        Result<DynamicArray<Rows>, PgError> s = c.simpleQuery(sql: sql);
+        string simple = match (give s) {
+            case Ok(value: rs): { Result<string, PgError> v = column::<string>(rows: rs[0], row: 0, index: 0); := match (give v) { case Ok(value: t): give t; case Err(error: e): e.message(); }; }
+            case Err(error: e): e.message();
+        };
+        f = f + check(ok: simple.equals(other: text), what: label.concat(other: "read from text as ").concat(other: simple));
+
+        // Read into its kama type, and sent back.
+        string trip = typed(c: ref c, rows: rows, type: type, literal: literal, text: text);
+        f = f + check(ok: trip.length() == 0, what: label.concat(other: trip));
+        i = i + 1;
+    }
+    c.close();
+    return f;
+}

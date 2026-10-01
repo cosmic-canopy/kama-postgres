@@ -180,6 +180,8 @@ type resource ScramClient {
     string clientFirstBare;
     string clientNonce;
     DynamicArray<uint8> expectedServerSignature;
+    DynamicArray<uint8> givenClientKey;   // libpq's scram_client_key and scram_server_key: empty unless given
+    DynamicArray<uint8> givenServerKey;
     int32 stage = 0;                   // 0 before client-first, 1 after it, 2 after client-final, 3 verified
 
     // A client for `user` ("" is what PostgreSQL clients send: the server takes the name from the startup
@@ -209,7 +211,18 @@ type resource ScramClient {
         this.clientFirstBare = bareStart.concat(other: nonce);
         this.clientNonce = give nonce;
         this.expectedServerSignature = DynamicArray.empty();
+        this.givenClientKey = DynamicArray.empty();
+        this.givenServerKey = DynamicArray.empty();
         this.stage = 0;
+    }
+
+    // SCRAM's ClientKey and ServerKey, given instead of being derived from the password (libpq's scram_client_key
+    // and scram_server_key, which postgres_fdw passes through). Each is used on its own: an empty one is derived.
+    public fn void useKeys(ConstView<uint8> clientKey, ConstView<uint8> serverKey) {
+        this.givenClientKey = DynamicArray.empty();
+        appendBytes(to: ref this.givenClientKey, from: clientKey);
+        this.givenServerKey = DynamicArray.empty();
+        appendBytes(to: ref this.givenServerKey, from: serverKey);
     }
 
     // The mechanism this client speaks: SCRAM-SHA-256-PLUS when it binds to the channel.
@@ -244,12 +257,22 @@ type resource ScramClient {
 
         // SaltedPassword := Hi(Normalize(password), salt, i); the keys and signatures of RFC 5802 §3.
         FixedArray<uint8> salted = FixedArray.make(size: 32);
-        pbkdf2(hash: Sha256.make(), password: this.password.bytes(), salt: salt.view(), iterations: iterations, into: salted.viewMut());
+        if (this.givenClientKey.length() != 32 || this.givenServerKey.length() != 32) {
+            pbkdf2(hash: Sha256.make(), password: this.password.bytes(), salt: salt.view(), iterations: iterations, into: salted.viewMut());
+        }
         string clientKeyLabel = "Client Key";
         string serverKeyLabel = "Server Key";
         InlineArray<uint8>#(32) clientKey = hmacSha256(key: salted.view(), message: clientKeyLabel.bytes());
+        if (this.givenClientKey.length() == 32) {
+            isize k = 0;
+            while (k < 32) { clientKey[cast<usize>(k)] = this.givenClientKey[k]; k = k + 1; }
+        }
         InlineArray<uint8>#(32) storedKey = sha256(bytes: clientKey.view());
         InlineArray<uint8>#(32) serverKey = hmacSha256(key: salted.view(), message: serverKeyLabel.bytes());
+        if (this.givenServerKey.length() == 32) {
+            isize k = 0;
+            while (k < 32) { serverKey[cast<usize>(k)] = this.givenServerKey[k]; k = k + 1; }
+        }
 
         // c= is the GS2 header and, when bound, the binding data, base64-encoded.
         DynamicArray<uint8> cbind = DynamicArray.empty();

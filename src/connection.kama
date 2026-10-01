@@ -1,0 +1,713 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::validate,
+         std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error, std::io::IoError,
+         std::memory::Owned, std::net::SocketAddr, std::net::IpAddr, std::net::resolve, std::net::parseIp,
+         std::time::Duration,
+         postgres::PgError, postgres::ServerError, postgres::ConnectError, postgres::ConnectAttempt,
+         postgres::Config, postgres::HostKind, postgres::ChannelBindingMode, postgres::RequireAuth,
+         postgres::Transport, postgres::TcpTransport, postgres::NoticeHandler, postgres::Notification,
+         postgres::logNotice, postgres::SimpleResult,
+         postgres::wire::Wire, postgres::wire::Deadline,
+         postgres::protocol::MessageWriter, postgres::protocol::BackendMessage, postgres::protocol::ProtocolError,
+         postgres::protocol::FieldDescription, postgres::protocol::RowValues, postgres::protocol::ErrorFields,
+         postgres::protocol::ScramClient, postgres::protocol::ChannelBinding, postgres::protocol::AuthError,
+         postgres::protocol::md5Password, postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
+         postgres::protocol::startup as sendStartup, postgres::protocol::password as sendPassword,
+         postgres::protocol::saslInitialResponse, postgres::protocol::saslResponse,
+         postgres::protocol::query as sendQuery, postgres::protocol::terminate as sendTerminate,
+         postgres::protocol::copyFail as sendCopyFail };
+export { Connection, TransactionStatus };
+
+// postgres::Connection — one session with a server: connecting as libpq connects (every host and address in
+// turn, each within connect_timeout), authenticating, and running queries. A connection belongs to one isolate at
+// a time and moves between them: it is Sendable, and it holds no Shared.
+
+// Where the session's transaction stands, from the last ReadyForQuery (libpq's PQtransactionStatus).
+type enum TransactionStatus implements Sendable { Idle, InTransaction, Failed, Unknown }
+
+// The authentication request codes (AUTH_REQ_* in PostgreSQL's src/include/libpq/protocol.h).
+comptime int32 AUTH_OK = 0;
+comptime int32 AUTH_PASSWORD = 3;
+comptime int32 AUTH_MD5 = 5;
+comptime int32 AUTH_SASL = 10;
+comptime int32 AUTH_SASL_CONT = 11;
+comptime int32 AUTH_SASL_FIN = 12;
+
+type resource Connection implements Sendable {
+    Wire wire;
+    MessageWriter outbox;
+    bool live = false;
+    int32 pid = 0;
+    DynamicArray<uint8> cancelKey;
+    int32 protocol = 0;
+    uint8 txStatus = 73ui8;   // 'I'
+    DynamicArray<string> paramNames;
+    DynamicArray<string> paramValues;
+    Optional<Owned<NoticeHandler>> handler;
+    DynamicArray<Notification> pending;
+    bool passwordFromFile = false;
+
+    ctor over(Owned<Transport> transport) {
+        this.wire = Wire.over(transport: give transport);
+        this.outbox = MessageWriter.make();
+        this.live = true;
+        this.pid = 0;
+        this.cancelKey = DynamicArray.empty();
+        this.protocol = 0;
+        this.txStatus = 73ui8;
+        this.paramNames = DynamicArray.empty();
+        this.paramValues = DynamicArray.empty();
+        this.handler = Optional::None;
+        this.pending = DynamicArray.empty();
+        this.passwordFromFile = false;
+    }
+
+    // Connect as `config` says: each host in order, each of its addresses in turn. A failure to reach an address,
+    // or connect_timeout passing, moves on to the next address; once a server has answered, its refusal is final,
+    // as libpq's is. Every attempt is kept in the error.
+    public unsafe ctor Result<Connection, PgError> connect(const ref Config config) {
+        ConnectError failures = ConnectError.make();
+        bool refused = false;   // a server answered and refused: libpq tries no further host
+        isize h = 0;
+        while (h < config.hostCount() && !refused) {
+            string shown = config.host(index: h).display();
+            string portText = copy config.host(index: h).port();
+            if (portText.length() == 0) { portText = "5432"; }
+            Optional<int32> parsedPort = config.host(index: h).portNumber();
+            int32 portValue = match (parsedPort) {
+                case Some(value: p): p;
+                case None: {
+                    return Result::Err(error: PgError::Config(detail: "invalid integer value \"".concat(other: config.host(index: h).port()).concat(other: "\" for connection option \"port\"")));
+                }
+            };
+            if (portValue < 1 || portValue > 65535) {
+                failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: "",
+                    error: PgError::Config(detail: "invalid port number: \"".concat(other: config.host(index: h).port()).concat(other: "\"")), passfile: ""));
+                h = h + 1;
+                continue;
+            }
+            uint16 port = cast<uint16>(portValue);
+            if (config.host(index: h).kind() == HostKind::Socket) {
+                string socket = config.host(index: h).name().concat(other: "/.s.PGSQL.${portValue}");
+                failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText,
+                    lead: "connection to server on socket \"".concat(other: socket).concat(other: "\" failed: "),
+                    error: PgError::Config(detail: "Unix-domain socket connections are not supported by this client yet"), passfile: ""));
+                h = h + 1;
+                continue;
+            }
+            DynamicArray<SocketAddr> addresses = DynamicArray.empty();
+            if (config.host(index: h).kind() == HostKind::Address) {
+                Optional<IpAddr> ip = parseIp(text: config.host(index: h).address());
+                match (ip) {
+                    case Some(value: a): { addresses.add(item: SocketAddr.of(ip: a, port: port)); }
+                    case None: {
+                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText,
+                            lead: "could not parse network address \"".concat(other: config.host(index: h).address()).concat(other: "\": "),
+                            error: PgError::Io(error: IoError::InvalidInput), passfile: ""));
+                    }
+                };
+            } else {
+                Result<DynamicArray<SocketAddr>, IoError> found = resolve(host: config.host(index: h).name(), port: port);
+                match (give found) {
+                    case Ok(value: list): { addresses = give list; }
+                    case Err(error: e): {
+                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText,
+                            lead: "could not translate host name \"".concat(other: config.host(index: h).name()).concat(other: "\" to address: "),
+                            error: PgError::Io(error: e), passfile: ""));
+                    }
+                };
+            }
+            isize a = 0;
+            while (a < addresses.length() && !refused) {
+                IpAddr ip = addresses[a].ip;
+                string addressText = "${ip}";
+                string lead = identity(host: shown, address: addressText, port: portText);
+                Deadline deadline = Deadline.none();
+                if (config.connectTimeout() > 0) { deadline = Deadline.after(span: Duration.fromSecs(s: cast<int64>(config.connectTimeout()))); }
+                Result<Owned<TcpTransport>, IoError> made = new TcpTransport.connect(address: addresses[a], timeoutMs: deadline.remainingMs());
+                Owned<TcpTransport> tcp = match (give made) {
+                    case Ok(value: t): give t;
+                    case Err(error: e): {
+                        PgError cause = PgError::Io(error: e);
+                        match (e) { case TimedOut: { cause = PgError::Timeout; } case _: { } };
+                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: copy addressText, port: copy portText, lead: copy lead, error: give cause, passfile: ""));
+                        a = a + 1;
+                        continue;
+                    }
+                };
+                Result<Owned<TcpTransport>, PgError> configured = socketOptions(tcp: give tcp, config: config);
+                Owned<TcpTransport> ready = match (give configured) {
+                    case Ok(value: t): give t;
+                    case Err(error: e): {
+                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: copy addressText, port: copy portText, lead: copy lead, error: give e, passfile: ""));
+                        a = a + 1;
+                        continue;
+                    }
+                };
+                Owned<Transport> transport = give ready;
+                Connection c = Connection.over(transport: give transport);
+                Result<Unit, PgError> started = c.startup(config: config, hostIndex: h, deadline: deadline);
+                match (give started) {
+                    case Ok(value: u): { return Result::Ok(value: give c); }
+                    case Err(error: e): {
+                        bool timedOut = match (e) { case Timeout: true; case _: false; };
+                        string passfile = "";
+                        if (c.passwordFromFile) { passfile = copy config.passfile(); }
+                        c.lose();
+                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: copy addressText, port: copy portText, lead: copy lead, error: give e, passfile: give passfile));
+                        if (!timedOut) { refused = true; }
+                    }
+                };
+                a = a + 1;
+            }
+            h = h + 1;
+        }
+        return Result::Err(error: PgError::Connect(error: give failures));
+    }
+
+    // Start a session over a transport the caller opened: a tunnel, a proxy, a test's scripted server
+    // (tokio-postgres's connect_raw). `config` supplies everything but the hosts; connect_timeout bounds the startup.
+    public unsafe ctor Result<Connection, PgError> connectOver(Owned<Transport> transport, const ref Config config) {
+        Deadline deadline = Deadline.none();
+        if (config.connectTimeout() > 0) { deadline = Deadline.after(span: Duration.fromSecs(s: cast<int64>(config.connectTimeout()))); }
+        Connection c = Connection.over(transport: give transport);
+        Result<Unit, PgError> started = c.startup(config: config, hostIndex: -1, deadline: deadline);
+        match (give started) { case Ok(value: u): { } case Err(error: e): { c.lose(); return Result::Err(error: give e); } };
+        return Result::Ok(value: give c);
+    }
+
+    // ---- the session ----
+
+    // Run `sql` with the simple protocol: one or more statements separated by semicolons, each giving one result
+    // (an empty statement gives none). Values arrive as text. If a statement fails, the server runs none after
+    // it, and the error is returned in place of every result.
+    public unsafe fn Result<DynamicArray<SimpleResult>, PgError> simpleQuery(const ref string sql) {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        this.outbox.clear();
+        if (!sendQuery(w: this.outbox, sql: sql)) {
+            return Result::Err(error: PgError::Usage(detail: "the query text holds a NUL byte, which the protocol cannot carry"));
+        }
+        Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+
+        DynamicArray<SimpleResult> results = DynamicArray.empty();
+        isize columns = -1;                                     // the open result's column count; -1 when none is open
+        DynamicArray<int16> formats = DynamicArray.empty();     // its columns' formats, for checking each row
+        DynamicArray<PgError> failed = DynamicArray.empty();    // errors, in order: the first is the one returned
+        bool copyRefused = false;
+        bool copying = false;
+        bool done = false;
+        while (!done) {
+            Result<BackendMessage, PgError> received = this.wire.receive(deadline: Deadline.none());
+            BackendMessage m = match (give received) {
+                case Ok(value: v): give v;
+                case Err(error: e): { this.lose(); return Result::Err(error: give e); }
+            };
+            match (give m) {
+                case RowDescription(fields: f): {
+                    if (columns >= 0) { return this.violation(detail: unexpected(tag: 84ui8)); }
+                    columns = f.length();
+                    formats = DynamicArray.empty();
+                    isize k = 0;
+                    while (k < f.length()) { formats.add(item: f[k].format()); k = k + 1; }
+                    results.add(item: SimpleResult.make(fields: give f, rows: DynamicArray.empty(), tag: ""));
+                }
+                case DataRow(row: r): {
+                    if (columns < 0) { return this.violation(detail: "server sent data (\"D\" message) without prior row description (\"T\" message)"); }
+                    if (r.columnCount() != columns) { return this.violation(detail: "unexpected field count in \"D\" message"); }
+                    if (!textValid(row: r, formats: formats)) {
+                        this.lose();
+                        return Result::Err(error: PgError::Protocol(error: ProtocolError::NotUtf8(tag: 68ui8)));
+                    }
+                    results[results.length() - 1].addRow(row: give r);
+                }
+                case CommandComplete(commandTag: t): {
+                    if (columns >= 0) { results[results.length() - 1].complete(tag: give t); }
+                    else { results.add(item: SimpleResult.make(fields: DynamicArray.empty(), rows: DynamicArray.empty(), tag: give t)); }
+                    columns = -1;
+                }
+                case EmptyQueryResponse: { columns = -1; }
+                case ErrorResponse(fields: f): {
+                    ServerError e = ServerError.make(fields: give f);
+                    bool fatal = e.isFatal();
+                    failed.add(item: PgError::Server(error: give e));
+                    if (fatal) { this.lose(); done = true; }
+                    // A result the error cut short is not one the server completed.
+                    if (columns >= 0) { Optional<SimpleResult> partial = results.pop(); }
+                    columns = -1;
+                }
+                case NoticeResponse(fields: f): { this.deliver(fields: give f); }
+                case ParameterStatus(name: n, value: v): { this.setParameter(name: give n, value: give v); }
+                case NotificationResponse(processId: p, channel: c, payload: x): {
+                    this.pending.add(item: Notification.make(processId: p, channel: give c, payload: give x));
+                }
+                case CopyInResponse(formats: cf): {
+                    // COPY has its own interface; refusing it here keeps the session usable.
+                    this.outbox.clear();
+                    bool framed = sendCopyFail(w: this.outbox, reason: "COPY FROM STDIN is not supported by simpleQuery");
+                    Result<Unit, PgError> refusal = this.flush(deadline: Deadline.none());
+                    match (give refusal) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                    copyRefused = true;
+                }
+                case CopyOutResponse(formats: cf): { copyRefused = true; copying = true; }
+                case CopyData(data: d): { if (!copying) { return this.violation(detail: unexpected(tag: 100ui8)); } }
+                case CopyDone: {
+                    if (!copying) { return this.violation(detail: unexpected(tag: 99ui8)); }
+                    copying = false;
+                }
+                case ReadyForQuery(status: s): { this.txStatus = s; done = true; }
+                case _: { return this.violation(detail: "unexpected response from server: a message the simple query protocol does not send"); }
+            };
+        }
+        if (copyRefused && this.live) {
+            return Result::Err(error: PgError::Usage(detail: "COPY is not supported by simpleQuery; the statement was not run, or its output was discarded"));
+        }
+        if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
+        return Result::Ok(value: give results);
+    }
+
+    // Send Terminate and close the transport. Every later call returns `Closed`. Closing a closed connection does
+    // nothing.
+    public unsafe fn void close() {
+        if (!this.live) { return; }
+        this.outbox.clear();
+        sendTerminate(w: this.outbox);
+        Result<Unit, PgError> sent = this.wire.send(bytes: this.outbox.view(), deadline: Deadline.after(span: Duration.fromSecs(s: 1i64)));
+        this.lose();
+    }
+
+    // The value of a run-time parameter the server reported (ParameterStatus): server_version, TimeZone,
+    // application_name, … kept current as the server sends changes.
+    public const fn Optional<string> parameter(const ref string name) {
+        isize i = 0;
+        while (i < this.paramNames.length()) {
+            if (this.paramNames[i].equals(other: name)) { return Optional::Some(value: copy this.paramValues[i]); }
+            i = i + 1;
+        }
+        return Optional::None;
+    }
+
+    // The server's version as libpq's PQserverVersion gives it: 180004 for 18.4, 190000 for 19beta4, 90624 for
+    // 9.6.24; 0 if the server did not report one.
+    public const fn int32 serverVersion() {
+        Optional<string> v = this.parameter(name: "server_version");
+        return match (v) { case Some(value: text): versionNumber(text: text); case None: 0; };
+    }
+
+    public const fn TransactionStatus transactionStatus() {
+        if (!this.live) { return TransactionStatus::Unknown; }
+        if (this.txStatus == 84ui8) { return TransactionStatus::InTransaction; }
+        if (this.txStatus == 69ui8) { return TransactionStatus::Failed; }
+        return TransactionStatus::Idle;
+    }
+
+    // The server process serving this session (pg_backend_pid()).
+    public const fn int32 processId() { return this.pid; }
+    // The protocol version in use, as PROTOCOL_3_0 or PROTOCOL_3_2.
+    public const fn int32 protocolVersion() { return this.protocol; }
+    public const fn bool isClosed() { return !this.live; }
+
+    // Notices go to `handler` from now on, instead of std::log.
+    public fn void setNoticeHandler(Owned<NoticeHandler> handler) { this.handler = Optional::Some(value: give handler); }
+    public fn void clearNoticeHandler() { this.handler = Optional::None; }
+
+    // The LISTEN/NOTIFY notifications received so far, oldest first, as libpq's PQnotifies queues them. They
+    // arrive with query results; taking them empties the queue.
+    public fn DynamicArray<Notification> takeNotifications() {
+        DynamicArray<Notification> taken = DynamicArray.empty();
+        bool more = true;
+        while (more) {
+            Optional<Notification> last = this.pending.pop();
+            match (give last) { case Some(value: n): { taken.insertAt(index: 0, item: give n); } case None: { more = false; } };
+        }
+        return taken;
+    }
+
+    // ---- startup ----
+
+    // From the StartupMessage to ReadyForQuery: authentication, then the session's parameters and cancel key.
+    // `hostIndex` is the host the password file was read for (-1 for a caller's transport).
+    unsafe fn Result<Unit, PgError> startup(const ref Config config, isize hostIndex, Deadline deadline) {
+        this.outbox.clear();
+        if (!sendStartup(w: this.outbox, version: config.maxProtocolVersion(), names: config.startupNames(), values: config.startupValues())) {
+            return Result::Err(error: PgError::Usage(detail: "a connection setting holds a NUL byte, which the protocol cannot carry"));
+        }
+        this.protocol = config.maxProtocolVersion();
+        Result<Unit, PgError> sent = this.flush(deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+
+        string secret = config.password();
+        if (secret.length() == 0 && hostIndex >= 0) {
+            Optional<string> fromFile = config.host(index: hostIndex).filePasswordFor();
+            match (give fromFile) { case Some(value: p): { secret = give p; this.passwordFromFile = true; } case None: { } };
+        }
+        bool authenticated = false;
+        bool finished = false;          // libpq's client_finished_auth
+        bool negotiated = false;
+        int32 saslStage = 0;            // 0 none, 1 client-first sent, 2 client-final sent, 3 server verified
+        DynamicArray<ScramClient> scram = DynamicArray.empty();   // zero or one
+        while (true) {
+            Result<BackendMessage, PgError> received = this.wire.receive(deadline: deadline);
+            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+            if (!authenticated) {
+                match (give m) {
+                    case AuthenticationOk: {
+                        Result<Unit, PgError> allowed = expected(config: config, code: AUTH_OK, finished: finished);
+                        match (give allowed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        if (saslStage == 1 || saslStage == 2) {
+                            return Result::Err(error: PgError::Auth(detail: "server did not complete authentication: it sent AuthenticationOk before proving that it knows the password"));
+                        }
+                        authenticated = true;
+                    }
+                    case AuthenticationCleartextPassword: {
+                        Result<Unit, PgError> allowed = expected(config: config, code: AUTH_PASSWORD, finished: finished);
+                        match (give allowed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        if (secret.length() == 0) { return Result::Err(error: noPassword()); }
+                        this.outbox.clear();
+                        if (!sendPassword(w: this.outbox, text: secret)) { return Result::Err(error: PgError::Usage(detail: "the password holds a NUL byte, which the protocol cannot carry")); }
+                        Result<Unit, PgError> s = this.flush(deadline: deadline);
+                        match (give s) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        finished = true;
+                    }
+                    case AuthenticationMd5Password(salt: salt): {
+                        Result<Unit, PgError> allowed = expected(config: config, code: AUTH_MD5, finished: finished);
+                        match (give allowed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        if (secret.length() == 0) { return Result::Err(error: noPassword()); }
+                        string response = md5Password(user: config.user(), password: secret, salt: salt);
+                        this.outbox.clear();
+                        if (!sendPassword(w: this.outbox, text: response)) { return Result::Err(error: PgError::Usage(detail: "the md5 response holds a NUL byte")); }
+                        Result<Unit, PgError> s = this.flush(deadline: deadline);
+                        match (give s) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        finished = true;
+                    }
+                    case AuthenticationSasl(mechanisms: offered): {
+                        Result<Unit, PgError> allowed = expected(config: config, code: AUTH_SASL, finished: finished);
+                        match (give allowed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        Result<Unit, PgError> begun = this.beginSasl(config: config, offered: offered, secret: secret, scram: ref scram);
+                        match (give begun) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        saslStage = 1;
+                    }
+                    case AuthenticationSaslContinue(data: d): {
+                        Result<Unit, PgError> allowed = expected(config: config, code: AUTH_SASL_CONT, finished: finished);
+                        match (give allowed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        if (saslStage == 0) { return Result::Err(error: PgError::Auth(detail: "fe_sendauth: invalid authentication request from server: AUTH_REQ_SASL_CONT without AUTH_REQ_SASL")); }
+                        if (saslStage != 1) { return Result::Err(error: violation(detail: "unexpected response from server: a second AuthenticationSASLContinue")); }
+                        Result<string, PgError> serverFirst = saslText(data: d);
+                        string first = match (give serverFirst) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+                        Result<string, AuthError> answer = scram[0].clientFinal(serverFirst: first);
+                        string reply = match (give answer) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: PgError::Auth(detail: e.message())); } };
+                        this.outbox.clear();
+                        saslResponse(w: this.outbox, data: reply.bytes());
+                        Result<Unit, PgError> s = this.flush(deadline: deadline);
+                        match (give s) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        saslStage = 2;
+                    }
+                    case AuthenticationSaslFinal(data: d): {
+                        Result<Unit, PgError> allowed = expected(config: config, code: AUTH_SASL_FIN, finished: finished);
+                        match (give allowed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        if (saslStage != 2) { return Result::Err(error: PgError::Auth(detail: "AuthenticationSASLFinal received from server, but SASL authentication was not completed")); }
+                        Result<string, PgError> serverFinal = saslText(data: d);
+                        string last = match (give serverFinal) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+                        Result<Unit, AuthError> verified = scram[0].verifyServerFinal(serverFinal: last);
+                        match (give verified) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: PgError::Auth(detail: e.message())); } };
+                        saslStage = 3;
+                        finished = true;
+                    }
+                    case AuthenticationUnsupported(method: code): {
+                        Result<Unit, PgError> allowed = expected(config: config, code: code, finished: finished);
+                        match (give allowed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        return Result::Err(error: PgError::Auth(detail: unsupportedMethod(code: code)));
+                    }
+                    case NegotiateProtocolVersion(newestVersion: v, unrecognized: names): {
+                        if (negotiated) { return Result::Err(error: negotiation(what: "received duplicate protocol negotiation message")); }
+                        negotiated = true;
+                        Result<Unit, PgError> agreed = this.negotiate(config: config, offered: v, unrecognized: names);
+                        match (give agreed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                    }
+                    case ErrorResponse(fields: f): { return Result::Err(error: PgError::Server(error: ServerError.make(fields: give f))); }
+                    case NoticeResponse(fields: f): { this.deliver(fields: give f); }
+                    case _: {
+                        return Result::Err(error: violation(detail: "expected authentication request from server, but received a message of another kind"));
+                    }
+                };
+            } else {
+                match (give m) {
+                    case BackendKeyData(processId: p, secretKey: k): {
+                        if (this.protocol == PROTOCOL_3_0 && k.length() != 4) {
+                            isize n = k.length();
+                            return Result::Err(error: violation(detail: "received invalid BackendKeyData message: cancel key with length ${n} not allowed in protocol version 3.0 (must be 4 bytes)"));
+                        }
+                        this.pid = p;
+                        this.cancelKey = give k;
+                    }
+                    case ParameterStatus(name: n, value: v): { this.setParameter(name: give n, value: give v); }
+                    case NoticeResponse(fields: f): { this.deliver(fields: give f); }
+                    case ErrorResponse(fields: f): { return Result::Err(error: PgError::Server(error: ServerError.make(fields: give f))); }
+                    case ReadyForQuery(status: s): {
+                        this.txStatus = s;
+                        Optional<string> encoding = this.parameter(name: "client_encoding");
+                        match (give encoding) {
+                            case Some(value: e): {
+                                if (!e.equals(other: "UTF8")) {
+                                    return Result::Err(error: violation(detail: "the server's client_encoding is ".concat(other: e).concat(other: "; this client requires UTF8")));
+                                }
+                            }
+                            case None: { }
+                        };
+                        return Result::Ok(value: Unit::Unit);
+                    }
+                    case _: {
+                        return Result::Err(error: violation(detail: "unexpected response from server: a message the server does not send after AuthenticationOk"));
+                    }
+                };
+            }
+        }
+        return Result::Err(error: PgError::Closed);
+    }
+
+    // pg_SASL_init: choose a mechanism the server offered and this client may use, and send the client-first
+    // message.
+    unsafe fn Result<Unit, PgError> beginSasl(const ref Config config, const ref DynamicArray<string> offered, const ref string secret, ref DynamicArray<ScramClient> scram) {
+        if (config.channelBinding() == ChannelBindingMode::Require) { return Result::Err(error: PgError::Auth(detail: "channel binding required, but SSL not in use")); }
+        if (scram.length() > 0) { return Result::Err(error: PgError::Auth(detail: "duplicate SASL authentication request")); }
+        string chosen = "";
+        isize i = 0;
+        while (i < offered.length()) {
+            if (offered[i].equals(other: "SCRAM-SHA-256-PLUS")) {
+                return Result::Err(error: PgError::Auth(detail: "server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection"));
+            }
+            if (offered[i].equals(other: "SCRAM-SHA-256") && chosen.length() == 0) { chosen = "SCRAM-SHA-256"; }
+            if (offered[i].equals(other: "OAUTHBEARER") && chosen.length() == 0) { chosen = "OAUTHBEARER"; }
+            i = i + 1;
+        }
+        if (chosen.length() == 0) { return Result::Err(error: PgError::Auth(detail: "none of the server's SASL authentication mechanisms are supported")); }
+        Optional<string> refused = config.requireAuth().refuseMechanism(mechanism: chosen);
+        match (give refused) { case Some(value: r): { return Result::Err(error: PgError::Auth(detail: give r)); } case None: { } };
+        if (chosen.equals(other: "OAUTHBEARER")) {
+            return Result::Err(error: PgError::Auth(detail: "the server requested OAuth authentication (OAUTHBEARER), which this client does not support"));
+        }
+        bool keys = config.scramClientKey().length() > 0;
+        if (!keys && secret.length() == 0) { return Result::Err(error: noPassword()); }
+        // The client name in SCRAM is empty: the server takes the user from the StartupMessage.
+        string anonymous = "";
+        ScramClient client = ScramClient.make(user: anonymous, password: secret, binding: ChannelBinding::NotSupported);
+        if (keys) { client.useKeys(clientKey: config.scramClientKey().view(), serverKey: config.scramServerKey().view()); }
+        string first = client.clientFirst();
+        string mechanism = client.mechanism();
+        scram.add(item: give client);
+        this.outbox.clear();
+        if (!saslInitialResponse(w: this.outbox, mechanism: mechanism, data: first.bytes())) {
+            return Result::Err(error: PgError::Usage(detail: "the SASL mechanism name holds a NUL byte"));
+        }
+        return this.flush(deadline: Deadline.none());
+    }
+
+    // pqGetNegotiateProtocolVersion3: the server's newest version must be one this client asked for or below, and
+    // at least min_protocol_version; this client requests no protocol options, so none may come back unrecognized.
+    fn Result<Unit, PgError> negotiate(const ref Config config, int32 offered, const ref DynamicArray<string> unrecognized) {
+        if (offered > this.protocol) { return Result::Err(error: negotiation(what: "received invalid protocol negotiation message: server requested downgrade to a higher-numbered version")); }
+        if (offered < PROTOCOL_3_0) { return Result::Err(error: negotiation(what: "received invalid protocol negotiation message: server requested downgrade to pre-3.0 protocol version")); }
+        if (offered == PROTOCOL_3_0 + 1) { return Result::Err(error: negotiation(what: "received invalid protocol negotiation message: server requested downgrade to non-existent 3.1 protocol version")); }
+        if (offered == this.protocol && unrecognized.length() == 0) { return Result::Err(error: negotiation(what: "received invalid protocol negotiation message: server negotiated but asks for no changes")); }
+        if (offered < config.minProtocolVersion()) {
+            int32 theirMinor = offered & 65535;
+            int32 minMinor = config.minProtocolVersion() & 65535;
+            return Result::Err(error: negotiation(what: "server only supports protocol version 3.${theirMinor}, but \"min_protocol_version\" was set to 3.${minMinor}"));
+        }
+        this.protocol = offered;
+        if (unrecognized.length() > 0) {
+            string name = copy unrecognized[0];
+            if (!name.startsWith(prefix: "_pq_.")) {
+                return Result::Err(error: negotiation(what: "received invalid protocol negotiation message: server reported unsupported parameter name without a \"_pq_.\" prefix (\"".concat(other: name).concat(other: "\")")));
+            }
+            return Result::Err(error: negotiation(what: "received invalid protocol negotiation message: server reported an unsupported parameter that was not requested (\"".concat(other: name).concat(other: "\")")));
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // ---- helpers ----
+
+    // Send what is queued. A server that ended the session usually said why first: if a write fails, a FATAL
+    // ErrorResponse already waiting is the error reported, as libpq reports it.
+    unsafe fn Result<Unit, PgError> flush(Deadline deadline) {
+        Result<Unit, PgError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        this.outbox.clear();
+        match (give sent) {
+            case Ok(value: u): { return Result::Ok(value: Unit::Unit); }
+            case Err(error: e): {
+                bool io = match (e) { case Io(error: x): true; case _: false; };
+                if (io) {
+                    Result<BackendMessage, PgError> waiting = this.wire.receive(deadline: Deadline.after(span: Duration.fromMillis(ms: 0i64)));
+                    match (give waiting) {
+                        case Ok(value: m): {
+                            match (give m) {
+                                case ErrorResponse(fields: f): { this.lose(); return Result::Err(error: PgError::Server(error: ServerError.make(fields: give f))); }
+                                case _: { }
+                            };
+                        }
+                        case Err(error: x): { }
+                    };
+                }
+                this.lose();
+                return Result::Err(error: give e);
+            }
+        };
+    }
+
+    // A message the protocol does not allow here: the session cannot recover its place, so it ends.
+    unsafe fn Result<DynamicArray<SimpleResult>, PgError> violation(const ref string detail) {
+        this.lose();
+        return Result::Err(error: PgError::Protocol(error: ProtocolError::Violation(detail: copy detail)));
+    }
+
+    fn void deliver(ErrorFields fields) {
+        ServerError notice = ServerError.make(fields: give fields);
+        match (this.handler) {
+            case Some(value: h): { h.notice(notice: notice); }
+            case None: { logNotice(notice: notice); }
+        };
+    }
+
+    fn void setParameter(string name, string value) {
+        isize found = -1;
+        isize i = 0;
+        while (i < this.paramNames.length() && found < 0) {
+            if (this.paramNames[i].equals(other: name)) { found = i; }
+            i = i + 1;
+        }
+        if (found >= 0) { this.paramValues[found] = give value; return; }
+        this.paramNames.add(item: give name);
+        this.paramValues.add(item: give value);
+    }
+
+    // The session is over: the transport is shut and every later call is `Closed`.
+    unsafe fn void lose() {
+        if (!this.live) { return; }
+        this.live = false;
+        this.wire.shutdown();
+    }
+
+    unsafe ~Connection() { this.close(); }
+}
+
+// check_expected_areq, in libpq's order: require_auth first, then channel_binding=require.
+fn Result<Unit, PgError> expected(const ref Config config, int32 code, bool finished) {
+    Optional<string> refused = config.requireAuth().refuse(code: code, finished: finished);
+    match (give refused) { case Some(value: r): { return Result::Err(error: PgError::Auth(detail: give r)); } case None: { } };
+    if (config.channelBinding() == ChannelBindingMode::Require) {
+        if (code == AUTH_SASL || code == AUTH_SASL_CONT || code == AUTH_SASL_FIN) { return Result::Ok(value: Unit::Unit); }
+        if (code == AUTH_OK) { return Result::Err(error: PgError::Auth(detail: "channel binding required, but server authenticated client without channel binding")); }
+        return Result::Err(error: PgError::Auth(detail: "channel binding required but not supported by server's authentication request"));
+    }
+    return Result::Ok(value: Unit::Unit);
+}
+
+fn PgError noPassword() { return PgError::Auth(detail: "fe_sendauth: no password supplied"); }
+
+fn PgError negotiation(const ref string what) { return violation(detail: what); }
+
+fn PgError violation(const ref string detail) { return PgError::Protocol(error: ProtocolError::Violation(detail: copy detail)); }
+
+// libpq's message for a message out of place, naming its type byte.
+unsafe fn string unexpected(uint8 tag) {
+    DynamicArray<uint8> one = DynamicArray.empty();
+    one.add(item: tag);
+    Result<string, Utf8Error> c = utf8Decode(bytes: one.view());
+    string shown = match (give c) { case Ok(value: s): give s; case Err(error: e): "?"; };
+    return "unexpected response from server; first received character was \"".concat(other: shown).concat(other: "\"");
+}
+
+// pg_fe_sendauth's messages for a method this client does not speak.
+fn string unsupportedMethod(int32 code) {
+    if (code == 1) { return "Kerberos 4 authentication not supported"; }
+    if (code == 2) { return "Kerberos 5 authentication not supported"; }
+    if (code == 4) { return "Crypt authentication not supported"; }
+    if (code == 7 || code == 8) { return "GSSAPI authentication not supported"; }
+    return "authentication method ${code} not supported";
+}
+
+// libpq's emitHostIdentityInfo for a TCP address.
+fn string identity(const ref string host, const ref string address, const ref string port) {
+    string text = "connection to server at \"".concat(other: host).concat(other: "\"");
+    if (address.length() > 0 && !address.equals(other: host)) { text = text.concat(other: " (").concat(other: address).concat(other: ")"); }
+    return text.concat(other: ", port ").concat(other: port).concat(other: " failed: ");
+}
+
+// Keepalive and tcp_user_timeout, as libpq applies them to each socket. A failure is reported as libpq reports it,
+// and the next address is tried.
+unsafe fn Result<Owned<TcpTransport>, PgError> socketOptions(Owned<TcpTransport> tcp, const ref Config config) {
+    if (config.keepalives()) {
+        Result<Unit, IoError> on = tcp.keepAlive(on: true);
+        match (on) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "SO_KEEPALIVE", e: e)); } };
+        if (config.keepalivesIdle() >= 0) {
+            Result<Unit, IoError> r = tcp.keepAliveIdle(idle: Duration.fromSecs(s: cast<int64>(config.keepalivesIdle())));
+            match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_KEEPIDLE", e: e)); } };
+        }
+        if (config.keepalivesInterval() >= 0) {
+            Result<Unit, IoError> r = tcp.keepAliveInterval(interval: Duration.fromSecs(s: cast<int64>(config.keepalivesInterval())));
+            match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_KEEPINTVL", e: e)); } };
+        }
+        if (config.keepalivesCount() >= 0) {
+            Result<Unit, IoError> r = tcp.keepAliveCount(count: cast<uint32>(config.keepalivesCount()));
+            match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_KEEPCNT", e: e)); } };
+        }
+    }
+    // libpq passes 0 through, which Linux takes as "the system default"; std refuses 0, so 0 leaves it unset.
+    if (config.tcpUserTimeout() > 0) {
+        Result<Unit, IoError> r = tcp.userTimeout(timeout: Duration.fromMillis(ms: cast<int64>(config.tcpUserTimeout())));
+        match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_USER_TIMEOUT", e: e)); } };
+    }
+    return Result::Ok(value: give tcp);
+}
+
+fn PgError setsockopt(const ref string option, const ref IoError e) {
+    return PgError::Config(detail: "setsockopt(".concat(other: option).concat(other: ") failed: ").concat(other: e.message()));
+}
+
+// A SASL payload as text: SCRAM's messages are UTF-8.
+unsafe fn Result<string, PgError> saslText(const ref DynamicArray<uint8> data) {
+    Result<string, Utf8Error> t = utf8Decode(bytes: data.view());
+    return match (give t) {
+        case Ok(value: s): Result::Ok(value: give s);
+        case Err(error: e): Result::Err(error: PgError::Protocol(error: ProtocolError::NotUtf8(tag: 82ui8)));
+    };
+}
+
+// Every text-format value of a row is UTF-8: what the server sends in client_encoding UTF8, and what
+// SimpleResult.text relies on.
+unsafe fn bool textValid(const ref RowValues row, const ref DynamicArray<int16> formats) {
+    isize c = 0;
+    while (c < row.columnCount()) {
+        if (formats[c] == 0i16 && !row.isNull(column: c)) {
+            if (!validate(bytes: row.value(column: c))) { return false; }
+        }
+        c = c + 1;
+    }
+    return true;
+}
+
+// pqSaveParameterStatus's reading of server_version: up to three dot-separated integers, as sscanf("%d.%d.%d")
+// reads them.
+fn int32 versionNumber(const ref string text) { return versionFrom(b: text.bytes()); }
+
+fn int32 versionFrom(ConstView<uint8> b) {
+    InlineArray<int32>#(3) parts = [0; 3];
+    isize count = 0;
+    isize i = 0;
+    while (count < 3) {
+        isize start = i;
+        int32 v = 0;
+        while (i < b.length() && b[i] >= 48ui8 && b[i] <= 57ui8 && v < 100000) { v = v * 10 + cast<int32>(b[i] - 48ui8); i = i + 1; }
+        if (i == start) { break; }
+        parts[cast<usize>(count)] = v;
+        count = count + 1;
+        if (i >= b.length() || b[i] != 46ui8) { break; }   // '.'
+        i = i + 1;
+    }
+    if (count == 3) { return (100 * parts[0] + parts[1]) * 100 + parts[2]; }
+    if (count == 2) {
+        if (parts[0] >= 10) { return 10000 * parts[0] + parts[1]; }
+        return (100 * parts[0] + parts[1]) * 100;
+    }
+    if (count == 1) { return 10000 * parts[0]; }
+    return 0;
+}

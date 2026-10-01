@@ -1,0 +1,37 @@
+import { std::log::logWarn, std::log::logInfo, std::log::logDebug, postgres::ServerError };
+export { NoticeHandler, Notification, logNotice };
+
+// What the server says outside a query's results: notices (RAISE NOTICE, a deprecation warning, …) and LISTEN/NOTIFY
+// notifications.
+
+// Receives a connection's notices, in the order the server sends them. Set one with
+// `Connection.setNoticeHandler`; it moves with the connection between isolates, so it must be Sendable.
+type contract NoticeHandler for resource implements Sendable {
+    fn void notice(const ref ServerError notice);
+}
+
+// Where a notice goes when no handler is set: std::log, under the tag "postgres". WARNING is a warning, DEBUG and
+// LOG are debug, and NOTICE and INFO are info. The application chooses what it sees with KAMA_LOG or `setLogSink`.
+// Notices raised while connecting (PostgreSQL 18's md5 deprecation warning, for one) always go here, because no
+// handler can be set before the connection exists.
+fn void logNotice(const ref ServerError notice) {
+    string severity = notice.severity();
+    string text = notice.message();
+    if (severity.equals(other: "WARNING")) { logWarn(tag: "postgres", msg: give text); }
+    else if (severity.equals(other: "DEBUG") || severity.equals(other: "LOG")) { logDebug(tag: "postgres", msg: give text); }
+    else { logInfo(tag: "postgres", msg: give text); }
+}
+
+// A NOTIFY delivered to this session: the channel, the payload, and the process that sent it.
+type resource Notification implements Sendable {
+    int32 pid = 0;
+    string channelName;
+    string payloadText;
+
+    public ctor make(int32 processId, string channel, string payload) {
+        this.pid = processId; this.channelName = give channel; this.payloadText = give payload;
+    }
+    public const fn int32 processId() { return this.pid; }
+    public const fn const ref string channel() { return this.channelName; }
+    public const fn const ref string payload() { return this.payloadText; }
+}

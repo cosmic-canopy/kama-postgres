@@ -1,0 +1,313 @@
+// A PostgreSQL server played from a script, as a Transport: no network, no clock. The client's bytes are framed
+// into messages as they arrive, and each message takes the next step of the script, which may check it and
+// queues the server's reply. Replies are handed to the client `chunk` bytes per read, and the client's writes are
+// accepted `writeLimit` bytes at a time, so framing and partial writes are exercised on every test.
+//
+// When the script has nothing more to say, a read reports WouldBlock and `wait` reports a timeout (a silent
+// server), or, after `Hangup`, a read reports the end of the stream.
+import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView,
+         std::collections::FixedArray, std::io::IoError, std::net::Interest, std::net::Ready,
+         std::encoding::base64::encode as b64encode, std::encoding::base64::decode as b64decode,
+         std::encoding::base64::DecodeError, std::encoding::utf8::decode as utf8Decode,
+         std::encoding::utf8::Utf8Error, std::digest::pbkdf2, std::digest::sha256::Sha256,
+         std::digest::sha256::hmacSha256, std::digest::sha256::sha256,
+         postgres::Transport, postgres::protocol::MessageWriter, postgres::protocol::md5Password };
+export { FakeServer, Step, Wire };
+
+// What the server does with the next message from the client.
+type enum Step implements Sendable {
+    // Reply with these bytes, whatever the message was.
+    Send(DynamicArray<uint8> bytes),
+    // The message must be a PasswordMessage holding exactly `text`; then reply with `then`. Otherwise reply
+    // FATAL 28P01, as a server does for a wrong password.
+    Password(string text, DynamicArray<uint8> then),
+    // The message must be SASLInitialResponse for SCRAM-SHA-256; reply AuthenticationSASLContinue with the
+    // server-first-message. `extend` false answers with a nonce that does not extend the client's.
+    ScramFirst(string password, bool extend),
+    // The message must be the client-final-message, with a proof that the password is right (else FATAL 28P01).
+    // Reply with AuthenticationSASLFinal, `signature` saying which: "right", "wrong", or "error" (an e=
+    // attribute); "none" skips SASLFinal and sends `then` at once. Then `then`.
+    ScramFinal(string signature, DynamicArray<uint8> then),
+    // Close the connection: right after the previous step's reply, or, as the first step, after the first message.
+    Hangup,
+    // Say nothing.
+    Silent
+}
+
+// Backend messages, built as the protocol documentation lays them out.
+type resource Wire {
+    MessageWriter w;
+    public ctor make() { this.w = MessageWriter.make(); }
+    public fn DynamicArray<uint8> bytes() { return copied(v: this.w.view()); }
+    public fn void auth(int32 code) { this.w.begin(tag: 82ui8); this.w.putI32(v: code); this.w.end(); }
+    public fn void authMd5(uint8 a, uint8 b, uint8 c, uint8 d) {
+        this.w.begin(tag: 82ui8); this.w.putI32(v: 5); this.w.putU8(v: a); this.w.putU8(v: b); this.w.putU8(v: c); this.w.putU8(v: d); this.w.end();
+    }
+    public fn void authSasl(const ref DynamicArray<string> mechanisms) {
+        this.w.begin(tag: 82ui8); this.w.putI32(v: 10);
+        isize i = 0;
+        while (i < mechanisms.length()) { bool ok = this.w.putCString(s: mechanisms[i]); i = i + 1; }
+        this.w.putU8(v: 0ui8);
+        this.w.end();
+    }
+    public fn void authSaslData(int32 code, const ref string data) {
+        this.w.begin(tag: 82ui8); this.w.putI32(v: code); this.w.putBytes(b: data.bytes()); this.w.end();
+    }
+    public fn void parameter(const ref string name, const ref string value) {
+        this.w.begin(tag: 83ui8); bool a = this.w.putCString(s: name); bool b = this.w.putCString(s: value); this.w.end();
+    }
+    public fn void backendKey(int32 pid, isize keyLength) {
+        this.w.begin(tag: 75ui8); this.w.putI32(v: pid);
+        isize i = 0;
+        while (i < keyLength) { this.w.putU8(v: truncate<uint8>(i + 1)); i = i + 1; }
+        this.w.end();
+    }
+    public fn void ready(uint8 status) { this.w.begin(tag: 90ui8); this.w.putU8(v: status); this.w.end(); }
+    // An ErrorResponse ('E') or NoticeResponse ('N') with severity, SQLSTATE and message.
+    public fn void report(uint8 tag, const ref string severity, const ref string code, const ref string message) {
+        this.w.begin(tag: tag);
+        this.w.putU8(v: 83ui8); bool a = this.w.putCString(s: severity);
+        this.w.putU8(v: 86ui8); bool b = this.w.putCString(s: severity);
+        this.w.putU8(v: 67ui8); bool c = this.w.putCString(s: code);
+        this.w.putU8(v: 77ui8); bool d = this.w.putCString(s: message);
+        this.w.putU8(v: 0ui8);
+        this.w.end();
+    }
+    public fn void negotiate(int32 version, const ref DynamicArray<string> unrecognized) {
+        this.w.begin(tag: 118ui8); this.w.putI32(v: version); this.w.putI32(v: cast<int32>(unrecognized.length()));
+        isize i = 0;
+        while (i < unrecognized.length()) { bool ok = this.w.putCString(s: unrecognized[i]); i = i + 1; }
+        this.w.end();
+    }
+    // A RowDescription of text columns of type text (OID 25).
+    public fn void columns(const ref DynamicArray<string> names) {
+        this.w.begin(tag: 84ui8); this.w.putI16(v: cast<int16>(names.length()));
+        isize i = 0;
+        while (i < names.length()) {
+            bool ok = this.w.putCString(s: names[i]);
+            this.w.putI32(v: 0); this.w.putI16(v: 0i16); this.w.putI32(v: 25); this.w.putI16(v: -1i16); this.w.putI32(v: -1); this.w.putI16(v: 0i16);
+            i = i + 1;
+        }
+        this.w.end();
+    }
+    // A DataRow; a value of "\u{1}NULL" stands for NULL.
+    public fn void row(const ref DynamicArray<string> values) {
+        this.w.begin(tag: 68ui8); this.w.putI16(v: cast<int16>(values.length()));
+        isize i = 0;
+        while (i < values.length()) {
+            if (values[i].equals(other: "NULL!")) { this.w.putI32(v: -1); }
+            else { this.w.putI32(v: cast<int32>(values[i].length())); this.w.putBytes(b: values[i].bytes()); }
+            i = i + 1;
+        }
+        this.w.end();
+    }
+    // A DataRow with one value of raw bytes.
+    public fn void rawRow(ConstView<uint8> value) {
+        this.w.begin(tag: 68ui8); this.w.putI16(v: 1i16); this.w.putI32(v: cast<int32>(value.length())); this.w.putBytes(b: value); this.w.end();
+    }
+    public fn void complete(const ref string tag) { this.w.begin(tag: 67ui8); bool ok = this.w.putCString(s: tag); this.w.end(); }
+    public fn void emptyQuery() { this.w.begin(tag: 73ui8); this.w.end(); }
+    public fn void notification(int32 pid, const ref string channel, const ref string payload) {
+        this.w.begin(tag: 65ui8); this.w.putI32(v: pid); bool a = this.w.putCString(s: channel); bool b = this.w.putCString(s: payload); this.w.end();
+    }
+    public fn void copyResponse(uint8 tag) { this.w.begin(tag: tag); this.w.putU8(v: 0ui8); this.w.putI16(v: 1i16); this.w.putI16(v: 0i16); this.w.end(); }
+    public fn void copyData(const ref string data) { this.w.begin(tag: 100ui8); this.w.putBytes(b: data.bytes()); this.w.end(); }
+    public fn void copyDone() { this.w.begin(tag: 99ui8); this.w.end(); }
+    // Raw bytes, for a message no server would send.
+    public fn void raw(ConstView<uint8> b) { this.w.putBytes(b: b); }
+}
+
+fn DynamicArray<uint8> copied(ConstView<uint8> v) {
+    DynamicArray<uint8> b = DynamicArray.empty();
+    isize i = 0;
+    while (i < v.length()) { b.add(item: v[i]); i = i + 1; }
+    return b;
+}
+
+// The fixed parts of the fake's SCRAM exchange.
+fn string serverNonceTail() { return "fakeServerNonce"; }
+
+type resource FakeServer implements Transport, Sendable {
+    DynamicArray<Step> steps;
+    isize next = 0;
+    DynamicArray<uint8> toClient;
+    isize readAt = 0;
+    DynamicArray<uint8> fromClient;
+    isize parsedAt = 0;
+    bool startupSeen = false;
+    bool hungUp = false;
+    isize chunk = 1;
+    isize writeLimit = 3;
+    string clientFirstBare;
+    string serverFirst;
+    string scramPassword;
+
+    public ctor make(DynamicArray<Step> steps, isize chunk, isize writeLimit) {
+        this.steps = give steps; this.next = 0;
+        this.toClient = DynamicArray.empty(); this.readAt = 0;
+        this.fromClient = DynamicArray.empty(); this.parsedAt = 0;
+        this.startupSeen = false; this.hungUp = false;
+        this.chunk = chunk; this.writeLimit = writeLimit;
+        this.clientFirstBare = ""; this.serverFirst = ""; this.scramPassword = "";
+    }
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) {
+        isize available = this.toClient.length() - this.readAt;
+        if (available == 0) {
+            if (this.hungUp) { return Result::Ok(value: 0); }
+            return Result::Err(error: IoError::WouldBlock);
+        }
+        isize n = available;
+        if (n > this.chunk) { n = this.chunk; }
+        if (n > into.length()) { n = into.length(); }
+        isize i = 0;
+        while (i < n) { into[i] = this.toClient[this.readAt + i]; i = i + 1; }
+        this.readAt = this.readAt + n;
+        return Result::Ok(value: n);
+    }
+
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
+        if (this.hungUp) { return Result::Err(error: IoError::BrokenPipe); }
+        isize n = bytes.length();
+        if (n > this.writeLimit) { n = this.writeLimit; }
+        isize i = 0;
+        while (i < n) { this.fromClient.add(item: bytes[i]); i = i + 1; }
+        this.serve();
+        return Result::Ok(value: n);
+    }
+
+    public fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        bool readable = this.readAt < this.toClient.length() || this.hungUp;
+        return Result::Ok(value: Ready.of(readable: readable, writable: true));
+    }
+
+    public fn void shutdown() { }
+
+    // Frame every whole message the client has sent, and answer each with the next step.
+    unsafe fn void serve() {
+        bool more = true;
+        while (more) {
+            isize start = this.parsedAt;
+            isize have = this.fromClient.length() - start;
+            isize header = 5;
+            if (!this.startupSeen) { header = 4; }
+            if (have < header) { return; }
+            isize lenAt = start + header - 4;
+            isize len = (cast<isize>(this.fromClient[lenAt]) << 24) | (cast<isize>(this.fromClient[lenAt + 1]) << 16)
+                      | (cast<isize>(this.fromClient[lenAt + 2]) << 8) | cast<isize>(this.fromClient[lenAt + 3]);
+            isize total = len + header - 4;
+            if (have < total) { return; }
+            uint8 tag = 0ui8;
+            if (this.startupSeen) { tag = this.fromClient[start]; }
+            DynamicArray<uint8> body = DynamicArray.empty();
+            isize i = start + header;
+            while (i < start + total) { body.add(item: this.fromClient[i]); i = i + 1; }
+            this.parsedAt = start + total;
+            this.startupSeen = true;
+            this.answer(tag: tag, body: body);
+        }
+    }
+
+    unsafe fn void answer(uint8 tag, const ref DynamicArray<uint8> body) {
+        if (tag == 88ui8) { return; }   // Terminate: no reply
+        if (this.next >= this.steps.length()) { return; }
+        isize at = this.next;
+        this.next = this.next + 1;
+        match (this.steps[at]) {
+            case Send(bytes: b): { this.queue(b: b.view()); }
+            case Password(text: expected, then: t): {
+                string got = cString(body: body, from: 0);
+                if (tag == 112ui8 && got.equals(other: expected)) { this.queue(b: t.view()); } else { this.refuse(); }
+            }
+            case ScramFirst(password: pw, extend: ext): {
+                // SASLInitialResponse: mechanism, Int32 length, client-first-message.
+                string mechanism = cString(body: body, from: 0);
+                isize dataAt = mechanism.length() + 1 + 4;
+                string clientFirst = textFrom(body: body, from: dataAt);
+                if (tag != 112ui8 || !mechanism.equals(other: "SCRAM-SHA-256") || !clientFirst.startsWith(prefix: "n,,")) { this.refuse(); return; }
+                this.scramPassword = copy pw;
+                this.clientFirstBare = clientFirst.substring(start: 3, end: clientFirst.length());
+                string clientNonce = attribute(message: this.clientFirstBare, name: "r");
+                string nonce = clientNonce.concat(other: serverNonceTail());
+                if (!ext) { nonce = "notTheClientsNonce"; }
+                string salt = "a2FtYS1wb3N0Z3Jlcy1zYWx0";   // base64 of "kama-postgres-salt"
+                this.serverFirst = "r=".concat(other: nonce).concat(other: ",s=").concat(other: salt).concat(other: ",i=4096");
+                Wire m = Wire.make();
+                m.authSaslData(code: 11, data: this.serverFirst);
+                this.queue(b: m.bytes().view());
+            }
+            case ScramFinal(signature: sig, then: t): {
+                string clientFinal = textFrom(body: body, from: 0);
+                Optional<usize> proofAt = clientFinal.find(substring: ",p=");
+                isize cut = match (proofAt) { case Some(value: i): cast<isize>(i); case None: -1; };
+                if (tag != 112ui8 || cut < 0) { this.refuse(); return; }
+                string withoutProof = clientFinal.substring(start: 0, end: cut);
+                string proof = clientFinal.substring(start: cut + 3, end: clientFinal.length());
+                string authMessage = this.clientFirstBare.concat(other: ",").concat(other: this.serverFirst).concat(other: ",").concat(other: withoutProof);
+                string saltText = "kama-postgres-salt";
+                FixedArray<uint8> salted = FixedArray.make(size: 32);
+                pbkdf2(hash: Sha256.make(), password: this.scramPassword.bytes(), salt: saltText.bytes(), iterations: 4096, into: salted.viewMut());
+                string clientLabel = "Client Key";
+                string serverLabel = "Server Key";
+                InlineArray<uint8>#(32) clientKey = hmacSha256(key: salted.view(), message: clientLabel.bytes());
+                InlineArray<uint8>#(32) storedKey = sha256(bytes: clientKey.view());
+                InlineArray<uint8>#(32) clientSignature = hmacSha256(key: storedKey.view(), message: authMessage.bytes());
+                InlineArray<uint8>#(32) expected = [0ui8; 32];
+                isize k = 0;
+                while (k < 32) { expected[cast<usize>(k)] = clientKey[cast<usize>(k)] ^ clientSignature[cast<usize>(k)]; k = k + 1; }
+                string expectedText = b64encode(bytes: expected.view());
+                if (!proof.equals(other: expectedText)) { this.refuse(); return; }
+                InlineArray<uint8>#(32) serverKey = hmacSha256(key: salted.view(), message: serverLabel.bytes());
+                InlineArray<uint8>#(32) serverSignature = hmacSha256(key: serverKey.view(), message: authMessage.bytes());
+                if (sig.equals(other: "wrong")) { serverSignature[0] = serverSignature[0] ^ 1ui8; }
+                Wire m = Wire.make();
+                if (sig.equals(other: "error")) { m.authSaslData(code: 12, data: "e=other-error"); }
+                else if (!sig.equals(other: "none")) {
+                    string v = b64encode(bytes: serverSignature.view());
+                    m.authSaslData(code: 12, data: "v=".concat(other: v));
+                }
+                this.queue(b: m.bytes().view());
+                this.queue(b: t.view());
+            }
+            case Hangup: { this.hungUp = true; }
+            case Silent: { }
+        };
+        // A Hangup after a reply closes the connection as soon as that reply is sent.
+        if (this.next < this.steps.length()) {
+            bool hangup = match (this.steps[this.next]) { case Hangup: true; case _: false; };
+            if (hangup) { this.hungUp = true; this.next = this.next + 1; }
+        }
+    }
+
+    unsafe fn void refuse() {
+        Wire m = Wire.make();
+        m.report(tag: 69ui8, severity: "FATAL", code: "28P01", message: "password authentication failed for user \"fake\"");
+        this.queue(b: m.bytes().view());
+        this.hungUp = true;
+    }
+
+    fn void queue(ConstView<uint8> b) {
+        isize i = 0;
+        while (i < b.length()) { this.toClient.add(item: b[i]); i = i + 1; }
+    }
+}
+
+// The NUL-terminated string at `from`.
+unsafe fn string cString(const ref DynamicArray<uint8> body, isize from) {
+    isize end = from;
+    while (end < body.length() && body[end] != 0ui8) { end = end + 1; }
+    return textFrom(body: body, from: from).substring(start: 0, end: end - from);
+}
+
+unsafe fn string textFrom(const ref DynamicArray<uint8> body, isize from) {
+    Result<string, Utf8Error> t = utf8Decode(bytes: body.slice(from: from, count: body.length() - from));
+    return match (give t) { case Ok(value: s): give s; case Err(error: e): ""; };
+}
+
+fn string attribute(const ref string message, const ref string name) {
+    string prefix = name.concat(other: "=");
+    foreach (string part in message.split(separator: ",")) {
+        if (part.startsWith(prefix: prefix)) { return part.substring(start: prefix.length(), end: part.length()); }
+    }
+    return "";
+}

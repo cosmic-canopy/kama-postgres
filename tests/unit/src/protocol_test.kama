@@ -148,7 +148,7 @@ fn bool isErr(Result<BackendMessage, ProtocolError> r) { return match (give r) {
 fn bool errIs(Result<BackendMessage, ProtocolError> r, int32 kind) {
     ProtocolError e = match (give r) { case Ok(value: m): { return false; } case Err(error: x): give x; };
     int32 k = match (e) { case Truncated(tag: t): 1; case BadLength(tag: t, length: n): 2; case TooLarge(tag: t, length: n): 3;
-                          case Unexpected(tag: t): 4; case NotUtf8(tag: t): 5; case Malformed(tag: t, what: w): 6; };
+                          case Unexpected(tag: t): 4; case NotUtf8(tag: t): 5; case Malformed(tag: t, what: w): 6; case Violation(detail: d): 7; };
     return k == kind;
 }
 
@@ -227,8 +227,8 @@ fn int32 backendTests() {
     BackendMessage pd = ok(r: dec(tag: 116ui8, body: "0002 00000017 00000019"), what: "ParameterDescription");
     f = f + check(ok: match (pd) { case ParameterDescription(oids: o): o.length() == 2 && o[1] == 25ui32; case _: false; }, what: "backend: ParameterDescription");
 
-    BackendMessage nv = ok(r: dec(tag: 118ui8, body: "00000000 00000001 5f70712e666f6f00"), what: "NegotiateProtocolVersion");
-    f = f + check(ok: match (nv) { case NegotiateProtocolVersion(newestMinor: m, unrecognized: u): m == 0 && u.length() == 1 && u[0].equals(other: "_pq.foo"); case _: false; }, what: "backend: NegotiateProtocolVersion");
+    BackendMessage nv = ok(r: dec(tag: 118ui8, body: "00030000 00000001 5f70712e666f6f00"), what: "NegotiateProtocolVersion");
+    f = f + check(ok: match (nv) { case NegotiateProtocolVersion(newestVersion: m, unrecognized: u): m == PROTOCOL_3_0 && u.length() == 1 && u[0].equals(other: "_pq.foo"); case _: false; }, what: "backend: NegotiateProtocolVersion");
 
     BackendMessage co = ok(r: dec(tag: 72ui8, body: "00 0002 0000 0000"), what: "CopyOutResponse");
     f = f + check(ok: match (co) { case CopyOutResponse(formats: x): x.overall() == 0i8 && x.columnCount() == 2; case _: false; }, what: "backend: CopyOutResponse");

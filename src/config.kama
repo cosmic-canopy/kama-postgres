@@ -177,6 +177,13 @@ type resource Host implements Sendable {
     // The port as configured; "" means 5432. It is parsed when the host is tried, as libpq parses it.
     public const fn const ref string port() { return this.portText; }
     public const fn HostKind kind() { return this.hostKind; }
+    // The port to connect to, parsed as libpq parses it when it tries the host: 5432 when none was configured,
+    // None when the setting is not an integer. A number outside 1-65535 is returned as it is; libpq reports it as
+    // an invalid port number and tries the next host.
+    public const fn Optional<int32> portNumber() {
+        if (this.portText.length() == 0) { return Optional::Some(value: 5432); }
+        return parseIntParam(text: this.portText);
+    }
     // The password the password file gave for this host, if the connection string gave none.
     public const fn Optional<string> filePasswordFor() {
         if (!this.fromFile) { return Optional::None; }

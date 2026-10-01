@@ -16,8 +16,8 @@ type contract Transport for resource implements Sendable {
     fn Result<isize, IoError> read(View<uint8> into);
     // As many of `bytes` as can be written now: the count. `WouldBlock` when none can.
     fn Result<isize, IoError> write(ConstView<uint8> bytes);
-    // Block until `interest` can proceed, or `timeoutMs` passes (< 0: no limit). A timeout is a `Ready` with
-    // neither side set. A peer that closed or failed reads as readable, so the following read reports it.
+    // Block until `interest` can proceed, or `timeoutMs` passes (< 0: no limit). A timeout is a `Ready` without
+    // the side asked for. A peer that closed or failed reads as readable, so the following read reports it.
     fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs);
     // Stop both directions. Called once, when the connection closes; the transport may still be dropped later.
     fn void shutdown();
@@ -54,26 +54,12 @@ type resource TcpTransport implements Transport, Sendable {
         return Result::Ok(value: TcpTransport.make(stream: give stream, poller: give poller));
     }
 
-    // TCP keepalive, as libpq's `keepalives*` settings configure it. A zero duration or count leaves the
-    // system's default in place.
-    public unsafe fn Result<Unit, IoError> keepAlive(bool on, Duration idle, Duration interval, uint32 count) {
-        Result<Unit, IoError> r = this.stream.setKeepAlive(on: on);
-        match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
-        if (!on) { return Result::Ok(value: Unit::Unit); }
-        if (idle.asNanos() > 0i64) {
-            Result<Unit, IoError> i = this.stream.setKeepAliveIdle(idle: idle);
-            match (i) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
-        }
-        if (interval.asNanos() > 0i64) {
-            Result<Unit, IoError> v = this.stream.setKeepAliveInterval(interval: interval);
-            match (v) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
-        }
-        if (count > 0ui32) {
-            Result<Unit, IoError> c = this.stream.setKeepAliveCount(count: count);
-            match (c) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
-        }
-        return Result::Ok(value: Unit::Unit);
-    }
+    // TCP keepalive, as libpq's `keepalives`, `keepalives_idle`, `keepalives_interval` and `keepalives_count`
+    // configure it: each one a socket option of its own, so a failure names the one that failed.
+    public unsafe fn Result<Unit, IoError> keepAlive(bool on) { return this.stream.setKeepAlive(on: on); }
+    public unsafe fn Result<Unit, IoError> keepAliveIdle(Duration idle) { return this.stream.setKeepAliveIdle(idle: idle); }
+    public unsafe fn Result<Unit, IoError> keepAliveInterval(Duration interval) { return this.stream.setKeepAliveInterval(interval: interval); }
+    public unsafe fn Result<Unit, IoError> keepAliveCount(uint32 count) { return this.stream.setKeepAliveCount(count: count); }
 
     // libpq's `tcp_user_timeout`: how long sent data may stay unacknowledged before the connection is dropped.
     public unsafe fn Result<Unit, IoError> userTimeout(Duration timeout) { return this.stream.setUserTimeout(timeout: timeout); }

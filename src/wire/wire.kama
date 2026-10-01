@@ -126,7 +126,9 @@ type resource Wire implements Sendable {
     unsafe fn Result<Unit, PgError> await(Interest interest, Deadline deadline) {
         Result<Ready, IoError> w = this.link.wait(interest: interest, timeoutMs: deadline.remainingMs());
         Ready r = match (w) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: PgError::Io(error: e)); } };
-        if (!r.readable && !r.writable) { return Result::Err(error: PgError::Timeout); }
+        // Only the side asked for counts: a transport ready for the other one has not let this one proceed.
+        bool ready = match (interest) { case Read: r.readable; case Write: r.writable; case ReadWrite: r.readable || r.writable; };
+        if (!ready) { return Result::Err(error: PgError::Timeout); }
         return Result::Ok(value: Unit::Unit);
     }
 

@@ -1,0 +1,441 @@
+// postgres::Connection against a scripted server (fake_server.kama): every way a server can answer a startup and a
+// query, including the ways a broken or hostile one can. Replies arrive a byte at a time and writes go out three
+// bytes at a time, so every case also exercises framing and partial writes. No network, no clock.
+import { std::collections::DynamicArray, std::memory::Owned,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::SimpleResult,
+         postgres::Transport, postgres::TransactionStatus, postgres::Notification,
+         postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2, postgres::protocol::md5Password,
+         postgres::sqlstate::INVALID_PASSWORD, postgres::sqlstate::ADMIN_SHUTDOWN, postgres::sqlstate::DIVISION_BY_ZERO,
+         postgres::sqlstate::TOO_MANY_CONNECTIONS, postgres::sqlstate::QUERY_CANCELED,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire };
+export { connectionTests };
+
+// What every successful startup ends with: AuthenticationOk, the parameters a server reports, a cancel key,
+// ReadyForQuery.
+fn DynamicArray<uint8> welcome() {
+    Wire m = Wire.make();
+    m.auth(code: 0);
+    m.parameter(name: "server_version", value: "18.4 (Debian 18.4-1)");
+    m.parameter(name: "client_encoding", value: "UTF8");
+    m.parameter(name: "TimeZone", value: "UTC");
+    m.backendKey(pid: 4242, keyLength: 4);
+    m.ready(status: 73ui8);
+    return m.bytes();
+}
+
+fn DynamicArray<uint8> bytesOf(Wire m) { return m.bytes(); }
+
+fn DynamicArray<Step> steps() { return DynamicArray.empty(); }
+
+fn bool sqlstateIs(const ref Result<DynamicArray<SimpleResult>, PgError> r, int32 code) {
+    return match (r) { case Ok(value: v): false; case Err(error: e): e.sqlstate() == code; };
+}
+
+fn bool isClosedError(const ref Result<DynamicArray<SimpleResult>, PgError> r) {
+    return match (r) { case Ok(value: v): false; case Err(error: e): match (e) { case Closed: true; case _: false; }; };
+}
+
+// Connect over a fake server running `script`, configured by `conninfo`: the connection, or the error's message.
+unsafe fn Result<Connection, PgError> over(DynamicArray<Step> script, const ref string conninfo) {
+    Environment env = testEnvironment();
+    Result<Config, PgError> c = resolveWith(text: conninfo, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    Owned<Transport> fake = new FakeServer.make(steps: give script, chunk: 1, writeLimit: 3);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+unsafe fn string failure(DynamicArray<Step> script, const ref string conninfo) {
+    Result<Connection, PgError> r = over(script: give script, conninfo: conninfo);
+    return match (r) { case Ok(value: c): "connected"; case Err(error: e): e.message(); };
+}
+
+unsafe fn bool connects(DynamicArray<Step> script, const ref string conninfo) {
+    Result<Connection, PgError> r = over(script: give script, conninfo: conninfo);
+    return match (r) { case Ok(value: c): true; case Err(error: e): false; };
+}
+
+fn string strings1(const ref string a) { return copy a; }
+
+unsafe fn int32 authenticationTests() {
+    int32 f = 0;
+    // trust
+    DynamicArray<Step> trust = steps();
+    trust.add(item: Step::Send(bytes: welcome()));
+    Result<Connection, PgError> t = over(script: give trust, conninfo: "user=u dbname=d");
+    match (give t) {
+        case Ok(value: c): {
+            Optional<string> v = c.parameter(name: "server_version");
+            bool reported = match (v) { case Some(value: s): s.startsWith(prefix: "18.4"); case None: false; };
+            f = f + check(ok: reported && c.serverVersion() == 180004, what: "connection: trust, parameters, server version");
+            f = f + check(ok: c.processId() == 4242 && c.protocolVersion() == PROTOCOL_3_0 && c.transactionStatus() == TransactionStatus::Idle, what: "connection: process id, protocol, idle");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "connection: trust: ".concat(other: m)); }
+    };
+
+    // cleartext
+    Wire askClear = Wire.make(); askClear.auth(code: 3);
+    DynamicArray<Step> clear = steps();
+    clear.add(item: Step::Send(bytes: bytesOf(m: askClear)));
+    clear.add(item: Step::Password(text: "secret", then: welcome()));
+    f = f + check(ok: connects(script: give clear, conninfo: "user=u dbname=d password=secret"), what: "connection: cleartext password");
+    Wire askClear2 = Wire.make(); askClear2.auth(code: 3);
+    DynamicArray<Step> clearNone = steps();
+    clearNone.add(item: Step::Send(bytes: bytesOf(m: askClear2)));
+    string none = failure(script: give clearNone, conninfo: "user=u dbname=d");
+    f = f + check(ok: none.equals(other: "fe_sendauth: no password supplied"), what: "connection: no password: ".concat(other: none));
+
+    // md5
+    Wire askMd5 = Wire.make(); askMd5.authMd5(a: 1ui8, b: 2ui8, c: 3ui8, d: 4ui8);
+    InlineArray<uint8>#(4) salt = [1ui8, 2ui8, 3ui8, 4ui8];
+    string user = "u";
+    string pw = "secret";
+    DynamicArray<Step> md5 = steps();
+    md5.add(item: Step::Send(bytes: bytesOf(m: askMd5)));
+    md5.add(item: Step::Password(text: md5Password(user: user, password: pw, salt: salt), then: welcome()));
+    f = f + check(ok: connects(script: give md5, conninfo: "user=u dbname=d password=secret"), what: "connection: md5");
+
+    // SCRAM
+    DynamicArray<string> scramOnly = DynamicArray.empty(); scramOnly.add(item: "SCRAM-SHA-256");
+    Wire askScram = Wire.make(); askScram.authSasl(mechanisms: scramOnly);
+    DynamicArray<Step> scram = steps();
+    scram.add(item: Step::Send(bytes: askScram.bytes()));
+    scram.add(item: Step::ScramFirst(password: "secret", extend: true));
+    scram.add(item: Step::ScramFinal(signature: "right", then: welcome()));
+    f = f + check(ok: connects(script: give scram, conninfo: "user=u dbname=d password=secret"), what: "connection: SCRAM-SHA-256");
+
+    // SCRAM with the wrong password: the server's FATAL 28P01.
+    DynamicArray<Step> wrongPw = steps();
+    wrongPw.add(item: Step::Send(bytes: askScram.bytes()));
+    wrongPw.add(item: Step::ScramFirst(password: "secret", extend: true));
+    wrongPw.add(item: Step::ScramFinal(signature: "right", then: welcome()));
+    Result<Connection, PgError> wp = over(script: give wrongPw, conninfo: "user=u dbname=d password=other");
+    f = f + check(ok: match (wp) { case Ok(value: c): false; case Err(error: e): e.sqlstate() == INVALID_PASSWORD; }, what: "connection: SCRAM with a wrong password is 28P01");
+
+    // A server that does not know the password: its signature is wrong.
+    DynamicArray<Step> badSig = steps();
+    badSig.add(item: Step::Send(bytes: askScram.bytes()));
+    badSig.add(item: Step::ScramFirst(password: "secret", extend: true));
+    badSig.add(item: Step::ScramFinal(signature: "wrong", then: welcome()));
+    string bs = failure(script: give badSig, conninfo: "user=u dbname=d password=secret");
+    f = f + check(ok: bs.equals(other: "incorrect server signature"), what: "connection: SCRAM, a wrong server signature is refused: ".concat(other: bs));
+
+    // AuthenticationOk before the server proved itself: refused, whatever require_auth says.
+    DynamicArray<Step> early = steps();
+    early.add(item: Step::Send(bytes: askScram.bytes()));
+    early.add(item: Step::ScramFirst(password: "secret", extend: true));
+    early.add(item: Step::ScramFinal(signature: "none", then: welcome()));
+    string ea = failure(script: give early, conninfo: "user=u dbname=d password=secret");
+    f = f + check(ok: ea.startsWith(prefix: "server did not complete authentication"), what: "connection: SCRAM, AuthenticationOk before SASLFinal is refused: ".concat(other: ea));
+    DynamicArray<Step> earlier = steps();
+    earlier.add(item: Step::Send(bytes: askScram.bytes()));
+    earlier.add(item: Step::Send(bytes: welcome()));
+    string er = failure(script: give earlier, conninfo: "user=u dbname=d password=secret");
+    f = f + check(ok: er.startsWith(prefix: "server did not complete authentication"), what: "connection: SCRAM, AuthenticationOk after the first message is refused");
+
+    DynamicArray<Step> nonce = steps();
+    nonce.add(item: Step::Send(bytes: askScram.bytes()));
+    nonce.add(item: Step::ScramFirst(password: "secret", extend: false));
+    string nm = failure(script: give nonce, conninfo: "user=u dbname=d password=secret");
+    f = f + check(ok: nm.equals(other: "invalid SCRAM response (nonce mismatch)"), what: "connection: SCRAM, a nonce that does not extend ours: ".concat(other: nm));
+
+    DynamicArray<Step> serverError = steps();
+    serverError.add(item: Step::Send(bytes: askScram.bytes()));
+    serverError.add(item: Step::ScramFirst(password: "secret", extend: true));
+    serverError.add(item: Step::ScramFinal(signature: "error", then: welcome()));
+    string se = failure(script: give serverError, conninfo: "user=u dbname=d password=secret");
+    f = f + check(ok: se.equals(other: "error received from server in SCRAM exchange: other-error"), what: "connection: SCRAM, an e= attribute: ".concat(other: se));
+
+    // Mechanisms and methods this client does not speak, or must refuse.
+    DynamicArray<string> unknown = DynamicArray.empty(); unknown.add(item: "SCRAM-SHA-512");
+    Wire askUnknown = Wire.make(); askUnknown.authSasl(mechanisms: unknown);
+    DynamicArray<Step> mech = steps();
+    mech.add(item: Step::Send(bytes: askUnknown.bytes()));
+    string um = failure(script: give mech, conninfo: "user=u dbname=d password=secret");
+    f = f + check(ok: um.equals(other: "none of the server's SASL authentication mechanisms are supported"), what: "connection: no supported SASL mechanism");
+    DynamicArray<string> plus = DynamicArray.empty(); plus.add(item: "SCRAM-SHA-256-PLUS"); plus.add(item: "SCRAM-SHA-256");
+    Wire askPlus = Wire.make(); askPlus.authSasl(mechanisms: plus);
+    DynamicArray<Step> plusPlain = steps();
+    plusPlain.add(item: Step::Send(bytes: askPlus.bytes()));
+    string pp = failure(script: give plusPlain, conninfo: "user=u dbname=d password=secret");
+    f = f + check(ok: pp.equals(other: "server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection"), what: "connection: SCRAM-SHA-256-PLUS offered without TLS is refused");
+    DynamicArray<int32> codes = DynamicArray.empty(); codes.add(item: 2); codes.add(item: 7); codes.add(item: 9); codes.add(item: 99);
+    DynamicArray<string> wants = DynamicArray.empty();
+    wants.add(item: "Kerberos 5 authentication not supported"); wants.add(item: "GSSAPI authentication not supported");
+    wants.add(item: "authentication method 9 not supported"); wants.add(item: "authentication method 99 not supported");
+    isize i = 0;
+    while (i < codes.length()) {
+        Wire ask = Wire.make(); ask.auth(code: codes[i]);
+        DynamicArray<Step> s = steps();
+        s.add(item: Step::Send(bytes: ask.bytes()));
+        string got = failure(script: give s, conninfo: "user=u dbname=d password=secret");
+        f = f + check(ok: got.equals(other: wants[i]), what: "connection: method ".concat(other: wants[i]));
+        i = i + 1;
+    }
+
+    // require_auth refuses what the server asks for, before any password is sent.
+    Wire askMd5Again = Wire.make(); askMd5Again.authMd5(a: 1ui8, b: 2ui8, c: 3ui8, d: 4ui8);
+    DynamicArray<Step> ra = steps();
+    ra.add(item: Step::Send(bytes: askMd5Again.bytes()));
+    string rm = failure(script: give ra, conninfo: "user=u dbname=d password=secret require_auth=password");
+    f = f + check(ok: rm.equals(other: "authentication method requirement \"password\" failed: server requested a hashed password"), what: "connection: require_auth refuses md5: ".concat(other: rm));
+
+    // A FATAL during startup is the server's error.
+    Wire full = Wire.make(); full.report(tag: 69ui8, severity: "FATAL", code: "53300", message: "sorry, too many clients already");
+    DynamicArray<Step> busy = steps();
+    busy.add(item: Step::Send(bytes: full.bytes()));
+    Result<Connection, PgError> bz = over(script: give busy, conninfo: "user=u dbname=d");
+    f = f + check(ok: match (bz) { case Ok(value: c): false; case Err(error: e): e.sqlstate() == TOO_MANY_CONNECTIONS; }, what: "connection: a FATAL during startup is the server's error");
+    return f;
+}
+
+unsafe fn int32 negotiationTests() {
+    int32 f = 0;
+    DynamicArray<string> none = DynamicArray.empty();
+    Wire down = Wire.make(); down.negotiate(version: PROTOCOL_3_0, unrecognized: none);
+    DynamicArray<uint8> downBytes = down.bytes();
+    DynamicArray<uint8> welcomed = welcome();
+    isize i = 0;
+    while (i < welcomed.length()) { downBytes.add(item: welcomed[i]); i = i + 1; }
+    DynamicArray<Step> s = steps();
+    s.add(item: Step::Send(bytes: give downBytes));
+    Result<Connection, PgError> r = over(script: give s, conninfo: "user=u dbname=d max_protocol_version=latest");
+    f = f + check(ok: match (r) { case Ok(value: c): c.protocolVersion() == PROTOCOL_3_0; case Err(error: e): false; }, what: "negotiation: a downgrade to 3.0 is accepted");
+
+    DynamicArray<Step> strict = steps();
+    Wire down2 = Wire.make(); down2.negotiate(version: PROTOCOL_3_0, unrecognized: none);
+    strict.add(item: Step::Send(bytes: down2.bytes()));
+    string sm = failure(script: give strict, conninfo: "user=u dbname=d min_protocol_version=3.2");
+    f = f + check(ok: sm.equals(other: "server only supports protocol version 3.0, but \"min_protocol_version\" was set to 3.2"), what: "negotiation: below min_protocol_version: ".concat(other: sm));
+
+    DynamicArray<string> option = DynamicArray.empty(); option.add(item: "_pq_.something");
+    Wire opt = Wire.make(); opt.negotiate(version: PROTOCOL_3_0, unrecognized: option);
+    DynamicArray<Step> o = steps();
+    o.add(item: Step::Send(bytes: opt.bytes()));
+    string om = failure(script: give o, conninfo: "user=u dbname=d max_protocol_version=latest");
+    f = f + check(ok: om.equals(other: "received invalid protocol negotiation message: server reported an unsupported parameter that was not requested (\"_pq_.something\")"), what: "negotiation: an option this client never asked for");
+
+    Wire higher = Wire.make(); higher.negotiate(version: PROTOCOL_3_2, unrecognized: none);
+    DynamicArray<Step> h = steps();
+    h.add(item: Step::Send(bytes: higher.bytes()));
+    string hm = failure(script: give h, conninfo: "user=u dbname=d");
+    f = f + check(ok: hm.equals(other: "received invalid protocol negotiation message: server requested downgrade to a higher-numbered version"), what: "negotiation: a \"downgrade\" upward");
+
+    Wire twice = Wire.make();
+    twice.negotiate(version: PROTOCOL_3_0, unrecognized: none);
+    twice.negotiate(version: PROTOCOL_3_0, unrecognized: none);
+    DynamicArray<Step> tw = steps();
+    tw.add(item: Step::Send(bytes: twice.bytes()));
+    string twm = failure(script: give tw, conninfo: "user=u dbname=d max_protocol_version=latest");
+    f = f + check(ok: twm.equals(other: "received duplicate protocol negotiation message"), what: "negotiation: a second message");
+
+    // 3.0 cancel keys are 4 bytes.
+    Wire longKey = Wire.make();
+    longKey.auth(code: 0);
+    longKey.backendKey(pid: 1, keyLength: 32);
+    DynamicArray<Step> lk = steps();
+    lk.add(item: Step::Send(bytes: longKey.bytes()));
+    string lkm = failure(script: give lk, conninfo: "user=u dbname=d");
+    f = f + check(ok: lkm.contains(substring: "cancel key with length 32 not allowed in protocol version 3.0"), what: "negotiation: a 32-byte cancel key under 3.0: ".concat(other: lkm));
+    return f;
+}
+
+unsafe fn int32 hostileStartupTests() {
+    int32 f = 0;
+    // ReadyForQuery before authentication.
+    Wire early = Wire.make(); early.ready(status: 73ui8);
+    DynamicArray<Step> e = steps();
+    e.add(item: Step::Send(bytes: early.bytes()));
+    string em = failure(script: give e, conninfo: "user=u dbname=d");
+    f = f + check(ok: em.contains(substring: "expected authentication request from server"), what: "hostile: ReadyForQuery before authentication: ".concat(other: em));
+
+    // A length no server sends.
+    Wire huge = Wire.make();
+    DynamicArray<uint8> raw = DynamicArray.empty();
+    raw.add(item: 82ui8); raw.add(item: 127ui8); raw.add(item: 255ui8); raw.add(item: 255ui8); raw.add(item: 255ui8);
+    huge.raw(b: raw.view());
+    DynamicArray<Step> hg = steps();
+    hg.add(item: Step::Send(bytes: huge.bytes()));
+    string hm = failure(script: give hg, conninfo: "user=u dbname=d");
+    f = f + check(ok: hm.contains(substring: "over the 1 GiB limit"), what: "hostile: a 2 GiB length is refused before anything is allocated: ".concat(other: hm));
+
+    // A message cut short, then the end of the stream.
+    Wire cut = Wire.make();
+    DynamicArray<uint8> partial = DynamicArray.empty();
+    partial.add(item: 82ui8); partial.add(item: 0ui8); partial.add(item: 0ui8); partial.add(item: 0ui8); partial.add(item: 8ui8); partial.add(item: 0ui8);
+    cut.raw(b: partial.view());
+    DynamicArray<Step> ct = steps();
+    ct.add(item: Step::Send(bytes: cut.bytes()));
+    ct.add(item: Step::Hangup);
+    DynamicArray<Step> ctDone = steps();
+    Result<Connection, PgError> cr = over(script: give ct, conninfo: "user=u dbname=d");
+    string cm = match (cr) { case Ok(value: c): "connected"; case Err(error: x): x.message(); };
+    f = f + check(ok: cm.startsWith(prefix: "server closed the connection unexpectedly"), what: "hostile: the stream ends mid-message: ".concat(other: cm));
+
+    // A server that stops answering: connect_timeout ends the wait.
+    DynamicArray<Step> silent = steps();
+    silent.add(item: Step::Silent);
+    string sm = failure(script: give silent, conninfo: "user=u dbname=d connect_timeout=1");
+    f = f + check(ok: sm.equals(other: "timeout expired"), what: "hostile: a silent server times out: ".concat(other: sm));
+
+    // A client_encoding this client cannot read.
+    Wire latin = Wire.make();
+    latin.auth(code: 0);
+    latin.parameter(name: "client_encoding", value: "LATIN1");
+    latin.ready(status: 73ui8);
+    DynamicArray<Step> lt = steps();
+    lt.add(item: Step::Send(bytes: latin.bytes()));
+    string lm = failure(script: give lt, conninfo: "user=u dbname=d");
+    f = f + check(ok: lm.contains(substring: "client_encoding is LATIN1"), what: "hostile: a server reporting LATIN1: ".concat(other: lm));
+    return f;
+}
+
+// Connect over a fake server whose startup succeeds and whose next step answers the first query.
+unsafe fn Result<Connection, PgError> session(DynamicArray<Step> afterStartup) {
+    DynamicArray<Step> s = steps();
+    s.add(item: Step::Send(bytes: welcome()));
+    isize i = 0;
+    while (i < afterStartup.length()) {
+        Step step = afterStartup.remove(index: 0);
+        s.add(item: give step);
+    }
+    return over(script: give s, conninfo: "user=u dbname=d");
+}
+
+unsafe fn int32 queryTests() {
+    int32 f = 0;
+    DynamicArray<string> names = DynamicArray.empty(); names.add(item: "a"); names.add(item: "b");
+    DynamicArray<string> row1 = DynamicArray.empty(); row1.add(item: "1"); row1.add(item: "NULL!");
+    DynamicArray<string> row2 = DynamicArray.empty(); row2.add(item: "héllo"); row2.add(item: "");
+    Wire answer = Wire.make();
+    answer.columns(names: names); answer.row(values: row1); answer.row(values: row2); answer.complete(tag: "SELECT 2");
+    answer.complete(tag: "CREATE TABLE");
+    answer.emptyQuery();
+    answer.notification(pid: 7, channel: "ch", payload: "hi");
+    answer.parameter(name: "TimeZone", value: "Europe/Paris");
+    answer.ready(status: 84ui8);
+    DynamicArray<Step> after = steps();
+    after.add(item: Step::Send(bytes: answer.bytes()));
+    Result<Connection, PgError> r = session(afterStartup: give after);
+    Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return check(ok: false, what: "query: connect"); } };
+    Result<DynamicArray<SimpleResult>, PgError> q = c.simpleQuery(sql: "select …; create …; ;");
+    match (give q) {
+        case Ok(value: rs): {
+            f = f + check(ok: rs.length() == 2, what: "query: two results, the empty statement none");
+            if (rs.length() == 2) {
+                Optional<string> v = rs[0].text(row: 1, column: 0);
+                bool hello = match (v) { case Some(value: s): s.equals(other: "héllo"); case None: false; };
+                f = f + check(ok: rs[0].rowCount() == 2 && rs[0].isNull(row: 0, column: 1) && hello, what: "query: rows, NULL and UTF-8");
+                f = f + check(ok: rs[1].commandTag().equals(other: "CREATE TABLE") && rs[1].columnCount() == 0, what: "query: a command with no rows");
+            }
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "query: ".concat(other: m)); }
+    };
+    DynamicArray<Notification> n = c.takeNotifications();
+    Optional<string> tz = c.parameter(name: "TimeZone");
+    bool paris = match (tz) { case Some(value: z): z.equals(other: "Europe/Paris"); case None: false; };
+    f = f + check(ok: n.length() == 1 && n[0].payload().equals(other: "hi") && paris && c.transactionStatus() == TransactionStatus::InTransaction,
+                  what: "query: a notification, a parameter change, and the transaction status");
+
+    // An error mid-query: returned once ReadyForQuery arrives; the session goes on.
+    Wire failing = Wire.make();
+    failing.columns(names: names); failing.row(values: row1);
+    failing.report(tag: 69ui8, severity: "ERROR", code: "22012", message: "division by zero");
+    failing.ready(status: 73ui8);
+    Wire fine = Wire.make();
+    fine.complete(tag: "SELECT 0");
+    fine.ready(status: 73ui8);
+    DynamicArray<Step> errs = steps();
+    errs.add(item: Step::Send(bytes: failing.bytes()));
+    errs.add(item: Step::Send(bytes: fine.bytes()));
+    Result<Connection, PgError> r2 = session(afterStartup: give errs);
+    Connection c2 = match (give r2) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "query: connect 2"); } };
+    Result<DynamicArray<SimpleResult>, PgError> boom = c2.simpleQuery(sql: "select 1/0");
+    f = f + check(ok: match (boom) { case Ok(value: v): false; case Err(error: e): e.sqlstate() == DIVISION_BY_ZERO; }, what: "query: an error is returned");
+    Result<DynamicArray<SimpleResult>, PgError> again = c2.simpleQuery(sql: "select");
+    bool answered = match (again) { case Ok(value: v): v.length() == 1; case Err(error: e): false; };
+    f = f + check(ok: answered && !c2.isClosed(), what: "query: the session goes on after an error");
+
+    // A FATAL mid-query ends the session, and later calls are Closed.
+    Wire fatal = Wire.make(); fatal.report(tag: 69ui8, severity: "FATAL", code: "57P01", message: "terminating connection due to administrator command");
+    DynamicArray<Step> ft = steps();
+    ft.add(item: Step::Send(bytes: fatal.bytes()));
+    ft.add(item: Step::Hangup);
+    Result<Connection, PgError> r3 = session(afterStartup: give ft);
+    Connection c3 = match (give r3) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "query: connect 3"); } };
+    Result<DynamicArray<SimpleResult>, PgError> killed = c3.simpleQuery(sql: "select 1");
+    Result<DynamicArray<SimpleResult>, PgError> after2 = c3.simpleQuery(sql: "select 1");
+    bool shutdown = sqlstateIs(r: killed, code: ADMIN_SHUTDOWN);
+    bool closedAfter = isClosedError(r: after2);
+    f = f + check(ok: shutdown && c3.isClosed() && closedAfter,
+                  what: "query: FATAL closes the connection");
+    return f;
+}
+
+unsafe fn int32 hostileQueryTests() {
+    int32 f = 0;
+    DynamicArray<string> one = DynamicArray.empty(); one.add(item: "x");
+    DynamicArray<string> two = DynamicArray.empty(); two.add(item: "x"); two.add(item: "y");
+    // A DataRow before any RowDescription.
+    Wire early = Wire.make(); early.row(values: one); early.ready(status: 73ui8);
+    // A DataRow with the wrong number of columns.
+    Wire wide = Wire.make(); wide.columns(names: one); wide.row(values: two); wide.ready(status: 73ui8);
+    // A text value that is not UTF-8.
+    Wire latin = Wire.make(); latin.columns(names: one);
+    DynamicArray<uint8> bad = DynamicArray.empty(); bad.add(item: 104ui8); bad.add(item: 233ui8); bad.add(item: 108ui8);
+    latin.rawRow(value: bad.view()); latin.ready(status: 73ui8);
+    // A message the simple protocol does not send.
+    Wire odd = Wire.make(); odd.auth(code: 0); odd.ready(status: 73ui8);
+    DynamicArray<string> wants = DynamicArray.empty();
+    wants.add(item: "server sent data (\"D\" message) without prior row description (\"T\" message)");
+    wants.add(item: "unexpected field count in \"D\" message");
+    wants.add(item: "not UTF-8");
+    wants.add(item: "does not send");
+    DynamicArray<DynamicArray<uint8>> replies = DynamicArray.empty();
+    replies.add(item: early.bytes()); replies.add(item: wide.bytes()); replies.add(item: latin.bytes()); replies.add(item: odd.bytes());
+    isize i = 0;
+    while (i < replies.length()) {
+        DynamicArray<uint8> reply = DynamicArray.empty();
+        isize k = 0;
+        while (k < replies[i].length()) { reply.add(item: replies[i][k]); k = k + 1; }
+        DynamicArray<Step> s = steps();
+        s.add(item: Step::Send(bytes: give reply));
+        Result<Connection, PgError> r = session(afterStartup: give s);
+        Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "hostile query: connect"); } };
+        Result<DynamicArray<SimpleResult>, PgError> q = c.simpleQuery(sql: "select");
+        string m = match (q) { case Ok(value: v): "succeeded"; case Err(error: e): e.message(); };
+        f = f + check(ok: m.contains(substring: wants[i]) && c.isClosed(), what: "hostile query: ".concat(other: wants[i]).concat(other: " ends the session: ").concat(other: m));
+        i = i + 1;
+    }
+
+    // COPY is refused, and the session goes on. COPY IN: the client must answer CopyFail.
+    Wire copyIn = Wire.make(); copyIn.copyResponse(tag: 71ui8);
+    Wire copyFailed = Wire.make(); copyFailed.report(tag: 69ui8, severity: "ERROR", code: "57014", message: "COPY from stdin failed"); copyFailed.ready(status: 73ui8);
+    Wire copyOut = Wire.make(); copyOut.copyResponse(tag: 72ui8); copyOut.copyData(data: "1\n"); copyOut.copyDone(); copyOut.complete(tag: "COPY 1"); copyOut.ready(status: 73ui8);
+    Wire fine = Wire.make(); fine.complete(tag: "SELECT 0"); fine.ready(status: 73ui8);
+    DynamicArray<Step> copies = steps();
+    copies.add(item: Step::Send(bytes: copyIn.bytes()));
+    copies.add(item: Step::Send(bytes: copyFailed.bytes()));   // the answer to the client's CopyFail
+    copies.add(item: Step::Send(bytes: copyOut.bytes()));
+    copies.add(item: Step::Send(bytes: fine.bytes()));
+    Result<Connection, PgError> r = session(afterStartup: give copies);
+    Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "copy: connect"); } };
+    Result<DynamicArray<SimpleResult>, PgError> inward = c.simpleQuery(sql: "copy t from stdin");
+    Result<DynamicArray<SimpleResult>, PgError> outward = c.simpleQuery(sql: "copy t to stdout");
+    Result<DynamicArray<SimpleResult>, PgError> next = c.simpleQuery(sql: "select");
+    bool inRefused = match (inward) { case Ok(value: v): false; case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; };
+    bool outRefused = match (outward) { case Ok(value: v): false; case Err(error: e): match (e) { case Usage(detail: d): true; case _: false; }; };
+    bool nextOk = match (next) { case Ok(value: v): v.length() == 1; case Err(error: e): false; };
+    f = f + check(ok: inRefused && outRefused && nextOk && !c.isClosed(), what: "copy: both directions are refused and the session goes on");
+    return f;
+}
+
+unsafe fn int32 connectionTests() {
+    int32 f = 0;
+    f = f + authenticationTests();
+    f = f + negotiationTests();
+    f = f + hostileStartupTests();
+    f = f + queryTests();
+    f = f + hostileQueryTests();
+    return f;
+}

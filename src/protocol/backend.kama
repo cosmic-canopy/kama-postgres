@@ -128,7 +128,9 @@ type enum BackendMessage {
     EmptyQueryResponse,
     ErrorResponse(ErrorFields fields),
     NoticeResponse(ErrorFields fields),
-    NegotiateProtocolVersion(int32 newestMinor, DynamicArray<string> unrecognized),
+    // The newest protocol version the server supports for the major version asked for, spelled as the
+    // StartupMessage spells it (3.0 is PROTOCOL_3_0), and the `_pq_.` options it did not recognize.
+    NegotiateProtocolVersion(int32 newestVersion, DynamicArray<string> unrecognized),
     NoData,
     NotificationResponse(int32 processId, string channel, string payload),
     ParameterDescription(DynamicArray<uint32> oids),
@@ -200,7 +202,7 @@ unsafe fn Result<BackendMessage, ProtocolError> decode(uint8 tag, ConstView<uint
             i = i + 1;
         }
         if (!c.atEnd(b: body)) { return trailing(tag: tag); }
-        return Result::Ok(value: BackendMessage::NegotiateProtocolVersion(newestMinor: m, unrecognized: give names));
+        return Result::Ok(value: BackendMessage::NegotiateProtocolVersion(newestVersion: m, unrecognized: give names));
     }
     if (tag == 110ui8) { return empty(tag: tag, b: body, m: BackendMessage::NoData); }            // 'n'
     if (tag == 65ui8) {                                                               // 'A'

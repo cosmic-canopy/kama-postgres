@@ -31,7 +31,11 @@ type enum ProtocolError implements Error {
     // A field that must be UTF-8 text is not.
     NotUtf8(uint8 tag),
     // A field with a value the protocol does not allow; `what` says which.
-    Malformed(uint8 tag, string what);
+    Malformed(uint8 tag, string what),
+    // A message that is well-formed but out of place, seen by a connection rather than by the decoder: a
+    // DataRow before its RowDescription, a protocol downgrade nobody asked for. `detail` is libpq's message
+    // for it, where libpq has one.
+    Violation(string detail);
 
     public const fn string message() {
         return match (this) {
@@ -41,6 +45,7 @@ type enum ProtocolError implements Error {
             case Unexpected(tag: t): "unexpected message '${t}'";
             case NotUtf8(tag: t): "message '${t}' carries text that is not UTF-8";
             case Malformed(tag: t, what: w): "message '${t}': ".concat(other: w);
+            case Violation(detail: d): copy d;
         };
     }
 }
@@ -54,7 +59,7 @@ fn bool hasNul(ConstView<uint8> b) {
 // Builds frontend messages into one growable buffer: `begin(tag:)`, the fields, `end()`. The length field is
 // written as a placeholder and patched at `end()`, so a message is always framed correctly however it was
 // filled. Several messages may be queued before the buffer is sent (a pipeline is exactly that).
-type resource MessageWriter {
+type resource MessageWriter implements Sendable {
     DynamicArray<uint8> buf;
     isize mark = -1;   // offset of the open message's length field; -1 when none is open
 

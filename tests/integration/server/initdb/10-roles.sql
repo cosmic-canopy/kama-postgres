@@ -3,6 +3,10 @@
 
 SET password_encryption = 'scram-sha-256';
 CREATE ROLE kp_scram    LOGIN PASSWORD 'kp_scram_pw';
+-- A password SASLprep changes: full-width letters, a soft hyphen (mapped to nothing), a no-break space (mapped to a
+-- space) and the ligature U+FB01 (NFKC: "fi"). The server prepares it before hashing, so a client must prepare it
+-- the same way to log in. Prepared, it is "KPsasl prepfi".
+CREATE ROLE kp_saslprep LOGIN PASSWORD U&'\FF2B\FF30\00ADsasl\00A0prep\FB01';
 CREATE ROLE kp_password LOGIN PASSWORD 'kp_password_pw';   -- stored as SCRAM; the `password` method
                                                           -- sends cleartext and the server checks it
 CREATE ROLE kp_ssl_only LOGIN PASSWORD 'kp_ssl_only_pw';

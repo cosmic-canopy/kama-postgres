@@ -16,8 +16,8 @@ workaround can be deleted when the gap closes. **We are not attached to any work
 changes the right design here, say so and we will follow it.
 
 **Open now:**
-- KPG-15: fixed upstream in 0.9.506; this package adopts it next (SASLprep).
 - KPG-23, found porting to 0.9.506.
+- KPG-24, found adopting KPG-15's fix (SASLprep).
 
 Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
@@ -64,35 +64,55 @@ words separately (`session_test.kama`, `socket_test.kama`).
 **Suggested fix.** A public `osMessage()` (or `description()`) on `IoError`, returning `Optional<string>`: the OS's
 text for the code, `None` for an error kama raised itself.
 
-### KPG-15 · MED · std has no Unicode normalization, so SASLprep (and SCRAM with a non-ASCII password) cannot be done right
+### KPG-24 · MED · A `comptime InlineArray` imported from another file loses its type
 
-**Status:** open. An absence, checked on 0.9.490.
+**Status:** open. Reproduces on 0.9.506.
 
-**What is missing.** Unicode normalization: NFKC at least, and NFC/NFD/NFKD with it. Nothing in `lib/std` or
-`lib/core` normalizes:
-- `grep -rli 'nfkc\|normaliz' lib/std lib/core` finds only vector `normalize` in `std::math`.
-- `std::encoding::utf8` exports `decode, validate, Utf8Error` and nothing else (`lib/std/encoding/utf8/utf8.kama:2`).
+A `comptime InlineArray` works in the file that declares it. In a file that imports it, it is not the same value:
+- `.view()` is "no method `view`", and a chained call is "cannot resolve the receiver".
+- Indexing it passes as safe code nowhere: `kama check` says "raw pointer access requires an `unsafe fn`".
+- In an `unsafe fn`, the index passes `kama check` and reaches clang as a subscript of the struct, which clang
+  rejects.
 
-**Why a PostgreSQL client needs it.** SCRAM-SHA-256 hashes the password after SASLprep (RFC 4013), and SASLprep is
-stringprep with normalization form KC (RFC 4013 §2.2). Both sides must prepare the password identically:
-- The server prepares it when it stores the verifier (`pg_saslprep` in `src/common/saslprep.c`).
-- libpq prepares it before hashing.
+Copying it into a local of the same type first works.
 
-If this client hashes the raw bytes, a password whose NFKC form differs cannot log in. Examples: full-width
-letters, a ligature such as `ﬁ`, or a decomposed accent. Neither side reports anything but "password
-authentication failed".
+```kama
+// src/tables.kama
+export { RANGES };
+comptime InlineArray<uint32>#(4) RANGES = [0x00A0ui32, 0x00A0ui32, 0x2000ui32, 0x200Bui32];
+```
 
-**The rest of SASLprep** is mapping (RFC 3454 B.1, C.1.2), prohibited output (C.1.2–C.9) and the bidi check
-(D.1, D.2). This package will generate those tables by script from PostgreSQL's pinned `saslprep.c`. They are
-specific to SASL and do not belong in std. Only normalization is general-purpose.
+```kama
+// src/main.kama (the same module)
+import { core::println, std::collections::ConstView, RANGES };
+unsafe fn uint32 last() { return RANGES[3]; }
+fn isize count() { return RANGES.view().length(); }
+fn int32 main() { uint32 l = last(); isize n = count(); println(s: "${l} ${n}"); return 0; }
+```
 
-**Workaround here.** None. `postgres::protocol`'s `saslPrep` passes the password through unchanged, which is
-correct for ASCII. Its comment documents the limit.
+```
+src/main.kama:3:0: error: cannot resolve the receiver of `length` — its type is not known here
+```
 
-**Suggested fix.** `std::unicode` (or a method on `string`) with `normalize(form: NormalizationForm)` for NFC,
-NFD, NFKC and NFKD, with tables generated from the UCD at a pinned Unicode version. Rust keeps this in a crate
-(`unicode-normalization`) and Go in `x/text`, but kama has no package for it. A std module is the place where
-one implementation can be tested against the UCD's `NormalizationTest.txt`.
+With `count` removed, `last` passes `kama check`, and `kama build` fails in clang:
+
+```
+src/main.kama:2:30: error: subscripted value is not an array, pointer, or vector
+    2 |     kama_ret_0 = (p2__RANGES)[3];
+```
+
+The same module, or another module, gives the same result. Declared in `main.kama` itself, `RANGES.view()` and
+`RANGES[3]` both work. So does `InlineArray<uint32>#(4) local = RANGES;` followed by `local[3]`.
+
+**Why it matters here.** SASLprep's stringprep tables are generated into a file of their own, as every generated
+table in this package is. The code that searches them lives elsewhere.
+
+**Workaround here.** The generated file holds the search too (`src/stringprep/tables.kama`). Its predicates
+(`isProhibitedOutput(code:)`, …) are what other files call, so no table crosses a file. That is the shape the module
+would keep anyway, so there is nothing to delete.
+
+**Suggested fix.** Give an imported `comptime` the type it was declared with: an `InlineArray`'s methods and its
+indexing, as in the declaring file.
 
 ---
 
@@ -121,6 +141,19 @@ Fixed by `f4a84e46`: only an overflow is out of range. The repro prints `5e-324:
 
 Fixed by `312c8c34`. The repro builds with no warning. `src/types/datetime.kama`'s `timestampBegin()` is the
 `comptime` `TIMESTAMP_BEGIN` again.
+
+### KPG-15 · MED · std had no Unicode normalization, so SASLprep could not be done right — FIXED in 0.9.506
+
+Fixed by `da28a2a2`: `std::unicode::normalize`, NFC/NFD/NFKC/NFKD from UCD 18.0.0. `postgres::protocol::saslPrep`
+is now PostgreSQL's `pg_saslprep`, step for step: mapping, NFKC, prohibited output and the bidi rule, with the
+stringprep tables generated from the pinned `saslprep.c` (`tools/gen-saslprep.sh`). The differences between Unicode
+versions cannot matter. Stringprep's tables are Unicode 3.2, and a code point assigned later is "unassigned", which
+is prohibited, so the password is used as given on both sides.
+
+It is tested against:
+- the 128 outcomes of PostgreSQL's own `test_saslprep` module;
+- 32 SCRAM verifiers a live server stored for passwords that exercise each step;
+- an integration role, `kp_saslprep`, whose password SASLprep changes. It logs in on 14 to 19.
 
 ### KPG-16 · LOW · No home-directory lookup in std — FIXED in 0.9.504
 

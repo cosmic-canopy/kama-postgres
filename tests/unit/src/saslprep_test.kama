@@ -1,0 +1,93 @@
+// SASLprep against PostgreSQL itself: the outcome its own test module records for every ASCII byte, and, for
+// passwords that exercise each step, the SCRAM verifier a live server stored. The server prepares a password
+// before hashing it, so this client's preparation is right exactly when it derives the same StoredKey and
+// ServerKey from the verifier's salt. Both sets of vectors are generated (tools/gen-saslprep.sh).
+import { std::collections::DynamicArray, std::collections::FixedArray,
+         std::encoding::hex::decode as hexDecode, std::encoding::hex::encode as hexEncode,
+         std::encoding::hex::DecodeError as HexError, std::encoding::base64::encode as b64encode,
+         std::encoding::base64::decode as b64decode, std::encoding::base64::DecodeError as Base64Error,
+         std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error, std::fmt::parse,
+         std::fmt::ParseError, std::digest::pbkdf2, std::digest::sha256::Sha256,
+         std::digest::sha256::hmacSha256, std::digest::sha256::sha256,
+         postgres::protocol::saslPrep, postgres::protocol::SaslPrepOutcome, postgres::protocol::scramPassword,
+         postgres_unit_tests::check, postgres_unit_tests::saslprepStatusInputs,
+         postgres_unit_tests::saslprepStatusResults, postgres_unit_tests::saslprepServerPasswords,
+         postgres_unit_tests::saslprepServerVerifiers };
+export { saslprepTests };
+
+// The UTF-8 text a vector holds in hex.
+unsafe fn string textOf(const ref string hex) {
+    Result<DynamicArray<uint8>, HexError> bytes = hexDecode(text: hex);
+    DynamicArray<uint8> b = match (give bytes) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "saslprep vector: bad hex"); return ""; } };
+    Result<string, Utf8Error> s = utf8Decode(bytes: b.view());
+    return match (give s) { case Ok(value: t): give t; case Err(error: e): { panic(msg: "saslprep vector: not UTF-8"); return ""; } };
+}
+
+// The outcome as the test module prints it.
+unsafe fn string outcomeText(const ref string password) {
+    SaslPrepOutcome o = saslPrep(password: password);
+    return match (give o) {
+        case Prepared(text: t): "SUCCESS ".concat(other: hexEncode(bytes: t.bytes()));
+        case Prohibited: "PROHIBITED";
+    };
+}
+
+// Whether `password`, as this client prepares it, gives the StoredKey and ServerKey in `verifier`
+// ("SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>").
+unsafe fn bool matchesVerifier(const ref string password, const ref string verifier) {
+    string prefix = "SCRAM-SHA-256$";
+    if (!verifier.startsWith(prefix: prefix)) { return false; }
+    string rest = verifier.substring(start: prefix.length(), end: verifier.length());
+    Optional<usize> colon = rest.find(substring: ":");
+    Optional<usize> dollar = rest.find(substring: "$");
+    isize c = match (colon) { case Some(value: i): cast<isize>(i); case None: -1; };
+    isize d = match (dollar) { case Some(value: i): cast<isize>(i); case None: -1; };
+    if (c < 0 || d < c) { return false; }
+    string iterationText = rest.substring(start: 0, end: c);
+    string saltText = rest.substring(start: c + 1, end: d);
+    string keys = rest.substring(start: d + 1, end: rest.length());
+    Optional<usize> split = keys.find(substring: ":");
+    isize k = match (split) { case Some(value: i): cast<isize>(i); case None: -1; };
+    if (k < 0) { return false; }
+    string storedText = keys.substring(start: 0, end: k);
+    string serverText = keys.substring(start: k + 1, end: keys.length());
+    Result<int32, ParseError> iterations = parse::<int32>(s: iterationText);
+    int32 n = match (iterations) { case Ok(value: v): v; case Err(error: e): { return false; } };
+    Result<DynamicArray<uint8>, Base64Error> salt = b64decode(text: saltText);
+    DynamicArray<uint8> s = match (give salt) { case Ok(value: v): give v; case Err(error: e): { return false; } };
+
+    string prepared = scramPassword(password: password);
+    FixedArray<uint8> salted = FixedArray.make(size: 32);
+    pbkdf2(hash: Sha256.make(), password: prepared.bytes(), salt: s.view(), iterations: n, into: salted.viewMut());
+    string clientLabel = "Client Key";
+    string serverLabel = "Server Key";
+    InlineArray<uint8>#(32) clientKey = hmacSha256(key: salted.view(), message: clientLabel.bytes());
+    InlineArray<uint8>#(32) storedKey = sha256(bytes: clientKey.view());
+    InlineArray<uint8>#(32) serverKey = hmacSha256(key: salted.view(), message: serverLabel.bytes());
+    return b64encode(bytes: storedKey.view()).equals(other: storedText) && b64encode(bytes: serverKey.view()).equals(other: serverText);
+}
+
+unsafe fn int32 saslprepTests() {
+    int32 f = 0;
+    DynamicArray<string> inputs = saslprepStatusInputs();
+    DynamicArray<string> results = saslprepStatusResults();
+    isize i = 0;
+    while (i < inputs.length()) {
+        string input = textOf(hex: inputs[i]);
+        string got = outcomeText(password: input);
+        string hex = copy inputs[i];
+        f = f + check(ok: got.equals(other: results[i]), what: "saslprep: byte \\x".concat(other: hex).concat(other: " is ").concat(other: results[i]).concat(other: ", got ").concat(other: got));
+        i = i + 1;
+    }
+
+    DynamicArray<string> passwords = saslprepServerPasswords();
+    DynamicArray<string> verifiers = saslprepServerVerifiers();
+    i = 0;
+    while (i < passwords.length()) {
+        string password = textOf(hex: passwords[i]);
+        string hex = copy passwords[i];
+        f = f + check(ok: matchesVerifier(password: password, verifier: verifiers[i]), what: "saslprep: the server's verifier for the password ".concat(other: hex));
+        i = i + 1;
+    }
+    return f;
+}

@@ -26,6 +26,7 @@ unsafe fn string passwordFor(const ref string user) {
     if (user.equals(other: "kp_scram")) { return setting(name: "PGTEST_SCRAM_PASSWORD"); }
     if (user.equals(other: "kp_ssl_only")) { return setting(name: "PGTEST_SSL_ONLY_PASSWORD"); }
     if (user.equals(other: "kp_nossl")) { return setting(name: "PGTEST_NOSSL_PASSWORD"); }
+    if (user.equals(other: "kp_saslprep")) { return setting(name: "PGTEST_SASLPREP_PASSWORD"); }
     return "";
 }
 

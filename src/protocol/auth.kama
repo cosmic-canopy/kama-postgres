@@ -2,7 +2,8 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::colle
          std::math::sin, std::math::abs, std::math::floor,
          std::digest::pbkdf2, std::digest::sha256::Sha256, std::digest::sha256::hmacSha256, std::digest::sha256::sha256,
          std::encoding::base64::encode as b64encode, std::encoding::base64::decode as b64decode,
-         std::encoding::base64::DecodeError, std::encoding::hex::encode as hexEncode, std::random::entropy };
+         std::encoding::base64::DecodeError, std::encoding::hex::encode as hexEncode, std::random::entropy,
+         postgres::protocol::scramPassword };
 export { Md5, md5, md5Password, ScramClient, ChannelBinding, AuthError };
 
 // Password authentication: the `md5` method's response, and a SCRAM-SHA-256 client (RFC 5802, RFC 7677) with
@@ -196,7 +197,7 @@ type resource ScramClient {
     }
 
     fn void init(const ref string user, const ref string password, ChannelBinding binding, string nonce) {
-        this.password = saslPrep(password: password);
+        this.password = scramPassword(password: password);
         this.bindingData = DynamicArray.empty();
         match (give binding) {
             case NotSupported: { this.gs2Header = "n,,"; }
@@ -344,11 +345,6 @@ fn int32 parsePositive(ConstView<uint8> b) {
 
 // RFC 5802 saslname: ',' and '=' are escaped as =2C and =3D.
 fn string saslName(const ref string name) { return name.replace(old: "=", with: "=3D").replace(old: ",", with: "=2C"); }
-
-// SASLprep (RFC 4013), as far as this client goes: printable ASCII is its own preparation, and anything else
-// is used as given — what libpq also does when preparation fails. A non-ASCII password that SASLprep would
-// change (a non-ASCII space, a character NFKC folds) must be set on the server in its prepared form.
-fn string saslPrep(const ref string password) { return copy password; }
 
 fn bool constantTimeEqual(ConstView<uint8> a, ConstView<uint8> b) {
     if (a.length() != b.length()) { return false; }

@@ -40,6 +40,8 @@ TAG=$VERSION
 IMAGE=${PGTEST_IMAGE:-docker.io/library/postgres:$TAG}
 ENVFILE="$ROOT/out/pgtest-$VERSION.env"
 SUPERPW=kp_super_pw
+# kp_saslprep's password, as UTF-8 in octal: U+FF2B U+FF30, U+00AD, "sasl", U+00A0, "prep", U+FB01.
+SASLPREP_PW=$(printf '\357\274\253\357\274\260\302\255sasl\302\240prep\357\254\201')
 
 running() { [ "$("$RT" inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = "true" ]; }
 
@@ -59,6 +61,7 @@ PGTEST_MD5_PASSWORD=kp_md5_pw
 PGTEST_MD5_SCRAM_PASSWORD=kp_md5_scram_pw
 PGTEST_SSL_ONLY_PASSWORD=kp_ssl_only_pw
 PGTEST_NOSSL_PASSWORD=kp_nossl_pw
+PGTEST_SASLPREP_PASSWORD='$SASLPREP_PW'
 EOF
 }
 
@@ -112,7 +115,7 @@ case "$cmd" in
         # One login per method, from inside the container over TCP, so this checks the SERVER's
         # configuration independently of the kama client. libpq wants a client key it alone can read,
         # hence the private copy.
-        "$RT" exec -i "$NAME" sh -eu -s <<'EOF'
+        "$RT" exec -i -e SASLPREP_PW="$SASLPREP_PW" "$NAME" sh -eu -s <<'EOF'
 cp /certs/client.key /tmp/client.key && chmod 0600 /tmp/client.key
 try() {  # try <expect ok|fail> <what> <conninfo> [password]
     if PGPASSWORD="${4:-}" psql -X -A -t -q -d "$3" -c "select 1" >/dev/null 2>/tmp/err; then got=ok; else got=fail; fi
@@ -124,6 +127,7 @@ try ok   "password (cleartext)"          "$B user=kp_password sslmode=disable" k
 try ok   "md5"                           "$B user=kp_md5 sslmode=disable" kp_md5_pw
 try ok   "md5 method, SCRAM password"    "$B user=kp_md5_scram sslmode=disable require_auth=scram-sha-256" kp_md5_scram_pw
 try ok   "scram-sha-256"                 "$B user=kp_scram sslmode=disable" kp_scram_pw
+try ok   "scram-sha-256, SASLprep"       "$B user=kp_saslprep sslmode=disable" "$SASLPREP_PW"
 try ok   "scram-sha-256-plus (TLS)"      "$B user=kp_scram sslmode=require channel_binding=require" kp_scram_pw
 try ok   "verify-full vs test CA"        "host=localhost dbname=kp_test user=kp_scram sslmode=verify-full sslrootcert=/certs/ca.crt" kp_scram_pw
 try fail "verify-full vs untrusted CA"   "host=localhost dbname=kp_test user=kp_scram sslmode=verify-full sslrootcert=/certs/other-ca.crt" kp_scram_pw

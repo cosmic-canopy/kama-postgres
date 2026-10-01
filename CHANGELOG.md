@@ -14,6 +14,11 @@ Needs **kama ≥ 0.9.506**.
 - The password file is checked on the file opened, as libpq checks it. One that is not a regular file
   (`/dev/null`, a FIFO, a directory) gets libpq's "is not a plain file" warning.
 - With `HOME` unset or empty, the home directory is the account's, from its passwd entry, as libpq finds it.
+- **SASLprep** is PostgreSQL's `pg_saslprep`, step for step, so a SCRAM password with non-ASCII characters
+  (full-width letters, a no-break space, a ligature) logs in as it does with psql. `postgres::protocol` has
+  `saslPrep` and `scramPassword`. The stringprep tables are generated from PostgreSQL's source
+  (`tools/gen-saslprep.sh`). Tested against PostgreSQL's own `test_saslprep` outcomes and against verifiers a
+  live server stored.
 - A Unix-domain socket connects without blocking, so `connect_timeout` bounds the connect too. A full listen
   queue fails that host at once, as in libpq.
 - `postgres::protocol`: `AuthError` messages are libpq's. `NegotiateProtocolVersion` carries `newestVersion`,

@@ -16,6 +16,7 @@
     "conninfo": { "visibility": "public" },
     "sqlstate": { "visibility": "public" },
     "types":    { "visibility": "public" },
-    "wire":     { "visibility": "internal" }
+    "wire":     { "visibility": "internal" },
+    "stringprep": { "visibility": "internal" }
   }
 }

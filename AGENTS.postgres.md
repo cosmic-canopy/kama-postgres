@@ -46,6 +46,8 @@ compiler with everything this package relies on:
     - for configuration and authentication, libpq itself (`tools/gen-libpq-test-cases.sh`): the cases of
       PostgreSQL's `001_password.pl` and `006_service.pl`, and the container's libpq asked live about
       `.pgpass` files, service files and settings.
+    - for SASLprep, PostgreSQL's `test_saslprep` module and the SCRAM verifiers a live server stores
+      (`tools/gen-saslprep.sh`).
 
     A message this client prints is libpq's message, compared exactly.
 
@@ -54,6 +56,8 @@ compiler with everything this package relies on:
     `tests/integration/server/` configures it.
   - There is one role per authentication method: `kp_trust`, `kp_password`, `kp_md5`, `kp_scram`,
     `kp_cert`, `kp_ssl_only` and `kp_nossl`. A test picks the method by picking the user.
+  - `kp_saslprep` has a password that SASLprep changes, so it logs in only if this client prepares it as the
+    server did.
   - `kp_md5_scram` has `md5` in pg_hba but a SCRAM-stored password, so the server runs SCRAM. This is
     upstream's md5 section of `001_password.pl`.
   - The database `kp_notice` raises a NOTICE on every login (a login event trigger, 17 and later), for testing

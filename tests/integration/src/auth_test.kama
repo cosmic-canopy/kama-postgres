@@ -60,11 +60,18 @@ unsafe fn string attempt(const ref string conninfo, const ref Environment env) {
     return "";
 }
 
+// kp_saslprep's password is stored prepared, so its prepared form logs in as well as the form it was set in.
+unsafe fn int32 saslprepTests() {
+    Environment env = quietEnvironment();
+    string got = attempt(conninfo: conninfoFor(user: "kp_saslprep").concat(other: " password='KPsasl prepfi'"), env: env);
+    return check(ok: got.length() == 0, what: "saslprep: the prepared password logs in: ".concat(other: got));
+}
+
 unsafe fn int32 loginTests() {
     int32 f = 0;
     DynamicArray<string> users = DynamicArray.empty();
     users.add(item: "kp_trust"); users.add(item: "kp_password"); users.add(item: "kp_md5"); users.add(item: "kp_scram");
-    users.add(item: "kp_md5_scram"); users.add(item: "kp_nossl");
+    users.add(item: "kp_md5_scram"); users.add(item: "kp_nossl"); users.add(item: "kp_saslprep");
     isize i = 0;
     while (i < users.length()) {
         string conninfo = conninfoFor(user: users[i]);
@@ -295,6 +302,7 @@ unsafe fn int32 environmentTests() {
 unsafe fn int32 authTests() {
     int32 f = 0;
     f = f + loginTests();
+    f = f + saslprepTests();
     f = f + requireAuthTests();
     f = f + channelBindingTests();
     f = f + passfileTests();

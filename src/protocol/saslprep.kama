@@ -1,0 +1,66 @@
+import { std::collections::DynamicArray, std::unicode::normalize, std::unicode::NormalizationForm,
+         postgres::stringprep::isNonAsciiSpace, postgres::stringprep::isMappedToNothing,
+         postgres::stringprep::isProhibitedOutput, postgres::stringprep::isUnassigned,
+         postgres::stringprep::isRandALCat, postgres::stringprep::isLCat };
+export { SaslPrepOutcome, saslPrep, scramPassword };
+
+// SASLprep (RFC 4013), PostgreSQL's pg_saslprep (src/common/saslprep.c), step for step. SCRAM hashes the prepared
+// password, and the server prepared it the same way when it stored the verifier, so the two must agree exactly.
+// That includes where PostgreSQL departs from the RFC: the prohibited-output and bidi checks look at the mapped
+// input, before normalization.
+
+// What pg_saslprep makes of a password. Its third outcome, INVALID_UTF8, cannot arise: a kama string is UTF-8.
+type enum SaslPrepOutcome {
+    // The prepared password.
+    Prepared(string text),
+    // The password holds a character SASLprep prohibits, or maps to nothing at all.
+    Prohibited;
+}
+
+comptime uint32 SPACE = 32ui32;
+
+unsafe fn SaslPrepOutcome saslPrep(const ref string password) {
+    // 1) Map: a non-ASCII space becomes a space; a character "commonly mapped to nothing" is dropped.
+    DynamicArray<uint32> mapped = DynamicArray.empty();
+    Formatter text = Formatter.make();
+    string space = " ";
+    foreach (char c in password.chars()) {
+        uint32 code = cast<uint32>(c);
+        if (isNonAsciiSpace(code: code)) { mapped.add(item: SPACE); text.writeStr(s: ref space); }
+        else if (!isMappedToNothing(code: code)) { mapped.add(item: code); text.writeChar(c: c); }
+    }
+    if (mapped.length() == 0) { return SaslPrepOutcome::Prohibited; }   // an empty password is not allowed
+
+    // 2) Normalize: NFKC.
+    string before = text.finish();
+    string prepared = normalize(s: before, form: NormalizationForm::Nfkc);
+
+    // 3) Prohibit, and 4) the bidi rule (RFC 3454 §6): a string with a right-to-left character holds no
+    // left-to-right one, and starts and ends with a right-to-left one. Both over the mapped input.
+    bool rightToLeft = false;
+    isize i = 0;
+    while (i < mapped.length()) {
+        if (isProhibitedOutput(code: mapped[i]) || isUnassigned(code: mapped[i])) { return SaslPrepOutcome::Prohibited; }
+        if (isRandALCat(code: mapped[i])) { rightToLeft = true; }
+        i = i + 1;
+    }
+    if (rightToLeft) {
+        i = 0;
+        while (i < mapped.length()) {
+            if (isLCat(code: mapped[i])) { return SaslPrepOutcome::Prohibited; }
+            i = i + 1;
+        }
+        if (!isRandALCat(code: mapped[0]) || !isRandALCat(code: mapped[mapped.length() - 1])) { return SaslPrepOutcome::Prohibited; }
+    }
+    return SaslPrepOutcome::Prepared(text: give prepared);
+}
+
+// The password SCRAM hashes: the prepared one, or, when SASLprep refuses it, the password as given. libpq
+// (scram_init) and the server (pg_be_scram_build_secret) both fall back that way.
+unsafe fn string scramPassword(const ref string password) {
+    SaslPrepOutcome outcome = saslPrep(password: password);
+    return match (give outcome) {
+        case Prepared(text: t): give t;
+        case Prohibited: copy password;
+    };
+}

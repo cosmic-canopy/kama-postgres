@@ -2,7 +2,7 @@
 // server, no network, no clock — these run anywhere `tools/test.sh` runs, debug and release. The cases that
 // need a live PostgreSQL are in tests/integration. A failing case prints its name, so the log says WHICH,
 // not just that.
-import { core::println, postgres_unit_tests::protocolTests, postgres_unit_tests::authTests, postgres_unit_tests::conninfoTests, postgres_unit_tests::catalogTests, postgres_unit_tests::codecTests, postgres_unit_tests::errorTests, postgres_unit_tests::configTests, postgres_unit_tests::connectionTests };
+import { core::println, postgres_unit_tests::protocolTests, postgres_unit_tests::authTests, postgres_unit_tests::conninfoTests, postgres_unit_tests::catalogTests, postgres_unit_tests::codecTests, postgres_unit_tests::errorTests, postgres_unit_tests::configTests, postgres_unit_tests::connectionTests, postgres_unit_tests::saslprepTests };
 export { check };
 
 fn int32 check(bool ok, string what) {
@@ -14,6 +14,7 @@ fn int32 main() {
     int32 failed = 0;
     failed = failed + protocolTests();
     failed = failed + authTests();
+    failed = failed + saslprepTests();
     failed = failed + conninfoTests();
     failed = failed + catalogTests();
     failed = failed + codecTests();

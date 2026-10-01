@@ -6,17 +6,20 @@ it. Every entry with a repro was **run** on the version named. Nothing is inferr
 spec. An entry that is an absence cites the cstar files that show it instead. This file is excluded from
 the published package, as it is in `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.486+gea6cae46`, the dev build at `../cstar/out/Darwin-arm64/kama`. The
-cstar tree is at `ecb9b3a8`, which changes only `lib/` beyond the binary's commit; the binary reads
-`lib/` from the tree, so this is effectively HEAD. Earlier rounds: `0.9.477` (KPG-1 also on Linux
-aarch64 inside `localhost/kama-dev`), and the first report against `0.9.470` and the public `0.9.440`.
+**Current compiler:** `kama 0.9.490+g9a69fc30`, the dev build at `../cstar/out/Darwin-arm64/kama`, built
+from cstar HEAD (`9a69fc30`). KPG-11 to KPG-14 were re-run on it and all four still reproduce. Earlier rounds:
+`0.9.486` (KPG-11 to KPG-14 first filed), `0.9.477` (KPG-1 also on Linux aarch64 inside
+`localhost/kama-dev`), and the first report against `0.9.470` and the public `0.9.440`.
 
 **Reporter:** the `@kama/postgres` repo. Each open entry names the workaround this package uses, so the
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** KPG-11 to KPG-14, found building the protocol and type layers. Every earlier gap is fixed, except KPG-8,
-which is closed as a non-goal (see below).
+**Open now:**
+- KPG-11 to KPG-14, found building the protocol and type layers.
+- KPG-15 to KPG-17, found planning the first live connection (phase 4).
+
+Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -27,9 +30,85 @@ which is closed as a non-goal (see below).
 
 ## OPEN
 
+### KPG-15 · MED · std has no Unicode normalization, so SASLprep (and SCRAM with a non-ASCII password) cannot be done right
+
+**Status:** open. An absence, checked on 0.9.490.
+
+**What is missing.** Unicode normalization: NFKC at least, and NFC/NFD/NFKD with it. Nothing in `lib/std` or
+`lib/core` normalizes:
+- `grep -rli 'nfkc\|normaliz' lib/std lib/core` finds only vector `normalize` in `std::math`.
+- `std::encoding::utf8` exports `decode, validate, Utf8Error` and nothing else (`lib/std/encoding/utf8/utf8.kama:2`).
+
+**Why a PostgreSQL client needs it.** SCRAM-SHA-256 hashes the password after SASLprep (RFC 4013), and SASLprep is
+stringprep with normalization form KC (RFC 4013 §2.2). Both sides must prepare the password identically:
+- The server prepares it when it stores the verifier (`pg_saslprep` in `src/common/saslprep.c`).
+- libpq prepares it before hashing.
+
+If this client hashes the raw bytes, a password whose NFKC form differs cannot log in. Examples: full-width
+letters, a ligature such as `ﬁ`, or a decomposed accent. Neither side reports anything but "password
+authentication failed".
+
+**The rest of SASLprep** is mapping (RFC 3454 B.1, C.1.2), prohibited output (C.1.2–C.9) and the bidi check
+(D.1, D.2). This package will generate those tables by script from PostgreSQL's pinned `saslprep.c`. They are
+specific to SASL and do not belong in std. Only normalization is general-purpose.
+
+**Workaround here.** None. `postgres::protocol`'s `saslPrep` passes the password through unchanged, which is
+correct for ASCII. Its comment documents the limit.
+
+**Suggested fix.** `std::unicode` (or a method on `string`) with `normalize(form: NormalizationForm)` for NFC,
+NFD, NFKC and NFKD, with tables generated from the UCD at a pinned Unicode version. Rust keeps this in a crate
+(`unicode-normalization`) and Go in `x/text`, but kama has no package for it. A std module is the place where
+one implementation can be tested against the UCD's `NormalizationTest.txt`.
+
+### KPG-16 · LOW · No home-directory lookup in std
+
+**Status:** open. An absence, checked on 0.9.490.
+
+`std::process::identity` exports `UserId, GroupId, AccessToken, currentUser, currentGroup, currentProcessId`
+(`lib/std/process/identity.kama:18`). A `UserId` gives `raw()` and `name()` (`:59-61`) but not its home
+directory, and nothing in `lib/std` or `lib/core` reads `getpwuid_r`'s `pw_dir`.
+
+**Why it matters here.** libpq finds `~/.pgpass` and `~/.pg_service.conf` through `$HOME`. When `HOME` is unset it
+falls back to the passwd entry (`pqGetHomeDirectory` in `fe-connect.c`); this is common under a service manager
+or in a container. On Windows it uses `%APPDATA%`, which an environment variable already gives.
+
+**Workaround here.** None. When `HOME` is unset, this package uses no user file, and says so in its docs.
+
+**Suggested fix.** `UserId.homeDirectory()` returning `Result<string, IoError>` from `getpwuid_r`. Optionally
+also `std::process::homeDirectory()`, which reads `$HOME` first and then the passwd entry, as Rust's
+`std::env::home_dir` does on Unix.
+
+### KPG-17 · MED · An interrupted system call is `IoError::Other(4)`, indistinguishable from a real failure
+
+**Status:** open. An absence, checked on 0.9.490.
+
+`lastError()` (`lib/std/io/io.kama:68-86`) classifies errno into named variants, but EINTR is not one of them,
+so it falls through to `IoError::Other(code: e)`. The runtime's poll returns -1 with errno EINTR to the kama
+layer as it is:
+- `kama_poller_wait` (`include/kama_os.h:1910-1913`) is `return poll(...)`.
+- `recv` and `send` are the same (`:1742`).
+
+`Poller.wait`'s own comment says "EINTR surfaces as Err(Other) — the caller may retry". But the caller cannot
+tell EINTR from any other `Other` without comparing a raw, platform-specific errno. The runtime knows the value
+(`kama_EINTR()`, `include/kama_os.h:1333`) and does not expose it.
+
+**Why it matters here.** This package's connection is a non-blocking socket driven by `Poller.wait` with a
+deadline, which is libpq's design. A signal handled anywhere in the application wakes `poll` with EINTR, whatever
+`SA_RESTART` says. Examples: SIGCHLD from a child process, SIGWINCH, or a profiler's SIGPROF.
+- The right response is to recompute the remaining time and wait again.
+- As things stand, the connection must either fail, which is wrong, or test `code == 4`, which is a magic
+  number.
+
+**Workaround here.** None. EINTR is reported as an I/O error, and the connection closes. That is wrong, but
+honest, until this is fixed.
+
+**Suggested fix.** Either one would do. The first is the general fix, and Rust has both.
+- Add `IoError::Interrupted` (Rust's `ErrorKind::Interrupted`), classified in `lastError()`.
+- Have `Poller.wait` retry EINTR internally, with the remaining time recomputed against the monotonic clock.
+
 ### KPG-11 · MED · A generic-inference error is reported against the wrong file, and `kama query --diagnostics` misses it
 
-**Status:** open. Reproduces on 0.9.486.
+**Status:** open. Reproduces on 0.9.486 and 0.9.490.
 
 **Symptom.** One error, reported three different ways:
 - `kama check` reports it, but names the package's **root** file (or, from a consumer, the **consumer's**
@@ -76,7 +155,7 @@ real site meant recognising the parameter name (`x`, which the test file never u
 
 ### KPG-12 · LOW · A generic call cannot take another generic call's result as its argument
 
-**Status:** open. Reproduces on 0.9.486. It may be a deliberate limit of local inference; recorded as a
+**Status:** open. Reproduces on 0.9.486 and 0.9.490. It may be a deliberate limit of local inference; recorded as a
 consumer data point.
 
 `abs(x: sin(x: t))` with `t` a `float64` local is refused ("argument 'x' is not a literal or a locally-typed
@@ -95,7 +174,7 @@ float64 magnitude = abs(x: sine);
 
 ### KPG-13 · MED · `parse::<float64>` refuses a subnormal it read exactly
 
-**Status:** open. Reproduces on 0.9.486.
+**Status:** open. Reproduces on 0.9.486 and 0.9.490.
 
 ```kama
 import { core::println, std::fmt::parse, std::fmt::ParseError };
@@ -133,7 +212,7 @@ returns a value that is exactly what was written, or the nearest representable o
 
 ### KPG-14 · LOW · A `comptime int64` at int64's minimum is emitted as an out-of-range C literal
 
-**Status:** open. Reproduces on 0.9.486.
+**Status:** open. Reproduces on 0.9.486 and 0.9.490.
 
 ```kama
 // The minimum int64, spelled the only way a literal can reach it.

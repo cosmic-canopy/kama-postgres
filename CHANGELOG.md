@@ -23,6 +23,11 @@ Needs **kama ≥ 0.9.506**.
     its PostgreSQL text. NULL reads only into an Optional.
   - `rowAs` refuses a row with no column for a field, and a row whose columns share a name.
   - `PgError::Value` names the column, its type, and what was asked.
+- **Arrays of one dimension**, text and binary (`postgres::types::decodeArray`, `formatArray`, `ArrayValues`):
+  `column::<DynamicArray<int32>>` and every other element type this client reads, `bytea[]` as
+  `DynamicArray<DynamicArray<uint8>>`. A binary array read as a string is `array_out`'s text. An array of more
+  dimensions, or one with a NULL element, is refused with the reason. `elementType(arrayOid:)` is generated with
+  the other OIDs.
 - `postgres::types`: `Numeric`, `LocalDateTime`, `TimeOfDay`, `TimeTz` and `Interval` are `Serializable` and
   `Deserializable` as PostgreSQL's text, so each reads from a column and travels through any serde backend.
   `LocalDateTime` is `Formattable`, and each has a `parse` constructor for that text.

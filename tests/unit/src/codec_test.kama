@@ -21,7 +21,8 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::types::encodeTimeTz, postgres::types::decodeInterval, postgres::types::encodeInterval,
          postgres::types::decodeNumeric, postgres::types::encodeNumeric,
          postgres::types::LocalDateTime, postgres::types::TimeOfDay, postgres::types::TimeTz,
-         postgres::types::Interval, postgres::types::Numeric,
+         postgres::types::Interval, postgres::types::Numeric, postgres::types::ArrayValues,
+         postgres::types::decodeArray,
          postgres_unit_tests::check, postgres_unit_tests::unhex,
          postgres_unit_tests::codecTypes, postgres_unit_tests::codecLiterals, postgres_unit_tests::codecTexts,
          postgres_unit_tests::codecBinaries };
@@ -243,6 +244,23 @@ fn string checkCase(const ref string type, const ref string literal, const ref s
         if (!av.equals(other: bv)) { return "numeric text and binary differ"; }
         if (!hexIs(bytes: enc, want: hex)) { string h = hexEncode(bytes: enc.view()); return "numeric re-encoded as ".concat(other: h); }
         if (!f.equals(other: text)) { return "numeric formatted as ".concat(other: f); }
+        return "";
+    }
+    if (type.endsWith(suffix: "[]")) {
+        Result<ArrayValues, DecodeError> a = decodeArray(format: FORMAT_TEXT, raw: t, elementOid: 0ui32);
+        Result<ArrayValues, DecodeError> b = decodeArray(format: FORMAT_BINARY, raw: bin.view(), elementOid: 0ui32);
+        if (text.startsWith(prefix: "{{")) {
+            // Two dimensions: refused in both formats, as Unsupported.
+            bool textRefused = match (a) { case Ok(value: x): false; case Err(error: e): match (e) { case Unsupported(type: ty, what: w): true; case _: false; }; };
+            bool binaryRefused = match (b) { case Ok(value: x): false; case Err(error: e): match (e) { case Unsupported(type: ty, what: w): true; case _: false; }; };
+            if (!textRefused || !binaryRefused) { return "a 2-D array was not refused"; }
+            return "";
+        }
+        ArrayValues av = match (give a) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        ArrayValues bv = match (give b) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+        if (av.count() != bv.count() || av.lowerBound() != bv.lowerBound()) { return "text and binary disagree on the shape"; }
+        isize i = 0;
+        while (i < av.count()) { if (av.isNull(index: i) != bv.isNull(index: i)) { return "text and binary disagree on a NULL"; } i = i + 1; }
         return "";
     }
     return "no codec for ".concat(other: type);

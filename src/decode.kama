@@ -9,7 +9,9 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::memor
          postgres::types::formatBytea, postgres::types::dateText, postgres::types::timestampText,
          postgres::types::decodeTime, postgres::types::decodeTimeTz, postgres::types::decodeInterval,
          postgres::types::decodeNumeric, postgres::types::TimeOfDay, postgres::types::TimeTz,
-         postgres::types::Interval, postgres::types::Numeric,
+         postgres::types::Interval, postgres::types::Numeric, postgres::types::ArrayValues,
+         postgres::types::decodeArray, postgres::types::formatArray, postgres::types::arrayDelimiter,
+         postgres::types::elementType,
          postgres::types::BOOL, postgres::types::INT2, postgres::types::INT4, postgres::types::INT8,
          postgres::types::OID, postgres::types::FLOAT4, postgres::types::FLOAT8, postgres::types::TEXT,
          postgres::types::VARCHAR, postgres::types::BPCHAR, postgres::types::NAME, postgres::types::JSON,
@@ -28,7 +30,9 @@ export { column, columnOpt, rowAs, hasBinaryCodec };
 //     int64; int4 into int32 or int64; int8 into int64; oid into uint32, uint64 or int64. Never narrower, even
 //     when the value would fit, so a result does not depend on the data;
 //   - float4 into float32 or float64, float8 into float64; bool into bool;
-//   - bytea into DynamicArray<uint8>;
+//   - bytea into DynamicArray<uint8>, and a one-dimensional array into a DynamicArray of its element's type
+//     (int4[] into DynamicArray<int32>, bytea[] into DynamicArray<DynamicArray<uint8>>); an element may not be
+//     NULL, and an array of more dimensions is refused;
 //   - every non-NULL column into a string: the value's PostgreSQL text, as psql shows it (a float read from a
 //     binary column is the exact value in 17 digits, KPG-27). Uuid, Timestamp, Date, Numeric, LocalDateTime,
 //     TimeOfDay, TimeTz and Interval read that text;
@@ -39,6 +43,12 @@ export { column, columnOpt, rowAs, hasBinaryCodec };
 // The OIDs this client reads in binary: what the extended protocol asks the server for. Every other type comes as
 // text.
 fn bool hasBinaryCodec(uint32 oid) {
+    uint32 element = elementType(arrayOid: oid);
+    if (element != 0ui32) { return scalarCodec(oid: element); }
+    return scalarCodec(oid: oid);
+}
+
+fn bool scalarCodec(uint32 oid) {
     return oid == BOOL || oid == INT2 || oid == INT4 || oid == INT8 || oid == OID || oid == FLOAT4 || oid == FLOAT8
         || oid == TEXT || oid == VARCHAR || oid == BPCHAR || oid == NAME || oid == JSON || oid == JSONB
         || oid == BYTEA || oid == UUID || oid == DATE || oid == TIME || oid == TIMETZ || oid == TIMESTAMP
@@ -56,8 +66,12 @@ type enum Cell {
     // Its PostgreSQL text: a text type's value, or the text of a type read only as text.
     Text(string text),
     Bytes(DynamicArray<uint8> bytes),
+    // An array: its elements, `count` of them from `first` in the reader's element list, and its text.
+    Elements(isize first, isize count, string text),
     // A value that does not decode: the reason, raised when it is read.
-    Bad(string why)
+    Bad(string why),
+    // A text value that reads only as a string (an array of two dimensions): its text, and why it is no more.
+    Opaque(string text, string why)
 }
 
 // What went wrong in a read, for the message.
@@ -68,10 +82,40 @@ unsafe fn Cell textCell(ConstView<uint8> raw) {
     return match (give t) { case Ok(value: s): Cell::Text(text: give s); case Err(error: e): Cell::Bad(why: e.message()); };
 }
 
-unsafe fn Cell decodeCell(const ref FieldDescription f, ConstView<uint8> raw, bool isNull) {
+// A column's value: an array's elements go to `elements`, and the cell names them.
+unsafe fn Cell decodeColumn(ref DynamicArray<Cell> elements, uint32 oid, int16 format, ConstView<uint8> raw, bool isNull) {
     if (isNull) { return Cell::Null; }
-    uint32 oid = f.typeOid();
-    int16 format = f.format();
+    uint32 element = elementType(arrayOid: oid);
+    if (element == 0ui32) { return decodeValue(oid: oid, format: format, raw: raw, isNull: false); }
+    Result<ArrayValues, DecodeError> r = decodeArray(format: format, raw: raw, elementOid: element);
+    ArrayValues a = match (give r) {
+        case Ok(value: v): give v;
+        case Err(error: e): {
+            if (format == FORMAT_TEXT) { return Cell::Opaque(text: textIf(format: format, raw: raw), why: e.message()); }
+            return Cell::Bad(why: e.message());
+        }
+    };
+    isize first = elements.length();
+    DynamicArray<string> texts = DynamicArray.withCapacity(capacity: a.count());
+    DynamicArray<bool> nulls = DynamicArray.withCapacity(capacity: a.count());
+    isize i = 0;
+    while (i < a.count()) {
+        Cell c = decodeValue(oid: element, format: a.format(), raw: a.value(index: i), isNull: a.isNull(index: i));
+        string bad = match (c) { case Bad(why: w): copy w; case _: ""; };
+        if (bad.length() > 0) { return Cell::Bad(why: "element ${i}: ".concat(other: bad)); }
+        texts.add(item: cellText(c: c));
+        nulls.add(item: a.isNull(index: i));
+        elements.add(item: give c);
+        i = i + 1;
+    }
+    string text = textIf(format: format, raw: raw);
+    if (format != FORMAT_TEXT) { text = formatArray(texts: texts, nulls: nulls, lowerBound: a.lowerBound(), delimiter: arrayDelimiter(elementOid: element)); }
+    return Cell::Elements(first: first, count: a.count(), text: give text);
+}
+
+// One value of a type that is not an array.
+unsafe fn Cell decodeValue(uint32 oid, int16 format, ConstView<uint8> raw, bool isNull) {
+    if (isNull) { return Cell::Null; }
     if (oid == INT2) {
         Result<int16, DecodeError> r = decodeInt2(format: format, raw: raw);
         return match (give r) { case Ok(value: v): Cell::Integer(value: cast<int64>(v), bits: 16); case Err(error: e): Cell::Bad(why: e.message()); };
@@ -149,6 +193,21 @@ fn Cell textResult(Result<string, DecodeError> r) {
     return match (give r) { case Ok(value: s): Cell::Text(text: give s); case Err(error: e): Cell::Bad(why: e.message()); };
 }
 
+// A value's PostgreSQL text; "" for NULL or a value that did not decode.
+unsafe fn string cellText(const ref Cell c) {
+    return match (c) {
+        case Integer(value: v, bits: b): "${v}";
+        case Oid(value: v): "${v}";
+        case Float(value: v, bits: b, text: t): { if (t.length() > 0) { return copy t; } := floatText(v: v, bits: b); }
+        case Boolean(value: v): formatBool(v: v);
+        case Text(text: t): copy t;
+        case Bytes(bytes: b): formatBytea(v: b.view());
+        case Elements(first: f, count: n, text: t): copy t;
+        case Opaque(text: t, why: w): copy t;
+        case _: "";
+    };
+}
+
 // A float as text: PostgreSQL's spellings of the infinities and NaN, and otherwise the exact value in as many
 // digits as its width can need (KPG-27: not PostgreSQL's shortest digits).
 fn string floatText(float64 v, int32 bits) {
@@ -161,86 +220,125 @@ fn string floatText(float64 v, int32 bits) {
 
 // One value, or the columns of a row, served through the Deserializer contract. Reads never throw: a read that
 // cannot be served records why and sets the sticky error, and the caller turns that into a PgError.
+//
+// A read is of the current column, or, inside an array, of its next element. Inside a bytea (a column, or an
+// element of a bytea[]), readU8 gives its bytes. Columns and elements are one list, matched by index: matching on
+// a method's `const ref` result destroys the referent (KPG-29).
 type resource CellReader implements Deserializer {
-    DynamicArray<Cell> cells;      // one per column (one in all for a single value)
+    DynamicArray<Cell> cells;      // one per column (one in all for a single value), then every array's elements
+    isize elementBase = 0;               // where the elements start: an Elements cell's `first` counts from here
     DynamicArray<string> labels;   // the column names, for a row
     bool whole = false;            // a whole row (rowAs), read as an object of fields
     bool opened = false;           // the row's beginObject has been seen
-    isize current = 0;             // the cell being read
-    isize next = 0;                // the cell the next field() gives
-    isize element = -1;            // inside a bytea: the next byte; -1 outside
+    isize current = 0;             // the column being read
+    isize next = 0;                // the column the next field() gives
+    isize element = -1;            // inside an array: the element read next; -1 outside
+    isize firstElement = 0;        // that array's first element
+    isize endElement = 0;          // one past its last
+    int32 bytesFrom = 0;           // inside a bytea: 1 the column, 2 an element; 0 outside
+    isize bytesElement = 0;        // the cell, for 2
+    isize byteAt = 0;              // the byte read next
     isize wanted = 0;              // beginObject's count: the fields the type has
     isize taken = 0;               // fields read rather than skipped
     bool err = false;
     DeError code;
     Problem problem;
     isize failedCell = 0;
+    isize failedElement = -1;
     string asked;
     string why;
 
-    ctor make(DynamicArray<Cell> cells, DynamicArray<string> labels, bool whole) {
-        this.cells = give cells; this.labels = give labels; this.whole = whole; this.opened = false;
-        this.current = 0; this.next = 0; this.element = -1; this.wanted = 0; this.taken = 0;
+    ctor make(DynamicArray<Cell> cells, DynamicArray<Cell> elements, DynamicArray<string> labels, bool whole) {
+        this.elementBase = cells.length();
+        this.cells = give cells;
+        // Two passes of pop keep the elements' order, in linear time.
+        DynamicArray<Cell> rest = give elements;
+        DynamicArray<Cell> reversed = DynamicArray.withCapacity(capacity: rest.length());
+        bool more = true;
+        while (more) { Optional<Cell> c = rest.pop(); match (give c) { case Some(value: x): { reversed.add(item: give x); } case None: { more = false; } }; }
+        more = true;
+        while (more) { Optional<Cell> c = reversed.pop(); match (give c) { case Some(value: x): { this.cells.add(item: give x); } case None: { more = false; } }; }
+        this.labels = give labels; this.whole = whole;
+        this.opened = false; this.current = 0; this.next = 0;
+        this.element = -1; this.firstElement = 0; this.endElement = 0; this.bytesFrom = 0; this.bytesElement = 0; this.byteAt = 0;
+        this.wanted = 0; this.taken = 0;
         this.err = false; this.code = DeError::Malformed; this.problem = Problem::Fine;
-        this.failedCell = 0; this.asked = ""; this.why = "";
+        this.failedCell = 0; this.failedElement = -1; this.asked = ""; this.why = "";
     }
-
     friend valueReader[make];
     friend rowReader[make];
-    friend readFailure[failedAt, askedFor, trouble, reason, fieldsWanted, fieldsTaken];
+    friend readFailure[failedAt, failedIndex, askedFor, trouble, reason, fieldsWanted, fieldsTaken];
 
     const fn Problem trouble() { return this.problem; }
     const fn isize failedAt() { return this.failedCell; }
+    const fn isize failedIndex() { return this.failedElement; }
     const fn const ref string askedFor() { return this.asked; }
     const fn const ref string reason() { return this.why; }
     const fn isize fieldsWanted() { return this.wanted; }
     const fn isize fieldsTaken() { return this.taken; }
 
+    // The cell the next read is of.
+    const fn isize at() {
+        if (this.element >= 0) { return this.element; }
+        return this.current;
+    }
+    // A value has been read: inside an array, the next element is next.
+    fn void advance() { if (this.element >= 0) { this.element = this.element + 1; } }
+
     // The first failure is the one reported.
     fn void refuse(Problem p, const ref string what, string detail, DeError e) {
         if (this.err) { return; }
         this.err = true; this.code = e; this.problem = p; this.failedCell = this.current;
+        this.failedElement = -1;
+        if (this.element >= 0) { this.failedElement = this.element - this.firstElement; }
         this.asked = copy what; this.why = give detail;
     }
 
     // Before a read: NULL and an undecodable value are refused here, whatever was asked.
     fn bool usable(const ref string what) {
         if (this.err) { return false; }
-        bool isNull = match (this.cells[this.current]) { case Null: true; case _: false; };
+        bool isNull = match (this.cells[this.at()]) { case Null: true; case _: false; };
         if (isNull) { this.refuse(p: Problem::IsNull, what: what, detail: "", e: DeError::TypeMismatch); return false; }
-        string bad = match (this.cells[this.current]) { case Bad(why: w): copy w; case _: ""; };
+        string bad = match (this.cells[this.at()]) { case Bad(why: w): copy w; case Opaque(text: t, why: w): copy w; case _: ""; };
         if (bad.length() > 0) { this.refuse(p: Problem::Undecodable, what: what, detail: give bad, e: DeError::Malformed); return false; }
         return true;
     }
 
+    fn void mismatch(const ref string what) { this.refuse(p: Problem::Mismatch, what: what, detail: "", e: DeError::TypeMismatch); }
+
     fn int64 integer(int32 maxBits, const ref string what) {
         if (!this.usable(what: what)) { return 0i64; }
-        int32 bits = match (this.cells[this.current]) { case Integer(value: v, bits: b): b; case _: 0; };
-        if (bits == 0 || bits > maxBits) { this.refuse(p: Problem::Mismatch, what: what, detail: "", e: DeError::TypeMismatch); return 0i64; }
-        return match (this.cells[this.current]) { case Integer(value: v, bits: b): v; case _: 0i64; };
+        int32 bits = match (this.cells[this.at()]) { case Integer(value: v, bits: b): b; case _: 0; };
+        if (bits == 0 || bits > maxBits) { this.mismatch(what: what); return 0i64; }
+        int64 v = match (this.cells[this.at()]) { case Integer(value: x, bits: b): x; case _: 0i64; };
+        this.advance();
+        return v;
     }
 
     fn uint32 oid(const ref string what) {
         if (!this.usable(what: what)) { return 0ui32; }
-        bool isOid = match (this.cells[this.current]) { case Oid(value: v): true; case _: false; };
-        if (!isOid) { this.refuse(p: Problem::Mismatch, what: what, detail: "", e: DeError::TypeMismatch); return 0ui32; }
-        return match (this.cells[this.current]) { case Oid(value: v): v; case _: 0ui32; };
+        bool isOid = match (this.cells[this.at()]) { case Oid(value: v): true; case _: false; };
+        if (!isOid) { this.mismatch(what: what); return 0ui32; }
+        uint32 v = match (this.cells[this.at()]) { case Oid(value: x): x; case _: 0ui32; };
+        this.advance();
+        return v;
     }
 
     fn float64 floating(int32 maxBits, const ref string what) {
         if (!this.usable(what: what)) { return 0.0; }
-        int32 bits = match (this.cells[this.current]) { case Float(value: v, bits: b, text: t): b; case _: 0; };
-        if (bits == 0 || bits > maxBits) { this.refuse(p: Problem::Mismatch, what: what, detail: "", e: DeError::TypeMismatch); return 0.0; }
-        return match (this.cells[this.current]) { case Float(value: v, bits: b, text: t): v; case _: 0.0; };
+        int32 bits = match (this.cells[this.at()]) { case Float(value: v, bits: b, text: t): b; case _: 0; };
+        if (bits == 0 || bits > maxBits) { this.mismatch(what: what); return 0.0; }
+        float64 v = match (this.cells[this.at()]) { case Float(value: x, bits: b, text: t): x; case _: 0.0; };
+        this.advance();
+        return v;
     }
-
-    fn void mismatch(const ref string what) { this.refuse(p: Problem::Mismatch, what: what, detail: "", e: DeError::TypeMismatch); }
 
     // ---- Deserializer ----
 
     public fn void beginObject(usize count) {
-        if (!this.whole) { string w = "a struct"; this.refuse(p: Problem::Shape, what: w, detail: "a column holds one value; read a row into a struct with rowAs", e: DeError::TypeMismatch); return; }
-        if (this.opened) { string w = "a struct"; this.refuse(p: Problem::Shape, what: w, detail: "a field of a row is one column, not a nested struct", e: DeError::TypeMismatch); return; }
+        string w = "a struct";
+        if (!this.whole) { this.refuse(p: Problem::Shape, what: w, detail: "a column holds one value; read a row into a struct with rowAs", e: DeError::TypeMismatch); return; }
+        if (this.opened) { this.refuse(p: Problem::Shape, what: w, detail: "a field of a row is one column, not a nested struct", e: DeError::TypeMismatch); return; }
         this.opened = true;
         this.wanted = cast<isize>(count);
         this.taken = 0;
@@ -258,28 +356,55 @@ type resource CellReader implements Deserializer {
         this.current = this.next;
         this.next = this.next + 1;
         this.taken = this.taken + 1;
+        this.element = -1;
+        this.bytesFrom = 0;
         return FieldKey::Name(name: copy this.labels[this.current]);
     }
     // A PostgreSQL enum's label names the kama variant.
     public fn FieldKey variant() {
         string what = "an enum";
         if (!this.usable(what: what)) { return FieldKey::Name(name: ""); }
-        string label = match (this.cells[this.current]) { case Text(text: t): copy t; case _: ""; };
-        bool isText = match (this.cells[this.current]) { case Text(text: t): true; case _: false; };
+        bool isText = match (this.cells[this.at()]) { case Text(text: t): true; case _: false; };
         if (!isText) { this.mismatch(what: what); return FieldKey::Name(name: ""); }
+        string label = match (this.cells[this.at()]) { case Text(text: t): copy t; case _: ""; };
+        this.advance();
         return FieldKey::Name(name: give label);
     }
+    // An array's elements, or a bytea's bytes.
     public fn void beginArray() {
         string what = "an array";
         if (!this.usable(what: what)) { return; }
-        bool isBytes = match (this.cells[this.current]) { case Bytes(bytes: b): true; case _: false; };
-        if (!isBytes) { this.mismatch(what: what); return; }
-        this.element = 0;
+        bool isBytes = match (this.cells[this.at()]) { case Bytes(bytes: b): true; case _: false; };
+        if (isBytes) {
+            this.bytesFrom = 1;
+            if (this.element >= 0) { this.bytesFrom = 2; this.bytesElement = this.element; }
+            this.byteAt = 0;
+            return;
+        }
+        isize first = match (this.cells[this.at()]) { case Elements(first: f, count: n, text: t): f; case _: -1; };
+        isize count = match (this.cells[this.at()]) { case Elements(first: f, count: n, text: t): n; case _: 0; };
+        if (first < 0) { this.mismatch(what: what); return; }
+        if (this.element >= 0) {
+            this.refuse(p: Problem::Shape, what: what, detail: "an array inside an array: this client reads arrays of one dimension", e: DeError::TypeMismatch);
+            return;
+        }
+        this.element = this.elementBase + first;
+        this.firstElement = this.elementBase + first;
+        this.endElement = this.elementBase + first + count;
     }
     public fn bool moreElems() {
-        if (this.err || this.element < 0) { return false; }
-        isize n = match (this.cells[this.current]) { case Bytes(bytes: b): b.length(); case _: 0; };
-        if (this.element < n) { return true; }
+        if (this.err) { return false; }
+        if (this.bytesFrom != 0) {
+            isize n = 0;
+            if (this.bytesFrom == 1) { n = match (this.cells[this.current]) { case Bytes(bytes: b): b.length(); case _: 0; }; }
+            else { n = match (this.cells[this.bytesElement]) { case Bytes(bytes: b): b.length(); case _: 0; }; }
+            if (this.byteAt < n) { return true; }
+            this.bytesFrom = 0;
+            this.advance();   // a bytea that was an element is read
+            return false;
+        }
+        if (this.element < 0) { return false; }
+        if (this.element < this.endElement) { return true; }
         this.element = -1;
         return false;
     }
@@ -288,16 +413,18 @@ type resource CellReader implements Deserializer {
     public fn int32 readI32() { string w = "int32"; return truncate<int32>(this.integer(maxBits: 32, what: w)); }
     public fn int64 readI64() {
         string w = "int64";
-        bool isOid = match (this.cells[this.current]) { case Oid(value: v): true; case _: false; };
+        bool isOid = match (this.cells[this.at()]) { case Oid(value: v): true; case _: false; };
         if (isOid) { return cast<int64>(this.oid(what: w)); }
         return this.integer(maxBits: 64, what: w);
     }
     public fn uint8 readU8() {
         string w = "uint8";
         if (this.err) { return 0ui8; }
-        if (this.element < 0) { this.mismatch(what: w); return 0ui8; }
-        uint8 b = match (this.cells[this.current]) { case Bytes(bytes: x): x[this.element]; case _: 0ui8; };
-        this.element = this.element + 1;
+        if (this.bytesFrom == 0) { this.mismatch(what: w); return 0ui8; }
+        uint8 b = 0ui8;
+        if (this.bytesFrom == 1) { b = match (this.cells[this.current]) { case Bytes(bytes: x): x[this.byteAt]; case _: 0ui8; }; }
+        else { b = match (this.cells[this.bytesElement]) { case Bytes(bytes: x): x[this.byteAt]; case _: 0ui8; }; }
+        this.byteAt = this.byteAt + 1;
         return b;
     }
     public fn uint16 readU16() { string w = "uint16"; this.mismatch(what: w); return 0ui16; }
@@ -308,38 +435,36 @@ type resource CellReader implements Deserializer {
     public fn bool readBool() {
         string w = "bool";
         if (!this.usable(what: w)) { return false; }
-        bool isBool = match (this.cells[this.current]) { case Boolean(value: v): true; case _: false; };
+        bool isBool = match (this.cells[this.at()]) { case Boolean(value: v): true; case _: false; };
         if (!isBool) { this.mismatch(what: w); return false; }
-        return match (this.cells[this.current]) { case Boolean(value: v): v; case _: false; };
+        bool v = match (this.cells[this.at()]) { case Boolean(value: x): x; case _: false; };
+        this.advance();
+        return v;
     }
     public fn char readChar() {
         string w = "char";
         if (!this.usable(what: w)) { return ' '; }
-        string text = match (this.cells[this.current]) { case Text(text: t): copy t; case _: ""; };
+        string text = match (this.cells[this.at()]) { case Text(text: t): copy t; case _: ""; };
         isize count = 0;
         char only = ' ';
         foreach (char c in text.chars()) { only = c; count = count + 1; }
         if (count != 1) { this.mismatch(what: w); return ' '; }
+        this.advance();
         return only;
     }
-    // Every column's value as PostgreSQL prints it.
+    // Every value as PostgreSQL prints it.
     public unsafe fn string readString() {
         string w = "string";
-        if (!this.usable(what: w)) { return ""; }
-        return match (this.cells[this.current]) {
-            case Integer(value: v, bits: b): "${v}";
-            case Oid(value: v): "${v}";
-            case Float(value: v, bits: b, text: t): { if (t.length() > 0) { return copy t; } := floatText(v: v, bits: b); }
-            case Boolean(value: v): formatBool(v: v);
-            case Text(text: t): copy t;
-            case Bytes(bytes: b): formatBytea(v: b.view());
-            case _: "";
-        };
+        bool opaque = match (this.cells[this.at()]) { case Opaque(text: t, why: y): true; case _: false; };
+        if (!opaque && !this.usable(what: w)) { return ""; }
+        string text = cellText(c: this.cells[this.at()]);
+        this.advance();
+        return text;
     }
     // NULL is an Optional's None. Asking does not consume the value: a non-NULL one is read next.
     public fn bool readNull() {
-        if (this.err || this.element >= 0) { return false; }
-        return match (this.cells[this.current]) { case Null: true; case _: false; };
+        if (this.err || this.bytesFrom != 0) { return false; }
+        return match (this.cells[this.at()]) { case Null: true; case _: false; };
     }
     // A column no field asked for.
     public fn void skipValue() { if (this.whole) { this.taken = this.taken - 1; } }
@@ -351,8 +476,10 @@ type resource CellReader implements Deserializer {
     public fn void failWith(DeError e) {
         if (this.err) { return; }
         string w = "this type";
-        // A type's own deserialize refused the text it was given (Uuid, Timestamp, Numeric, …).
-        string text = match (this.cells[this.current]) { case Text(text: t): copy t; case _: ""; };
+        // A type's own deserialize refused the text it was given (Uuid, Timestamp, Numeric, …). That value was
+        // read, so it is the one before the next.
+        if (this.element > this.firstElement) { this.element = this.element - 1; }
+        string text = match (this.cells[this.at()]) { case Text(text: t): copy t; case _: ""; };
         this.refuse(p: Problem::Undecodable, what: w, detail: "\"".concat(other: text).concat(other: "\" is not a value of the type read"), e: e);
     }
     public const fn DeError errorCode() { return this.code; }
@@ -373,10 +500,14 @@ fn PgError readFailure(const ref CellReader r, const ref Rows rows, isize index,
     isize at = index;
     if (index < 0) { at = r.failedAt(); }
     string where = describeColumn(rows: rows, index: at);
+    isize element = r.failedIndex();
+    if (element >= 0) { where = where.concat(other: " at index ${element}"); }
     string asked = copy r.askedFor();
+    string nullAdvice = " is not Optional: read it with columnOpt, or into an Optional field";
+    if (element >= 0) { nullAdvice = ": an element of a DynamicArray cannot be NULL"; }
     string detail = match (r.trouble()) {
         case Mismatch: where.concat(other: " cannot be read as ").concat(other: asked);
-        case IsNull: where.concat(other: " is NULL, and ").concat(other: asked).concat(other: " is not Optional: read it with columnOpt, or into an Optional field");
+        case IsNull: { if (element >= 0) { return PgError::Value(detail: where.concat(other: " is NULL").concat(other: nullAdvice)); } := where.concat(other: " is NULL, and ").concat(other: asked).concat(other: nullAdvice); }
         case Undecodable: where.concat(other: ": ").concat(other: r.reason());
         case Shape: where.concat(other: ": ").concat(other: r.reason());
         case Missing: {
@@ -393,13 +524,16 @@ fn PgError readFailure(const ref CellReader r, const ref Rows rows, isize index,
 // holds where one to a generic function would not (KPG-28).
 unsafe fn CellReader valueReader(const ref Rows rows, isize row, isize index) {
     DynamicArray<Cell> cells = DynamicArray.empty();
-    cells.add(item: decodeCell(f: rows.field(index: index), raw: rows.values(row: row).value(column: index), isNull: rows.isNull(row: row, column: index)));
-    return CellReader.make(cells: give cells, labels: DynamicArray.empty(), whole: false);
+    DynamicArray<Cell> elements = DynamicArray.empty();
+    cells.add(item: decodeColumn(elements: ref elements, oid: rows.field(index: index).typeOid(), format: rows.field(index: index).format(),
+                                 raw: rows.values(row: row).value(column: index), isNull: rows.isNull(row: row, column: index)));
+    return CellReader.make(cells: give cells, elements: give elements, labels: DynamicArray.empty(), whole: false);
 }
 
 // The reader for a whole row, or the error for a row whose columns do not have distinct names.
 unsafe fn Result<CellReader, PgError> rowReader(const ref Rows rows, isize row) {
     DynamicArray<Cell> cells = DynamicArray.withCapacity(capacity: rows.columnCount());
+    DynamicArray<Cell> elements = DynamicArray.empty();
     DynamicArray<string> labels = DynamicArray.withCapacity(capacity: rows.columnCount());
     isize c = 0;
     while (c < rows.columnCount()) {
@@ -411,11 +545,12 @@ unsafe fn Result<CellReader, PgError> rowReader(const ref Rows rows, isize row) 
             }
             earlier = earlier + 1;
         }
-        cells.add(item: decodeCell(f: rows.field(index: c), raw: rows.values(row: row).value(column: c), isNull: rows.isNull(row: row, column: c)));
+        cells.add(item: decodeColumn(elements: ref elements, oid: rows.field(index: c).typeOid(), format: rows.field(index: c).format(),
+                                     raw: rows.values(row: row).value(column: c), isNull: rows.isNull(row: row, column: c)));
         labels.add(item: copy rows.field(index: c).name());
         c = c + 1;
     }
-    return Result::Ok(value: CellReader.make(cells: give cells, labels: give labels, whole: true));
+    return Result::Ok(value: CellReader.make(cells: give cells, elements: give elements, labels: give labels, whole: true));
 }
 
 // The value of column `index` of row `row`, as T: libpq's PQgetvalue, typed. NULL is an error: read a column that

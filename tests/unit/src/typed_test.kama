@@ -16,11 +16,31 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::
          postgres::types::JSONB, postgres::types::BYTEA, postgres::types::UUID, postgres::types::DATE,
          postgres::types::TIME, postgres::types::TIMETZ, postgres::types::TIMESTAMP,
          postgres::types::TIMESTAMPTZ, postgres::types::INTERVAL, postgres::types::NUMERIC,
+         postgres::types::INT4_ARRAY, postgres::types::INT2_ARRAY, postgres::types::INT8_ARRAY,
+         postgres::types::TEXT_ARRAY, postgres::types::BOOL_ARRAY, postgres::types::FLOAT8_ARRAY,
+         postgres::types::UUID_ARRAY, postgres::types::DATE_ARRAY, postgres::types::TIMESTAMPTZ_ARRAY,
+         postgres::types::NUMERIC_ARRAY, postgres::types::BYTEA_ARRAY, postgres::types::JSONB_ARRAY,
          postgres_unit_tests::check, postgres_unit_tests::unhex,
          postgres_unit_tests::codecTypes, postgres_unit_tests::codecTexts, postgres_unit_tests::codecBinaries };
 export { typedTests };
 
 fn uint32 oidOf(const ref string type) {
+    if (type.endsWith(suffix: "[]")) {
+        string element = type.substring(start: 0, end: type.length() - 2);
+        if (element.equals(other: "int4")) { return INT4_ARRAY; }
+        if (element.equals(other: "int2")) { return INT2_ARRAY; }
+        if (element.equals(other: "int8")) { return INT8_ARRAY; }
+        if (element.equals(other: "text")) { return TEXT_ARRAY; }
+        if (element.equals(other: "bool")) { return BOOL_ARRAY; }
+        if (element.equals(other: "float8")) { return FLOAT8_ARRAY; }
+        if (element.equals(other: "uuid")) { return UUID_ARRAY; }
+        if (element.equals(other: "date")) { return DATE_ARRAY; }
+        if (element.equals(other: "timestamptz")) { return TIMESTAMPTZ_ARRAY; }
+        if (element.equals(other: "numeric")) { return NUMERIC_ARRAY; }
+        if (element.equals(other: "bytea")) { return BYTEA_ARRAY; }
+        if (element.equals(other: "jsonb")) { return JSONB_ARRAY; }
+        panic(msg: "typed test: no OID for a vector array type");
+    }
     if (type.equals(other: "bool")) { return BOOL; }
     if (type.equals(other: "int2")) { return INT2; }
     if (type.equals(other: "int4")) { return INT4; }
@@ -111,6 +131,10 @@ unsafe fn int32 textTests() {
         Result<string, PgError> b = column::<string>(rows: fromBinary, row: 0, index: 0);
         string gotBinary = match (give b) { case Ok(value: s): give s; case Err(error: e): e.message(); };
         bool same = gotBinary.equals(other: text);
+        if (text.startsWith(prefix: "{{")) {
+            // An array of two dimensions in binary has no text here: the refusal says why.
+            same = gotBinary.equals(other: "column 0 (\"v\", _int4): unsupported array: an array of 2 dimensions; this client reads one");
+        }
         if (!same && (type.equals(other: "float4") || type.equals(other: "float8"))) {
             // KPG-27: the same number, in 17 (or 9) digits rather than PostgreSQL's shortest.
             Result<float64, ParseError> want = parse::<float64>(s: text);
@@ -178,6 +202,23 @@ unsafe fn int32 nativeTests() {
             Result<Date, PgError> a = column::<Date>(rows: rt, row: 0, index: 0);
             Result<Date, PgError> b = column::<Date>(rows: rb, row: 0, index: 0);
             f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.unixDays() == y.unixDays(); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "int4[]") && !text.startsWith(prefix: "{{") && !text.contains(substring: "NULL")) {
+            Result<DynamicArray<int32>, PgError> a = column::<DynamicArray<int32>>(rows: rt, row: 0, index: 0);
+            Result<DynamicArray<int32>, PgError> b = column::<DynamicArray<int32>>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): sameInts(a: x, b: y) && intsText(v: x, text: text); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "text[]")) {
+            Result<DynamicArray<string>, PgError> a = column::<DynamicArray<string>>(rows: rt, row: 0, index: 0);
+            Result<DynamicArray<string>, PgError> b = column::<DynamicArray<string>>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): sameStrings(a: x, b: y) && x.length() > 0; case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
+        } else if (type.equals(other: "bytea[]")) {
+            Result<DynamicArray<DynamicArray<uint8>>, PgError> a = column::<DynamicArray<DynamicArray<uint8>>>(rows: rt, row: 0, index: 0);
+            Result<DynamicArray<DynamicArray<uint8>>, PgError> b = column::<DynamicArray<DynamicArray<uint8>>>(rows: rb, row: 0, index: 0);
+            bool same = match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.length() == 2 && y.length() == 2 && sameBytes(a: x[0].view(), b: y[0].view()) && x[0].length() == 2 && x[1].length() == 0 && y[1].length() == 0; case Err(error: e): false; }; case Err(error: e): false; };
+            f = f + check(ok: same, what: copy what);
+        } else if (type.equals(other: "uuid[]")) {
+            Result<DynamicArray<Uuid>, PgError> a = column::<DynamicArray<Uuid>>(rows: rt, row: 0, index: 0);
+            Result<DynamicArray<Uuid>, PgError> b = column::<DynamicArray<Uuid>>(rows: rb, row: 0, index: 0);
+            f = f + check(ok: match (a) { case Ok(value: x): match (b) { case Ok(value: y): x.length() == 1 && y.length() == 1 && "${x[0]}".equals(other: "${y[0]}"); case Err(error: e): false; }; case Err(error: e): false; }, what: copy what);
         } else if (type.equals(other: "numeric")) {
             Result<Numeric, PgError> a = column::<Numeric>(rows: rt, row: 0, index: 0);
             Result<Numeric, PgError> b = column::<Numeric>(rows: rb, row: 0, index: 0);
@@ -206,6 +247,28 @@ unsafe fn int32 nativeTests() {
         i = i + 1;
     }
     return f;
+}
+
+fn bool sameInts(const ref DynamicArray<int32> a, const ref DynamicArray<int32> b) {
+    if (a.length() != b.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) { if (a[i] != b[i]) { return false; } i = i + 1; }
+    return true;
+}
+
+fn bool sameStrings(const ref DynamicArray<string> a, const ref DynamicArray<string> b) {
+    if (a.length() != b.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) { if (!a[i].equals(other: b[i])) { return false; } i = i + 1; }
+    return true;
+}
+
+// The elements, as the server's text writes them ({1,2,3}, [0:1]={5,6}, {}).
+fn bool intsText(const ref DynamicArray<int32> v, const ref string text) {
+    string inner = "";
+    isize i = 0;
+    while (i < v.length()) { int32 x = v[i]; if (i > 0) { inner = inner.concat(other: ","); } inner = inner.concat(other: "${x}"); i = i + 1; }
+    return text.endsWith(suffix: "{".concat(other: inner).concat(other: "}"));
 }
 
 fn bool sameBytes(ConstView<uint8> a, ConstView<uint8> b) {

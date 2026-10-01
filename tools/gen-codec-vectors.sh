@@ -121,6 +121,23 @@ numeric|1.0000
 numeric|NaN
 numeric|Infinity
 numeric|-Infinity
+int4[]|{1,2,3}
+int4[]|{}
+int4[]|[0:1]={5,6}
+int4[]|{1,NULL,3}
+int4[]|{{1,2},{3,4}}
+int2[]|{-1,32767}
+int8[]|{-9223372036854775808,9223372036854775807}
+text[]|{a,"b c","d,e","q\"uote","back\\slash","","NULL",x}
+text[]|{"{brace}", spaced , "two  spaces"}
+bool[]|{t,f}
+float8[]|{0.5,Infinity,NaN}
+uuid[]|{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}
+date[]|{2000-01-01,infinity}
+timestamptz[]|{"2026-09-30 12:34:56+00"}
+numeric[]|{1.5,NaN}
+bytea[]|{"\\x00ff","\\x"}
+jsonb[]|{"{\"a\": 1}"}
 EOF
 
 # The send function of each type (pg_type.typsend). It cannot be called through a variable in plain SQL, so it is
@@ -133,6 +150,7 @@ sendfn() {
         uuid) echo uuid_send ;; json) echo json_send ;; jsonb) echo jsonb_send ;; date) echo date_send ;;
         time) echo time_send ;; timetz) echo timetz_send ;; timestamp) echo timestamp_send ;;
         timestamptz) echo timestamptz_send ;; interval) echo interval_send ;; numeric) echo numeric_send ;;
+        *'[]') echo array_send ;;
         *) echo "gen-codec-vectors: no send function known for $1" >&2; exit 1 ;;
     esac
 }

@@ -20,6 +20,7 @@ changes the right design here, say so and we will follow it.
 - KPG-24, found adopting KPG-15's fix (SASLprep).
 - KPG-25 and KPG-26, found probing phase 5's typed parameters and rows.
 - KPG-27 and KPG-28, found building phase 5's typed rows.
+- KPG-29, found building phase 5's arrays.
 
 Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
@@ -31,6 +32,59 @@ Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below
 ---
 
 ## OPEN
+
+### KPG-29 · HIGH · Matching on a method's `const ref` result destroys the value it refers to (a double free in safe code)
+
+**Status:** open. Reproduces on 0.9.506.
+
+`match (this.slot())`, where `slot()` returns `const ref Cell` (an element of a field), makes the match subject a
+bitwise copy of the referent (`Cell kama_msubj = (*Holder__slot(self));`). When an arm binds a payload, it then
+emits `Cell__dtor(&kama_msubj)` after the match, which frees the heap the referent still owns. Nothing here is
+`unsafe`, and `kama check` is clean.
+
+```kama
+import { core::println, std::collections::DynamicArray };
+type enum Cell { Empty, Text(string text) }
+type resource Holder {
+    DynamicArray<Cell> cells;
+    public ctor make() {
+        this.cells = DynamicArray.empty();
+        string built = "hel".concat(other: "lo");   // on the heap, unlike a literal
+        this.cells.add(item: Cell::Text(text: give built));
+    }
+    const fn const ref Cell slot() { return this.cells[0]; }
+    public fn string copied() {
+        string s = match (this.slot()) { case Text(text: t): copy t; case _: ""; };
+        return s;
+    }
+}
+fn int32 main() {
+    Holder h = Holder.make();
+    string a = h.copied();
+    string b = h.copied();
+    println(s: a.concat(other: " ").concat(other: b));
+    return 0;
+}
+```
+
+```
+$ kama build refmatch3.kama && ./refmatch3; echo "exit=$?"
+hello hello
+exit=133
+```
+
+In the package, the second read through the same reader was `malloc: pointer being freed was not allocated`.
+With a literal payload (`"hello"`, not on the heap) the program happens to survive. `match (this.cells[0])`,
+an index expression rather than a call, emits no destructor and is correct.
+
+**Why it matters here.** The row reader serves a column or an array element through one accessor, and matched on
+it in every read.
+
+**Workaround here.** `src/decode.kama`'s `CellReader` keeps columns and array elements in one list and matches
+`this.cells[this.at()]`, an index. Its comment names this gap.
+
+**Suggested fix.** A `const ref` result is a borrow: match on it in place (`Cell* kama_msub = Holder__slot(self)`),
+and never destroy it.
 
 ### KPG-25 · HIGH · A string tag's holes lose their type, so an `Optional` hole is sent as the text "None"
 

@@ -1,0 +1,103 @@
+// What every live test shares: connection strings for the test server, a hermetic environment, a log sink that
+// counts what the client logs, and a notice handler that hands notices back to the test.
+import { std::collections::DynamicArray, std::concurrent::Sender, std::concurrent::SendResult, std::fs::writeText,
+         std::fs::setPermissions, std::fs::Permissions, std::io::IoError,
+         postgres::Config, postgres::Connection, postgres::PgError, postgres::Environment, postgres::SimpleResult,
+         postgres::NoticeHandler, postgres::ServerError, postgres::conninfo::ConnInfo,
+         postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
+         postgres_integration_tests::setting };
+export { conninfoFor, passwordFor, quietEnvironment, openWith, open, scalar, writePrivate, writeShared, capture,
+         warningsLogged, infosLogged, NoticeCollector, scratchDir };
+
+// The connection string for `user` on the test server, over plain TCP (TLS arrives in phase 6).
+unsafe fn string conninfoFor(const ref string user) {
+    string host = setting(name: "PGTEST_HOST");
+    string port = setting(name: "PGTEST_PORT");
+    string db = setting(name: "PGTEST_DATABASE");
+    return "host=".concat(other: host).concat(other: " port=").concat(other: port).concat(other: " dbname=").concat(other: db)
+        .concat(other: " sslmode=disable user=").concat(other: user);
+}
+
+// The test password of each role (tools/pg.sh writes them into the environment file).
+unsafe fn string passwordFor(const ref string user) {
+    if (user.equals(other: "kp_password")) { return setting(name: "PGTEST_PASSWORD_PASSWORD"); }
+    if (user.equals(other: "kp_md5")) { return setting(name: "PGTEST_MD5_PASSWORD"); }
+    if (user.equals(other: "kp_md5_scram")) { return setting(name: "PGTEST_MD5_SCRAM_PASSWORD"); }
+    if (user.equals(other: "kp_scram")) { return setting(name: "PGTEST_SCRAM_PASSWORD"); }
+    if (user.equals(other: "kp_ssl_only")) { return setting(name: "PGTEST_SSL_ONLY_PASSWORD"); }
+    if (user.equals(other: "kp_nossl")) { return setting(name: "PGTEST_NOSSL_PASSWORD"); }
+    return "";
+}
+
+// A directory of the test's own, for password and service files.
+unsafe fn string scratchDir() { return setting(name: "PGTEST_TMP"); }
+
+// An environment with nothing in it but a home directory that holds no .pgpass or .pg_service.conf, so the
+// developer's own settings cannot leak into a test.
+unsafe fn Environment quietEnvironment() {
+    Environment env = Environment.empty();
+    env.setUser(name: "kp_trust");
+    env.set(name: "HOME", value: scratchDir().concat(other: "/home"));
+    return env;
+}
+
+unsafe fn Result<Connection, PgError> openWith(const ref string conninfo, const ref Environment env) {
+    Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: conninfo);
+    ConnInfo info = match (give parsed) { case Ok(value: i): give i; case Err(error: e): { return Result::Err(error: PgError::Config(detail: e.message())); } };
+    Result<Config, PgError> c = Config.resolve(info: give info, environment: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    return Connection.connect(config: config);
+}
+
+unsafe fn Result<Connection, PgError> open(const ref string conninfo) {
+    Environment env = quietEnvironment();
+    return openWith(conninfo: conninfo, env: env);
+}
+
+// The first value of the first result as text ("NULL" for NULL), or the error's message.
+unsafe fn string scalar(ref Connection c, const ref string sql) {
+    Result<DynamicArray<SimpleResult>, PgError> r = c.simpleQuery(sql: sql);
+    DynamicArray<SimpleResult> rs = match (give r) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+    if (rs.length() == 0 || rs[0].rowCount() == 0) { return "(no rows)"; }
+    Optional<string> v = rs[0].text(row: 0, column: 0);
+    return match (give v) { case Some(value: t): give t; case None: "NULL"; };
+}
+
+// Write a file only its owner may read (0600), as a password file must be.
+unsafe fn bool writePrivate(const ref string path, const ref string text) {
+    Result<isize, IoError> w = writeText(path: path, text: text);
+    bool written = match (w) { case Ok(value: n): true; case Err(error: e): false; };
+    Result<Unit, IoError> p = setPermissions(path: path, permissions: Permissions::OwnerRead | Permissions::OwnerWrite);
+    bool permitted = match (p) { case Ok(value: u): true; case Err(error: e): false; };
+    return written && permitted;
+}
+
+// Write a file anyone may read (0644).
+unsafe fn bool writeShared(const ref string path, const ref string text) {
+    Result<isize, IoError> w = writeText(path: path, text: text);
+    bool written = match (w) { case Ok(value: n): true; case Err(error: e): false; };
+    Result<Unit, IoError> p = setPermissions(path: path, permissions: Permissions::OwnerRead | Permissions::OwnerWrite | Permissions::GroupRead | Permissions::OtherRead);
+    bool permitted = match (p) { case Ok(value: u): true; case Err(error: e): false; };
+    return written && permitted;
+}
+
+// The log sink, installed by main before anything logs. The client logs from the isolate that runs the
+// connection; these tests log from the main one, whose statics these are.
+static int32 warnings = 0;
+static int32 infos = 0;
+
+fn void capture(int32 level, string tag, string msg) {
+    if (!tag.equals(other: "postgres")) { return; }
+    if (level == 1) { warnings = warnings + 1; }
+    if (level == 2) { infos = infos + 1; }
+}
+
+fn int32 warningsLogged() { return warnings; }
+fn int32 infosLogged() { return infos; }
+
+// A notice handler that sends each notice's primary message to the test.
+type resource NoticeCollector implements NoticeHandler, Sendable {
+    Sender<string> sink;
+    public ctor make(Sender<string> sink) { this.sink = give sink; }
+    public unsafe fn void notice(const ref ServerError notice) { SendResult<string> r = this.sink.send(item: notice.primary()); }
+}

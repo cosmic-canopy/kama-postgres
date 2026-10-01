@@ -1,0 +1,292 @@
+// Connecting and authenticating, against a real server: every method, every refusal, require_auth as PostgreSQL's
+// own tests exercise it, channel binding without TLS, the password file, service files, and the environment.
+// Expected messages come from libpq (libpq_cases.kama, tools/gen-libpq-test-cases.sh), never typed here.
+import { std::collections::DynamicArray, std::fs::createDirAll, std::fs::remove, std::io::IoError,
+         postgres::Connection, postgres::PgError, postgres::Environment,
+         postgres::sqlstate::INVALID_PASSWORD, postgres::sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
+         postgres::sqlstate::INVALID_CATALOG_NAME,
+         postgres_integration_tests::check, postgres_integration_tests::setting,
+         postgres_integration_tests::conninfoFor, postgres_integration_tests::passwordFor,
+         postgres_integration_tests::quietEnvironment, postgres_integration_tests::openWith,
+         postgres_integration_tests::open, postgres_integration_tests::scalar,
+         postgres_integration_tests::writePrivate, postgres_integration_tests::writeShared,
+         postgres_integration_tests::warningsLogged, postgres_integration_tests::scratchDir,
+         postgres_integration_tests::requireAuthMethods, postgres_integration_tests::requireAuthSettings,
+         postgres_integration_tests::requireAuthConnects, postgres_integration_tests::requireAuthMessages,
+         postgres_integration_tests::serviceFileKinds, postgres_integration_tests::serviceSysconf,
+         postgres_integration_tests::serviceEnvSet, postgres_integration_tests::serviceEnvValues,
+         postgres_integration_tests::serviceConnstrs, postgres_integration_tests::serviceOutcomes,
+         postgres_integration_tests::servicePatterns, postgres_integration_tests::serviceValidFile,
+         postgres_integration_tests::settingStages, postgres_integration_tests::settingStrings,
+         postgres_integration_tests::settingAccepted, postgres_integration_tests::settingErrors };
+export { authTests, matches };
+
+// A message matched against one of upstream's patterns: literal text, where ".*" stands for anything.
+fn bool matches(const ref string text, const ref string pattern) {
+    isize from = 0;
+    foreach (string part in pattern.split(separator: ".*")) {
+        string rest = text.substring(start: from, end: text.length());
+        Optional<usize> at = rest.find(substring: part);
+        isize found = match (at) { case Some(value: i): cast<isize>(i); case None: -1; };
+        if (found < 0) { return false; }
+        from = from + found + part.length();
+    }
+    return true;
+}
+
+// Where the operating system's text starts in a libpq message: just past its last ": ".
+fn isize lastSeparator(const ref string text) {
+    isize cut = text.length();
+    isize from = 0;
+    bool more = true;
+    while (more) {
+        string rest = text.substring(start: from, end: text.length());
+        Optional<usize> at = rest.find(substring: ": ");
+        match (at) {
+            case Some(value: i): { cut = from + cast<isize>(i) + 2; from = cut; }
+            case None: { more = false; }
+        };
+    }
+    return cut;
+}
+
+// Connect, run one query, close: the error's message, or "".
+unsafe fn string attempt(const ref string conninfo, const ref Environment env) {
+    Result<Connection, PgError> r = openWith(conninfo: conninfo, env: env);
+    Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+    string one = scalar(c: c, sql: "select 1");
+    c.close();
+    if (!one.equals(other: "1")) { return "query failed: ".concat(other: one); }
+    return "";
+}
+
+unsafe fn int32 loginTests() {
+    int32 f = 0;
+    DynamicArray<string> users = DynamicArray.empty();
+    users.add(item: "kp_trust"); users.add(item: "kp_password"); users.add(item: "kp_md5"); users.add(item: "kp_scram");
+    users.add(item: "kp_md5_scram"); users.add(item: "kp_nossl");
+    isize i = 0;
+    while (i < users.length()) {
+        string conninfo = conninfoFor(user: users[i]);
+        string pw = passwordFor(user: users[i]);
+        if (pw.length() > 0) { conninfo = conninfo.concat(other: " password=").concat(other: pw); }
+        Result<Connection, PgError> r = open(conninfo: conninfo);
+        match (give r) {
+            case Ok(value: c): {
+                string who = scalar(c: c, sql: "select current_user");
+                f = f + check(ok: who.equals(other: users[i]), what: "login: ".concat(other: users[i]).concat(other: " connects (got ").concat(other: who).concat(other: ")"));
+                c.close();
+            }
+            case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "login: ".concat(other: users[i]).concat(other: ": ").concat(other: m)); }
+        };
+        if (pw.length() > 0) {
+            // The wrong password: the server's refusal, as psql prints it.
+            Result<Connection, PgError> wrong = open(conninfo: conninfoFor(user: users[i]).concat(other: " password=wrong"));
+            match (give wrong) {
+                case Ok(value: c): { f = f + check(ok: false, what: "login: ".concat(other: users[i]).concat(other: " with a wrong password connects")); }
+                case Err(error: e): {
+                    string m = e.message();
+                    string port = setting(name: "PGTEST_PORT");
+                    string want = "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: FATAL:  password authentication failed for user \"").concat(other: users[i]).concat(other: "\"");
+                    f = f + check(ok: e.sqlstate() == INVALID_PASSWORD && m.equals(other: want), what: "login: ".concat(other: users[i]).concat(other: ", wrong password: ").concat(other: m));
+                }
+            };
+            // No password at all: libpq's message, without asking the server twice.
+            Environment env = quietEnvironment();
+            string none = attempt(conninfo: conninfoFor(user: users[i]), env: env);
+            f = f + check(ok: none.contains(substring: "fe_sendauth: no password supplied"), what: "login: ".concat(other: users[i]).concat(other: " without a password: ").concat(other: none));
+        }
+        i = i + 1;
+    }
+    Environment env = quietEnvironment();
+    Result<Connection, PgError> ssl = openWith(conninfo: conninfoFor(user: "kp_ssl_only").concat(other: " password=").concat(other: passwordFor(user: "kp_ssl_only")), env: env);
+    f = f + check(ok: match (ssl) { case Ok(value: c): false; case Err(error: e): e.sqlstate() == INVALID_AUTHORIZATION_SPECIFICATION; }, what: "login: a hostssl-only role is refused over plain TCP (28000)");
+    Result<Connection, PgError> cert = openWith(conninfo: conninfoFor(user: "kp_cert"), env: env);
+    f = f + check(ok: match (cert) { case Ok(value: c): false; case Err(error: e): e.sqlstate() == INVALID_AUTHORIZATION_SPECIFICATION; }, what: "login: a certificate role is refused without TLS (28000)");
+    Result<Connection, PgError> nodb = openWith(conninfo: conninfoFor(user: "kp_trust").concat(other: " dbname=kp_no_such_db"), env: env);
+    f = f + check(ok: match (nodb) { case Ok(value: c): false; case Err(error: e): e.sqlstate() == INVALID_CATALOG_NAME; }, what: "login: an unknown database is 3D000");
+    return f;
+}
+
+// PostgreSQL's require_auth cases, each as the role standing for its pg_hba method.
+unsafe fn int32 requireAuthTests() {
+    int32 f = 0;
+    DynamicArray<string> methods = requireAuthMethods();
+    DynamicArray<string> settings = requireAuthSettings();
+    DynamicArray<bool> connects = requireAuthConnects();
+    DynamicArray<string> messages = requireAuthMessages();
+    Environment env = quietEnvironment();
+    isize i = 0;
+    while (i < methods.length()) {
+        string role = "kp_trust";
+        if (methods[i].equals(other: "password")) { role = "kp_password"; }
+        if (methods[i].equals(other: "scram-sha-256")) { role = "kp_scram"; }
+        if (methods[i].equals(other: "md5")) { role = "kp_md5_scram"; }
+        string conninfo = conninfoFor(user: role);
+        string pw = passwordFor(user: role);
+        if (pw.length() > 0) { conninfo = conninfo.concat(other: " password=").concat(other: pw); }
+        conninfo = conninfo.concat(other: " ").concat(other: settings[i]);
+        string got = attempt(conninfo: conninfo, env: env);
+        bool ok = false;
+        if (connects[i]) { ok = got.length() == 0; } else { ok = got.length() > 0 && got.contains(substring: messages[i]); }
+        f = f + check(ok: ok, what: "require_auth: ".concat(other: methods[i]).concat(other: " ").concat(other: settings[i]).concat(other: ": ").concat(other: got));
+        i = i + 1;
+    }
+    return f;
+}
+
+// channel_binding=require cannot be met without TLS: libpq's two refusals.
+unsafe fn int32 channelBindingTests() {
+    int32 f = 0;
+    Environment env = quietEnvironment();
+    string clear = attempt(conninfo: conninfoFor(user: "kp_password").concat(other: " channel_binding=require password=").concat(other: passwordFor(user: "kp_password")), env: env);
+    f = f + check(ok: clear.contains(substring: "channel binding required but not supported by server's authentication request"), what: "channel binding: a cleartext request is refused: ".concat(other: clear));
+    string scram = attempt(conninfo: conninfoFor(user: "kp_scram").concat(other: " channel_binding=require password=").concat(other: passwordFor(user: "kp_scram")), env: env);
+    f = f + check(ok: scram.contains(substring: "channel binding required, but SSL not in use"), what: "channel binding: SCRAM without TLS is refused: ".concat(other: scram));
+    return f;
+}
+
+unsafe fn int32 passfileTests() {
+    int32 f = 0;
+    string dir = scratchDir();
+    string port = setting(name: "PGTEST_PORT");
+    string line = "127.0.0.1:".concat(other: port).concat(other: ":kp_test:kp_scram:");
+    string good = dir.concat(other: "/pgpass_good");
+    string wrong = dir.concat(other: "/pgpass_wrong");
+    string readable = dir.concat(other: "/pgpass_open");
+    bool written = writePrivate(path: good, text: line.concat(other: passwordFor(user: "kp_scram")).concat(other: "\n"))
+        && writePrivate(path: wrong, text: line.concat(other: "not_the_password\n"))
+        && writeShared(path: readable, text: line.concat(other: passwordFor(user: "kp_scram")).concat(other: "\n"));
+    f = f + check(ok: written, what: "pgpass: write the test files");
+
+    Environment env = quietEnvironment();
+    env.set(name: "PGPASSFILE", value: copy good);
+    string ok = attempt(conninfo: conninfoFor(user: "kp_scram"), env: env);
+    f = f + check(ok: ok.length() == 0, what: "pgpass: the password comes from PGPASSFILE: ".concat(other: ok));
+
+    env.set(name: "PGPASSFILE", value: copy wrong);
+    string bad = attempt(conninfo: conninfoFor(user: "kp_scram"), env: env);
+    f = f + check(ok: bad.contains(substring: "password authentication failed") && bad.contains(substring: "password retrieved from file \"".concat(other: wrong).concat(other: "\"")),
+                  what: "pgpass: a wrong password names the file it came from: ".concat(other: bad));
+
+    int32 before = warningsLogged();
+    env.set(name: "PGPASSFILE", value: copy readable);
+    string loose = attempt(conninfo: conninfoFor(user: "kp_scram"), env: env);
+    f = f + check(ok: loose.contains(substring: "fe_sendauth: no password supplied") && warningsLogged() == before + 1,
+                  what: "pgpass: a file others can read is ignored, with a warning: ".concat(other: loose));
+
+    Environment keyword = quietEnvironment();
+    string passfile = attempt(conninfo: conninfoFor(user: "kp_scram").concat(other: " passfile=").concat(other: good), env: keyword);
+    f = f + check(ok: passfile.length() == 0, what: "pgpass: the passfile keyword: ".concat(other: passfile));
+    return f;
+}
+
+// PostgreSQL's service-file scenarios (006_service.pl), as they ran there.
+unsafe fn int32 serviceTests() {
+    int32 f = 0;
+    string dir = scratchDir().concat(other: "/service");
+    string sysconf = dir.concat(other: "/sysconf");
+    Result<Unit, IoError> made = createDirAll(path: sysconf);
+    string valid = serviceValidFile()[0].replace(old: "@HOST@", with: setting(name: "PGTEST_HOST"))
+        .replace(old: "@PORT@", with: setting(name: "PGTEST_PORT")).replace(old: "@DATABASE@", with: setting(name: "PGTEST_DATABASE"))
+        .replace(old: "@USER@", with: "kp_trust");
+    string validPath = dir.concat(other: "/pg_service_valid.conf");
+    string emptyPath = dir.concat(other: "/pg_service_empty.conf");
+    string missingPath = dir.concat(other: "/pg_service_missing.conf");
+    string systemPath = sysconf.concat(other: "/pg_service.conf");
+    bool written = writeShared(path: validPath, text: valid) && writeShared(path: emptyPath, text: "");
+    f = f + check(ok: written, what: "service: write the test files");
+
+    DynamicArray<string> kinds = serviceFileKinds();
+    DynamicArray<bool> system = serviceSysconf();
+    DynamicArray<bool> envSet = serviceEnvSet();
+    DynamicArray<string> envValues = serviceEnvValues();
+    DynamicArray<string> connstrs = serviceConnstrs();
+    DynamicArray<bool> outcomes = serviceOutcomes();
+    DynamicArray<string> patterns = servicePatterns();
+    isize i = 0;
+    while (i < kinds.length()) {
+        if (system[i]) { bool w = writeShared(path: systemPath, text: valid); }
+        else { Result<Unit, IoError> gone = remove(path: systemPath); }
+        Environment env = quietEnvironment();
+        env.set(name: "PGSYSCONFDIR", value: copy sysconf);
+        env.set(name: "PGSSLMODE", value: "disable");
+        if (kinds[i].equals(other: "valid")) { env.set(name: "PGSERVICEFILE", value: copy validPath); }
+        if (kinds[i].equals(other: "empty")) { env.set(name: "PGSERVICEFILE", value: copy emptyPath); }
+        if (kinds[i].equals(other: "missing")) { env.set(name: "PGSERVICEFILE", value: copy missingPath); }
+        if (envSet[i]) { env.set(name: "PGSERVICE", value: copy envValues[i]); }
+        string got = attempt(conninfo: connstrs[i], env: env);
+        bool ok = false;
+        if (outcomes[i]) { ok = got.length() == 0; } else { ok = matches(text: got, pattern: patterns[i]); }
+        f = f + check(ok: ok, what: "service: 006_service.pl case ${i} (\"".concat(other: connstrs[i]).concat(other: "\", PGSERVICEFILE ").concat(other: kinds[i]).concat(other: "): ").concat(other: got));
+        i = i + 1;
+    }
+    Result<Unit, IoError> cleared = remove(path: systemPath);
+    return f;
+}
+
+// Settings libpq checks host by host, with its verdicts.
+unsafe fn int32 settingTests() {
+    int32 f = 0;
+    DynamicArray<string> stages = settingStages();
+    DynamicArray<string> settings = settingStrings();
+    DynamicArray<bool> accepted = settingAccepted();
+    DynamicArray<string> errors = settingErrors();
+    Environment env = quietEnvironment();
+    isize i = 0;
+    while (i < settings.length()) {
+        if (stages[i].equals(other: "connect")) {
+            string got = attempt(conninfo: conninfoFor(user: "kp_trust").concat(other: " ").concat(other: settings[i]), env: env);
+            string want = copy errors[i];
+            // What follows the name is the operating system's resolver text, which differs between libcs.
+            if (want.startsWith(prefix: "could not translate host name") || want.startsWith(prefix: "could not parse network address")) {
+                want = want.substring(start: 0, end: lastSeparator(text: want));
+                f = f + check(ok: got.startsWith(prefix: want), what: "settings: \"".concat(other: settings[i]).concat(other: "\": ").concat(other: got));
+            } else {
+                f = f + check(ok: got.equals(other: want), what: "settings: \"".concat(other: settings[i]).concat(other: "\": want \"").concat(other: want).concat(other: "\", got \"").concat(other: got).concat(other: "\""));
+            }
+        }
+        i = i + 1;
+    }
+    return f;
+}
+
+// The environment reaches the server: application name, options, and libpq's run-time settings.
+unsafe fn int32 environmentTests() {
+    int32 f = 0;
+    Environment env = quietEnvironment();
+    env.set(name: "PGAPPNAME", value: "kp_env_app");
+    env.set(name: "PGOPTIONS", value: "-c search_path=kp_env_path");
+    env.set(name: "PGTZ", value: "Pacific/Auckland");
+    env.set(name: "PGDATESTYLE", value: "SQL, DMY");
+    Result<Connection, PgError> r = openWith(conninfo: conninfoFor(user: "kp_trust"), env: env);
+    match (give r) {
+        case Ok(value: c): {
+            string app = scalar(c: c, sql: "select current_setting('application_name')");
+            string path = scalar(c: c, sql: "select current_setting('search_path')");
+            string tz = scalar(c: c, sql: "select current_setting('TimeZone')");
+            string style = scalar(c: c, sql: "select current_setting('DateStyle')");
+            f = f + check(ok: app.equals(other: "kp_env_app"), what: "environment: PGAPPNAME is application_name: ".concat(other: app));
+            f = f + check(ok: path.equals(other: "kp_env_path"), what: "environment: PGOPTIONS reaches the server: ".concat(other: path));
+            f = f + check(ok: tz.equals(other: "Pacific/Auckland"), what: "environment: PGTZ is the time zone: ".concat(other: tz));
+            f = f + check(ok: style.equals(other: "SQL, DMY"), what: "environment: PGDATESTYLE is the date style: ".concat(other: style));
+            Optional<string> reported = c.parameter(name: "application_name");
+            f = f + check(ok: match (reported) { case Some(value: v): v.equals(other: "kp_env_app"); case None: false; }, what: "environment: the server reported application_name");
+            c.close();
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "environment: connect: ".concat(other: m)); }
+    };
+    return f;
+}
+
+unsafe fn int32 authTests() {
+    int32 f = 0;
+    f = f + loginTests();
+    f = f + requireAuthTests();
+    f = f + channelBindingTests();
+    f = f + passfileTests();
+    f = f + serviceTests();
+    f = f + settingTests();
+    f = f + environmentTests();
+    return f;
+}

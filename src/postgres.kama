@@ -2,7 +2,12 @@
 // std::net; there is no libpq and nothing to install. TLS comes from @kama/tls.
 //
 // The shape of the package, as it fills in:
-//   postgres            Connection, Config, Query and the `pg"…"` tag, Row and `column::<T>`, PgError
+//   postgres            Config and Environment (resolved as libpq resolves them), Connection, SimpleResult,
+//                       PgError and ServerError, NoticeHandler, Transport; later the `pg"…"` tag, Row and
+//                       `column::<T>`
+//   postgres::conninfo  connection strings, the password file and the service file, as libpq reads them
+//   postgres::protocol  the v3 wire protocol as data, for a proxy, a pooler or a test harness
+//   postgres::sqlstate  every SQLSTATE, as packed integer constants
 //   postgres::types     the value types PostgreSQL has and kama's std does not (Numeric, Interval, Inet, …)
 //   postgres::pool      a connection pool shared by isolates
 //
@@ -11,4 +16,7 @@
 //     validated as UTF-8, and a malformed message is `PgError::Protocol`, never a panic.
 //   - A data error is a `Result`; a contract violation (a column index out of range) panics, exactly
 //     like an index out of range on a collection.
-//   - Blocking I/O with deadlines. A connection belongs to one isolate at a time and moves between them.
+//   - Blocking calls over a non-blocking socket, each step bounded by a deadline (libpq's design). A connection
+//     belongs to one isolate at a time and moves between them.
+//   - Every libpq setting is honoured, or refused with a clear error; none is silently ignored. Messages are
+//     libpq's, word for word, wherever libpq has one.

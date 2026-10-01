@@ -17,7 +17,7 @@ changes the right design here, say so and we will follow it.
 
 **Open now:**
 - KPG-11 to KPG-14, found building the protocol and type layers.
-- KPG-15 to KPG-19, found planning and building the first live connection (phase 4).
+- KPG-15 to KPG-20, found planning and building the first live connection (phase 4).
 
 Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
@@ -173,6 +173,46 @@ anyway.
 
 **Suggested fix.** Resolve a field's default initializer in the scope of the type that declares it, wherever the
 type is instantiated.
+
+### KPG-20 · MED · `kama check` accepts `Optional<E> x = <an E>` for a user enum, and clang rejects it
+
+**Status:** open. Reproduces on 0.9.490.
+
+The checker types by kind. Assigning a plain enum value to a local declared `Optional` of that enum passes the
+check, because both sides are enums. `kama build` then fails in clang, with the mangled C names and nothing that
+points at the kama line's mistake. A number is caught (`a local is declared 'Optional', so it cannot be
+initialized with a number`), so this is specific to enum, and resource, element types.
+
+```kama
+import { core::println, std::collections::DynamicArray };
+type enum Step { Go(int32 n), Stop }
+fn int32 main() {
+    DynamicArray<Step> xs = DynamicArray.empty();
+    xs.add(item: Step::Go(n: 7));
+    Optional<Step> first = xs.remove(index: 0);     // remove returns Step, not Optional<Step>
+    int32 v = match (first) { case Some(value: x): 1; case None: -1; };
+    println(s: "${v}");
+    return 0;
+}
+```
+
+```
+$ kama check g.kama
+kama: g.kama OK (4 units analyzed)
+$ kama build g.kama
+g.kama:6:13: error: assigning to 'kama__Optional_k_Fg__Step' (aka 'struct kama__Optional_k_Fg__Step') from
+incompatible type 'k_Fg__Step' (aka 'struct k_Fg__Step')
+```
+
+The same happens with a resource payload (`Go(string n)`).
+
+**Impact.** It cost a build round in this package's test fake server. `remove` and `pop` are easy to confuse,
+since one returns `T` and the other `Optional<T>`.
+
+**Workaround here.** None needed: the code was wrong, and is fixed. The gap is that only clang said so.
+
+**Suggested fix.** Check `Optional<T>` against `T` (and `Result<T, E>` against its arms) by type, not only by
+kind, at every crossing.
 
 ### KPG-11 · MED · A generic-inference error is reported against the wrong file, and `kama query --diagnostics` misses it
 

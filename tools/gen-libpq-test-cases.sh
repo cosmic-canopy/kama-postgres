@@ -394,7 +394,8 @@ method to a role), the rest of its connection string, whether it connects, and t
 Service files: each scenario of 006_service.pl, as it ran: PGSERVICEFILE (unset, valid, empty or missing), the
 PGSYSCONFDIR file (valid or none), PGSERVICE (set or not, and its value), the connection string, the outcome, and
 libpq\x27s message as upstream\x27s pattern (\".*\" matches anything). The valid file\x27s @HOST@, @PORT@, @DATABASE@ and
-@USER@ stand for the test server." <<EOF
+@USER@ stand for the test server.
+Settings: as in tests/unit, and the ones libpq checks host by host are run here." <<EOF
 requireAuthMethods|$tmp/require_auth.tsv|0|string
 requireAuthSettings|$tmp/require_auth.tsv|1|string
 requireAuthConnects|$tmp/require_auth.tsv|2|bool
@@ -407,6 +408,10 @@ serviceConnstrs|$tmp/service_scenarios.tsv|4|string
 serviceOutcomes|$tmp/service_scenarios.tsv|5|bool
 servicePatterns|$tmp/service_scenarios.tsv|6|string
 serviceValidFile|$tmp/service_valid.tsv|1|string|hex
+settingStages|$tmp/settings_verdicts.tsv|0|string
+settingStrings|$tmp/settings_verdicts.tsv|1|string
+settingAccepted|$tmp/settings_verdicts.tsv|2|bool
+settingErrors|$tmp/settings_verdicts.tsv|3|string
 EOF
 
 echo "gen-libpq-test-cases: $(wc -l < "$tmp/require_auth.tsv" | tr -d ' ') require_auth cases (libpq agrees), $(wc -l < "$tmp/pgpass_upstream.tsv" | tr -d ' ')+$(wc -l < "$tmp/pgpass_verdicts.tsv" | tr -d ' ') .pgpass cases, $(wc -l < "$tmp/service_verdicts.tsv" | tr -d ' ') service files, $(wc -l < "$tmp/service_scenarios.tsv" | tr -d ' ') service scenarios, $(wc -l < "$tmp/settings_verdicts.tsv" | tr -d ' ') settings (PostgreSQL ${COMMIT%${COMMIT#????????}}, libpq $VERSION)"

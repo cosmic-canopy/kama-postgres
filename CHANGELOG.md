@@ -9,6 +9,9 @@ All notable changes to this package are recorded here. The format follows
 Needs **kama ≥ 0.9.486**.
 
 ### Changed
+- `postgres::protocol`: `AuthError` messages are libpq's. `NegotiateProtocolVersion` carries `newestVersion`,
+  the full version the server sends (it was misnamed `newestMinor`). `ProtocolError::Violation` covers a
+  well-formed message out of place. `MessageWriter` is `Sendable`.
 - **Licensed under MIT OR Apache-2.0**, at your option, like kama itself (`LICENSE-MIT`, `LICENSE-APACHE`).
   Copyright is Cosmic Canopy LLC and the kama contributors.
 
@@ -27,6 +30,44 @@ Needs **kama ≥ 0.9.486**.
   jsonb, bytea (hex and escape), uuid, date, time, timetz, timestamp (LocalDateTime), timestamptz, interval
   (IntervalStyle postgres), and numeric (exact; NaN and ±Infinity). Tested against 97 values a live PostgreSQL
   18 produced in both formats.
+- **Connections.**
+  - `Config` and `Environment`: a connection string resolved as libpq resolves it. The service file
+    (`pg_service.conf`) comes first, then the PG* environment, compiled defaults, the local user, and
+    `.pgpass` per host. Every setting is checked with libpq's messages.
+  - `require_auth` is libpq's, parse and enforcement.
+  - Until TLS lands, this client behaves as libpq built without SSL: `sslmode` require and above are refused
+    in libpq's words.
+  - `target_session_attrs`, `load_balance_hosts=random` and replication are refused, not ignored.
+- **`Connection`.**
+  - Each host and each address is tried in turn, `connect_timeout` per address, with TCP keepalive and
+    `tcp_user_timeout`.
+  - Authentication: trust, cleartext, md5, and SCRAM-SHA-256, including `scram_client_key` /
+    `scram_server_key`. AuthenticationOk before the server proves its SCRAM signature is refused.
+  - Protocol 3.0 or 3.2, with NegotiateProtocolVersion handled as libpq handles it.
+  - `simpleQuery` gives `SimpleResult`s: text values checked as UTF-8 on arrival, `rowsAffected` as
+    PQcmdTuples reads the tag. COPY is refused cleanly, and the session goes on.
+  - Session state: parameters kept current, `serverVersion()`, the transaction status, a LISTEN/NOTIFY queue
+    (`takeNotifications`).
+  - Ending: `close()` and the destructor send Terminate. A FATAL error, EOF or protocol violation closes the
+    connection, and later calls return `Closed`.
+- **Errors and notices.**
+  - `PgError` holds typed causes, and a failed connect keeps every attempt's own error. `sqlstate()` reaches
+    through it.
+  - `ServerError` has every ErrorResponse field, rendered as libpq's pqBuildErrorMessage3 renders them.
+  - Notices go to a `NoticeHandler`, else to `std::log` under the tag `postgres`.
+- **`Transport` and `Connection.connectOver`**: a session over a stream the caller opened (tokio-postgres's
+  connect_raw). The built-in one is a non-blocking TCP socket with a poller and deadlines.
+- **`postgres::conninfo`**: `pgpassLookup` and `parseServiceFile`, ports of libpq's.
+- **`tests/integration`, run by `tools/test-integration.sh` on PostgreSQL 14, 15, 16, 17, 18 and 19beta4,
+  debug and release.** It covers:
+  - every authentication method and refusal, and the 48 `require_auth` cases of PostgreSQL's 001_password.pl;
+  - the service-file scenarios of 006_service.pl, `.pgpass`, and the environment;
+  - queries, errors and their fields, notices, notifications and COPY refusal;
+  - protocol negotiation, server-side termination, `connect_timeout`, and a connection moved between isolates.
+- **Unit tests drive `Connection` against a scripted server** that sends a byte at a time: every auth path and
+  its misbehaving variants, negotiation, hostile and truncated messages, and silence.
+- `tools/gen-libpq-test-cases.sh`: the cases of PostgreSQL's TAP tests, extracted, and libpq's own verdicts
+  on .pgpass files, service files and settings, asked of the test server's libpq.
 - Generators, each pinned to its source by SHA256 and reproducible: `tools/gen-auth-vectors.sh`,
   `tools/gen-libpq-tables.sh`, `tools/gen-pg-catalog.sh`, `tools/gen-codec-vectors.sh`.
 - The package scaffold: manifest, agent files, hermetic unit-test program (`tools/test.sh`).

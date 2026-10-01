@@ -4,9 +4,39 @@ The PostgreSQL client for [kama](https://kama-lang.org). It speaks the PostgreSQ
 in kama, over `std::net`, the way pgx, tokio-postgres, pgjdbc and Npgsql do. There is no libpq and nothing to
 install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
-> **Status: under construction, not yet published.** Everything that needs no server is done and tested:
-> the wire protocol, SCRAM and md5 authentication, libpq-compatible connection strings, and the type codecs.
-> Live connections are next; see [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.486**.
+> **Status: under construction, not yet published.** It connects, authenticates and runs simple queries on
+> PostgreSQL 14–18 and 19 beta, over plain TCP. TLS, the extended protocol and typed rows come next; see
+> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.486**.
+
+## Using it
+
+```kama
+import { core::println, std::collections::DynamicArray,
+         postgres::Config, postgres::Connection, postgres::PgError, postgres::SimpleResult };
+
+fn int32 main() {
+    // A libpq connection string; the service file, PG* variables and ~/.pgpass apply as they do for psql.
+    Result<Config, PgError> parsed = Config.parse(text: "postgresql://app@db.internal/inventory?connect_timeout=5");
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, PgError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+
+    Result<DynamicArray<SimpleResult>, PgError> r = conn.simpleQuery(sql: "select name, qty from items order by name");
+    DynamicArray<SimpleResult> results = match (give r) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    isize i = 0;
+    while (i < results[0].rowCount()) {
+        Optional<string> name = results[0].text(row: i, column: 0);
+        match (give name) { case Some(value: n): { println(s: give n); } case None: { println(s: "(null)"); } };
+        i = i + 1;
+    }
+    conn.close();
+    return 0;
+}
+```
+
+A server error is `PgError::Server` with every field PostgreSQL sends. Compare `e.sqlstate()` with the
+constants in `postgres::sqlstate`. Messages read as psql prints them. With no `NoticeHandler` set, notices go
+to `std::log` under the tag `postgres`.
 
 ## What it will cover
 
@@ -37,11 +67,17 @@ No GSSAPI/Kerberos/SSPI: a server that asks for them gets a clear error.
 ## Tests
 
 ```sh
-KAMA=/path/to/kama tools/test.sh          # hermetic unit tests, debug and release
-tools/pg.sh up --version 18               # a real PostgreSQL in podman or docker (14–18, 19 beta)
-tools/pg.sh smoke --version 18            # one login per auth method, with the server's own psql
+KAMA=/path/to/kama tools/test.sh               # hermetic unit tests, debug and release
+KAMA=/path/to/kama tools/test-integration.sh   # live tests on PostgreSQL 14–18 and 19 beta, debug and release
+tools/test-integration.sh --version 18         # one version
+tools/pg.sh smoke --version 18                 # one login per auth method, with the server's own psql
 tools/pg.sh down --version 18
 ```
+
+The unit tests need no server. They include a scripted fake server that drives every startup and query path,
+hostile ones included. The integration tests start each server in podman or docker. Their expected results
+come from libpq itself: PostgreSQL's own authentication and service-file tests, and the server container's
+libpq asked case by case (`tools/gen-libpq-test-cases.sh`).
 
 The integration server has one role per authentication method and TLS on. Its test certificates are
 generated into `out/` and never committed. See `tests/integration/server/`.

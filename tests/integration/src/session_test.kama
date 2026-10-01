@@ -1,0 +1,193 @@
+// A session's life against a real server: the protocol version it settles on, the server ending it, a server
+// that is not there or does not answer, a connection moved to another isolate, and closing.
+import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender,
+         std::concurrent::Receiver, std::concurrent::SendResult, std::io::IoError, std::net::TcpListener,
+         std::time::monotonicNow, std::time::Instant, std::time::Duration,
+         postgres::Connection, postgres::PgError, postgres::SimpleResult, postgres::Environment,
+         postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
+         postgres::sqlstate::ADMIN_SHUTDOWN,
+         postgres_integration_tests::check, postgres_integration_tests::setting,
+         postgres_integration_tests::conninfoFor, postgres_integration_tests::open,
+         postgres_integration_tests::openWith, postgres_integration_tests::quietEnvironment,
+         postgres_integration_tests::scalar, postgres_integration_tests::infosLogged };
+export { sessionTests };
+
+unsafe fn int32 protocolTests() {
+    int32 f = 0;
+    Result<Connection, PgError> plain = open(conninfo: conninfoFor(user: "kp_trust"));
+    int32 version = 0;
+    match (give plain) {
+        case Ok(value: c): {
+            version = c.serverVersion();
+            string pid = scalar(c: c, sql: "select pg_backend_pid()");
+            int32 mine = c.processId();
+            f = f + check(ok: c.protocolVersion() == PROTOCOL_3_0 && pid.equals(other: "${mine}"), what: "protocol: 3.0 by default, and the server's process id");
+            string major = setting(name: "PGTEST_VERSION");
+            int32 expected = 0;
+            if (major.equals(other: "14")) { expected = 14; } else if (major.equals(other: "15")) { expected = 15; }
+            else if (major.equals(other: "16")) { expected = 16; } else if (major.equals(other: "17")) { expected = 17; }
+            else if (major.equals(other: "18")) { expected = 18; } else if (major.equals(other: "19")) { expected = 19; }
+            f = f + check(ok: version / 10000 == expected, what: "protocol: serverVersion() is the running server's: ${version}");
+            c.close();
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "protocol: connect: ".concat(other: m)); }
+    };
+    Result<Connection, PgError> latest = open(conninfo: conninfoFor(user: "kp_trust").concat(other: " max_protocol_version=latest"));
+    match (give latest) {
+        case Ok(value: c): {
+            int32 want = PROTOCOL_3_0;
+            if (version >= 180000) { want = PROTOCOL_3_2; }
+            f = f + check(ok: c.protocolVersion() == want, what: "protocol: latest is 3.2 from PostgreSQL 18, negotiated down to 3.0 before");
+            string one = scalar(c: c, sql: "select 1");
+            f = f + check(ok: one.equals(other: "1"), what: "protocol: the session works at the negotiated version");
+            c.close();
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "protocol: max_protocol_version=latest: ".concat(other: m)); }
+    };
+    Result<Connection, PgError> strict = open(conninfo: conninfoFor(user: "kp_trust").concat(other: " min_protocol_version=3.2"));
+    if (version >= 180000) {
+        f = f + check(ok: match (strict) { case Ok(value: c): c.protocolVersion() == PROTOCOL_3_2; case Err(error: e): false; }, what: "protocol: min 3.2 is met from PostgreSQL 18");
+    } else {
+        string m = match (strict) { case Ok(value: c): "connected"; case Err(error: e): e.message(); };
+        f = f + check(ok: m.contains(substring: "server only supports protocol version 3.0, but \"min_protocol_version\" was set to 3.2"), what: "protocol: min 3.2 is refused before PostgreSQL 18: ".concat(other: m));
+    }
+    return f;
+}
+
+unsafe fn int32 terminationTests() {
+    int32 f = 0;
+    Result<Connection, PgError> r = open(conninfo: conninfoFor(user: "kp_trust"));
+    match (give r) {
+        case Ok(value: c): {
+            Result<DynamicArray<SimpleResult>, PgError> killed = c.simpleQuery(sql: "select pg_terminate_backend(pg_backend_pid())");
+            bool shutdown = match (killed) { case Ok(value: v): false; case Err(error: e): e.sqlstate() == ADMIN_SHUTDOWN; };
+            f = f + check(ok: shutdown && c.isClosed(), what: "termination: the server ending this session is FATAL 57P01, and the connection closes");
+            Result<DynamicArray<SimpleResult>, PgError> later = c.simpleQuery(sql: "select 1");
+            f = f + check(ok: match (later) { case Ok(value: v): false; case Err(error: e): match (e) { case Closed: true; case _: false; }; }, what: "termination: every later call is Closed");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "termination: connect"); }
+    };
+    // Ended by another session while idle: the next query finds out.
+    Result<Connection, PgError> a = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection victim = match (give a) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "termination: first connection"); } };
+    Result<Connection, PgError> b = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection killer = match (give b) { case Ok(value: v): give v; case Err(error: e): { return f + check(ok: false, what: "termination: second connection"); } };
+    int32 pid = victim.processId();
+    string done = scalar(c: killer, sql: "select pg_terminate_backend(".concat(other: "${pid}").concat(other: ", 5000)"));
+    Result<DynamicArray<SimpleResult>, PgError> next = victim.simpleQuery(sql: "select 1");
+    string m = match (next) { case Ok(value: v): "succeeded"; case Err(error: e): e.message(); };
+    f = f + check(ok: done.equals(other: "t") && victim.isClosed() && !m.equals(other: "succeeded"), what: "termination: an idle session ended elsewhere fails its next query: ".concat(other: m));
+    killer.close();
+    return f;
+}
+
+unsafe fn int32 unreachableTests() {
+    int32 f = 0;
+    Environment env = quietEnvironment();
+    Result<Connection, PgError> refused = openWith(conninfo: "host=127.0.0.1 port=1 user=kp_trust dbname=kp_test sslmode=disable", env: env);
+    string rm = match (refused) { case Ok(value: c): "connected"; case Err(error: e): e.message(); };
+    f = f + check(ok: rm.equals(other: "connection to server at \"127.0.0.1\", port 1 failed: connection refused"), what: "unreachable: a closed port: ".concat(other: rm));
+
+    // A listener that never answers: the TCP handshake completes in the kernel, the StartupMessage gets no reply.
+    string host = "127.0.0.1";
+    Result<TcpListener, IoError> bound = TcpListener.bind(host: host, port: 0ui16);
+    match (give bound) {
+        case Ok(value: listener): {
+            uint16 port = match (listener.localAddr()) { case Ok(value: a): a.port; case Err(error: e): 0ui16; };
+            Instant started = monotonicNow();
+            Result<Connection, PgError> silent = openWith(conninfo: "host=127.0.0.1 port=${port} user=kp_trust dbname=kp_test sslmode=disable connect_timeout=2", env: env);
+            int64 ms = (monotonicNow() - started).asMillis();
+            string sm = match (silent) { case Ok(value: c): "connected"; case Err(error: e): e.message(); };
+            f = f + check(ok: sm.equals(other: "connection to server at \"127.0.0.1\", port ${port} failed: timeout expired") && ms >= 1900i64 && ms < 4000i64,
+                          what: "unreachable: connect_timeout=2 against a silent server, after ${ms} ms: ".concat(other: sm));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "unreachable: bind a listener"); }
+    };
+    return f;
+}
+
+// A connection moved into another isolate and used there.
+type resource Job implements Sendable {
+    Connection conn;
+    Sender<string> report;
+    public ctor make(Connection conn, Sender<string> report) { this.conn = give conn; this.report = give report; }
+    public unsafe fn void run() {
+        string v = scalar(c: this.conn, sql: "select 'from the other isolate'");
+        this.conn.close();
+        SendResult<string> r = this.report.send(item: give v);
+    }
+}
+
+fn void work(Job job) { job.run(); }
+
+unsafe fn int32 isolateTests() {
+    int32 f = 0;
+    Result<Connection, PgError> r = open(conninfo: conninfoFor(user: "kp_trust"));
+    match (give r) {
+        case Ok(value: c): {
+            Channel<string> results = Channel.bounded(capacity: 1);
+            Receiver<string> rx = results.receiver();
+            Job job = Job.make(conn: give c, report: results.sender());
+            scope { spawn work(job: give job); }
+            Optional<string> got = rx.recv();
+            f = f + check(ok: match (got) { case Some(value: s): s.equals(other: "from the other isolate"); case None: false; }, what: "isolates: a connection moves to another isolate and works there");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "isolates: connect"); }
+    };
+    return f;
+}
+
+unsafe fn int32 closeTests() {
+    int32 f = 0;
+    Result<Connection, PgError> r = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection c = match (give r) { case Ok(value: v): give v; case Err(error: e): { return check(ok: false, what: "close: connect"); } };
+    Result<Connection, PgError> watching = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection w = match (give watching) { case Ok(value: v): give v; case Err(error: e): { return check(ok: false, what: "close: watcher"); } };
+    int32 pid = c.processId();
+    c.close();
+    c.close();
+    Result<DynamicArray<SimpleResult>, PgError> after = c.simpleQuery(sql: "select 1");
+    bool closed = match (after) { case Ok(value: v): false; case Err(error: e): match (e) { case Closed: true; case _: false; }; };
+    f = f + check(ok: c.isClosed() && closed, what: "close: a closed connection is Closed, and closing twice is harmless");
+    // The server ends the session when Terminate arrives, a moment later: poll for it.
+    string sql = "select count(*) from pg_stat_activity where pid = ".concat(other: "${pid}");
+    string left = "1";
+    int32 tries = 0;
+    while (tries < 50 && !left.equals(other: "0")) {
+        left = scalar(c: w, sql: sql);
+        if (!left.equals(other: "0")) { Result<DynamicArray<SimpleResult>, PgError> pause = w.simpleQuery(sql: "select pg_sleep(0.05)"); }
+        tries = tries + 1;
+    }
+    f = f + check(ok: left.equals(other: "0"), what: "close: the server sees the session end");
+    w.close();
+    return f;
+}
+
+// A notice during startup goes to std::log: kp_notice's login trigger raises one (PostgreSQL 17 and later).
+unsafe fn int32 startupNoticeTests() {
+    int32 f = 0;
+    int32 before = infosLogged();
+    Result<Connection, PgError> r = open(conninfo: conninfoFor(user: "kp_trust").concat(other: " dbname=kp_notice"));
+    match (give r) {
+        case Ok(value: c): {
+            int32 logged = infosLogged() - before;
+            int32 want = 0;
+            if (c.serverVersion() >= 170000) { want = 1; }
+            f = f + check(ok: logged == want, what: "notices: a login trigger's NOTICE is logged (${logged} logged)");
+            c.close();
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "notices: connect to kp_notice: ".concat(other: m)); }
+    };
+    return f;
+}
+
+unsafe fn int32 sessionTests() {
+    int32 f = 0;
+    f = f + protocolTests();
+    f = f + terminationTests();
+    f = f + unreachableTests();
+    f = f + isolateTests();
+    f = f + closeTests();
+    f = f + startupNoticeTests();
+    return f;
+}

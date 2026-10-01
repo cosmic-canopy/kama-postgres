@@ -1,0 +1,32 @@
+// The live tests: one program run against each server version by tools/test-integration.sh, which starts the
+// server (tools/pg.sh) and exports its PGTEST_* settings. A failing case prints its name. When cases fail, run
+// `tools/pg.sh smoke` first: it tells a misconfigured server from a wrong client.
+import { core::println, core::env, std::log::setLogSink, postgres_integration_tests::capture,
+         postgres_integration_tests::authTests, postgres_integration_tests::queryTests,
+         postgres_integration_tests::sessionTests };
+export { check, setting };
+
+fn int32 check(bool ok, string what) {
+    if (!ok) { println(s: "  FAIL ${what}"); return 1; }
+    return 0;
+}
+
+// A PGTEST_* setting the runner exports; the program cannot run without them.
+unsafe fn string setting(string name) {
+    Optional<string> v = env(name: copy name);
+    return match (give v) {
+        case Some(value: s): give s;
+        case None: { panic(msg: "PGTEST settings are missing: run tools/test-integration.sh, or source out/pgtest-N.env"); return ""; }
+    };
+}
+
+fn int32 main() {
+    setLogSink(s: capture);
+    int32 failed = 0;
+    failed = failed + authTests();
+    failed = failed + queryTests();
+    failed = failed + sessionTests();
+    if (failed != 0) { println(s: "postgres integration tests: ${failed} failed"); return 1; }
+    println(s: "postgres integration tests: OK");
+    return 0;
+}

@@ -19,3 +19,16 @@ CREATE ROLE kp_md5      LOGIN PASSWORD 'kp_md5_pw';
 RESET password_encryption;
 
 CREATE DATABASE kp_test OWNER kp_scram;
+
+-- A database whose every login raises a NOTICE (a login event trigger, PostgreSQL 17 and later), so a test can
+-- see a notice sent during startup reach std::log. On older servers it is an ordinary, quiet database.
+CREATE DATABASE kp_notice;
+\connect kp_notice
+DO $$
+BEGIN
+    IF current_setting('server_version_num')::int >= 170000 THEN
+        EXECUTE $f$CREATE FUNCTION kp_login_notice() RETURNS event_trigger LANGUAGE plpgsql
+                   AS $b$ BEGIN RAISE NOTICE 'kp_login_notice'; END $b$ $f$;
+        EXECUTE 'CREATE EVENT TRIGGER kp_login ON login EXECUTE FUNCTION kp_login_notice()';
+    END IF;
+END $$;

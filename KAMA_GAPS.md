@@ -16,7 +16,7 @@ KPG-14 filed), `0.9.477` (KPG-1 also on Linux aarch64 inside `localhost/kama-dev
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** none. Every gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** KPG-31. Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -27,7 +27,35 @@ changes the right design here, say so and we will follow it.
 
 ## OPEN
 
-None.
+### KPG-31 · LOW · `std::fs::Metadata` has no owner, so libpq's private-key rule cannot be ported whole
+
+**Found** porting libpq's `initialize_SSL` (phase 6), on `kama 0.9.520+gca7e0d21`.
+
+libpq refuses a client private key that others can read, with one exception for system-wide keys: a file root owns
+may be mode 0640 (group-readable), any other file at most 0600. It tells them apart by `st_uid`
+(src/interfaces/libpq/fe-secure-openssl.c, `buf.st_uid == 0 ? mode & (S_IWGRP | S_IXGRP | S_IRWXO) : mode &
+(S_IRWXG | S_IRWXO)`). `std::fs::Metadata` has the kind, size, mtime and permission bits, but not the owner:
+
+```kama
+import { core::println, std::fs::stat, std::fs::Metadata, std::io::IoError };
+fn int32 main() {
+    string path = "/etc/hosts";
+    Result<Metadata, IoError> m = stat(path: path);
+    match (m) {
+        case Ok(value: md): { uint32 owner = md.owner; println(s: "owner ${owner}"); }
+        case Err(error: e): { println(s: "stat failed"); }
+    };
+    return 0;
+}
+```
+
+`kama check owner.kama` says `` `std::fs::Metadata` has no field `owner` ``. Asked for: the owning user (and group) on
+`Metadata`, from `st_uid`/`st_gid`, as a `UserId` or a raw id. `File.metadata()` should carry it too, since the key is
+checked on the file it is read from.
+
+**Workaround** (in `src/secure/setup.kama`, to delete when this is fixed): every key file gets the non-root rule,
+mode 0600 or less. A root-owned key at 0640, which libpq accepts, is refused with libpq's own message. That is
+stricter, never looser.
 
 ---
 

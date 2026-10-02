@@ -1,7 +1,7 @@
 import { std::collections::View, std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::net::TcpStream,
          std::net::SocketAddr, std::net::Poller, std::net::Interest, std::net::Ready, std::net::Shutdown,
          std::net::UnixStream, std::net::UnixAddr, std::net::PeerCredentials, std::process::UserId,
-         std::time::Duration };
+         std::time::Duration, postgres::PgError };
 export { Transport, TcpTransport, UnixTransport, socketPathMax };
 
 // The byte stream a connection runs over. It is non-blocking: `read` and `write` move what they can now, or say
@@ -22,6 +22,11 @@ type contract Transport for resource implements Sendable {
     fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs);
     // Stop both directions. Called once, when the connection closes; the transport may still be dropped later.
     fn void shutdown();
+    // libpq's account of a failure this transport reported (a read, write or wait that answered `error`, or a read
+    // of 0, which arrives as `UnexpectedEof`), when it has one of its own; `None` to report the `IoError` as it is
+    // (strerror's words, or libpq's "server closed the connection unexpectedly"). A TLS transport words its
+    // failures as libpq's TLS layer does ("SSL SYSCALL error: EOF detected", "SSL error: …").
+    fn Optional<PgError> explain(IoError error);
 }
 
 // TCP, as `Connection.connect` makes it: a non-blocking `TcpStream` and its own `Poller`.
@@ -79,6 +84,8 @@ type resource TcpTransport implements Transport, Sendable {
     public unsafe fn void shutdown() {
         Result<Unit, IoError> r = this.stream.shutdown(how: Shutdown::Both);
     }
+
+    public fn Optional<PgError> explain(IoError error) { return Optional::None; }
 }
 
 // A Unix-domain socket, as `Connection.connect` makes it for a host that is a directory: a non-blocking
@@ -138,6 +145,8 @@ type resource UnixTransport implements Transport, Sendable {
     public unsafe fn void shutdown() {
         Result<Unit, IoError> r = this.stream.shutdown(how: Shutdown::Both);
     }
+
+    public fn Optional<PgError> explain(IoError error) { return Optional::None; }
 }
 
 // Linux reaches its abstract namespace through a name; everywhere else a socket is a path.

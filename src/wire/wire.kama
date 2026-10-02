@@ -56,6 +56,19 @@ type resource Wire implements Sendable {
         this.end = 0;
     }
 
+    // Over a transport some of whose bytes were read before this Wire existed (the answer to an SSLRequest was
+    // read alone, and the server may already have sent more): `preread` is what was read past it, first in line.
+    public ctor resume(Owned<Transport> transport, ConstView<uint8> preread) {
+        this.link = give transport;
+        isize size = INITIAL_BYTES;
+        while (size < preread.length()) { size = size * 2; }
+        this.buf = FixedArray.make(size: size);
+        isize i = 0;
+        while (i < preread.length()) { this.buf[i] = preread[i]; i = i + 1; }
+        this.start = 0;
+        this.end = preread.length();
+    }
+
     // The next message from the server. The bytes of every message are checked before anything is believed
     // (postgres::protocol): a malformed one is `Protocol`, and the connection cannot recover its framing after it.
     public unsafe fn Result<BackendMessage, PgError> receive(Deadline deadline) {
@@ -89,7 +102,7 @@ type resource Wire implements Sendable {
             match (w) {
                 case Ok(value: n): { if (n > 0) { sent = sent + n; } else { wait = true; } }
                 case Err(error: e): {
-                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: PgError::Io(error: e)); } };
+                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };
                 }
             };
             if (wait) {
@@ -115,11 +128,11 @@ type resource Wire implements Sendable {
             bool wait = false;
             match (r) {
                 case Ok(value: n): {
-                    if (n == 0) { return Result::Err(error: PgError::Io(error: IoError.of(kind: IoErrorKind::UnexpectedEof))); }
+                    if (n == 0) { return Result::Err(error: this.failure(error: IoError.of(kind: IoErrorKind::UnexpectedEof))); }
                     this.end = this.end + n;
                 }
                 case Err(error: e): {
-                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: PgError::Io(error: e)); } };
+                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };
                 }
             };
             if (wait) {
@@ -132,11 +145,18 @@ type resource Wire implements Sendable {
 
     unsafe fn Result<Unit, PgError> await(Interest interest, Deadline deadline) {
         Result<Ready, IoError> w = this.link.wait(interest: interest, timeoutMs: deadline.remainingMs());
-        Ready r = match (w) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: PgError::Io(error: e)); } };
+        Ready r = match (w) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: this.failure(error: e)); } };
         // Only the side asked for counts: a transport ready for the other one has not let this one proceed.
         bool ready = match (interest) { case Read: r.readable; case Write: r.writable; case ReadWrite: r.readable || r.writable; };
         if (!ready) { return Result::Err(error: PgError::Timeout); }
         return Result::Ok(value: Unit::Unit);
+    }
+
+    // A failure the transport reported, in its own words when it has them (a TLS transport's), else as the I/O
+    // error it is.
+    fn PgError failure(IoError error) {
+        Optional<PgError> own = this.link.explain(error: error);
+        return match (give own) { case Some(value: p): give p; case None: PgError::Io(error: error); };
     }
 
     // Space for `needed` bytes from `start`: the unread bytes move to the front, and the buffer doubles until

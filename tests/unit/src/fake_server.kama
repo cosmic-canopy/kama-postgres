@@ -11,7 +11,7 @@ import { std::collections::DynamicArray, std::collections::View, std::collection
          std::encoding::base64::DecodeError, std::encoding::utf8::decode as utf8Decode,
          std::encoding::utf8::Utf8Error, std::encoding::hex::encode as hexEncode, std::digest::pbkdf2, std::digest::sha256::Sha256,
          std::digest::sha256::hmacSha256, std::digest::sha256::sha256,
-         postgres::Transport, postgres::protocol::MessageWriter, postgres::protocol::md5Password };
+         postgres::Transport, postgres::PgError, postgres::protocol::MessageWriter, postgres::protocol::md5Password };
 export { FakeServer, Step, Wire };
 
 // What the server does with the next message from the client.
@@ -217,6 +217,7 @@ type resource FakeServer implements Transport, Sendable {
     }
 
     public fn void shutdown() { }
+    public fn Optional<PgError> explain(IoError error) { return Optional::None; }
 
     // Frame every whole message the client has sent, and answer each with the next step.
     unsafe fn void serve() {

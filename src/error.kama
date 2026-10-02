@@ -1,5 +1,5 @@
 import { std::collections::DynamicArray, std::io::IoError, postgres::protocol::ErrorFields,
-         postgres::protocol::ProtocolError, postgres::sqlstate::sqlstateCode, postgres::wire::strerror };
+         postgres::protocol::ProtocolError, postgres::sqlstate::sqlstateCode, postgres::wire::strerror, tls::TlsError };
 export { PgError, ServerError, ConnectError, ConnectAttempt };
 
 // What can go wrong talking to PostgreSQL. A data error is one of these; a contract violation (a column index out
@@ -13,6 +13,11 @@ type enum PgError implements Error {
     Config(string detail),
     // The socket failed. A server that closed the connection is `UnexpectedEof`.
     Io(IoError error),
+    // TLS failed: setting it up (a certificate or key file, the protocol versions), the handshake, the server's
+    // certificate or name, or the session afterwards. `detail` is libpq's whole message ("SSL error: …",
+    // "server certificate for \"h\" does not match host name \"x\"", "root certificate file … does not exist…").
+    // `cause` is the TLS library's own account when there is one: a rejected certificate's flags, an alert's number.
+    Tls(string detail, Optional<TlsError> cause),
     // `connect_timeout` passed before the connection was ready.
     Timeout,
     // The server sent bytes that are not the protocol, or a message the protocol does not allow at that point.
@@ -39,6 +44,7 @@ type enum PgError implements Error {
         return match (this) {
             case Config(detail: d): copy d;
             case Io(error: e): ioMessage(e: e);
+            case Tls(detail: d, cause: c): copy d;
             case Timeout: "timeout expired";
             case Protocol(error: e): e.message();
             case Auth(detail: d): copy d;

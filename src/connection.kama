@@ -991,7 +991,7 @@ type resource Connection implements Sendable {
         match (give sent) {
             case Ok(value: u): { return Result::Ok(value: Unit::Unit); }
             case Err(error: e): {
-                bool io = match (e) { case Io(error: x): true; case _: false; };
+                bool io = match (e) { case Io(error: x): true; case Tls(detail: d, cause: c): true; case _: false; };
                 if (io) {
                     Result<BackendMessage, PgError> waiting = this.wire.receive(deadline: Deadline.after(span: Duration.fromMillis(ms: 0i64)));
                     match (give waiting) {

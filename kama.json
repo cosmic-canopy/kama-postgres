@@ -4,6 +4,9 @@
   "license": "MIT OR Apache-2.0",
   "kind": "library",
   "kama": ">=0.9.519",
+  "dependencies": {
+    "@kama/tls": { "path": "../kama-tls" }
+  },
   "publish": {
     "exclude": [
       ".claude/", ".github/", "tools/", "docs/",

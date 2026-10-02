@@ -1,5 +1,7 @@
-import { std::collections::DynamicArray, std::collections::ConstView, std::memory::Owned,
-         postgres::PgError, postgres::Statement, postgres::protocol::FieldDescription, postgres::protocol::BindValues,
+import { std::collections::DynamicArray, std::collections::ConstView, std::memory::Owned, std::uuid::Uuid,
+         std::time::Timestamp, std::time::Date,
+         postgres::PgError, postgres::Statement, postgres::types::Numeric, postgres::types::LocalDateTime,
+         postgres::types::TimeOfDay, postgres::types::TimeTz, postgres::types::Interval, postgres::protocol::FieldDescription, postgres::protocol::BindValues,
          postgres::types::FORMAT_TEXT, postgres::types::FORMAT_BINARY, postgres::types::typeName,
          postgres::types::elementType, postgres::types::formatArray, postgres::types::arrayDelimiter,
          postgres::types::formatBool, postgres::types::formatBytea,
@@ -8,25 +10,48 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::memor
          postgres::types::encodeFloat8,
          postgres::types::BOOL, postgres::types::INT2, postgres::types::INT4, postgres::types::INT8,
          postgres::types::OID, postgres::types::FLOAT4, postgres::types::FLOAT8, postgres::types::BYTEA };
-export { Query, pg, addOptional };
+export { Query, PgParam, pg };
 
-// A statement to run and its parameters: SQL text with $1, $2, …, or a prepared Statement, and one value for each.
-// A value goes in through Serializable, the contract std's types, this package's and every @generate type share:
+// A statement to run and its parameters: SQL text with $1, $2, …, or a prepared Statement, and one value for each,
+// a PgParam:
 //
 //   Query q = Query.make(sql: "insert into account (id, name, nick) values ($1, $2, $3)");
 //   q.add(value: id);
 //   q.add(value: name);
-//   addOptional::<string>(query: ref q, value: nick);      // None is NULL
+//   q.add(value: nick);      // an Optional<string>: None is NULL
 //
-// or through the `pg` tag, which makes each hole a parameter (never text spliced into the SQL):
+// or through the `pg` tag, which makes each hole a parameter (never text spliced into the SQL), checked against
+// PgParam where the string is written:
 //
-//   Query q = pg"select * from account where org = ${org} and name = ${name}";
+//   Query q = pg"select * from account where org = ${org} and nick = ${nick}";
 //
 // Each value is sent as the type the server inferred for its parameter: binary when the value is that type's own
 // kind (an integer for int2, int4, int8 and oid that fits; a float for float4 and float8; a bool for bool; bytes
 // for bytea), and otherwise as text, which the server reads with the type's input function. So a Uuid, a
 // Timestamp or a Numeric, which serialize as their text, go as text, and an integer can be given for a numeric.
 // The server reports a value its type does not accept, in its own words.
+
+// A value that can be a query parameter: what it writes through a Serializer is what is sent. The integers, floats,
+// bool, char and string are PgParams; so are a DynamicArray of Serializable elements (an array, or bytea for
+// DynamicArray<uint8>), an Optional of a PgParam (None is NULL), std's Uuid, Timestamp and Date, and this
+// package's Numeric, LocalDateTime, TimeOfDay, TimeTz and Interval. A type of your own that is Serializable joins
+// with `implements PgParam` and a writeParam that serializes it. A struct is not a parameter value.
+type contract PgParam for value, resource, enum, intrinsic { const fn void writeParam(ref Serializer w); }
+
+type adapter <int8, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64, bool, char, string> implements PgParam {
+    public const fn void writeParam(ref Serializer w) { Serializable value = this; Result<Unit, Owned<Error>> r = value.serialize(w: ref w); }
+}
+type adapter <Uuid, Timestamp, Date, Numeric, LocalDateTime, TimeOfDay, TimeTz, Interval> implements PgParam {
+    public const fn void writeParam(ref Serializer w) { Result<Unit, Owned<Error>> r = this.serialize(w: ref w); }
+}
+type adapter <DynamicArray> implements PgParam when [T: Serializable] {
+    public const fn void writeParam(ref Serializer w) { Result<Unit, Owned<Error>> r = this.serialize(w: ref w); }
+}
+type adapter <Optional> implements PgParam when [T: PgParam] {
+    public const fn void writeParam(ref Serializer w) {
+        match (this) { case Some(value: v): { v.writeParam(w: ref w); } case None: { w.writeNull(); } };
+    }
+}
 
 // One parameter's value, as it was serialized.
 type enum Param implements Sendable {
@@ -149,10 +174,10 @@ type resource Query implements Sendable {
 
     // The next parameter's value. A value that cannot be a parameter (a struct, an array of arrays) is reported
     // when the query runs, as PgError::Value.
-    public fn void add(Serializable value) {
+    public fn void add(PgParam value) {
         ParamSerializer p = ParamSerializer.make();
         Serializer s = p;
-        Result<Unit, Owned<Error>> r = value.serialize(w: ref s);
+        value.writeParam(w: ref s);
         isize at = this.values.length();
         if (p.err || p.values.length() != 1) {
             int64 n = cast<int64>(at) + 1i64;
@@ -175,16 +200,12 @@ type resource Query implements Sendable {
     }
     // NULL for the next parameter.
     public fn void addNull() { this.values.add(item: Param::Null); }
-    // The text of the next parameter, sent as text for the server to read as the parameter's type.
-    public fn void addText(const ref string text) { this.values.add(item: Param::Text(text: copy text)); }
 
     public const fn const ref string sql() { return this.text; }
     public const fn isize parameterCount() { return this.values.length(); }
     public const fn bool isPrepared() { return this.prepared; }
 
     fn void refuse(const ref string detail) { if (this.trouble.length() == 0) { this.trouble = copy detail; } }
-    friend pg[refuse];
-    friend addOptional[refuse];
 
     const fn const ref string problem() { return this.trouble; }
     const fn const ref string statement() { return this.statementName; }
@@ -208,45 +229,23 @@ type resource Query implements Sendable {
     }
 }
 
-// An Optional value: Some's value, or NULL. (Optional is not Serializable itself, so it has a function of its
-// own; methods cannot be generic.)
-fn void addOptional<T: Serializable>(ref Query query, const ref Optional<T> value) {
-    match (value) {
-        case Some(value: v): { query.add(value: v); }
-        case None: { query.addNull(); }
-    };
-}
-
-// The `pg` tag: `pg"… ${x} …"` is a Query whose every hole is a parameter, $1 for the first, never text spliced
-// into the SQL. A hole is its text (kama renders every hole to a string before the tag sees it), sent as text for
-// the server to read as the parameter's type, so a number, a Uuid or a timestamp works where the server expects
-// one. NULL and bytes cannot be holes; add them with Query.add or addOptional. Write no $n of your own in it.
-//
-// An Optional hole would be rendered "Some { value: … }" or "None" and sent as that text (KPG-25). Until holes keep
-// their type, a hole that reads exactly so is refused.
-fn Query pg(ref Template t) {
+// The `pg` tag: `pg"… ${x} …"` is a Query whose every hole is a parameter, $1 for the first, never text spliced into
+// the SQL. Each hole is a PgParam, checked where the string is written, so a NULL is an empty Optional and bytes are
+// a DynamicArray<uint8>. Write no $n of your own in it.
+fn Query pg(Template<PgParam> t) {
     string sql = "";
     int32 n = t.holeCount();
-    DynamicArray<string> holes = DynamicArray.withCapacity(capacity: cast<isize>(n));
     int32 i = 0;
     while (i < n) {
         sql = sql.concat(other: t.part(at: i));
         int32 number = i + 1;
         sql = sql.concat(other: "$${number}");
-        holes.add(item: t.hole(at: i));
         i = i + 1;
     }
     sql = sql.concat(other: t.part(at: n));
     Query q = Query.make(sql: give sql);
-    isize k = 0;
-    while (k < holes.length()) {
-        if (holes[k].equals(other: "None") || holes[k].startsWith(prefix: "Some { value: ")) {
-            int64 number = cast<int64>(k) + 1i64;
-            q.refuse(detail: "parameter $${number} of a pg string is an Optional, which a hole would send as the text \"None\" or \"Some { … }\": add it with addOptional (KPG-25)");
-        }
-        q.addText(text: holes[k]);
-        k = k + 1;
-    }
+    i = 0;
+    while (i < n) { q.add(value: t.hole(at: i)); i = i + 1; }
     return q;
 }
 

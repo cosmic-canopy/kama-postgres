@@ -86,10 +86,7 @@ unsafe fn int32 unreachableTests() {
     Environment env = quietEnvironment();
     Result<Connection, PgError> refused = openWith(conninfo: "host=127.0.0.1 port=1 user=kp_trust dbname=kp_test sslmode=disable", env: env);
     string rm = match (refused) { case Ok(value: c): "connected"; case Err(error: e): e.message(); };
-    // libpq prints strerror alone ("Connection refused"); until std exposes the OS's words alone (KPG-23) the reason
-    // is IoError's message, which quotes them after the kind and the platform's errno.
-    f = f + check(ok: rm.startsWith(prefix: "connection to server at \"127.0.0.1\", port 1 failed: connection refused (os error ")
-        && rm.contains(substring: ": Connection refused)\n\tIs the server running on that host and accepting TCP/IP connections?"), what: "unreachable: a closed port: ".concat(other: rm));
+    f = f + check(ok: rm.equals(other: "connection to server at \"127.0.0.1\", port 1 failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?"), what: "unreachable: a closed port, in libpq's words: ".concat(other: rm));
 
     // A listener that never answers: the TCP handshake completes in the kernel, the StartupMessage gets no reply.
     string host = "127.0.0.1";

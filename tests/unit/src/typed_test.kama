@@ -1,9 +1,9 @@
 // Typed access to a result: column::<T>, columnOpt::<T> and rowAs::<T> over values a live PostgreSQL produced
 // (codec_vectors.kama), in both wire formats, and the rules a reader holds. Every value read as a string must be
-// the server's own text (a binary float is the one exception, KPG-27: it must be the same number). A column reads
+// the server's own text. A column reads
 // into a type at least as wide as its own, never narrower; NULL only into an Optional; a struct only from a row
 // that has a column for each of its fields.
-import { std::collections::DynamicArray, std::collections::ConstView, std::fmt::parse, std::fmt::ParseError,
+import { std::collections::DynamicArray, std::collections::ConstView,
          std::time::Date, std::time::Timestamp, std::uuid::Uuid,
          postgres::types::Numeric, postgres::types::LocalDateTime, postgres::types::TimeOfDay,
          postgres::types::TimeTz, postgres::types::Interval,
@@ -134,12 +134,6 @@ unsafe fn int32 textTests() {
         if (text.startsWith(prefix: "{{")) {
             // An array of two dimensions in binary has no text here: the refusal says why.
             same = gotBinary.equals(other: "column 0 (\"v\", _int4): unsupported array: an array of 2 dimensions; this client reads one");
-        }
-        if (!same && (type.equals(other: "float4") || type.equals(other: "float8"))) {
-            // KPG-27: the same number, in 17 (or 9) digits rather than PostgreSQL's shortest.
-            Result<float64, ParseError> want = parse::<float64>(s: text);
-            Result<float64, ParseError> got = parse::<float64>(s: gotBinary);
-            same = match (want) { case Ok(value: w): match (got) { case Ok(value: g): g == w || (type.equals(other: "float4") && cast<float32>(g) == cast<float32>(w)); case Err(error: e): false; }; case Err(error: e): false; };
         }
         f = f + check(ok: same, what: "typed: a binary ".concat(other: type).concat(other: " \"").concat(other: text).concat(other: "\" reads as the server's text: ").concat(other: gotBinary));
         i = i + 1;
@@ -301,6 +295,17 @@ type resource Account {
     public const fn int32 scoreSum() { int32 t = 0; isize i = 0; while (i < this.scores.length()) { t = t + this.scores[i]; i = i + 1; } return t; }
 }
 
+// Fields a row may leave out.
+@generate(Deserializable)
+type resource Sparse {
+    @field int32 id;
+    @field Optional<string> note;
+    @field(default) int32 limit = 10;
+    public const fn int32 sparseId() { return this.id; }
+    public const fn bool hasNote() { return match (this.note) { case Some(value: n): true; case None: false; }; }
+    public const fn int32 sparseLimit() { return this.limit; }
+}
+
 unsafe fn Shape accountRow(bool withNick, bool withAvatar) {
     Shape s = Shape.make();
     DynamicArray<uint8> id = DynamicArray.empty(); id.add(item: 0ui8); id.add(item: 0ui8); id.add(item: 0ui8); id.add(item: 7ui8);
@@ -380,7 +385,15 @@ unsafe fn int32 ruleTests() {
     Rows mr = missing.rows();
     Result<Account, PgError> partial = rowAs::<Account>(rows: mr, row: 0);
     string pm = match (partial) { case Ok(value: x): "read"; case Err(error: e): e.message(); };
-    f = f + check(ok: pm.equals(other: "the row has no column for every field: the type has 7 fields, and 6 of them name a column"), what: "typed: a field with no column: ".concat(other: pm));
+    f = f + check(ok: pm.equals(other: "the row has no column for a field of the type that is neither Optional nor @field(default)"), what: "typed: a field with no column: ".concat(other: pm));
+
+    // An Optional field with no column is None, and a @field(default) one keeps its declared value.
+    Shape lean = Shape.make();
+    lean.addText(name: "id", oid: INT4, text: "3");
+    Rows lr = lean.rows();
+    Result<Sparse, PgError> sparse = rowAs::<Sparse>(rows: lr, row: 0);
+    f = f + check(ok: match (sparse) { case Ok(value: x): x.sparseId() == 3 && !x.hasNote() && x.sparseLimit() == 10; case Err(error: e): false; },
+                  what: "typed: an Optional field with no column is None, a @field(default) one keeps its value");
 
     Shape twice = Shape.make();
     twice.addText(name: "id", oid: TEXT, text: "a");

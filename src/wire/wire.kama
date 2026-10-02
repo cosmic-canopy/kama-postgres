@@ -3,10 +3,17 @@ import { std::collections::FixedArray, std::collections::ConstView, std::io::IoE
          postgres::Transport, postgres::PgError,
          postgres::protocol::Frame, postgres::protocol::frame, postgres::protocol::decode,
          postgres::protocol::BackendMessage, postgres::protocol::ProtocolError, postgres::protocol::HEADER_BYTES };
-export { Wire, Deadline };
+export { Wire, Deadline, strerror };
 
 // postgres::wire — messages over a `Transport`: framing the bytes that arrive into backend messages, and writing
 // frontend bytes out, each step bounded by a deadline. Internal: a connection is the only user.
+
+// What libpq prints for an I/O failure, strerror's words: the operating system's own text for its code ("Connection
+// refused"), or, for an error kama raised itself, the kind's.
+fn string strerror(const ref IoError e) {
+    Optional<string> words = e.osMessage();
+    return match (give words) { case Some(value: w): give w; case None: e.message(); };
+}
 
 // When a wait must end: never, or at an instant of the monotonic clock.
 type value Deadline {

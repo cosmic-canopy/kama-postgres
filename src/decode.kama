@@ -33,11 +33,12 @@ export { column, columnOpt, rowAs, hasBinaryCodec };
 //   - bytea into DynamicArray<uint8>, and a one-dimensional array into a DynamicArray of its element's type
 //     (int4[] into DynamicArray<int32>, bytea[] into DynamicArray<DynamicArray<uint8>>); an element may not be
 //     NULL, and an array of more dimensions is refused;
-//   - every non-NULL column into a string: the value's PostgreSQL text, as psql shows it (a float read from a
-//     binary column is the exact value in 17 digits, KPG-27). Uuid, Timestamp, Date, Numeric, LocalDateTime,
-//     TimeOfDay, TimeTz and Interval read that text;
+//   - every non-NULL column into a string: the value's PostgreSQL text, as psql shows it. Uuid, Timestamp, Date,
+//     Numeric, LocalDateTime, TimeOfDay, TimeTz and Interval read that text;
 //   - a text column into a payload-less enum whose variant is named as the label is (a PostgreSQL enum);
-//   - NULL only into an Optional (a field, or columnOpt).
+//   - NULL only into an Optional (a field, or columnOpt);
+//   - a row into a struct (rowAs) by column name: a field with no column is an error unless it is Optional (then
+//     None) or @field(default) (then its declared value), as kama's serde has it.
 // Anything else is `PgError::Value`, naming the column, its type and what was asked.
 
 // The OIDs this client reads in binary: what the extended protocol asks the server for. Every other type comes as
@@ -75,7 +76,7 @@ type enum Cell {
 }
 
 // What went wrong in a read, for the message.
-type enum Problem { Fine, Mismatch, IsNull, Undecodable, Missing, Shape, Duplicate }
+type enum Problem { Fine, Mismatch, IsNull, Undecodable, Shape }
 
 unsafe fn Cell textCell(ConstView<uint8> raw) {
     Result<string, DecodeError> t = utf8Text(raw: raw);
@@ -208,8 +209,8 @@ unsafe fn string cellText(const ref Cell c) {
     };
 }
 
-// A float as text: PostgreSQL's spellings of the infinities and NaN, and otherwise the exact value in as many
-// digits as its width can need (KPG-27: not PostgreSQL's shortest digits).
+// A float as text: PostgreSQL's spellings of the infinities and NaN, and otherwise the shortest digits that read
+// back as the same value, as PostgreSQL prints it.
 fn string floatText(float64 v, int32 bits) {
     if (v != v) { return "NaN"; }
     if (v > 0.0 && v * 0.5 == v) { return "Infinity"; }
@@ -222,8 +223,8 @@ fn string floatText(float64 v, int32 bits) {
 // cannot be served records why and sets the sticky error, and the caller turns that into a PgError.
 //
 // A read is of the current column, or, inside an array, of its next element. Inside a bytea (a column, or an
-// element of a bytea[]), readU8 gives its bytes. Columns and elements are one list, matched by index: matching on
-// a method's `const ref` result destroys the referent (KPG-29).
+// element of a bytea[]), readU8 gives its bytes. Columns and elements are one list, so the cell a read is of is an
+// index into it.
 type resource CellReader implements Deserializer {
     DynamicArray<Cell> cells;      // one per column (one in all for a single value), then every array's elements
     isize elementBase = 0;               // where the elements start: an Elements cell's `first` counts from here
@@ -238,8 +239,6 @@ type resource CellReader implements Deserializer {
     int32 bytesFrom = 0;           // inside a bytea: 1 the column, 2 an element; 0 outside
     isize bytesElement = 0;        // the cell, for 2
     isize byteAt = 0;              // the byte read next
-    isize wanted = 0;              // beginObject's count: the fields the type has
-    isize taken = 0;               // fields read rather than skipped
     bool err = false;
     DeError code;
     Problem problem;
@@ -261,21 +260,18 @@ type resource CellReader implements Deserializer {
         this.labels = give labels; this.whole = whole;
         this.opened = false; this.current = 0; this.next = 0;
         this.element = -1; this.firstElement = 0; this.endElement = 0; this.bytesFrom = 0; this.bytesElement = 0; this.byteAt = 0;
-        this.wanted = 0; this.taken = 0;
         this.err = false; this.code = DeError::Malformed; this.problem = Problem::Fine;
         this.failedCell = 0; this.failedElement = -1; this.asked = ""; this.why = "";
     }
     friend valueReader[make];
     friend rowReader[make];
-    friend readFailure[failedAt, failedIndex, askedFor, trouble, reason, fieldsWanted, fieldsTaken];
+    friend readFailure[failedAt, failedIndex, askedFor, trouble, reason];
 
     const fn Problem trouble() { return this.problem; }
     const fn isize failedAt() { return this.failedCell; }
     const fn isize failedIndex() { return this.failedElement; }
     const fn const ref string askedFor() { return this.asked; }
     const fn const ref string reason() { return this.why; }
-    const fn isize fieldsWanted() { return this.wanted; }
-    const fn isize fieldsTaken() { return this.taken; }
 
     // The cell the next read is of.
     const fn isize at() {
@@ -340,22 +336,14 @@ type resource CellReader implements Deserializer {
         if (!this.whole) { this.refuse(p: Problem::Shape, what: w, detail: "a column holds one value; read a row into a struct with rowAs", e: DeError::TypeMismatch); return; }
         if (this.opened) { this.refuse(p: Problem::Shape, what: w, detail: "a field of a row is one column, not a nested struct", e: DeError::TypeMismatch); return; }
         this.opened = true;
-        this.wanted = cast<isize>(count);
-        this.taken = 0;
         this.next = 0;
     }
-    // A field with no column is an error: the derive leaves such a field zero (KPG-26), so the count of fields read
-    // is checked against the count the type declared.
-    public fn void endObject() {
-        if (this.whole && !this.err && this.taken < this.wanted) {
-            this.err = true; this.code = DeError::MissingField; this.problem = Problem::Missing;
-        }
-    }
+    // A field the row has no column for is the derive's to judge: Optional and @field(default) may be absent.
+    public fn void endObject() { }
     public fn bool moreFields() { return !this.err && this.whole && this.next < this.elementBase; }
     public fn FieldKey field() {
         this.current = this.next;
         this.next = this.next + 1;
-        this.taken = this.taken + 1;
         this.element = -1;
         this.bytesFrom = 0;
         return FieldKey::Name(name: copy this.labels[this.current]);
@@ -467,7 +455,7 @@ type resource CellReader implements Deserializer {
         return match (this.cells[this.at()]) { case Null: true; case _: false; };
     }
     // A column no field asked for.
-    public fn void skipValue() { if (this.whole) { this.taken = this.taken - 1; } }
+    public fn void skipValue() { }
     public const fn bool failed() { return this.err; }
     public fn void fail() {
         string w = "this type";
@@ -497,6 +485,12 @@ fn string describeColumn(const ref Rows rows, isize index) {
 // The PgError for a reader's failure. `index` is the column a single value came from; for a row (-1) the reader
 // knows.
 fn PgError readFailure(const ref CellReader r, const ref Rows rows, isize index, Owned<Error> e) {
+    // The derive's own verdict on a row: a field that had to have a column did not. The reader saw nothing wrong.
+    Optional<DeError> code = e.as<DeError>();
+    bool missing = match (code) { case Some(value: c): match (c) { case MissingField: true; case _: false; }; case None: false; };
+    if (missing && index < 0) {
+        return PgError::Value(detail: "the row has no column for a field of the type that is neither Optional nor @field(default)");
+    }
     isize at = index;
     if (index < 0) { at = r.failedAt(); }
     string where = describeColumn(rows: rows, index: at);
@@ -510,18 +504,13 @@ fn PgError readFailure(const ref CellReader r, const ref Rows rows, isize index,
         case IsNull: { if (element >= 0) { return PgError::Value(detail: where.concat(other: " is NULL").concat(other: nullAdvice)); } := where.concat(other: " is NULL, and ").concat(other: asked).concat(other: nullAdvice); }
         case Undecodable: where.concat(other: ": ").concat(other: r.reason());
         case Shape: where.concat(other: ": ").concat(other: r.reason());
-        case Missing: {
-            isize wanted = r.fieldsWanted();
-            isize taken = r.fieldsTaken();
-            := "the row has no column for every field: the type has ${wanted} fields, and ${taken} of them name a column";
-        }
         case _: where.concat(other: ": ").concat(other: e.message());
     };
     return PgError::Value(detail: give detail);
 }
 
-// The reader for one value, decoded by its column's type. Not generic, so every T shares it; and a grant to it
-// holds where one to a generic function would not (KPG-28).
+// The reader for one value, decoded by its column's type. Not generic, so every T shares it, and each instance of
+// the generic functions stays small.
 unsafe fn CellReader valueReader(const ref Rows rows, isize row, isize index) {
     DynamicArray<Cell> cells = DynamicArray.empty();
     DynamicArray<Cell> elements = DynamicArray.empty();

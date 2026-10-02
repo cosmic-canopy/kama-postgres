@@ -3,7 +3,7 @@
 // reads of what comes back.
 import { std::collections::DynamicArray, std::uuid::Uuid, std::time::Timestamp, std::time::Date,
          postgres::Connection, postgres::PgError, postgres::Rows, postgres::Query, postgres::Statement,
-         postgres::Portal, postgres::pg, postgres::addOptional, postgres::column, postgres::columnOpt,
+         postgres::Portal, postgres::pg, postgres::column, postgres::columnOpt,
          postgres::rowAs, postgres::TransactionStatus, postgres::types::Numeric,
          postgres::sqlstate::PROTOCOL_VIOLATION, postgres::sqlstate::SYNTAX_ERROR,
          postgres::sqlstate::DIVISION_BY_ZERO, postgres::sqlstate::INVALID_TEXT_REPRESENTATION,
@@ -73,13 +73,13 @@ unsafe fn int32 parameterTests(ref Connection c) {
         case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "params: every kind: ".concat(other: m)); }
     };
 
-    // NULL, from addNull and from addOptional.
+    // NULL, from addNull and from an empty Optional.
     Query nq = Query.make(sql: "select $1::text is null, $2::int4 is null, $3::int4");
     nq.addNull();
     Optional<int32> none = Optional::None;
     Optional<int32> some = Optional::Some(value: 5);
-    addOptional::<int32>(query: ref nq, value: none);
-    addOptional::<int32>(query: ref nq, value: some);
+    nq.add(value: none);
+    nq.add(value: some);
     Result<Rows, PgError> nr = c.query(q: nq);
     match (give nr) {
         case Ok(value: rows): {
@@ -88,8 +88,8 @@ unsafe fn int32 parameterTests(ref Connection c) {
             Result<Optional<int32>, PgError> z = columnOpt::<int32>(rows: rows, row: 0, index: 2);
             bool xNull = match (x) { case Ok(value: v): v; case Err(error: e): false; };
             bool yNull = match (y) { case Ok(value: v): v; case Err(error: e): false; };
-            f = f + check(ok: xNull && yNull, what: "params: addNull and addOptional(None) are NULL");
-            f = f + check(ok: match (z) { case Ok(value: o): match (o) { case Some(value: v): v == 5; case None: false; }; case Err(error: e): false; }, what: "params: addOptional(Some)");
+            f = f + check(ok: xNull && yNull, what: "params: addNull and an empty Optional are NULL");
+            f = f + check(ok: match (z) { case Ok(value: o): match (o) { case Some(value: v): v == 5; case None: false; }; case Err(error: e): false; }, what: "params: an Optional's value");
         }
         case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "params: NULL: ".concat(other: m)); }
     };
@@ -152,11 +152,24 @@ unsafe fn int32 tagTests(ref Connection c) {
         }
         case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pg tag: ".concat(other: m)); }
     };
-    Optional<int32> maybe = Optional::Some(value: 3);
-    Query opt = pg"select ${maybe}";
-    Result<Rows, PgError> o = c.query(q: opt);
-    string om = match (o) { case Ok(value: v): "ran"; case Err(error: e): e.message(); };
-    f = f + check(ok: om.contains(substring: "is an Optional"), what: "pg tag: an Optional hole is refused before anything is sent (KPG-25): ".concat(other: om));
+    // Holes keep their type: an Optional is its value or NULL, bytes are bytea.
+    Optional<int32> some = Optional::Some(value: 3);
+    Optional<int32> none = Optional::None;
+    DynamicArray<uint8> bytes = DynamicArray.empty(); bytes.add(item: 7ui8); bytes.add(item: 0ui8);
+    Query typed = pg"select ${some}::int4 * 2, ${none}::int4 is null, length(${bytes}::bytea)";
+    Result<Rows, PgError> o = c.query(q: typed);
+    match (give o) {
+        case Ok(value: rows): {
+            Result<int32, PgError> a = column::<int32>(rows: rows, row: 0, index: 0);
+            Result<bool, PgError> b = column::<bool>(rows: rows, row: 0, index: 1);
+            Result<int32, PgError> l = column::<int32>(rows: rows, row: 0, index: 2);
+            bool doubled = match (a) { case Ok(value: v): v == 6; case Err(error: e): false; };
+            bool isNull = match (b) { case Ok(value: v): v; case Err(error: e): false; };
+            bool two = match (l) { case Ok(value: v): v == 2; case Err(error: e): false; };
+            f = f + check(ok: doubled && isNull && two, what: "pg tag: an Optional hole is its value or NULL, and a bytes hole is bytea");
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "pg tag: typed holes: ".concat(other: m)); }
+    };
     return f;
 }
 
@@ -233,7 +246,7 @@ unsafe fn int32 rowTests(ref Connection c) {
     match (give mr) {
         case Ok(value: rows): {
             Result<Entry, PgError> e = rowAs::<Entry>(rows: rows, row: 0);
-            f = f + check(ok: match (e) { case Ok(value: x): false; case Err(error: x): x.message().contains(substring: "no column for every field"); }, what: "rowAs: a field with no column");
+            f = f + check(ok: match (e) { case Ok(value: x): false; case Err(error: x): x.message().equals(other: "the row has no column for a field of the type that is neither Optional nor @field(default)"); }, what: "rowAs: a field with no column");
         }
         case Err(error: e): { f = f + check(ok: false, what: "rowAs: missing: query"); }
     };

@@ -6,7 +6,7 @@ install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls)
 
 > **Status: under construction, not yet published.** It connects, authenticates and runs queries, with typed
 > parameters and typed rows, on PostgreSQL 14–18 and 19 beta, over TCP or a Unix-domain socket. TLS comes next; see
-> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.506**.
+> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.519**.
 
 ## Using it
 
@@ -41,10 +41,11 @@ fn int32 main() {
 ```
 
 Parameters go through the extended protocol, with the `pg` tag or a `Query`. A hole is always a parameter, never
-text in the SQL:
+text in the SQL. Holes are typed: an empty `Optional` is NULL, and a `DynamicArray<uint8>` is bytea:
 
 ```kama
-Query q = pg"select name, qty from items where qty > ${least} order by name";
+Optional<string> supplier = Optional::None;
+Query q = pg"select name, qty from items where qty > ${least} and supplier is not distinct from ${supplier}";
 Result<Rows, PgError> r = conn.query(q: q);
 ```
 

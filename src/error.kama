@@ -1,5 +1,5 @@
 import { std::collections::DynamicArray, std::io::IoError, postgres::protocol::ErrorFields,
-         postgres::protocol::ProtocolError, postgres::sqlstate::sqlstateCode };
+         postgres::protocol::ProtocolError, postgres::sqlstate::sqlstateCode, postgres::wire::strerror };
 export { PgError, ServerError, ConnectError, ConnectAttempt };
 
 // What can go wrong talking to PostgreSQL. A data error is one of these; a contract violation (a column index out
@@ -61,11 +61,12 @@ type enum PgError implements Error {
     }
 }
 
+// An I/O failure as libpq reports it: strerror's words for an error the operating system reported ("Connection
+// refused"), the kind's for one kama raised, and libpq's own text for a server that hung up.
 fn string ioMessage(const ref IoError e) {
-    return match (e.kind()) {
-        case UnexpectedEof: "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request.";
-        case _: e.message();
-    };
+    bool eof = match (e.kind()) { case UnexpectedEof: true; case _: false; };
+    if (eof) { return "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request."; }
+    return strerror(e: e);
 }
 
 // An ErrorResponse or a NoticeResponse: every field the server sent, by the one-letter codes of the protocol's

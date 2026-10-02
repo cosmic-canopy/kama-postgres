@@ -7,7 +7,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::Transport, postgres::TcpTransport, postgres::UnixTransport, postgres::socketPathMax,
          postgres::NoticeHandler, postgres::Notification,
          postgres::logNotice, postgres::Rows,
-         postgres::wire::Wire, postgres::wire::Deadline,
+         postgres::wire::Wire, postgres::wire::Deadline, postgres::wire::strerror,
          postgres::protocol::MessageWriter, postgres::protocol::BackendMessage, postgres::protocol::ProtocolError,
          postgres::protocol::FieldDescription, postgres::protocol::RowValues, postgres::protocol::ErrorFields,
          postgres::protocol::ScramClient, postgres::protocol::ChannelBinding, postgres::protocol::AuthError,
@@ -143,7 +143,7 @@ type resource Connection implements Sendable {
                     Result<string, IoError> who = local.peerUserName();
                     string refusal = match (give who) {
                         case Ok(value: name): peerMismatch(wanted: peer, actual: name);
-                        case Err(error: e): "could not get peer credentials: ".concat(other: e.message());
+                        case Err(error: e): "could not get peer credentials: ".concat(other: strerror(e: e));
                     };
                     if (refusal.length() > 0) {
                         failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: copy lead, error: PgError::Auth(detail: give refusal), passfile: "", note: ""));
@@ -1157,7 +1157,7 @@ unsafe fn Result<Owned<TcpTransport>, PgError> socketOptions(Owned<TcpTransport>
 }
 
 fn PgError setsockopt(const ref string option, const ref IoError e) {
-    return PgError::Config(detail: "setsockopt(".concat(other: option).concat(other: ") failed: ").concat(other: e.message()));
+    return PgError::Config(detail: "setsockopt(".concat(other: option).concat(other: ") failed: ").concat(other: strerror(e: e)));
 }
 
 // A SASL payload as text: SCRAM's messages are UTF-8.

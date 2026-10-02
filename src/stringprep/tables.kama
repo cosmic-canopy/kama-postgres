@@ -2,8 +2,7 @@
 // Do not edit: change the script and run it again.
 //
 // The stringprep tables (RFC 3454) that SASLprep uses, as PostgreSQL holds them: each a sorted list of
-// inclusive code point ranges, first and last. Each table is searched here, in the file that declares it,
-// so no table crosses a file (KPG-24).
+// inclusive code point ranges, first and last, each with the search the password code calls.
 import { std::collections::ConstView };
 export { isNonAsciiSpace, isMappedToNothing, isProhibitedOutput, isUnassigned, isRandALCat, isLCat };
 

@@ -12,7 +12,7 @@ edit.
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.506**, declared as `"kama"` in every manifest here. That is the first
+**The package needs kama ≥ 0.9.519**, declared as `"kama"` in every manifest here. That is the first
 compiler with everything this package relies on:
 - a non-fatal write to a closed socket;
 - a `Sendable` `TcpStream`;
@@ -23,7 +23,11 @@ compiler with everything this package relies on:
 - `std::process::currentUser` and the account's home directory;
 - `IoError` as a kind and the OS's code (`match (e.kind())`), with `Interrupted`;
 - `FileKind`, and `File.metadata()` on an open file;
-- `std::unicode` normalization, for SASLprep.
+- `std::unicode` normalization, for SASLprep;
+- typed tag holes (`Template<C>`) and `type adapter`, for the `pg` tag and `PgParam`;
+- serde's `MissingField` and `@field(default)`, which `rowAs` relies on;
+- `IoError.osMessage()`, for libpq's strerror text;
+- floats printed in their shortest form, as PostgreSQL prints them.
 
 ## What is true here and nowhere else
 
@@ -81,15 +85,20 @@ compiler with everything this package relies on:
     narrower; every column reads as a string, its PostgreSQL text; NULL reads only into an Optional.
   - `Rows` holds no `Shared`, so it stays `Sendable`. A row does not carry the column descriptions, which is
     why the functions take the result and a row index rather than a row.
-  - The non-generic `valueReader`/`rowReader` do the work and hold the `friend` grants. A grant to a generic
-    function is refused in a library (KPG-28), and a small generic body is better anyway.
+  - The non-generic `valueReader`/`rowReader` do the work and hold the `friend` grants, so each instance of the
+    generic functions stays small.
+  - `rowAs` follows kama's serde: a field with no column is an error unless it is `Optional` (None) or
+    `@field(default)` (its declared value). The derive decides that, not the reader.
 
 - **The extended protocol describes first** (Parse and Describe, then Bind, Execute and Sync). One reader
   (`Connection.readRows`) reads every result and checks each message's place. A server error is returned once
   the server is ready, and FATAL or a message out of place ends the session. While a result is open
   (`busy`), every other call is refused with libpq's "another command is already in progress".
-- **Parameters go through `Serializable`** (`src/query.kama`): binary when a value is its type's own kind, and
-  text for the server's input function otherwise.
+- **Parameters are `PgParam`s** (`src/query.kama`), a contract this package declares, with `type adapter`s for
+  the primitives, `DynamicArray`, `Optional` (None is NULL), std's `Uuid`, `Timestamp` and `Date`, and its own
+  types. Each writes itself through a `Serializer`. `Query.add(value:)` and the `pg` tag's holes
+  (`Template<PgParam>`) both take one. A value goes binary when it is its type's own kind, and as text for the
+  server's input function otherwise.
 
 - **A connection is libpq's, step for step.**
   - `Config` resolves settings in libpq's order, and every setting is either honoured or refused with a clear
@@ -138,8 +147,6 @@ compiler with everything this package relies on:
   - A parameter cannot have the name of a function in scope (no shadowing): `column::<T>`'s column is `index:`.
     Nor can a match binding have the name of a local (`case Err(error: e)` beside a `Wire e`).
   - A `ConstView` local must be rooted: pass the view as a by-value parameter to a helper instead.
-  - Never match on a method's `const ref` result (`match (this.slot())`): it destroys the referent (KPG-29).
-    Match an index expression.
   - A row a loop drops must still be moved: `else { RowValues dropped = give r; }`.
   - `float` is reserved, as every C keyword is; so is `out`.
   - A resource that implements `Copyable<This>` must say its bare hand-off: `Copyable<This>(bare: give)`.

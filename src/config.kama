@@ -2,7 +2,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          std::encoding::utf8::Utf8Error, std::encoding::base64::decode as b64decode,
          std::encoding::base64::DecodeError, std::fs::readFile, std::fs::File, std::fs::OpenMode, std::fs::Metadata,
          std::fs::Permissions, std::io::IoError, std::process::currentUser, std::process::UserId,
-         std::log::logWarn, core::env,
+         std::log::logWarn, core::env, postgres::wire::strerror,
          postgres::PgError, postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
          postgres::conninfo::ConnInfo, postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
          postgres::conninfo::Keyword, postgres::conninfo::libpqKeywords, postgres::conninfo::EnvironmentOption,
@@ -118,7 +118,7 @@ unsafe fn Result<string, ConnInfoError> localUserName() {
         case Ok(value: n): Result::Ok(value: give n);
         case Err(error: e): match (e.kind()) {
             case NotFound: Result::Err(error: fail(detail: "local user with ID ${raw} does not exist"));
-            case _: Result::Err(error: fail(detail: "could not look up local user ID ${raw}: ".concat(other: e.message())));
+            case _: Result::Err(error: fail(detail: "could not look up local user ID ${raw}: ".concat(other: strerror(e: e))));
         };
     };
 }

@@ -6,22 +6,25 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
-Needs **kama ≥ 0.9.506**.
+Needs **kama ≥ 0.9.519**.
 
 ### Changed
-- **Needs kama ≥ 0.9.506**, which fixed every compiler gap phases 3 and 4 filed (KPG-11 to KPG-22). Ported to
-  its `IoError`, a kind and the OS's code: an I/O failure's message now quotes the operating system's words.
+- **Needs kama ≥ 0.9.519**, which fixed every compiler gap this package filed (KPG-11 to KPG-30). Ported to its
+  `IoError`, a kind and the OS's code. An I/O failure reads as libpq's does, with strerror's words ("Connection
+  refused"): a connect, a socket option, a user lookup, peer credentials.
 - The password file is checked on the file opened, as libpq checks it. One that is not a regular file
   (`/dev/null`, a FIFO, a directory) gets libpq's "is not a plain file" warning.
 - With `HOME` unset or empty, the home directory is the account's, from its passwd entry, as libpq finds it.
 - **The extended query protocol**, as libpq and pgx drive it: Parse and Describe, then Bind, Execute and Sync.
   - `Connection.query(q:)` gives `Rows`, and `execute(q:)` gives the count. A column of a type this client reads in
     binary comes in binary, every other one as text.
-  - `Query`: SQL with `$n` and its parameters. `add(value:)` takes any `Serializable`, `addNull()`, and
-    `addOptional::<T>` takes an `Optional`. Each value is sent as the type the server inferred: binary when it is
-    that type's own kind, text otherwise, for the server's input function. Arrays go as array literals.
-  - The `pg"… ${x} …"` tag makes each hole a parameter, never text in the SQL. An `Optional` hole is refused
-    (KPG-25).
+  - `Query`: SQL with `$n` and its parameters. `add(value:)` takes a `PgParam` and `addNull()` adds NULL.
+    `PgParam` covers the primitives, `DynamicArray` (arrays, and bytea), `Optional` (None is NULL), `Uuid`,
+    `Timestamp`, `Date` and this package's types. A `Serializable` type of your own joins with
+    `implements PgParam`. Each value is sent as the type the server inferred: binary when it is that type's own
+    kind, text otherwise, for the server's input function. Arrays go as array literals.
+  - The `pg"… ${x} …"` tag makes each hole a parameter, never text in the SQL. Holes are typed: each is a
+    `PgParam`, checked where the string is written, so an empty Optional is NULL and bytes are bytea.
   - `prepare(sql:)` gives a `Statement` ("s0", "s1", …) with its parameter types and columns, as
     PQdescribePrepared gives them. Run it with `Query.of(statement:)`, then `closeStatement`.
   - Chunked rows (libpq 17's mode): `startRows`, `nextRows(maxRows:)`, `discardRows`, `isStreaming`.
@@ -37,7 +40,8 @@ Needs **kama ≥ 0.9.506**.
   `DynamicArray<uint8>`, PostgreSQL enums as kama enums, and `@generate(Deserializable)` structs by column name.
   - An integer reads into a type at least as wide as its column's, never narrower. Any column reads as a string:
     its PostgreSQL text. NULL reads only into an Optional.
-  - `rowAs` refuses a row with no column for a field, and a row whose columns share a name.
+  - `rowAs` refuses a row with no column for a field that is neither `Optional` nor `@field(default)`, and a row
+    whose columns share a name.
   - `PgError::Value` names the column, its type, and what was asked.
 - **Arrays of one dimension**, text and binary (`postgres::types::decodeArray`, `formatArray`, `ArrayValues`):
   `column::<DynamicArray<int32>>` and every other element type this client reads, `bytea[]` as

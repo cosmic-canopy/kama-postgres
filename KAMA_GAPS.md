@@ -6,24 +6,17 @@ it. Every entry with a repro was **run** on the version named. Nothing is inferr
 spec. An entry that is an absence cites the cstar files that show it instead. This file is excluded from
 the published package, as it is in `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.506+g1d11fb05`, the dev build at `../cstar/out/Darwin-arm64/kama`. Every entry from
-KPG-11 to KPG-22 was re-run on it, with the repro as filed, before it moved to FIXED. Earlier rounds: `0.9.490`
-(KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to KPG-14 filed), `0.9.477` (KPG-1 also on Linux aarch64 inside
-`localhost/kama-dev`), and the first report against `0.9.470` and the public `0.9.440`.
+**Current compiler:** `kama 0.9.519+g28136440`, the dev build at `../cstar/out/Darwin-arm64/kama`. Every entry from
+KPG-23 to KPG-30 was re-run on it, with the repro as filed, before it moved to FIXED. Earlier rounds: `0.9.506`
+(KPG-11 to KPG-22 verified, KPG-23 to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to
+KPG-14 filed), `0.9.477` (KPG-1 also on Linux aarch64 inside `localhost/kama-dev`), and the first report against
+`0.9.470` and the public `0.9.440`.
 
 **Reporter:** the `@kama/postgres` repo. Each open entry names the workaround this package uses, so the
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:**
-- KPG-23, found porting to 0.9.506.
-- KPG-24, found adopting KPG-15's fix (SASLprep).
-- KPG-25 and KPG-26, found probing phase 5's typed parameters and rows.
-- KPG-27 and KPG-28, found building phase 5's typed rows.
-- KPG-29, found building phase 5's arrays.
-- KPG-30, found building phase 5's type round-trips.
-
-Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** none. Every gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -34,365 +27,64 @@ Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below
 
 ## OPEN
 
-### KPG-30 · MED · A conditional conformance (`Serializable when [T: Serializable]`) is seen or not depending on imports, and a generic site never gets its vtable
-
-**Status:** open. Reproduces on 0.9.506.
-
-`DynamicArray<T>` declares `Serializable when [T: Serializable]` (`lib/std/collections/dynamic_array.kama:39`).
-Handing one to a contract parameter `Serializable value` behaves three ways:
-
-1. In a program that imports nothing from `std::serialization`, `kama check` refuses it, even for
-   `DynamicArray<int32>`: "argument `value` expects the contract `Serializable`, and
-   `std::collections::DynamicArray<int32>` does not implement it". A generic bound `<T: Serializable>` with
-   `T = DynamicArray<…>` is refused the same way: "does not satisfy bound `Serializable`".
-2. Add one unused import, `std::serialization::text::json::serializeJsonBuffer`, and the same call checks, builds
-   and runs.
-3. From a generic function, `fn void put<T: Serializable>(ref Sink s, const ref T v) { s.add(value: v); }` with
-   `T = DynamicArray<Uuid>`, `kama check` passes and clang fails. The vtable is never emitted, even when the same
-   conversion also appears outside generic code:
-
-```kama
-import { core::println, std::collections::DynamicArray, std::uuid::Uuid,
-         std::serialization::text::json::serializeJsonBuffer };
-type resource Sink {
-    isize n = 0;
-    public ctor make() { this.n = 0; }
-    public fn void add(Serializable value) { this.n = this.n + 1; }
-    public const fn isize count() { return this.n; }
-}
-// A generic function handing its T to a contract parameter.
-fn void put<T: Serializable>(ref Sink s, const ref T v) { s.add(value: v); }
-fn int32 main() {
-    Sink s = Sink.make();
-    DynamicArray<Uuid> ids = DynamicArray.empty(); ids.add(item: Uuid.fromBytes(bytes: [1ui8; 16]));
-    put::<DynamicArray<Uuid>>(s: ref s, v: ids);
-    isize n = s.count();
-    println(s: "${n}");
-    return 0;
-}
-```
-
-```
-$ kama check g.kama
-kama: g.kama OK (18 units analyzed)
-$ kama build g.kama
-g.kama:10:86: error: use of undeclared identifier
-'std__collections__DynamicArray_std__uuid__Uuid_kama__GlobalAllocator__as_kama__Serializable'
-```
-
-Remove the import and case 1 applies. Pass `ids` straight to `s.add` (not through `put`) and, with the import,
-it builds and runs.
-
-**Why it matters here.** `Query.add(value: Serializable)` is how a parameter goes in, and an array parameter
-is a `DynamicArray`. The type round-trip test reads each vector into its kama type with one generic function
-and sends it back.
-
-**Workaround here.** The package needs none: an application's own non-generic `q.add(value: list)` works. Its
-array parameters are tested from non-generic code. `tests/integration/src/types_test.kama` sends arrays back
-through one non-generic block per element type, and names this gap.
-
-**Suggested fix.** Decide a conditional conformance per instantiation from its own type arguments, never from
-what else is imported. Emit the `as_<Contract>` vtable for every instantiation that is converted to the
-contract, generic sites included.
-
-### KPG-29 · HIGH · Matching on a method's `const ref` result destroys the value it refers to (a double free in safe code)
-
-**Status:** open. Reproduces on 0.9.506.
-
-`match (this.slot())`, where `slot()` returns `const ref Cell` (an element of a field), makes the match subject a
-bitwise copy of the referent (`Cell kama_msubj = (*Holder__slot(self));`). When an arm binds a payload, it then
-emits `Cell__dtor(&kama_msubj)` after the match, which frees the heap the referent still owns. Nothing here is
-`unsafe`, and `kama check` is clean.
-
-```kama
-import { core::println, std::collections::DynamicArray };
-type enum Cell { Empty, Text(string text) }
-type resource Holder {
-    DynamicArray<Cell> cells;
-    public ctor make() {
-        this.cells = DynamicArray.empty();
-        string built = "hel".concat(other: "lo");   // on the heap, unlike a literal
-        this.cells.add(item: Cell::Text(text: give built));
-    }
-    const fn const ref Cell slot() { return this.cells[0]; }
-    public fn string copied() {
-        string s = match (this.slot()) { case Text(text: t): copy t; case _: ""; };
-        return s;
-    }
-}
-fn int32 main() {
-    Holder h = Holder.make();
-    string a = h.copied();
-    string b = h.copied();
-    println(s: a.concat(other: " ").concat(other: b));
-    return 0;
-}
-```
-
-```
-$ kama build refmatch3.kama && ./refmatch3; echo "exit=$?"
-hello hello
-exit=133
-```
-
-In the package, the second read through the same reader was `malloc: pointer being freed was not allocated`.
-With a literal payload (`"hello"`, not on the heap) the program happens to survive. `match (this.cells[0])`,
-an index expression rather than a call, emits no destructor and is correct.
-
-**Why it matters here.** The row reader serves a column or an array element through one accessor, and matched on
-it in every read.
-
-**Workaround here.** `src/decode.kama`'s `CellReader` keeps columns and array elements in one list and matches
-`this.cells[this.at()]`, an index. Its comment names this gap.
-
-**Suggested fix.** A `const ref` result is a borrow: match on it in place (`Cell* kama_msub = Holder__slot(self)`),
-and never destroy it.
-
-### KPG-25 · HIGH · A string tag's holes lose their type, so an `Optional` hole is sent as the text "None"
-
-**Status:** open. Reproduces on 0.9.506, with std's own `sql` tag.
-
-A tag receives every hole already rendered to a string through `Formattable` (`prelude/global.kama:688-699`;
-`SPEC.md:264-268` lists typed holes as the future "Model B"). For a SQL tag that is a hazard:
-- An `Optional` hole of a `Formattable` payload is sent as its derived text: `Some { value: 5 }`, or `None`.
-  Into a text column it is stored as that text. Nothing fails.
-- NULL cannot be expressed at all, and neither can bytes (a `DynamicArray<uint8>` hole does not compile).
-- An `Optional<string>` hole is refused at compile time, because `string` reaches interpolation by a fast path,
-  not through `Formattable`. The two `Optional`s behave differently.
-
-```kama
-import { core::println, std::fmt::sql, std::fmt::SqlQuery };
-fn int32 main() {
-    Optional<int32> score = Optional::None;
-    SqlQuery q = sql"update t set score = ${score}";
-    string p = copy q.param(at: 0);
-    println(s: copy q.queryText());
-    println(s: "param 0 is \"".concat(other: p).concat(other: "\""));
-    return 0;
-}
-```
-
-```
-update t set score = ?
-param 0 is "None"
-```
-
-**Why it matters here.** The `pg"…"` tag is how most code in this package's README will run a query. A hole is
-always a parameter and never spliced, so it is safe against injection. But a NULL written as `${x}` with
-`x` an `Optional` sends the word "None".
-
-**Workaround here.** `postgres::pg` refuses a hole whose text is exactly `None` or starts with `Some { value: `.
-The error names `Query.add`/`addOptional`, which take the value through `Serializable` and do send NULL. A
-genuine string "None" is refused too, with the same advice. This workaround should go when holes keep their
-type.
-
-**Suggested fix.** Typed holes: a tag sees each hole's value through a contract (`Serializable` would suit a
-SQL tag), so `Optional` can be NULL and bytes can be bytes. Short of that, refuse an `Optional` hole in a tagged
-string, as an `Optional<string>` already is, so the hazard is a compile error.
-
-### KPG-26 · MED · `@generate(Deserializable)` never reports a missing field
-
-**Status:** open. Reproduces on 0.9.506, with std's JSON backend.
-
-The derived `deserialize` zero-initializes the result and fills the fields whose keys arrive. A field whose key
-never arrives keeps its zero (`src/kama.cemit.cpp`, `emitDeserializeDefinition`). `DeError::MissingField` exists,
-but the derive never raises it.
-
-```kama
-import { core::println, std::memory::Owned, std::serialization::text::json::deserializeJsonBuffer };
-@generate(Deserializable)
-type value Point { @field public int32 x = 0; @field public int32 y = 0; }
-fn int32 main() {
-    // The JSON has no "y": the derive could report MissingField, and does not.
-    Result<Point, Owned<Error>> p = deserializeJsonBuffer::<Point>(src: "{\"x\": 1}");
-    string r = match (p) { case Ok(value: v): "Ok(x: ${v.x}, y: ${v.y})"; case Err(error: e): e.message(); };
-    println(s: give r);
-    return 0;
-}
-```
-
-```
-Ok(x: 1, y: 0)
-```
-
-**Why it matters here.** `rowAs::<T>` reads a row into a struct by column name. A query that does not select a
-field's column should fail, not fill the field with 0 or "". That is what sqlx's and pgx's row mapping do.
-
-**Workaround here.** The row reader counts the keys that were read rather than skipped, and fails at
-`endObject` with `MissingField` if fewer were read than `beginObject`'s count (the derive checks `failed()`
-after `endObject`). It works for a flat struct, which is all a row is. An `Optional` field counts as required:
-its column must be selected, and may be NULL.
-
-**Suggested fix.** The derive knows which slots it filled. After the loop, a field that is not `Optional` and has
-no default, whose slot was never filled, raises `MissingField`. That makes this hold for every backend.
-
-### KPG-27 · LOW · A float prints with 17 significant digits, not the shortest that round-trips
-
-**Status:** open. Reproduces on 0.9.506.
-
-`kama_fmt_f64` is `%.17g` and `kama_fmt_f32` is `%.9g` (`include/kama_runtime.h:1522-1540`). Their comments call
-that "shortest-round-trip precision", but it is the most digits a value can need, not the fewest it does need.
-Interpolation, `Formatter.writeF64` and the JSON backend all print through them.
-
-```kama
-import { core::println };
-fn int32 main() {
-    float64 tenth = 0.1;
-    float64 sum = 0.1 + 0.2;
-    float32 third = 0.3f32;
-    println(s: "${tenth} ${sum} ${third}");
-    return 0;
-}
-```
-
-```
-0.10000000000000001 0.30000000000000004 0.300000012
-```
-
-Rust, Go, JavaScript, Python and PostgreSQL itself (since 12, Ryu) print `0.1 0.30000000000000004 0.3`. The
-precision-taking formatter, `kama_fmt_f64_prec`, is `%.*f` only, so a caller cannot search for the shortest
-digits with `%.*g` either.
-
-**Why it matters here.** A value read as a string (`column::<string>`) is PostgreSQL's text for it. For a
-column the server sent in binary, this client formats that text itself. For float4 and float8 it cannot
-match what psql shows.
-
-**Workaround here.** None to delete later. A binary float read as a string is formatted with
-`%.17g` (`%.9g` for float4). That text round-trips exactly, but it is not PostgreSQL's. A float read as a
-float is exact.
-
-**Suggested fix.** The shortest round-trip formatting (Ryu, or Grisu with a fallback) for `float64` and
-`float32` everywhere a float is printed, with the comment made true.
-
-### KPG-28 · LOW · A `friend` grant to a generic free function is refused until something instantiates it
-
-**Status:** open. Reproduces on 0.9.506.
-
-SPEC (§ friend, "A **generic free function** accessor reaches the corresponding instance") allows a generic free
-function to be a friend. It works for an instantiation. The generic body itself, checked before any instance
-exists, is refused. A library's generic functions are not instantiated in the library, so there a grant to one
-can never be used.
-
-```kama
-import { core::println };
-type resource Box {
-    int32 v = 0;
-    public ctor make(int32 v) { this.v = v; }
-    const fn int32 secret() { return this.v; }
-    friend reader[secret];
-}
-fn T reader<T: Deserializable<T>>(const ref Box b, T fallback) { int32 s = b.secret(); return fallback; }
-fn int32 main() { println(s: "never instantiated"); return 0; }
-```
-
-```
-$ kama check v2.kama
-v2.kama:8:0: error: 'secret' is private in 'Box'
-```
-
-Add a call `reader::<int32>(b: Box.make(v: 3), fallback: 4)` to `main` and the same file checks, builds and
-runs. A library holding `Box` and `reader` and nothing else fails `kama check` the same way. With a function in
-the library that calls `reader::<int32>`, it passes.
-
-**Why it matters here.** `column::<T>` and `rowAs::<T>` read the private rows of a `Rows`, and build a private
-reader.
-
-**Workaround here.** None to delete later. The work is in non-generic functions that hold the grants
-(`valueReader`, `rowReader` in `src/decode.kama`), and the generic ones only call `T.deserialize`. That is the
-better shape anyway, because each instantiation stays small. But the grant should work as SPEC says.
-
-**Suggested fix.** When checking a generic function's body, honour a grant that names it, as the instance does.
-
-### KPG-23 · LOW · `IoError` gives the OS's words only inside its message, never alone
-
-**Status:** open. An absence, checked on 0.9.506.
-
-KPG-22's fix keeps the OS's code and quotes its text: `IoError.message()` is `"connection refused (os error 61:
-Connection refused)"`. The text alone comes from a private `osText(code:)` (`lib/std/io/io.kama:114`). The module
-exports `IoError, IoErrorKind, lastError` and nothing else (`:3`). `IoError` has `kind()`, `rawOsError()` and
-`message()` (`:94-110`).
-
-```kama
-import { core::println, std::io::IoError, std::net::TcpStream };
-fn int32 main() {
-    // Port 1 on loopback: nothing listens, so the OS refuses the connect.
-    Result<TcpStream, IoError> r = TcpStream.connect(host: "127.0.0.1", port: 1ui16);
-    string m = match (r) { case Ok(value: s): "connected"; case Err(error: e): e.message(); };
-    println(s: give m);
-    return 0;
-}
-```
-
-```
-connection refused (os error 61: Connection refused)
-```
-
-**Why it matters here.** libpq prints `strerror` and nothing else. psql says `… port 1 failed: Connection
-refused`, so this client cannot say exactly that. It can say the kind (`connection refused`) or the whole message.
-
-**Workaround here.** None to delete later. The client prints `IoError.message()`, which carries more than libpq's
-text but not libpq's text. The two integration checks that compare an I/O failure match its kind and the OS's
-words separately (`session_test.kama`, `socket_test.kama`).
-
-**Suggested fix.** A public `osMessage()` (or `description()`) on `IoError`, returning `Optional<string>`: the OS's
-text for the code, `None` for an error kama raised itself.
-
-### KPG-24 · MED · A `comptime InlineArray` imported from another file loses its type
-
-**Status:** open. Reproduces on 0.9.506.
-
-A `comptime InlineArray` works in the file that declares it. In a file that imports it, it is not the same value:
-- `.view()` is "no method `view`", and a chained call is "cannot resolve the receiver".
-- Indexing it passes as safe code nowhere: `kama check` says "raw pointer access requires an `unsafe fn`".
-- In an `unsafe fn`, the index passes `kama check` and reaches clang as a subscript of the struct, which clang
-  rejects.
-
-Copying it into a local of the same type first works.
-
-```kama
-// src/tables.kama
-export { RANGES };
-comptime InlineArray<uint32>#(4) RANGES = [0x00A0ui32, 0x00A0ui32, 0x2000ui32, 0x200Bui32];
-```
-
-```kama
-// src/main.kama (the same module)
-import { core::println, std::collections::ConstView, RANGES };
-unsafe fn uint32 last() { return RANGES[3]; }
-fn isize count() { return RANGES.view().length(); }
-fn int32 main() { uint32 l = last(); isize n = count(); println(s: "${l} ${n}"); return 0; }
-```
-
-```
-src/main.kama:3:0: error: cannot resolve the receiver of `length` — its type is not known here
-```
-
-With `count` removed, `last` passes `kama check`, and `kama build` fails in clang:
-
-```
-src/main.kama:2:30: error: subscripted value is not an array, pointer, or vector
-    2 |     kama_ret_0 = (p2__RANGES)[3];
-```
-
-The same module, or another module, gives the same result. Declared in `main.kama` itself, `RANGES.view()` and
-`RANGES[3]` both work. So does `InlineArray<uint32>#(4) local = RANGES;` followed by `local[3]`.
-
-**Why it matters here.** SASLprep's stringprep tables are generated into a file of their own, as every generated
-table in this package is. The code that searches them lives elsewhere.
-
-**Workaround here.** The generated file holds the search too (`src/stringprep/tables.kama`). Its predicates
-(`isProhibitedOutput(code:)`, …) are what other files call, so no table crosses a file. That is the shape the module
-would keep anyway, so there is nothing to delete.
-
-**Suggested fix.** Give an imported `comptime` the type it was declared with: an `InlineArray`'s methods and its
-indexing, as in the declaring file.
+None.
 
 ---
 
 ## FIXED — kept for the record
 
-KPG-11 to KPG-22 were verified on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
+KPG-23 to KPG-30 were verified on 0.9.519, KPG-11 to KPG-22 on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
 same repro as the original report.
+
+### KPG-29 · HIGH · Matching on a method's `const ref` result destroyed the referent — FIXED in 0.9.508
+
+Fixed by `36c044b8`: a place-returning call subject is borrowed, never copied and dropped. The repro prints
+`hello hello` and exits 0 (it was 133). The row reader keeps its one list of columns and elements, matched by
+index, because that is simpler, not because of the gap.
+
+### KPG-25 · HIGH · A string tag's holes lost their type — FIXED in 0.9.512
+
+Fixed by `951e7f77`: typed holes. A tag takes `Template<C>`, and each hole is checked against the contract `C`
+where the string is written. std's `sql` binds `SqlValue`s, and the repro's empty `Optional` is
+`SqlValue::Null`. `postgres::pg` takes `Template<PgParam>`, a contract this package declares, with `type adapter`s
+for the primitives, `DynamicArray`, `Optional`, std's `Uuid`, `Timestamp` and `Date`, and its own types. An empty
+Optional hole is NULL, and bytes are bytea. The refusal of Optional-shaped text holes is gone. `Query.add` takes a
+`PgParam` too, so `addOptional` and `addText` are gone.
+
+### KPG-30 · MED · A conditional conformance depended on imports, and a generic site got no vtable — FIXED in 0.9.514
+
+Fixed by `97beca1f`. Both repros build and run: `DynamicArray<int32>` handed to a `Serializable` parameter with no
+serialization import, and `put::<DynamicArray<Uuid>>` from a generic function. `types_test` sends arrays and bytea
+back through its one generic round trip again.
+
+### KPG-24 · MED · A `comptime InlineArray` imported from another file lost its type — FIXED in 0.9.515
+
+Fixed by `91c5ef56`. The repro (`RANGES[3]` and `RANGES.view()` in another file) prints `8203 4`. The generated
+stringprep tables keep their search beside them, which is the module's shape anyway.
+
+### KPG-26 · MED · `@generate(Deserializable)` never reported a missing field — FIXED in 0.9.516
+
+Fixed by `43da10f4`: a field the data leaves out is `Err(MissingField)` unless it is `Optional` (then `None`),
+`@deprecated`, or the new `@field(default)` (then its declared value). The repro prints `missing field`. The row
+reader's own count of fields read is gone. It would have refused a row that leaves out an Optional or
+`@field(default)` column, which serde allows. `rowAs` now reports the derive's verdict.
+
+### KPG-27 · LOW · A float printed with 17 significant digits — FIXED in 0.9.517
+
+Fixed by `905436d7`: the shortest round-trip decimal. The repro prints `0.1 0.30000000000000004 0.3`. Every binary
+float codec vector now reads as exactly the server's text, `1e+100` and `5e-324` included, so the tests compare
+floats exactly.
+
+### KPG-28 · LOW · A `friend` grant to a generic free function was refused until instantiated — FIXED in 0.9.518
+
+Fixed by `c98b33ac`. The repro checks clean. The typed readers keep their non-generic `valueReader`/`rowReader`,
+which keeps each instantiation small.
+
+### KPG-23 · LOW · `IoError` gave the OS's words only inside its message — FIXED in 0.9.519
+
+Fixed by `28136440`: `IoError.osMessage()`. The repro prints `Connection refused`. A failed connect, a failed
+socket option, a user lookup and a peer-credentials refusal now read exactly as libpq's do, with strerror's words,
+and the integration tests compare them exactly again.
 
 ### KPG-11 · MED · A generic-inference error was reported against the wrong file — FIXED in 0.9.493
 
@@ -463,7 +155,7 @@ tests pass on 14 to 19.
 ### KPG-22 · LOW · `IoError` carried no operating-system text — FIXED in 0.9.502
 
 Fixed by `176aca2f` (and `a412ce0a` for wasm): `IoError` is a kind and the OS's code, and `message()` quotes the
-OS's words. KPG-23 is what remains: those words alone, for libpq's message.
+OS's words. KPG-23 added those words alone.
 
 ### KPG-4 · MED · No Unix-domain sockets — FIXED in 0.9.483 (KR-104)
 

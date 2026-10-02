@@ -106,13 +106,38 @@ unsafe fn int32 queryTests() {
     Result<Connection, PgError> c2Made = connected(s: give s2);
     Connection c2 = match (give c2Made) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
     Query q2 = Query.make(sql: copy insert);
-    q2.addText(text: uuidText);
+    q2.add(value: uuidText);
     q2.add(value: true);
     q2.add(value: 70000);
     q2.addNull();
     Result<Optional<int64>, PgError> n2 = c2.execute(q: q2);
     f = f + check(ok: match (n2) { case Ok(value: o): match (o) { case Some(value: k): k == 1i64; case None: false; }; case Err(error: x): false; },
                   what: "extended: parameters encoded for their described types, and execute's count");
+
+    // The pg tag: each hole a parameter of its own type: an int in binary, an empty Optional as NULL, bytes in
+    // binary for bytea.
+    int32 seven = 7;
+    Optional<string> nobody = Optional::None;
+    DynamicArray<uint8> blob = DynamicArray.empty(); blob.add(item: 1ui8); blob.add(item: 2ui8);
+    Query tagged = pg"select ${seven} + 1, ${nobody}, ${blob}";
+    string taggedSql = "select $1 + 1, $2, $3";
+    f = f + check(ok: tagged.sql().equals(other: taggedSql) && tagged.parameterCount() == 3, what: "pg tag: $1, $2, $3 in the text, three parameters");
+    DynamicArray<Step> s6 = opening();
+    Wire d6 = Wire.make();
+    d6.parseComplete();
+    DynamicArray<uint32> three = DynamicArray.empty(); three.add(item: 23ui32); three.add(item: 25ui32); three.add(item: 17ui32);
+    d6.parameterTypes(oids: three);
+    d6.noData();
+    d6.ready(status: 73ui8);
+    describeSteps(s: ref s6, sql: taggedSql, reply: give d6);
+    s6.add(item: quiet(tag: BIND, body: "00 00 0003 0001 0000 0001 0003 00000004 00000007 ffffffff 00000002 0102 0000"));
+    s6.add(item: quiet(tag: EXECUTE, body: ""));
+    Wire e6 = Wire.make(); e6.bindComplete(); e6.complete(tag: "SELECT 1"); e6.ready(status: 73ui8);
+    s6.add(item: answer(tag: SYNC, reply: give e6));
+    Result<Connection, PgError> c6Made = connected(s: give s6);
+    Connection c6 = match (give c6Made) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Result<Rows, PgError> r6 = c6.query(q: tagged);
+    f = f + check(ok: errorText(r: r6).equals(other: "ok"), what: "pg tag: an int, NULL and bytes, each bound as its own type: ".concat(other: errorText(r: r6)));
 
     // An error at Parse: returned once the server is ready, and the session goes on.
     DynamicArray<Step> s3 = opening();
@@ -323,10 +348,6 @@ unsafe fn int32 refusalTests() {
     while (i < 65536) { many.addNull(); i = i + 1; }
     Result<Rows, PgError> r = c.query(q: many);
     f = f + check(ok: errorText(r: r).equals(other: "number of parameters must be between 0 and 65535"), what: "refused: 65536 parameters, in libpq's words");
-    Optional<int32> maybe = Optional::None;
-    Query tagged = pg"select ${maybe}";
-    Result<Rows, PgError> t = c.query(q: tagged);
-    f = f + check(ok: errorText(r: t).contains(substring: "is an Optional"), what: "refused: an Optional hole in a pg string (KPG-25)");
     Query nul = Query.make(sql: "select '\0'");
     Result<Rows, PgError> n = c.query(q: nul);
     f = f + check(ok: errorText(r: n).contains(substring: "NUL byte") && !c.isClosed(), what: "refused: a NUL in the SQL, before anything is sent");

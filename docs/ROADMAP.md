@@ -16,9 +16,9 @@ Where this is, 2026-10-01: phases 0–5 are done. The client connects and querie
 
 Expected values come from PostgreSQL itself: its TAP tests and test modules, a live libpq asked case by case, and a
 live server's send and output functions. Phase 5 began with the port to kama 0.9.506, which fixed every gap phases 3
-and 4 filed (KPG-11 to KPG-22); the workarounds they needed are gone. It filed KPG-23 to KPG-30, open in
-[KAMA_GAPS.md](../KAMA_GAPS.md); none blocks, and each workaround is named there. Phase 6, TLS, is next. It needs
-`@kama/tls` ported to 0.9.506's `IoError` first.
+and 4 filed (KPG-11 to KPG-22). Its own gaps, KPG-23 to KPG-30, were fixed in 0.9.519, and the package now needs that
+compiler: the `pg` tag's holes are typed, and every workaround is gone ([KAMA_GAPS.md](../KAMA_GAPS.md)). Phase 6,
+TLS, is next. It needs `@kama/tls` ported to the new `IoError` first.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -60,10 +60,12 @@ matrix.
 - **Describe first.** A query is parsed and described, then bound and executed. Each parameter is sent as the
   type the server inferred, and each column of a type this client reads in binary is asked for in binary, so
   every column can be read as text. The statement cache (phase 7) removes the extra round trip.
-- **Parameters go through `Serializable`.** A value is binary when it is its type's own kind, and text otherwise,
-  which the server's input function reads. So a `Uuid`, a `Timestamp` and a `Numeric` need no special case, and
-  the server reports a value it refuses in its own words.
-- **The `pg` tag's holes are text parameters.** kama renders every hole to a string before a tag sees it, so a
-  hole can be neither NULL nor bytes (KPG-25). `Query.add` and `addOptional` are for those.
+- **Parameters are `PgParam`s**, a contract this package declares, with `type adapter`s for the types it does not
+  own. Each writes itself through a `Serializer`. A value is binary when it is its type's own kind, and text
+  otherwise, which the server's input function reads. So a `Uuid`, a `Timestamp` and a `Numeric` need no special
+  case, and the server reports a value it refuses in its own words. std's `SqlParam` is too narrow for a driver
+  (no arrays, UUIDs or timestamps), as its own comment says.
+- **The `pg` tag's holes are typed** (`Template<PgParam>`), so each is checked where the string is written, and an
+  empty Optional hole is NULL.
 - **An integer reads into a type at least as wide as its column's, never narrower**, so whether a read succeeds
   never depends on the data.

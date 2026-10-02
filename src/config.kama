@@ -9,7 +9,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::conninfo::libpqEnvironmentOptions, postgres::conninfo::pgpassLookup,
          postgres::conninfo::defaultSocketDir, postgres::conninfo::parseServiceFile,
          postgres::conninfo::ServiceEntries };
-export { Config, Environment, Host, HostKind, SslMode, ChannelBindingMode, RequireAuth };
+export { Config, Environment, Host, HostKind, SslMode, SslCertMode, ChannelBindingMode, RequireAuth, TlsSettings };
 
 // postgres::Config — everything a connection needs, resolved the way libpq resolves it:
 //   1. the connection string (postgres::conninfo);
@@ -56,6 +56,8 @@ type resource Environment implements Sendable {
         DynamicArray<string> more = DynamicArray.empty();
         more.add(item: "PGSERVICEFILE"); more.add(item: "PGSYSCONFDIR"); more.add(item: "PGREQUIRESSL");
         more.add(item: "HOME"); more.add(item: "APPDATA");
+        // OpenSSL's override of the system trust store, which libpq's sslrootcert=system honours.
+        more.add(item: "SSL_CERT_FILE");
         i = 0;
         while (i < more.length()) { this.capture(name: more[i]); i = i + 1; }
         Result<string, ConnInfoError> who = localUserName();
@@ -174,6 +176,9 @@ fn Optional<string> nonEmpty(string s) { if (s.length() == 0) { return Optional:
 // ---- settings ------------------------------------------------------------------------------------------------
 
 type enum SslMode implements Sendable { Disable, Allow, Prefer, Require, VerifyCa, VerifyFull }
+// sslcertmode: whether a client certificate is sent (allow: if the server asks and one is configured), never sent, or
+// must have been asked for by the server.
+type enum SslCertMode implements Sendable { Disable, Allow, Require }
 type enum ChannelBindingMode implements Sendable { Disable, Prefer, Require }
 // A host given by name (resolved through DNS), by numeric address (`hostaddr`), or as a Unix-socket directory.
 type enum HostKind implements Sendable { Name, Address, Socket }
@@ -363,6 +368,75 @@ fn string describe(int32 code) {
     return "server requested an unknown authentication type";
 }
 
+// The files libpq's initialize_SSL reads when a setting leaves them to their default: in ~/.postgresql/, or the
+// PostgreSQL directory under %APPDATA% on Windows (libpq-int.h, USER_CERT_FILE and the rest).
+@compileFor(!OS_WINDOWS) fn string userCertFile() { return ".postgresql/postgresql.crt"; }
+@compileFor(!OS_WINDOWS) fn string userKeyFile() { return ".postgresql/postgresql.key"; }
+@compileFor(!OS_WINDOWS) fn string rootCertFile() { return ".postgresql/root.crt"; }
+@compileFor(!OS_WINDOWS) fn string rootCrlFile() { return ".postgresql/root.crl"; }
+@compileFor(OS_WINDOWS) fn string userCertFile() { return "postgresql.crt"; }
+@compileFor(OS_WINDOWS) fn string userKeyFile() { return "postgresql.key"; }
+@compileFor(OS_WINDOWS) fn string rootCertFile() { return "root.crt"; }
+@compileFor(OS_WINDOWS) fn string rootCrlFile() { return "root.crl"; }
+
+// The TLS settings of a configuration, resolved as libpq's initialize_SSL reads them: every file path after its
+// default (a setting left empty is the file of that name in the home directory, when there is one), the protocol
+// version bounds as written, and the environment's SSL_CERT_FILE for sslrootcert=system.
+type resource TlsSettings implements Sendable {
+    SslMode modeSetting = SslMode::Prefer;
+    bool directSetting = false;
+    SslCertMode certModeSetting = SslCertMode::Allow;
+    bool sniSetting = true;
+    string minText;
+    string maxText;
+    string passwordText;
+    string keylogText;
+    string certPath;
+    string keyPath;
+    string rootPath;
+    string crlPath;
+    string crlDirPath;
+    bool homeKnown = false;
+    Optional<string> systemCertFile;
+
+    ctor blank() {
+        this.modeSetting = SslMode::Prefer; this.directSetting = false; this.certModeSetting = SslCertMode::Allow;
+        this.sniSetting = true; this.minText = ""; this.maxText = ""; this.passwordText = ""; this.keylogText = "";
+        this.certPath = ""; this.keyPath = ""; this.rootPath = ""; this.crlPath = ""; this.crlDirPath = "";
+        this.homeKnown = false; this.systemCertFile = Optional::None;
+    }
+
+    friend Config::resolveTls[blank, modeSetting, directSetting, certModeSetting, sniSetting, minText, maxText, passwordText,
+                         keylogText, certPath, keyPath, rootPath, crlPath, crlDirPath, homeKnown, systemCertFile];
+    friend Config::blank[blank];
+
+    public const fn SslMode mode() { return this.modeSetting; }
+    // sslnegotiation=direct: a TLS ClientHello first, with no SSLRequest.
+    public const fn bool direct() { return this.directSetting; }
+    public const fn SslCertMode certMode() { return this.certModeSetting; }
+    // sslsni: whether a host name (never an address) is sent as SNI.
+    public const fn bool sni() { return this.sniSetting; }
+    // ssl_min_protocol_version and ssl_max_protocol_version as written ("TLSv1.2"), "" when unset.
+    public const fn const ref string minVersion() { return this.minText; }
+    public const fn const ref string maxVersion() { return this.maxText; }
+    // sslpassword: the client key's passphrase, "" for none.
+    public const fn const ref string password() { return this.passwordText; }
+    // sslkeylogfile, "" for none.
+    public const fn const ref string keyLogFile() { return this.keylogText; }
+    // sslcert, sslkey and sslrootcert after their defaults; "" when there is neither a setting nor a home directory.
+    // sslrootcert may be "system".
+    public const fn const ref string certFile() { return this.certPath; }
+    public const fn const ref string keyFile() { return this.keyPath; }
+    public const fn const ref string rootCert() { return this.rootPath; }
+    // sslcrl and sslcrldir. When neither is set, sslcrl is the home directory's root.crl.
+    public const fn const ref string crlFile() { return this.crlPath; }
+    public const fn const ref string crlDir() { return this.crlDirPath; }
+    // Whether the home directory was found: libpq's have_homedir, which picks its message for a missing root file.
+    public const fn bool homeDirectoryKnown() { return this.homeKnown; }
+    // SSL_CERT_FILE from the environment the configuration was resolved under.
+    public const fn const ref Optional<string> sslCertFile() { return this.systemCertFile; }
+}
+
 // ---- the configuration --------------------------------------------------------------------------------------
 
 type resource Config implements Sendable {
@@ -386,6 +460,7 @@ type resource Config implements Sendable {
     DynamicArray<string> paramValues;
     DynamicArray<uint8> clientKey;        // scram_client_key and scram_server_key, decoded; empty when not given
     DynamicArray<uint8> serverKey;
+    TlsSettings tlsSettings;
 
     // A connection string, resolved under the process environment.
     public unsafe ctor Result<Config, PgError> parse(const ref string text) {
@@ -432,6 +507,7 @@ type resource Config implements Sendable {
         this.paramValues = DynamicArray.empty();
         this.clientKey = DynamicArray.empty();
         this.serverKey = DynamicArray.empty();
+        this.tlsSettings = TlsSettings.blank();
     }
 
     // ---- reading it ----
@@ -474,6 +550,8 @@ type resource Config implements Sendable {
     // scram_client_key and scram_server_key: SCRAM's ClientKey and ServerKey, given instead of a password.
     public const fn const ref DynamicArray<uint8> scramClientKey() { return this.clientKey; }
     public const fn const ref DynamicArray<uint8> scramServerKey() { return this.serverKey; }
+    // The TLS settings, with their files resolved.
+    public const fn const ref TlsSettings tls() { return this.tlsSettings; }
 
     const fn isize indexOf(const ref string keyword) {
         isize i = 0;
@@ -675,7 +753,47 @@ type resource Config implements Sendable {
         Result<Unit, ConnInfoError> ints = this.parseIntegers();
         match (give ints) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
 
+        this.resolveTls(vars: vars);
         return this.buildStartup(vars: vars);
+    }
+
+    // The TLS settings as initialize_SSL reads them. The home directory is looked up only when a file is left to its
+    // default, as libpq looks it up.
+    fn void resolveTls(const ref Environment vars) {
+        TlsSettings t = TlsSettings.blank();
+        t.modeSetting = this.ssl;
+        t.directSetting = this.text(keyword: "sslnegotiation").equals(other: "direct");
+        string certmode = this.text(keyword: "sslcertmode");
+        if (certmode.equals(other: "disable")) { t.certModeSetting = SslCertMode::Disable; }
+        else if (certmode.equals(other: "require")) { t.certModeSetting = SslCertMode::Require; }
+        else { t.certModeSetting = SslCertMode::Allow; }
+        t.sniSetting = this.text(keyword: "sslsni").startsWith(prefix: "1");
+        t.minText = this.text(keyword: "ssl_min_protocol_version");
+        t.maxText = this.text(keyword: "ssl_max_protocol_version");
+        t.passwordText = this.text(keyword: "sslpassword");
+        t.keylogText = this.text(keyword: "sslkeylogfile");
+        string cert = this.text(keyword: "sslcert");
+        string key = this.text(keyword: "sslkey");
+        string root = this.text(keyword: "sslrootcert");
+        string crl = this.text(keyword: "sslcrl");
+        string crldir = this.text(keyword: "sslcrldir");
+        bool needHome = cert.length() == 0 || key.length() == 0 || root.length() == 0 || (crl.length() == 0 && crldir.length() == 0);
+        string home = "";
+        if (needHome) {
+            Optional<string> found = vars.homeDirectory();
+            match (give found) { case Some(value: h): { home = give h; t.homeKnown = true; } case None: { } };
+        }
+        if (cert.length() == 0 && t.homeKnown) { cert = home.concat(other: "/").concat(other: userCertFile()); }
+        if (key.length() == 0 && t.homeKnown) { key = home.concat(other: "/").concat(other: userKeyFile()); }
+        if (root.length() == 0 && t.homeKnown) { root = home.concat(other: "/").concat(other: rootCertFile()); }
+        if (crl.length() == 0 && crldir.length() == 0 && t.homeKnown) { crl = home.concat(other: "/").concat(other: rootCrlFile()); }
+        t.certPath = give cert;
+        t.keyPath = give key;
+        t.rootPath = give root;
+        t.crlPath = give crl;
+        t.crlDirPath = give crldir;
+        t.systemCertFile = vars.get(name: "SSL_CERT_FILE");
+        this.tlsSettings = give t;
     }
 
     // pqConnectOptions2's host layout: hostaddr and host lists paired by position, the default host, one port for

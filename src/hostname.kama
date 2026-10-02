@@ -1,0 +1,415 @@
+import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode as utf8Decode,
+         std::encoding::utf8::Utf8Error, tls::CertificateNames, tls::NameKind };
+export { verifyServerName };
+
+// libpq's check that the server's certificate is for the host the client asked for (sslmode=verify-full), ported
+// step for step from PostgreSQL REL_18_STABLE (c45ba888): pq_verify_peer_name_matches_certificate and its helpers
+// in src/interfaces/libpq/fe-secure-common.c, and pgtls_verify_peer_name_matches_certificate_guts in
+// fe-secure-openssl.c. The TLS library verifies only the chain; the names are compared here, by libpq's rules and
+// with libpq's messages:
+//   - a host that is an IP address is compared with the certificate's iPAddress names, any other with its dNSName
+//     names, in the order the certificate lists them; every name of either kind is counted for the message;
+//   - the subject's first commonName is compared (as a name, even for an IP host) only when the certificate has no
+//     subjectAltName of the host's kind, and no earlier name matched or failed;
+//   - a name matches exactly, ASCII case-insensitively, or as a wildcard: a leading "*." covers exactly one label;
+//   - a name with an embedded NUL, or an address that is neither 4 nor 16 bytes, fails the check outright.
+// Whether the host is an IP address is decided as libpq decides it, by inet_aton (which takes 127.1, 0x7f.1 and
+// 0177.0.0.1) or inet_pton(AF_INET6); both are ported from glibc 2.41 (resolv/inet_addr.c and resolv/inet_pton.c),
+// the C library of the server images libpq is tested against.
+
+// None when `names` (the server certificate's, from `TlsStream.peerNames()`) include `host`; otherwise libpq's
+// message: which name the certificate is for and how many others it has, or why the check could not be made.
+fn Optional<string> verifyServerName(const ref CertificateNames names, const ref string host) {
+    if (host.length() == 0) { return Optional::Some(value: "host name must be specified for a verified SSL connection"); }
+    Optional<DynamicArray<uint8>> v4 = inetAton(text: host);
+    Optional<DynamicArray<uint8>> v6 = inetPton6(text: host);
+    bool hostIsIp = isSome(v: v4) || isSome(v: v6);
+
+    int32 examined = 0;
+    string first = "";
+    bool haveFirst = false;
+    int32 rc = 0;            // libpq's: 1 a match, 0 none yet, -1 a failure that ends the check
+    string failure = "";
+    bool checkCn = true;
+    isize i = 0;
+    while (i < names.count() && rc == 0) {
+        NameKind kind = names.kindAt(index: i);
+        bool dns = match (kind) { case DnsName: true; case _: false; };
+        bool ip = match (kind) { case IpAddress: true; case _: false; };
+        if ((dns && !hostIsIp) || (ip && hostIsIp)) { checkCn = false; }
+        if (dns || ip) {
+            examined = examined + 1;
+            NameCheck c = NameCheck.unchecked();
+            if (dns) { c = checkName(raw: names.valueAt(index: i), host: host); }
+            else { c = checkAddress(raw: names.valueAt(index: i), v4: v4, v6: v6); }
+            if (c.hasStored() && !haveFirst) { first = c.stored(); haveFirst = true; }
+            rc = c.result();
+            if (rc < 0) { failure = c.failure(); }
+            if (rc != 0) { checkCn = false; }
+        }
+        i = i + 1;
+    }
+    if (checkCn) {
+        isize j = 0;
+        bool found = false;
+        while (j < names.count() && !found) {
+            NameKind kind = names.kindAt(index: j);
+            bool cn = match (kind) { case CommonName: true; case _: false; };
+            if (cn) {
+                found = true;
+                examined = examined + 1;
+                NameCheck c = checkName(raw: names.valueAt(index: j), host: host);
+                if (c.hasStored() && !haveFirst) { first = c.stored(); haveFirst = true; }
+                rc = c.result();
+                if (rc < 0) { failure = c.failure(); }
+            }
+            j = j + 1;
+        }
+    }
+    if (rc == 1) { return Optional::None; }
+    if (rc < 0) { return Optional::Some(value: give failure); }
+    if (examined > 1) {
+        int32 others = examined - 1;
+        string noun = "names";
+        if (others == 1) { noun = "name"; }
+        return Optional::Some(value: "server certificate for \"${first}\" (and ${others} other ${noun}) does not match host name \"${host}\"");
+    }
+    if (examined == 1) { return Optional::Some(value: "server certificate for \"${first}\" does not match host name \"${host}\""); }
+    return Optional::Some(value: "could not get server's host name from server certificate");
+}
+
+fn bool isSome(const ref Optional<DynamicArray<uint8>> v) { return match (v) { case Some(value: x): true; case None: false; }; }
+
+// One name compared: libpq's 1 (a match), 0 (no match) or -1 (a failure, with its message), and the name as
+// libpq stores it for the mismatch message (absent when it failed before storing one).
+type resource NameCheck {
+    int32 rc = 0;
+    bool storedSet = false;
+    string storedName;
+    string failed;
+
+    public ctor unchecked() { this.rc = 0; this.storedSet = false; this.storedName = ""; this.failed = ""; }
+    public ctor of(int32 rc, string stored) { this.rc = rc; this.storedSet = true; this.storedName = give stored; this.failed = ""; }
+    public ctor failing(string message) { this.rc = -1; this.storedSet = false; this.storedName = ""; this.failed = give message; }
+
+    public const fn int32 result() { return this.rc; }
+    public const fn bool hasStored() { return this.storedSet; }
+    public const fn string stored() { return copy this.storedName; }
+    public const fn string failure() { return copy this.failed; }
+}
+
+// pq_verify_peer_name_matches_certificate_name: a dNSName or commonName against the host.
+fn NameCheck checkName(const ref DynamicArray<uint8> raw, const ref string host) {
+    foreach (uint8 b in raw) { if (b == 0ui8) { return NameCheck.failing(message: "SSL certificate's name contains embedded null"); } }
+    string name = bytesText(raw: raw);
+    if (equalsIgnoringCase(a: raw.view(), b: host.bytes())) { return NameCheck.of(rc: 1, stored: give name); }
+    if (wildcardMatch(pattern: raw.view(), h: host.bytes())) { return NameCheck.of(rc: 1, stored: give name); }
+    return NameCheck.of(rc: 0, stored: give name);
+}
+
+// pq_verify_peer_name_matches_certificate_ip: an iPAddress against the host, which matches only when it parses as
+// an address of the same length; the stored name is the address as pg_inet_net_ntop prints it.
+fn NameCheck checkAddress(const ref DynamicArray<uint8> raw, const ref Optional<DynamicArray<uint8>> v4, const ref Optional<DynamicArray<uint8>> v6) {
+    isize len = raw.length();
+    bool match4 = false;
+    bool match6 = false;
+    if (len == 4) {
+        match4 = match (v4) { case Some(value: a): sameBytes(a: a, b: raw); case None: false; };
+    } else if (len == 16) {
+        match6 = match (v6) { case Some(value: a): sameBytes(a: a, b: raw); case None: false; };
+    } else {
+        return NameCheck.failing(message: "certificate contains IP address with invalid length ${len}");
+    }
+    string text = "";
+    if (len == 4) { text = ntop4(raw: raw); } else { text = ntop6(raw: raw); }
+    int32 rc = 0;
+    if (match4 || match6) { rc = 1; }
+    return NameCheck.of(rc: rc, stored: give text);
+}
+
+fn bool sameBytes(const ref DynamicArray<uint8> a, const ref DynamicArray<uint8> b) {
+    if (a.length() != b.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) { if (a[i] != b[i]) { return false; } i = i + 1; }
+    return true;
+}
+
+// The bytes as libpq prints them in a message: as they are. A name that is not UTF-8 shows each byte above 0x7F as
+// a '?', since a kama string holds UTF-8 only.
+fn string bytesText(const ref DynamicArray<uint8> raw) {
+    DynamicArray<uint8> clean = DynamicArray.withCapacity(capacity: raw.length());
+    foreach (uint8 b in raw) { if (b < 128ui8) { clean.add(item: b); } else { clean.add(item: 63ui8); } }
+    Result<string, Utf8Error> text = utf8Decode(bytes: clean.view());
+    return match (give text) { case Ok(value: t): give t; case Err(error: e): ""; };
+}
+
+fn uint8 lower(uint8 b) { if (b >= 65ui8 && b <= 90ui8) { return b + 32ui8; } return b; }
+
+fn bool equalsIgnoringCase(ConstView<uint8> a, ConstView<uint8> b) {
+    if (a.length() != b.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) { if (lower(b: a[i]) != lower(b: b[i])) { return false; } i = i + 1; }
+    return true;
+}
+
+// wildcard_certificate_match: "*.rest" matches a host that ends in ".rest" and has no dot before that point, so
+// the star covers one label (possibly empty), never more.
+fn bool wildcardMatch(ConstView<uint8> pattern, ConstView<uint8> h) {
+    isize lenpat = pattern.length();
+    isize lenstr = h.length();
+    if (lenpat < 3 || pattern[0] != 42ui8 || pattern[1] != 46ui8) { return false; }
+    if (lenpat > lenstr) { return false; }
+    if (!equalsIgnoringCase(a: pattern.slice(from: 1, count: lenpat - 1), b: h.slice(from: lenstr - lenpat + 1, count: lenpat - 1))) { return false; }
+    isize dot = 0;
+    while (dot < lenstr && h[dot] != 46ui8) { dot = dot + 1; }
+    if (dot < lenstr - lenpat) { return false; }
+    return true;
+}
+
+// ---- glibc 2.41's address parsers, as libpq calls them ----------------------------------------------------------
+
+fn bool isDigit(uint8 b) { return b >= 48ui8 && b <= 57ui8; }
+
+// C's isspace in the "C" locale.
+fn bool isSpace(uint8 b) { return b == 32ui8 || (b >= 9ui8 && b <= 13ui8); }
+
+fn int32 hexValue(uint8 b) {
+    if (b >= 48ui8 && b <= 57ui8) { return cast<int32>(b - 48ui8); }
+    if (b >= 97ui8 && b <= 102ui8) { return cast<int32>(b - 97ui8) + 10; }
+    if (b >= 65ui8 && b <= 70ui8) { return cast<int32>(b - 65ui8) + 10; }
+    return -1;
+}
+
+// inet_aton (resolv/inet_addr.c, inet_aton_end): one to four parts separated by dots, each decimal, octal (a
+// leading 0) or hex (0x), read as strtoul(…, 0) reads them; the last part fills the bytes the others left
+// (a.b.c takes c as 16 bits, a.b takes b as 24, a alone as 32); whitespace may end the text, with anything after it.
+fn Optional<DynamicArray<uint8>> inetAton(const ref string text) { return atonBytes(s: text.bytes()); }
+
+fn Optional<DynamicArray<uint8>> atonBytes(ConstView<uint8> s) {
+    isize at = 0;
+    DynamicArray<uint8> parts = DynamicArray.empty();
+    int64 val = 0;
+    while (true) {
+        if (at >= s.length() || !isDigit(b: s[at])) { return Optional::None; }
+        // strtoul with base 0 from a digit: "0x"/"0X" before a hex digit is hex, another leading 0 is octal.
+        int64 radix = 10;
+        if (s[at] == 48ui8) {
+            radix = 8;
+            if (at + 2 < s.length() && (s[at + 1] == 120ui8 || s[at + 1] == 88ui8) && hexValue(b: s[at + 2]) >= 0) { radix = 16; at = at + 2; }
+        }
+        val = 0;
+        bool more = true;
+        while (more && at < s.length()) {
+            int32 d = hexValue(b: s[at]);
+            if (d < 0 || cast<int64>(d) >= radix) { more = false; }
+            else {
+                val = val * radix + cast<int64>(d);
+                if (val > 4294967295i64) { return Optional::None; }
+                at = at + 1;
+            }
+        }
+        if (at < s.length() && s[at] == 46ui8) {
+            if (parts.length() > 2 || val > 255i64) { return Optional::None; }
+            parts.add(item: cast<uint8>(val));
+            at = at + 1;
+        } else {
+            if (at < s.length() && !isSpace(b: s[at])) { return Optional::None; }
+            // The last part fits in the bytes left: 32, 24, 16 or 8 bits for 0, 1, 2 or 3 parts before it.
+            int64 max = 4294967295i64;
+            if (parts.length() == 1) { max = 16777215i64; }
+            if (parts.length() == 2) { max = 65535i64; }
+            if (parts.length() == 3) { max = 255i64; }
+            if (val > max) { return Optional::None; }
+            DynamicArray<uint8> address = DynamicArray.empty();
+            foreach (uint8 p in parts) { address.add(item: p); }
+            isize left = 4 - parts.length();
+            isize k = left - 1;
+            while (k >= 0) {
+                address.add(item: truncate<uint8>(val >> (cast<int64>(k) * 8i64)));
+                k = k - 1;
+            }
+            return Optional::Some(value: give address);
+        }
+    }
+    return Optional::None;
+}
+
+// inet_pton4 (resolv/inet_pton.c): exactly four decimal parts of 0 to 255, no leading zeros, nothing else.
+fn bool inetPton4(ConstView<uint8> s, ref DynamicArray<uint8> into) {
+    bool sawDigit = false;
+    int32 octets = 0;
+    int32 cur = 0;
+    DynamicArray<uint8> tmp = DynamicArray.empty();
+    isize i = 0;
+    while (i < s.length()) {
+        uint8 ch = s[i];
+        i = i + 1;
+        if (isDigit(b: ch)) {
+            int32 next = cur * 10 + cast<int32>(ch - 48ui8);
+            if (sawDigit && cur == 0) { return false; }
+            if (next > 255) { return false; }
+            cur = next;
+            if (!sawDigit) {
+                octets = octets + 1;
+                if (octets > 4) { return false; }
+                sawDigit = true;
+            }
+        } else if (ch == 46ui8 && sawDigit) {
+            if (octets == 4) { return false; }
+            tmp.add(item: cast<uint8>(cur));
+            cur = 0;
+            sawDigit = false;
+        } else {
+            return false;
+        }
+    }
+    if (octets < 4) { return false; }
+    tmp.add(item: cast<uint8>(cur));
+    foreach (uint8 b in tmp) { into.add(item: b); }
+    return true;
+}
+
+// inet_pton6 (resolv/inet_pton.c): up to eight groups of one to four hex digits, one "::" for a run of zero
+// groups, and an optional dotted IPv4 address as the last 32 bits.
+fn Optional<DynamicArray<uint8>> inetPton6(const ref string text) { return pton6Bytes(s: text.bytes()); }
+
+fn Optional<DynamicArray<uint8>> pton6Bytes(ConstView<uint8> s) {
+    isize n = s.length();
+    if (n == 0) { return Optional::None; }
+    isize at = 0;
+    if (s[0] == 58ui8) {
+        at = 1;
+        if (at == n || s[at] != 58ui8) { return Optional::None; }
+    }
+    DynamicArray<uint8> tp = DynamicArray.empty();
+    isize colonp = -1;
+    isize curtok = at;
+    isize xdigits = 0;
+    int32 val = 0;
+    bool dotted = false;
+    while (at < n && !dotted) {
+        uint8 ch = s[at];
+        at = at + 1;
+        int32 digit = hexValue(b: ch);
+        if (digit >= 0) {
+            if (xdigits == 4) { return Optional::None; }
+            val = val * 16 + digit;
+            if (val > 65535) { return Optional::None; }
+            xdigits = xdigits + 1;
+        } else if (ch == 58ui8) {
+            curtok = at;
+            if (xdigits == 0) {
+                if (colonp >= 0) { return Optional::None; }
+                colonp = tp.length();
+            } else {
+                if (at == n) { return Optional::None; }
+                if (tp.length() + 2 > 16) { return Optional::None; }
+                tp.add(item: cast<uint8>(val >> 8));
+                tp.add(item: cast<uint8>(val & 255));
+                xdigits = 0;
+                val = 0;
+            }
+        } else if (ch == 46ui8 && tp.length() + 4 <= 16) {
+            DynamicArray<uint8> four = DynamicArray.empty();
+            if (!inetPton4(s: s.slice(from: curtok, count: n - curtok), into: four)) { return Optional::None; }
+            foreach (uint8 b in four) { tp.add(item: b); }
+            xdigits = 0;
+            dotted = true;
+        } else {
+            return Optional::None;
+        }
+    }
+    if (xdigits > 0) {
+        if (tp.length() + 2 > 16) { return Optional::None; }
+        tp.add(item: cast<uint8>(val >> 8));
+        tp.add(item: cast<uint8>(val & 255));
+    }
+    if (colonp >= 0) {
+        if (tp.length() == 16) { return Optional::None; }
+        // The groups after "::" move to the end; zeros fill the gap.
+        isize tail = tp.length() - colonp;
+        DynamicArray<uint8> full = DynamicArray.empty();
+        isize i = 0;
+        while (i < colonp) { full.add(item: tp[i]); i = i + 1; }
+        i = 0;
+        while (i < 16 - tp.length()) { full.add(item: 0ui8); i = i + 1; }
+        i = 0;
+        while (i < tail) { full.add(item: tp[colonp + i]); i = i + 1; }
+        return Optional::Some(value: give full);
+    }
+    if (tp.length() != 16) { return Optional::None; }
+    return Optional::Some(value: give tp);
+}
+
+// ---- pg_inet_net_ntop (src/port/inet_net_ntop.c), for a whole address ------------------------------------------
+
+fn string ntop4(const ref DynamicArray<uint8> raw) {
+    string text = "";
+    isize i = 0;
+    while (i < 4) {
+        if (i > 0) { text = text.concat(other: "."); }
+        int32 b = cast<int32>(raw[i]);
+        text = text.concat(other: "${b}");
+        i = i + 1;
+    }
+    return text;
+}
+
+fn string hexWord(int32 w) {
+    string digits = "0123456789abcdef";
+    if (w == 0) { return "0"; }
+    string text = "";
+    int32 v = w;
+    while (v > 0) {
+        isize d = cast<isize>(v & 15);
+        text = digits.substring(start: d, end: d + 1).concat(other: text);
+        v = v >> 4;
+    }
+    return text;
+}
+
+// inet_net_ntop_ipv6 at 128 bits: groups in lower-case hex, the longest run of two or more zero groups (the first
+// of equal runs) as "::", and an embedded IPv4 address in dotted form for ::a.b.c.d, ::ffff:a.b.c.d and ::ffff:0:…
+// as decoct writes it.
+fn string ntop6(const ref DynamicArray<uint8> raw) {
+    DynamicArray<int32> words = DynamicArray.empty();
+    isize i = 0;
+    while (i < 8) { words.add(item: cast<int32>(raw[2 * i]) * 256 + cast<int32>(raw[2 * i + 1])); i = i + 1; }
+    isize bestBase = -1;
+    isize bestLen = 0;
+    isize curBase = -1;
+    isize curLen = 0;
+    i = 0;
+    while (i < 8) {
+        if (words[i] == 0) {
+            if (curBase == -1) { curBase = i; curLen = 1; } else { curLen = curLen + 1; }
+        } else if (curBase != -1) {
+            if (bestBase == -1 || curLen > bestLen) { bestBase = curBase; bestLen = curLen; }
+            curBase = -1;
+        }
+        i = i + 1;
+    }
+    if (curBase != -1 && (bestBase == -1 || curLen > bestLen)) { bestBase = curBase; bestLen = curLen; }
+    if (bestBase != -1 && bestLen < 2) { bestBase = -1; }
+    string text = "";
+    i = 0;
+    bool done = false;
+    while (i < 8 && !done) {
+        if (bestBase != -1 && i >= bestBase && i < bestBase + bestLen) {
+            if (i == bestBase) { text = text.concat(other: ":"); }
+        } else {
+            if (i != 0) { text = text.concat(other: ":"); }
+            bool v4 = i == 6 && bestBase == 0 && (bestLen == 6 || (bestLen == 7 && words[7] != 1) || (bestLen == 5 && words[5] == 65535));
+            if (v4) {
+                int32 a = cast<int32>(raw[12]); int32 b = cast<int32>(raw[13]); int32 c = cast<int32>(raw[14]); int32 d = cast<int32>(raw[15]);
+                text = text.concat(other: "${a}.${b}.${c}.${d}");
+                done = true;
+            } else {
+                text = text.concat(other: hexWord(w: words[i]));
+            }
+        }
+        i = i + 1;
+    }
+    if (!done && bestBase != -1 && bestBase + bestLen == 8) { text = text.concat(other: ":"); }
+    return text;
+}

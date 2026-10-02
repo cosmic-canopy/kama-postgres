@@ -20,6 +20,7 @@
     "sqlstate": { "visibility": "public" },
     "types":    { "visibility": "public" },
     "wire":     { "visibility": "internal" },
+    "secure":   { "visibility": "internal" },
     "stringprep": { "visibility": "internal" }
   }
 }

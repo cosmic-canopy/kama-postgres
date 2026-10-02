@@ -1,0 +1,69 @@
+// Host-name verification (sslmode=verify-full) against every host-name case of PostgreSQL's own
+// src/test/ssl/t/001_ssltests.pl, with upstream's server certificates: libpq's verdict and its exact message
+// (tests/unit/src/ssl_name_vectors.kama, from tools/gen-ssl-vectors.sh). A few cases of the rules the upstream
+// file does not reach follow, each from libpq's source.
+import { std::collections::DynamicArray, tls::Certificate, tls::CertificateNames, tls::TlsError,
+         postgres::verifyServerName,
+         postgres_unit_tests::check, postgres_unit_tests::nameCertificates, postgres_unit_tests::nameHosts,
+         postgres_unit_tests::nameAccepted, postgres_unit_tests::nameMessages, postgres_unit_tests::certificatePem };
+export { tlsNameTests };
+
+fn int32 upstreamTests() {
+    int32 f = 0;
+    DynamicArray<string> certs = nameCertificates();
+    DynamicArray<string> hosts = nameHosts();
+    DynamicArray<bool> accepted = nameAccepted();
+    DynamicArray<string> messages = nameMessages();
+    isize i = 0;
+    while (i < certs.length()) {
+        string pem = certificatePem(name: certs[i]);
+        Result<Certificate, TlsError> parsed = Certificate.parse(bytes: pem.bytes());
+        match (give parsed) {
+            case Ok(value: c): {
+                CertificateNames names = c.names();
+                Optional<string> verdict = verifyServerName(names: names, host: hosts[i]);
+                string got = match (give verdict) { case Some(value: m): give m; case None: ""; };
+                bool right = false;
+                if (accepted[i]) { right = got.length() == 0; } else { right = got.equals(other: messages[i]); }
+                string what = "names: ".concat(other: certs[i]).concat(other: " for ").concat(other: hosts[i]).concat(other: " (").concat(other: got).concat(other: ")");
+                f = f + check(ok: right, what: give what);
+            }
+            case Err(error: e): { f = f + check(ok: false, what: "names: parse ".concat(other: certs[i]).concat(other: " (").concat(other: e.message()).concat(other: ")")); }
+        };
+        i = i + 1;
+    }
+    f = f + check(ok: certs.length() >= 30, what: "names: the upstream cases are all there");
+    return f;
+}
+
+// The rules upstream's certificates do not reach, against the test PKI's server certificate (SAN DNS:localhost,
+// IP:127.0.0.1, IP:::1; CN localhost), embedded nowhere: it is parsed from the fixtures directory when present.
+fn int32 ruleTests() {
+    int32 f = 0;
+    // An empty host: libpq's first check, before any name is read.
+    string pem = certificatePem(name: "server-cn-only");
+    Result<Certificate, TlsError> parsed = Certificate.parse(bytes: pem.bytes());
+    match (give parsed) {
+        case Ok(value: c): {
+            CertificateNames names = c.names();
+            string empty = "";
+            Optional<string> v = verifyServerName(names: names, host: empty);
+            string got = match (give v) { case Some(value: m): give m; case None: ""; };
+            f = f + check(ok: got.equals(other: "host name must be specified for a verified SSL connection"), what: "names: an empty host (".concat(other: got).concat(other: ")"));
+            // pg_strcasecmp: the comparison ignores ASCII case.
+            string upper = "COMMON-NAME.PG-SSLTEST.TEST";
+            Optional<string> u = verifyServerName(names: names, host: upper);
+            bool matched = match (give u) { case Some(value: m): false; case None: true; };
+            f = f + check(ok: matched, what: "names: a host in upper case matches");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "names: parse server-cn-only"); }
+    };
+    return f;
+}
+
+fn int32 tlsNameTests() {
+    int32 f = 0;
+    f = f + upstreamTests();
+    f = f + ruleTests();
+    return f;
+}

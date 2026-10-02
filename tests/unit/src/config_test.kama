@@ -287,8 +287,58 @@ fn int32 environmentTests() {
     return f;
 }
 
+// The TLS files as initialize_SSL finds them: each setting as given, else the file of that name under the home
+// directory (~/.postgresql/), root.crl only when neither sslcrl nor sslcrldir is set, and nothing when there is no
+// home directory. SSL_CERT_FILE comes from the environment the configuration was resolved under.
+fn string tlsPaths(const ref Config c) {
+    string line = c.tls().certFile().concat(other: "|").concat(other: c.tls().keyFile()).concat(other: "|")
+                  .concat(other: c.tls().rootCert()).concat(other: "|").concat(other: c.tls().crlFile()).concat(other: "|")
+                  .concat(other: c.tls().crlDir());
+    return line;
+}
+
+fn int32 tlsSettingTests() {
+    int32 f = 0;
+    Environment home = testEnvironment();
+    home.set(name: "HOME", value: "/home/t");
+    home.set(name: "SSL_CERT_FILE", value: "/etc/bundle.pem");
+    Result<Config, PgError> r1 = resolveWith(text: "host=h sslmode=disable", env: home);
+    match (give r1) {
+        case Ok(value: c): {
+            string got = tlsPaths(c: c);
+            f = f + check(ok: got.equals(other: "/home/t/.postgresql/postgresql.crt|/home/t/.postgresql/postgresql.key|/home/t/.postgresql/root.crt|/home/t/.postgresql/root.crl|"),
+                          what: "tls: every file defaults under the home directory (".concat(other: got).concat(other: ")"));
+            bool system = match (c.tls().sslCertFile()) { case Some(value: v): v.equals(other: "/etc/bundle.pem"); case None: false; };
+            f = f + check(ok: system, what: "tls: SSL_CERT_FILE comes from the environment");
+            bool allow = match (c.tls().certMode()) { case Allow: true; case _: false; };
+            f = f + check(ok: allow && c.tls().sni() && !c.tls().direct(), what: "tls: sslcertmode allow, sslsni 1 and postgres negotiation by default");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "tls: defaults resolve (".concat(other: e.message()).concat(other: ")")); }
+    };
+    Result<Config, PgError> r2 = resolveWith(text: "host=h sslmode=disable sslcert=/c sslkey=/k sslrootcert=/r sslcrldir=/d sslsni=0", env: home);
+    match (give r2) {
+        case Ok(value: c): {
+            string got = tlsPaths(c: c);
+            f = f + check(ok: got.equals(other: "/c|/k|/r||/d"), what: "tls: settings are used as given, and sslcrldir alone keeps sslcrl empty (".concat(other: got).concat(other: ")"));
+            f = f + check(ok: !c.tls().sni(), what: "tls: sslsni=0");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "tls: explicit files resolve"); }
+    };
+    Environment homeless = testEnvironment();
+    Result<Config, PgError> r3 = resolveWith(text: "host=h sslmode=disable", env: homeless);
+    match (give r3) {
+        case Ok(value: c): {
+            string got = tlsPaths(c: c);
+            f = f + check(ok: got.equals(other: "||||") && !c.tls().homeDirectoryKnown(), what: "tls: no home directory, no default files (".concat(other: got).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "tls: a configuration without a home resolves"); }
+    };
+    return f;
+}
+
 fn int32 configTests() {
     int32 f = 0;
+    f = f + tlsSettingTests();
     f = f + requireAuthTests();
     f = f + pgpassTests();
     f = f + serviceTests();

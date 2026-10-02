@@ -1,0 +1,88 @@
+import { postgres::SslMode };
+export { EncryptionPlan, Encryption, Fallback };
+
+// postgres::secure — TLS for a connection, as libpq sets it up. Internal: a connection is the only user.
+//
+// This file is the choice of encryption: which methods an address may be tried with, in what order, and what a
+// failure leads to. It is libpq's, ported from PostgreSQL REL_18_STABLE (c45ba888), src/interfaces/libpq/fe-connect.c:
+// init_allowed_encryption_methods, select_next_encryption_method, encryption_negotiation_failed and
+// connection_failed. This client is built without GSSAPI, so only SSL and plaintext are in play.
+
+// What one connection attempt uses.
+type enum Encryption implements Sendable { Plain, Ssl }
+
+// What a failure leads to.
+//   None            no method is left: the connect ends with this failure
+//   SameConnection  the server refused SSL ('N'), and plaintext may go on over the same socket
+//   NewConnection   the next method is tried on a new connection to the same address
+type enum Fallback implements Sendable { None, SameConnection, NewConnection }
+
+// The methods for one server address and which have failed. libpq resets it when it moves to another address or
+// host, and keeps it across new connections to the same address.
+type value EncryptionPlan implements Sendable {
+    bool allowSsl = false;
+    bool allowPlain = false;
+    bool plainFirst = false;    // sslmode=allow tries plaintext before SSL; prefer the other way round
+    bool sslFailed = false;
+    bool plainFailed = false;
+    bool sslNow = false;        // the method in use
+    bool exhausted = false;
+
+    // The plan for an address: a Unix socket is plaintext whatever sslmode says (libpq: "Don't request SSL or
+    // GSSAPI over Unix sockets"); otherwise sslmode decides, disable plain only, allow plain then SSL, prefer SSL
+    // then plain, and require, verify-ca and verify-full SSL only.
+    public ctor forAddress(SslMode mode, bool socket) {
+        bool disable = match (mode) { case Disable: true; case _: false; };
+        bool lenient = match (mode) { case Disable: true; case Allow: true; case Prefer: true; case _: false; };
+        this.allowSsl = !socket && !disable;
+        this.allowPlain = socket || lenient;
+        bool allow = match (mode) { case Allow: true; case _: false; };
+        this.plainFirst = allow;
+        this.sslFailed = false;
+        this.plainFailed = false;
+        this.sslNow = false;
+        this.exhausted = false;
+        this.selectNext();
+    }
+
+    // The method the next attempt uses.
+    public const fn Encryption current() {
+        if (this.sslNow) { return Encryption::Ssl; }
+        return Encryption::Plain;
+    }
+
+    // Whether any method was left to try; false once every allowed one has failed.
+    public const fn bool usable() { return !this.exhausted; }
+
+    // The server answered an SSLRequest with 'N': the connection is still good, so plaintext (if allowed) goes on
+    // over it. libpq's encryption_negotiation_failed.
+    public fn Fallback refused() {
+        this.markFailed();
+        if (!this.selectNext()) { return Fallback::None; }
+        return Fallback::SameConnection;
+    }
+
+    // Anything else failed after the method was chosen: the TLS setup or handshake, or an error from the server
+    // before authentication completed. The next method, if one is left, needs a new connection. libpq's
+    // connection_failed.
+    public fn Fallback failed() {
+        this.markFailed();
+        if (!this.selectNext()) { return Fallback::None; }
+        return Fallback::NewConnection;
+    }
+
+    fn void markFailed() {
+        if (this.sslNow) { this.sslFailed = true; } else { this.plainFailed = true; }
+    }
+
+    // select_next_encryption_method: allow puts plaintext first, every other mode SSL first.
+    fn bool selectNext() {
+        bool plainLeft = this.allowPlain && !this.plainFailed;
+        bool sslLeft = this.allowSsl && !this.sslFailed;
+        if (this.plainFirst && plainLeft) { this.sslNow = false; return true; }
+        if (sslLeft) { this.sslNow = true; return true; }
+        if (!this.plainFirst && plainLeft) { this.sslNow = false; return true; }
+        this.exhausted = true;
+        return false;
+    }
+}

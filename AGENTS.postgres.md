@@ -64,6 +64,11 @@ compiler with everything this package relies on:
     - for TLS (`tools/gen-ssl-vectors.sh`, no server needed): `001_ssltests.pl`'s host-name cases with upstream's
       certificates embedded, and every case of `005_negotiate_encryption.pl`, run as written against stubs; and a TLS
       table in `tools/gen-libpq-test-cases.sh`, each case asked of the container's libpq with the same files.
+    - for pipelines, the traces of libpq's `libpq_pipeline` test (`tools/gen-pipeline-vectors.sh`). The unit tests
+      replay them, comparing each frontend line through a port of fe-trace.c's regress format (`trace.kama`).
+    - for which server a connect settles on, `001_stream_rep.pl` and `003_load_balance_host_list.pl`
+      (`tools/gen-session-vectors.sh`); and a `target_session_attrs` table in `tools/gen-libpq-test-cases.sh`,
+      asked of a libpq on the host network against the primary and its standby.
 
     A message this client prints is libpq's message, compared exactly. The one exception is where libpq quotes
     OpenSSL ("SSL error: %s", "could not load private key file \"%s\": %s"): there the frame is libpq's and the words are
@@ -87,6 +92,9 @@ compiler with everything this package relies on:
     startup notices.
   - `tools/pg.sh smoke` logs in once per method with the container's own psql. When an integration test
     fails, run it first: it separates "the server is misconfigured" from "the client is wrong".
+  - A hot standby streams from each server: `kama-pg-N-standby` on port 544N (`PGTEST_STANDBY_PORT`), made with
+    `pg_basebackup -R` as the role `kp_repl`. The two containers share a network, `kama-pg-net-N`, with the aliases
+    `primary` and `standby`. `target_session_attrs` and `load_balance_hosts` are tested against both.
   - The test PKI is generated into `out/test-certs` by `tools/gen-test-certs.sh` and is never tracked.
     `kama publish` refuses a tracked `*.key`, and so does the registry.
 
@@ -107,10 +115,23 @@ compiler with everything this package relies on:
   - `rowAs` follows kama's serde: a field with no column is an error unless it is `Optional` (None) or
     `@field(default)` (its declared value). The derive decides that, not the reader.
 
-- **The extended protocol describes first** (Parse and Describe, then Bind, Execute and Sync). One reader
-  (`Connection.readRows`) reads every result and checks each message's place. A server error is returned once
-  the server is ready, and FATAL or a message out of place ends the session. While a result is open
-  (`busy`), every other call is refused with libpq's "another command is already in progress".
+- **One reader, driven by a queue.** `Connection.readRows` reads every result, and checks each message's place
+  against the queue of commands sent (`queue`, of `PipelineCommand`s), as libpq's PGcmdQueueEntry does. A plain
+  query, a cached statement, a pipeline and a batch all go through it.
+  - A server error is returned once the server is ready, and FATAL or a message out of place ends the session.
+  - While a result is open (`busy`), every other call is refused with libpq's "another command is already in
+    progress".
+  - In pipeline mode every synchronous call is refused with libpq's words.
+- **The statement cache is on by default** (`postgres::session::StatementCache`, pgx's design).
+  - A miss is Parse with a name (`sc0`, `sc1`, …) plus Describe; a hit is Bind and Execute, one round trip.
+  - Before Parse, eviction makes room, queueing a Close.
+  - An unknown query with the cache off still describes first: Parse and Describe, then Bind, Execute and Sync.
+  - A server error about a statement names `sc…`, not the unnamed statement. A test that compares a message with
+    the unnamed statement in it uses an uncached connection (`overUncached` in the unit tests).
+- **A cancel goes the way the session went.** `postgres::session::CancelRoute` keeps a copy of the `Config`, the
+  host index and the `DialTarget`, and `Opener` dials it again. A cancel runs the session's encryption plan, sends
+  CancelRequest, and waits for the server to close. A query timeout cancels through the same route, then waits the
+  grace period.
 - **Parameters are `PgParam`s** (`src/query.kama`), a contract this package declares, with `type adapter`s for
   the primitives, `DynamicArray`, `Optional` (None is NULL), std's `Uuid`, `Timestamp` and `Date`, and its own
   types. Each writes itself through a `Serializer`. `Query.add(value:)` and the `pg` tag's holes
@@ -186,6 +207,19 @@ compiler with everything this package relies on:
   - A function that must build a resource through a private constructor gets a `friend` grant, or is a `static` of
     the type: a free function in the same file cannot call it.
   - An `IoError` is a value: branch on `e.kind()`, and make one with `IoError.of(kind: IoErrorKind::…)`.
+  - A local cannot share a name with a field of its type (`int64 cents = this.cents;` is refused), nor with a
+    function in scope.
+  - `foreach` needs a `Copyable` element and a collection that is not a temporary. Loop over a resource array by
+    index.
+  - A contract-typed parameter borrows its argument: pass it without `give`.
+  - A value moved on some paths but not others is an error. Move it on every path, or on none.
+  - `match` takes no integer-literal patterns; compare with `if`.
+  - std's `shuffle` and other mutating helpers take a `View`, from `viewMut()`, not `view()`, which is const.
+  - `Result<Unit, E>` is made with `Result::Ok(value: Unit::Unit)`.
+  - A path dependency is relative to its manifest; an absolute path is not found.
+- **KPG-38's workaround.** Two files that use the same `type adapter` conversion (an int32 or a string into
+  `PgParam`) fail every release build. In `tests/unit`, those uses live in `extended_test.kama`, behind its helpers
+  `sevenQuery`, `sevenOf`, `withInt` and `withText`. Delete them when KPG-38 is fixed.
 
 - **Nothing from the server is trusted.**
   - Every length is bounded before it is used.

@@ -11,11 +11,11 @@ kama pkg add kama.json @kama/postgres --version ^0.1.0     # from the official r
 Needs **kama ≥ 0.9.523**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
 release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta.
 
-> **Status: 0.1.0, early.** It connects, authenticates and runs queries, with typed parameters and typed rows, over
-> TCP, a Unix-domain socket or TLS (every `sslmode`, client certificates, SCRAM-SHA-256-PLUS). Not there yet: the
-> statement cache, helpers for transactions (plain `begin`/`commit` statements work), COPY, waiting for
-> notifications, pipelining, cancellation and query timeouts, `target_session_attrs`, `load_balance_hosts`, and a
-> pool. See [docs/ROADMAP.md](docs/ROADMAP.md). In 0.x, a minor version may break the API.
+> **Status: early.** It connects, authenticates and runs queries, with typed parameters and typed rows, over TCP, a
+> Unix-domain socket or TLS (every `sslmode`, client certificates, SCRAM-SHA-256-PLUS). The statement cache,
+> transactions and savepoints, COPY, waiting for notifications, pipelining and batches, cancellation and query timeouts,
+> `target_session_attrs` and `load_balance_hosts` are on `main` and will be 0.2.0; the published 0.1.0 has none of them.
+> Not there yet: a pool. See [docs/ROADMAP.md](docs/ROADMAP.md). In 0.x, a minor version may break the API.
 
 ## Using it
 
@@ -105,13 +105,153 @@ that changes:
 - `sslcrldir` loads every CRL file of the hashed directory up front, where OpenSSL opens them by issuer; the same
   chains pass.
 
-## What it will cover
+## Transactions
+
+`begin(options:)`, `commit()` and `rollback()` run the statements, with what BEGIN asks for. A COMMIT that the server
+turns into a ROLLBACK, because the transaction had failed, is `PgError::RolledBack`. `savepoint()` gives a
+`Savepoint` the connection names (`sp_1`, `sp_2`, …), for `releaseSavepoint(sp:)` and `rollbackToSavepoint(sp:)`.
+
+```kama
+TransactionOptions options = TransactionOptions.of(isolation: IsolationLevel::Serializable, access: AccessMode::ReadOnly, deferrable: true);
+Result<Unit, PgError> begun = conn.begin(options: options);
+// … queries …
+Result<Unit, PgError> done = conn.commit();
+```
+
+`transaction(body:, options:)` runs a body between BEGIN and COMMIT, as psycopg's `with conn.transaction()` and pgx's
+BeginFunc do. An error from the body rolls back and is returned. Inside an open transaction the call nests as a
+savepoint. The body keeps what it produces in its own fields, which the caller reads afterwards:
+
+```kama
+type resource Transfer implements TransactionBody {
+    int64 cents = 0;
+    public ctor make(int64 cents) { this.cents = cents; }
+    public unsafe fn Result<Unit, PgError> run(ref Connection conn) {
+        int64 amount = this.cents;
+        Result<Optional<int64>, PgError> debit = conn.execute(q: pg"update accounts set balance = balance - ${amount} where id = 1");
+        match (give debit) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Optional<int64>, PgError> credit = conn.execute(q: pg"update accounts set balance = balance + ${amount} where id = 2");
+        match (give credit) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return Result::Ok(value: Unit::Unit);
+    }
+}
+
+Transfer transfer = Transfer.make(cents: 500i64);
+Result<Unit, PgError> moved = conn.transaction(body: transfer, options: TransactionOptions.defaults());
+```
+
+## COPY
+
+COPY runs as libpq runs it, and std::io drives it, as pgx's CopyFrom and CopyTo do:
+
+```kama
+Result<File, IoError> opened = File.open(path: "items.csv", mode: OpenMode::Read);
+// … unwrap it into `file` …
+Result<Optional<int64>, PgError> copied = conn.copyFrom(sql: "copy items (name, qty) from stdin (format csv)", source: file);
+```
+
+`copyTo(sql:, sink:)` writes COPY OUT to any `Writer`. The calls underneath are libpq's:
+
+- `startCopyIn(sql)`, which gives a `CopyInfo` (binary or text, each column's format);
+- `putCopyData(bytes:)`;
+- `endCopyIn()`, with the rows copied, or `failCopyIn(reason:)`;
+- `startCopyOut(sql)`, then `getCopyData()` until `CopyChunk::Done`.
+
+Data goes out in 64 KiB writes. If the server has already failed the COPY, the next put stops it rather than sending
+the rest.
+
+## The statement cache
+
+Each SQL text is prepared once, as a named statement, and bound directly after that. A repeated query then takes one
+round trip instead of two. This is pgx's design, and it is on by default, with 512 statements kept and the least
+recently used closed. It is set on the `Config`, since libpq has no keyword for it:
+
+```kama
+config.setStatementCache(mode: CacheMode::Describe, capacity: 512);   // for a pooler without named statements
+```
+
+The modes:
+
+- `CacheMode::Describe` keeps only descriptions, and parses the unnamed statement on each run.
+- `CacheMode::Off` describes before every run.
+
+When the server refuses a cached plan because a table changed under it ("cached plan must not change result type"),
+the entry is dropped. Outside a transaction the query runs again once, as pgjdbc does it; inside one, the error is
+returned. DISCARD ALL and DEALLOCATE ALL empty the cache.
+
+## Pipelines and batches
+
+A `Batch` sends many queries in one round trip, and is pgx's SendBatch:
+
+```kama
+Batch batch = Batch.make();
+batch.add(q: pg"insert into items (name, qty) values (${name}, 0)");
+batch.add(q: pg"select count(*) from items");
+Result<DynamicArray<BatchResult>, PgError> results = conn.runBatch(batch: batch);
+```
+
+Each query's result is `Rows`, `Failed` or `Aborted`. A failure aborts the queries after it, and the batch, which is
+one implicit transaction, rolls back. Any SQL the cache does not know yet is described first, in a single round trip.
+
+Underneath is libpq's pipeline mode, which is public:
+
+- `enterPipelineMode()` and `exitPipelineMode()`;
+- `sendQuery(q:)`, `sendPrepare(sql:)` and `sendClosePrepared(statement:)`;
+- `pipelineSync()`, `sendPipelineSync()` and `sendFlushRequest()`;
+- `getResult()`, which gives each command's `PipelineResult` in order.
+
+After an error, each command up to the next sync is `Aborted`, as in libpq, and libpq's refusals are quoted word for
+word. Seven of the nine traces of libpq's own `libpq_pipeline` test replay message for message.
+
+## Cancel and timeouts
+
+`conn.cancelToken()` gives a `CancelToken`, which is Sendable and can be copied. Another isolate uses it to cancel the
+running command with `cancel()`. The request goes as libpq 17's does: to the same address, with the session's
+`sslmode`, so it is encrypted when the session is.
+
+A query timeout cancels and keeps the connection, as Npgsql and pgjdbc do:
+
+```kama
+conn.setQueryTimeout(timeout: Optional::Some(value: Duration.fromSecs(s: 30i64)), grace: Duration.fromSecs(s: 2i64));
+```
+
+When a call waits past the timeout, the command is cancelled, and the server's 57014 ("canceling statement due to user
+request") is returned. The connection can then be used again. If the server does not answer within the grace period,
+the connection is closed and the call returns `PgError::Timeout`. A connection made with `connectOver` has no way to
+send a cancel, so it closes at the timeout.
+
+## Notifications
+
+`waitForNotification(timeout:)` returns the next LISTEN/NOTIFY notification. If none arrives in time it returns `None`,
+and it takes in any notices on the way. libpq leaves this loop to the application, through PQsocket, PQconsumeInput
+and PQnotifies.
+
+## Several hosts
+
+A connection string can list several hosts, as libpq's can:
+
+- `target_session_attrs` takes any of `any`, `read-write`, `read-only`, `primary`, `standby` or `prefer-standby`. Each
+  server is checked after login, the way libpq checks it, and one of the wrong kind is passed over for the next host.
+- `load_balance_hosts=random` tries the hosts, and each host's addresses, in a random order.
+
+## Where this differs from libpq
+
+- **Query timeouts.** libpq has none; `statement_timeout` is the server's. This client's is the drivers' design,
+  described above.
+- **The cancel race.** A cancel can reach the server just after its command finished and the next one started. libpq
+  documents the same race. This client narrows it as libpq does, by waiting for the server to close the cancel
+  connection, but no client can close it entirely.
+- **Text columns from pipelined SQL the cache has not seen.** Such a query goes as libpq's PQsendQueryParams sends it,
+  so its columns come back as text, and `column::<T>` reads them from text. A query the cache knows goes typed.
+- **Pipelines take no statement or portal names.** The two libpq_pipeline traces that name them are not replayed.
+
+## What it covers
 
 - **Connecting:**
   - TCP and Unix-domain sockets.
   - URI and `key=value` connection strings, `PG*` environment variables, `.pgpass` and
     `pg_service.conf`.
-  - Multiple hosts with `target_session_attrs`, connect timeouts, and TCP keepalive.
+  - Multiple hosts with `target_session_attrs` and `load_balance_hosts`, connect timeouts, and TCP keepalive.
 - **Security:**
   - TLS with every `sslmode` (`disable` … `verify-full`), `sslnegotiation=direct`, and client
     certificates.
@@ -119,15 +259,15 @@ that changes:
 - **Queries:**
   - Simple and extended protocol, typed parameters, and a `pg"… ${x}"` tag that parameterises
     interpolations (never splices them).
-  - Prepared-statement caching.
-  - Streaming rows, portals, and pipelining.
+  - A statement cache.
+  - Streaming rows, portals, pipelining and batches.
 - **Data:** `column::<T>(row:, index:)` and `rowAs::<T>` into `@generate(Deserializable)` structs.
   Types are the built-ins plus numeric, interval, inet/cidr, arrays and ranges, with UUIDs and timestamps
   through `std::uuid` and `std::time`.
 - **Everything else:**
   - Transactions and savepoints, COPY in and out, LISTEN/NOTIFY, query cancellation and timeouts.
   - Full `ErrorResponse` fields with SQLSTATE constants.
-  - A connection pool shared across isolates.
+  - A connection pool shared across isolates (phase 8, not there yet).
 
 No GSSAPI/Kerberos/SSPI: a server that asks for them gets a clear error.
 
@@ -147,8 +287,13 @@ podman or docker, and run the whole suite a second time over TLS. Their expected
 PostgreSQL's own authentication, service-file and TLS tests (its negotiation matrix and its host-name cases, replayed
 by `tools/gen-ssl-vectors.sh`), and the server container's libpq asked case by case (`tools/gen-libpq-test-cases.sh`).
 
-The integration server has one role per authentication method and TLS on. Its test certificates are
-generated into `out/` and never committed. See `tests/integration/server/`.
+The pipeline tests replay the traces of libpq's own `libpq_pipeline` (`tools/gen-pipeline-vectors.sh`). The session
+tests run the cases of PostgreSQL's `001_stream_rep.pl` and `003_load_balance_host_list.pl`
+(`tools/gen-session-vectors.sh`).
+
+The integration server has one role per authentication method and TLS on. A hot standby streams from each server,
+for `target_session_attrs` and `load_balance_hosts`. Its test certificates are generated into `out/` and never
+committed. See `tests/integration/server/`.
 
 ## License
 

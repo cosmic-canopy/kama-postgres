@@ -99,6 +99,8 @@ All notable changes to this package are recorded here. The format follows
   or less. Before, with no way to read a file's owner, every key had to be 0600 or less.
 - **Breaking:** `TransactionStatus` gains `Active`, reported while a command's result is still being read, as libpq's
   PQtransactionStatus reports PQTRANS_ACTIVE.
+- **Breaking:** `PgError` gains `Cancel`, `RolledBack` and `Target`. A `match` that names every variant must add
+  them.
 - `Config` is `Copyable`: a copy is the whole configuration, as libpq's pqCopyPGconn copies a connection's options.
 - Bind sends no format codes when every parameter is text, and Parse no types when none is given, as libpq does (each
   sent a 0 per parameter).

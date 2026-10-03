@@ -55,12 +55,11 @@ unsafe fn int32 fails(const ref string user, const ref string extra, const ref D
     }
     isize count = 0;
     string scan = copy message;
-    bool more = true;
-    while (more) {
+    while (true) {
         Optional<usize> lead = scan.find(substring: "connection to server at");
         match (lead) {
             case Some(value: i): { count = count + 1; scan = scan.substring(start: cast<isize>(i) + 1, end: scan.length()); }
-            case None: { more = false; }
+            case None: { break; }
         };
     }
     int32 f = check(ok: inOrder, what: what.concat(other: ": the message (").concat(other: message).concat(other: ")"));

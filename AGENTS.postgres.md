@@ -12,7 +12,7 @@ edit.
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.519**, declared as `"kama"` in every manifest here. That is the first
+**The package needs kama ≥ 0.9.523**, declared as `"kama"` in every manifest here, and pinned in CI. That is the first
 compiler with everything this package relies on:
 - a non-fatal write to a closed socket;
 - a `Sendable` `TcpStream`;
@@ -27,7 +27,9 @@ compiler with everything this package relies on:
 - typed tag holes (`Template<C>`) and `type adapter`, for the `pg` tag and `PgParam`;
 - serde's `MissingField` and `@field(default)`, which `rowAs` relies on;
 - `IoError.osMessage()`, for libpq's strerror text;
-- floats printed in their shortest form, as PostgreSQL prints them.
+- floats printed in their shortest form, as PostgreSQL prints them;
+- a `break` in a `match` arm that leaves the loop (KPG-32);
+- `Metadata.owner`, for libpq's rule that a root-owned key may be 0640 (KPG-31).
 
 ## What is true here and nowhere else
 
@@ -180,7 +182,6 @@ compiler with everything this package relies on:
   - `float` is reserved, as every C keyword is; so is `out`.
   - A resource that implements `Copyable<This>` must say its bare hand-off: `Copyable<This>(bare: give)`.
   - `DynamicArray.remove` returns `T` and `pop` returns `Optional<T>`.
-  - A `break` in a `match` arm leaves the match, not the loop (KPG-32): end such a loop on a flag.
   - A static function is called with `::` (`Connection::visit(…)`); `.` on a type calls a constructor.
   - A function that must build a resource through a private constructor gets a `friend` grant, or is a `static` of
     the type: a free function in the same file cannot call it.

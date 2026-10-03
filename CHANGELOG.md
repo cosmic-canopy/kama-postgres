@@ -6,6 +6,11 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **Needs kama ≥ 0.9.523**, the release with the fixes for KPG-31 and KPG-32.
+- A client private key owned by root may be group-readable (0640), as libpq allows. Every other key must still be 0600
+  or less. Before, with no way to read a file's owner, every key had to be 0600 or less.
+
 ## [0.1.0] — 2026-10-02
 
 The first published version. Needs **kama ≥ 0.9.519** and `@kama/tls` ^0.1.0 (Mbed TLS 4.1.1), from the registry.

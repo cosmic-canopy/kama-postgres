@@ -6,6 +6,7 @@
 // Certificates come from tools/gen-test-certs.sh (PGTEST_CERTDIR, set by tools/test.sh).
 import { core::env, std::collections::DynamicArray, std::memory::Owned, std::io::IoError, std::fs::readFile, std::fs::writeFile,
          std::fs::setPermissions, std::fs::Permissions, std::fs::readText, std::fs::stat, std::fs::Metadata, std::fs::remove,
+         std::process::currentUser, std::process::UserId,
          tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion, tls::Certificate,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Transport,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
@@ -266,6 +267,20 @@ unsafe fn int32 certificateTests() {
     string tooOpen = messageOf(r: overTls(script: trustScript(), conninfo: open, server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
     string want = "private key file \"".concat(other: sharedKey).concat(other: "\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root");
     f = f + check(ok: tooOpen.equals(other: want), what: "tls certificate: a key others can read (".concat(other: tooOpen).concat(other: ")"));
+    // 0640 is libpq's exception for a key root owns. The key is this process's, so the case is accepted when the tests
+    // run as root (the Linux container) and refused otherwise, with the same message as 0644.
+    string groupKey = scratch(name: "client-0640.key");
+    Result<isize, IoError> w3 = writeFile(path: groupKey, bytes: keyBytes);
+    Result<Unit, IoError> p3 = setPermissions(path: groupKey, permissions: Permissions::OwnerRead | Permissions::OwnerWrite | Permissions::GroupRead);
+    Result<UserId, IoError> who = currentUser();
+    bool root = match (who) { case Ok(value: u): u.raw() == 0ui32; case Err(error: e): false; };
+    string grouped = messageOf(r: overTls(script: trustScript(), conninfo: withCert.concat(other: groupKey), server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
+    string wantGrouped = "private key file \"".concat(other: groupKey).concat(other: "\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root");
+    if (root) {
+        f = f + check(ok: grouped.equals(other: "(connected)"), what: "tls certificate: a root-owned key at 0640 is libpq's exception (".concat(other: grouped).concat(other: ")"));
+    } else {
+        f = f + check(ok: grouped.equals(other: wantGrouped), what: "tls certificate: a key at 0640 not owned by root (".concat(other: grouped).concat(other: ")"));
+    }
     string missingKey = withCert.concat(other: scratch(name: "no-such.key"));
     string gm = messageOf(r: overTls(script: trustScript(), conninfo: missingKey, server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
     string wantMissing = "certificate present, but not private key file \"".concat(other: scratch(name: "no-such.key")).concat(other: "\"");

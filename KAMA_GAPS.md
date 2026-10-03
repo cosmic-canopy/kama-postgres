@@ -6,17 +6,18 @@ it. Every entry with a repro was **run** on the version named. Nothing is inferr
 spec. An entry that is an absence cites the cstar files that show it instead. This file is excluded from
 the published package, as it is in `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.519+g28136440`, the dev build at `../cstar/out/Darwin-arm64/kama`. Every entry from
-KPG-23 to KPG-30 was re-run on it, with the repro as filed, before it moved to FIXED. Earlier rounds: `0.9.506`
-(KPG-11 to KPG-22 verified, KPG-23 to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to
-KPG-14 filed), `0.9.477` (KPG-1 also on Linux aarch64 inside `localhost/kama-dev`), and the first report against
-`0.9.470` and the public `0.9.440`.
+**Current compiler:** `kama 0.9.523`, the release (`v0.9.523`), and the dev build at `../cstar/out/Darwin-arm64/kama`
+(`0.9.523+gf8212db3`). KPG-31 and KPG-32 were re-run on it, with the repros as filed, before they moved to FIXED;
+KPG-33 to KPG-37 were filed on it. Earlier rounds: `0.9.519` (KPG-23 to KPG-30 verified), `0.9.506` (KPG-11 to KPG-22
+verified, KPG-23 to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to KPG-14 filed), `0.9.477`
+(KPG-1 also on Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.470` and the public
+`0.9.440`.
 
 **Reporter:** the `@kama/postgres` repo. Each open entry names the workaround this package uses, so the
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** KPG-32 (HIGH) and KPG-31. Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** KPG-37 (HIGH), KPG-33 (HIGH), KPG-34 (HIGH), KPG-35 (MED, a request) and KPG-36 (LOW). Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -27,74 +28,189 @@ changes the right design here, say so and we will follow it.
 
 ## OPEN
 
-### KPG-32 · HIGH · `break` in a `match` arm does not leave the enclosing loop
+### KPG-37 · HIGH · A lock stops installing when a newer version is published, if the package is also reached through a path dependency
 
-**Found** writing phase 6's integration tests, on `kama 0.9.520+gca7e0d21`: a loop that ended with `case None: { break; }`
-never ended, and the test run hung.
+**Found** on `kama 0.9.523` (the release, `f8212db3`), the day `@kama/tls` 0.1.1 was published: `kama pkg install
+tests/unit/kama.json` in this repo, unchanged and green the day before, failed with `version resolution did not
+converge (too many range conflicts)`. That manifest depends on `@kama/postgres` by path (`../..`), whose manifest asks
+for `@kama/tls ^0.1.0`, and on `@kama/tls ^0.1.0` directly, and its `kama.lock` pins 0.1.0. Reduced, against a
+`file://` registry:
+
+```sh
+K=kama; T=$(mktemp -d); mkdir -p $T/reg $T/leaf/src $T/mid/src $T/app/src
+cat > $T/leaf/kama.json <<EOF
+{ "name": "@x/leaf", "version": "0.1.0", "license": "MIT", "kind": "library", "kama": ">=0.9.523",
+  "modules": { ".": { "visibility": "public" } } }
+EOF
+printf 'export { one };\nfn int32 one() { return 1; }\n' > $T/leaf/src/leaf.kama; printf 'MIT\n' > $T/leaf/LICENSE
+cat > $T/mid/kama.json <<EOF
+{ "name": "@x/mid", "version": "0.1.0", "kind": "library", "kama": ">=0.9.523", "modules": { ".": { "visibility": "public" } },
+  "registries": { "default": ["file://$T/reg"] }, "dependencies": { "@x/leaf": { "version": "^0.1.0" } } }
+EOF
+printf 'export { two };\nfn int32 two() { return 2; }\n' > $T/mid/src/mid.kama
+cat > $T/app/kama.json <<EOF
+{ "name": "app", "version": "0.0.1", "kind": "executable", "entry": "src/main.kama", "kama": ">=0.9.523",
+  "modules": { ".": { "visibility": "internal" } }, "registries": { "default": ["file://$T/reg"] },
+  "dependencies": { "@x/mid": { "path": "../mid" }, "@x/leaf": { "version": "^0.1.0" } } }
+EOF
+echo 'fn int32 main() { return 0; }' > $T/app/src/main.kama
+cd $T/leaf && git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm v1 && $K publish kama.json --registry file://$T/reg
+cd $T/app && $K pkg install kama.json          # installs, and the lock pins @x/leaf 0.1.0
+cd $T/leaf && sed -i.bak 's/"0.1.0"/"0.1.1"/' kama.json && git -c user.email=t@t -c user.name=t commit -qam v2 && $K publish kama.json --registry file://$T/reg
+cd $T/app && $K pkg install kama.json          # did not converge
+```
+
+The second install says `kama pkg install: version resolution did not converge (too many range conflicts)`. 0.1.0
+still satisfies every `^0.1.0` in the graph, and the lock names it. Each piece alone installs:
+- without the app's direct `@x/leaf` dependency, it installs;
+- with no lock, it resolves to 0.1.1;
+- a lock pinning 0.1.0 in a project with no path dependency installs 0.1.0.
+
+**Why HIGH:** a committed lock stops installing the moment a dependency publishes a compatible patch, with no commit
+in the project. CI goes red, and so does any checkout of a published package's own tests.
+
+**Workaround** (all three locks here): re-resolve, so each lock pins the newest version (`@kama/tls` 0.1.1). That
+lasts until the next release of `@kama/tls`.
+
+### KPG-33 · HIGH · A parent may use a place its `scope`'s spawned child borrows by `ref`: a data race, accepted
+
+**Found** surveying kama for phase 7 (a cancel token that another isolate uses), on `kama 0.9.523+gf8212db3`.
+
+```kama
+import { core::println, std::concurrent::Isolate };
+
+type resource Counter implements Sendable {
+    int64 n = 0;
+    public ctor make() { }
+    public fn void bump() { this.n = this.n + 1; }
+    public const fn int64 value() { return this.n; }
+}
+
+fn void worker(ref Counter c) {
+    int64 i = 0;
+    while (i < 20000000i64) { c.bump(); i = i + 1; }
+}
+
+fn int32 main() {
+    Counter c = Counter.make();
+    scope {
+        spawn worker(c: ref c);
+        int64 i = 0;
+        while (i < 20000000i64) { c.bump(); i = i + 1; }
+    }
+    int64 total = c.value();
+    println(s: "total ${total} (40000000 if nothing raced)");
+    return 0;
+}
+```
+
+`kama check` says OK. Built `--debug` on macOS arm64, it prints `total 22373426 (40000000 if nothing raced)`, and
+`22670326` on a second run: the child and the parent's own scope body write `c` at once. While a child holds a `ref`
+borrow, the scope body should not be able to touch the place (or the borrow should be refused).
+
+**Workaround:** none needed. This package never shares a place with a spawned child; a `Connection` moves whole
+between isolates. Filed because phase 7's cancel token and phase 8's pool are designed around isolates.
+
+### KPG-34 · HIGH · A `return` in a destructor body skips the fields' destructors, silently
+
+**Found** surveying kama for phase 7 (a transaction that rolls back in a destructor), on `kama 0.9.523+gf8212db3`.
 
 ```kama
 import { core::println };
-fn int32 main() {
-    int32 turns = 0;
-    while (true) {
-        turns = turns + 1;
-        Optional<int32> next = Optional::None;
-        if (turns < 3) { next = Optional::Some(value: turns); }
-        match (next) {
-            case Some(value: v): { }
-            case None: { break; }
-        };
-        if (turns > 10) { println(s: "break did not leave the loop: ${turns} turns"); return 1; }
+
+type resource Inner {
+    public ctor make() { }
+    ~Inner() { println(s: "Inner dropped"); }
+}
+
+type resource Outer {
+    Inner inner;
+    bool done = false;
+    public ctor make(bool done) { this.inner = Inner.make(); this.done = done; }
+    ~Outer() {
+        if (this.done) { return; }
+        println(s: "Outer: not done");
     }
-    println(s: "left the loop after ${turns} turns");
+}
+
+fn int32 main() {
+    { Outer a = Outer.make(done: false); }
+    println(s: "--");
+    { Outer b = Outer.make(done: true); }
+    println(s: "end");
     return 0;
 }
 ```
 
-`kama build` takes it with no diagnostic, and it prints `break did not leave the loop: 11 turns` and exits 1. The
-`break` ends the `match` only, as a `break` in a C `switch` ends the switch: the loop goes on. `continue` in the same
-place does continue the loop (checked the same way: `turns 5, counted 3`). Nothing in kama's SPEC says a `match`
-catches `break`, and a reader of the source takes it to leave the loop. It should, or be a compile error.
+`kama check` says OK. It prints `Outer: not done`, `Inner dropped`, `--`, `end`: for `b`, `Inner` is never dropped, so
+whatever it owns (a socket, a buffer) leaks. The emitter knows (`src/kama.cemit.cpp:30180`: "Early return inside a dtor
+body is unsupported."), but nothing tells the author. It should be an error, or the drops should run on every path.
 
-**Workaround** (tests/integration/src/tls_test.kama, `fails`): the loop runs on a flag the arm clears. Nothing else in
-this package or @kama/tls has a `break` in a `match` arm.
+**Workaround:** none needed yet. This package's destructors (`~Connection`) call one method and never return early.
 
-### KPG-31 · LOW · `std::fs::Metadata` has no owner, so libpq's private-key rule cannot be ported whole
+### KPG-35 · MED · A borrow window cannot run code when it ends (asked for: a scoped transaction)
 
-**Found** porting libpq's `initialize_SSL` (phase 6), on `kama 0.9.520+gca7e0d21`.
-
-libpq refuses a client private key that others can read, with one exception for system-wide keys: a file root owns
-may be mode 0640 (group-readable), any other file at most 0600. It tells them apart by `st_uid`
-(src/interfaces/libpq/fe-secure-openssl.c, `buf.st_uid == 0 ? mode & (S_IWGRP | S_IXGRP | S_IRWXO) : mode &
-(S_IRWXG | S_IRWXO)`). `std::fs::Metadata` has the kind, size, mtime and permission bits, but not the owner:
+**Asked for** in phase 7's transaction design, on `kama 0.9.523+gf8212db3`. A database transaction wants a scope that
+ends it on every path, rolling back unless the code committed. tokio-postgres and Npgsql use a guard that borrows the
+connection and rolls back on drop; psycopg's `with conn.transaction():` and pgx's `BeginFunc` use a block or a closure.
+kama has no stored borrows (GOALS 3e) and no closures (a non-goal), and its borrow window is the nearest thing. But the
+view a window mints cannot run anything when the window ends:
 
 ```kama
-import { core::println, std::fs::stat, std::fs::Metadata, std::io::IoError };
-fn int32 main() {
-    string path = "/etc/hosts";
-    Result<Metadata, IoError> m = stat(path: path);
-    match (m) {
-        case Ok(value: md): { uint32 owner = md.owner; println(s: "owner ${owner}"); }
-        case Err(error: e): { println(s: "stat failed"); }
-    };
-    return 0;
+type resource Conn { public ctor make() { } }
+type view Tx {
+    UnsafePtr<Conn> c;
+    unsafe ctor over(UnsafePtr<Conn> c) { this.c = c; }
+    ~Tx() { }
 }
+fn int32 main() { return 0; }
 ```
 
-`kama check owner.kama` says `` `std::fs::Metadata` has no field `owner` ``. Asked for: the owning user (and group) on
-`Metadata`, from `st_uid`/`st_gid`, as a `UserId` or a raw id. `File.metadata()` should carry it too, since the key is
-checked on the file it is read from.
+`kama check` refuses it: `a view borrows and owns nothing — it may not declare a ~dtor (it would free memory it doesn't
+own)`. Without the `~Tx()` it checks.
 
-**Workaround** (in `src/secure/setup.kama`, to delete when this is fixed): every key file gets the non-root rule,
-mode 0600 or less. A root-owned key at 0640, which libpq accepts, is refused with libpq's own message. That is
-stricter, never looser.
+**What would close it:** an exit hook on a view minted by a borrow window. That could be a `~dtor` that a view may
+declare, or a hook the minting contract declares, run when the window ends on any path, with the view's fields in
+scope. Then `borrow conn.transaction() as tx { … }` rolls back unless `tx.commit()` ran, and nothing escapes the window.
+
+**Workaround** (phase 7, `src/transaction.kama`):
+- `begin`, `commit`, `rollback` and savepoint methods on `Connection`;
+- `transaction(body:)`, which takes a contract-typed body and ends the transaction on every path.
+
+The cost is a small type per body, and, with the bare methods, a transaction an early return leaves open
+(`transactionStatus()` reports it).
+
+### KPG-36 · LOW · `docs/TYPE_MODEL.md` shows a `ref` field, which does not parse
+
+`docs/TYPE_MODEL.md:124` gives `type view EcsQuery { ref World w; … }` as an example of a view. On `kama 0.9.523`:
+
+```kama
+type resource World { public ctor make() { } }
+type view EcsQuery { ref World w; }
+fn int32 main() { return 0; }
+```
+
+`kama check` gives `reffield.kama:2:31: Parse error: syntax error, unexpected IDENTIFIER, expecting OPERATOR or # or ::
+or <`. SPEC (no stored borrows) agrees with the parser, so the example should hold an `UnsafePtr<World>`.
 
 ---
 
 ## FIXED — kept for the record
 
-KPG-23 to KPG-30 were verified on 0.9.519, KPG-11 to KPG-22 on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
+KPG-31 and KPG-32 were verified on 0.9.523, the first release with their fixes. KPG-23 to KPG-30 were verified on 0.9.519, KPG-11 to KPG-22 on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
 same repro as the original report.
+
+### KPG-32 · HIGH · `break` in a `match` arm did not leave the enclosing loop — FIXED in 0.9.521
+
+Fixed by `c34f9082`: a `break` in a `match` arm leaves the loop, and kama judges where a jump may go. The repro prints
+`left the loop after 3 turns` and exits 0 on 0.9.523 (it printed `break did not leave the loop: 11 turns`). The flag
+in `tests/integration/src/tls_test.kama` (`fails`) is gone.
+
+### KPG-31 · LOW · `std::fs::Metadata` had no owner, so libpq's private-key rule could not be ported whole — FIXED in 0.9.522
+
+Fixed by `fc170153`: `Metadata.owner` and `group`, from the same stat as `permissions` (`UserId`/`GroupId`; `Optional`
+on Windows). The repro, with `md.owner.raw()`, prints `owner 0` for `/etc/hosts`, as `stat` does. `src/secure/setup.kama`
+now applies libpq's whole rule: at most 0600, or 0640 when root owns the key.
 
 ### KPG-29 · HIGH · Matching on a method's `const ref` result destroyed the referent — FIXED in 0.9.508
 

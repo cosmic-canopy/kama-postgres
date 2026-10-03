@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "license": "MIT OR Apache-2.0",
   "kind": "library",
-  "kama": ">=0.9.519",
+  "kama": ">=0.9.523",
   "dependencies": {
     "@kama/tls": { "version": "^0.1.0" }
   },

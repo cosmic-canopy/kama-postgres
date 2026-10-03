@@ -8,7 +8,7 @@ install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls)
 kama pkg add kama.json @kama/postgres --version ^0.1.0     # from the official registry, registry.kama-lang.org
 ```
 
-Needs **kama ≥ 0.9.519**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
+Needs **kama ≥ 0.9.523**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
 release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta.
 
 > **Status: 0.1.0, early.** It connects, authenticates and runs queries, with typed parameters and typed rows, over
@@ -101,8 +101,6 @@ that changes:
   `SSL_CERT_DIR` is not read.
 - No DES-encrypted keys (Mbed TLS has no DES) and no OpenSSL engines (`sslkey=engine:key` is refused). A key's
   passphrase comes from `sslpassword`; this client never prompts on a terminal.
-- A private key owned by root at mode 0640, which libpq accepts, is refused until std can read a file's owner
-  ([KPG-31](KAMA_GAPS.md)).
 - `sslkeylogfile` is created, or made, readable by its owner alone, and has no TLS 1.3 `EXPORTER_SECRET` line.
 - `sslcrldir` loads every CRL file of the hashed directory up front, where OpenSSL opens them by issuer; the same
   chains pass.

@@ -257,11 +257,15 @@ unsafe fn Result<Unit, PgError> loadKey(ref TlsConfig config, const ref TlsSetti
     };
 }
 
-// libpq's rule for a key file: one its owner alone can read (0600 or less), or, owned by root, readable by its group
-// too (0640). std::fs::Metadata has no owner (KPG-31), so every key gets the first rule: a root-owned key at 0640 is
-// refused here where libpq takes it. Stricter, never looser. Windows has no such bits, and libpq checks nothing there.
+// libpq's rule for a key file (fe-secure-openssl.c): one its owner alone can read (0600 or less), or, owned by root,
+// readable by its group too (0640), so a system-wide key can be shared with a group. Windows has no such bits, and
+// libpq checks nothing there.
 @compileFor(!OS_WINDOWS)
-fn bool keyTooOpen(const ref Metadata m) { return (m.permissions.mode() & 63ui32) != 0ui32; }   // S_IRWXG | S_IRWXO
+fn bool keyTooOpen(const ref Metadata m) {
+    uint32 mode = m.permissions.mode();
+    if (m.owner.raw() == 0ui32) { return (mode & 31ui32) != 0ui32; }   // S_IWGRP | S_IXGRP | S_IRWXO
+    return (mode & 63ui32) != 0ui32;                                   // S_IRWXG | S_IRWXO
+}
 
 @compileFor(OS_WINDOWS)
 fn bool keyTooOpen(const ref Metadata m) { return false; }

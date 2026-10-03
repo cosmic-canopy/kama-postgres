@@ -22,8 +22,8 @@ Expected values come from PostgreSQL itself: its TAP tests and test modules, a l
 live server's send and output functions. For TLS that is `005_negotiate_encryption.pl`'s 53 negotiation cases (replayed
 event by event against a scripted server), `001_ssltests.pl`'s 36 host-name cases with upstream's certificates, and 43
 cases the container's libpq answered against the same server and files. Phase 5's gaps (KPG-23 to KPG-30) were fixed in
-0.9.519, which the package needs. Phase 6 filed KPG-31 (a file's owner, for libpq's root-owned key rule; the stricter
-rule applies meanwhile) and KPG-32 (`break` in a `match` arm) ([KAMA_GAPS.md](../KAMA_GAPS.md)). Phase 7 is next.
+0.9.519, and phase 6's (KPG-31, a file's owner, and KPG-32, `break` in a `match` arm) in 0.9.521 and 0.9.522; the
+package needs the 0.9.523 release that carries them ([KAMA_GAPS.md](../KAMA_GAPS.md)). Phase 7 is in progress.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.

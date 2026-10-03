@@ -8,7 +8,7 @@ import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode
          postgres::sqlstate::SYNTAX_ERROR, postgres::sqlstate::DIVISION_BY_ZERO,
          postgres_unit_tests::check, postgres_unit_tests::Step, postgres_unit_tests::Wire,
          postgres_unit_tests::overUncached, postgres_unit_tests::overJammed, postgres_unit_tests::welcome };
-export { extendedTests, sevenQuery, sevenOf };
+export { extendedTests, sevenQuery, sevenOf, withInt, withText };
 
 comptime uint8 PARSE = 80ui8;      // 'P'
 comptime uint8 BIND = 66ui8;       // 'B'
@@ -68,6 +68,11 @@ fn Query sevenQuery(const ref string sql) {
     q.add(value: 7);
     return q;
 }
+
+// `sql` with one parameter: an int32 (declared int4 in a pipeline), or a string (left for the server to infer). Here
+// for the same reason as sevenQuery (KPG-38).
+fn Query withInt(const ref string sql, int32 n) { Query q = Query.make(sql: copy sql); q.add(value: n); return q; }
+fn Query withText(const ref string sql, const ref string text) { Query q = Query.make(sql: copy sql); q.add(value: text); return q; }
 
 // `statement`'s query with the int4 parameter 7 (see sevenQuery: KPG-38).
 fn Query sevenOf(const ref Statement statement) {

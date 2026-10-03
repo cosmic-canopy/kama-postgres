@@ -1,0 +1,112 @@
+// A frontend message as libpq's PQtrace prints it in regress mode (fe-trace.c at the pinned commit): "F", the length,
+// the message's name, and its fields, each after a space; strings as "…", integers in decimal, byte runs as '…' with
+// \xNN for each byte that is not printable, a single byte as itself or \xNN, and Parse's parameter types as NNNN. So
+// this client's messages compare line for line with libpq_pipeline's traces (pipeline_vectors.kama).
+import { std::collections::DynamicArray, std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error };
+export { traceFrontend };
+
+// The line, built as bytes.
+type resource Line {
+    DynamicArray<uint8> line;
+    isize at = 0;   // the next byte of the message body to print
+    public ctor make() { this.line = DynamicArray.empty(); this.at = 0; }
+
+    public fn void text(const ref string s) { foreach (uint8 b in s) { this.line.add(item: b); } }
+    public fn void hex(uint8 b) {
+        string digits = "0123456789abcdef";
+        this.text(s: "\\x");
+        this.line.add(item: digits[cast<isize>(b >> 4)]);
+        this.line.add(item: digits[cast<isize>(b & 15ui8)]);
+    }
+    public fn void shown(uint8 b) { if (b >= 32ui8 && b <= 126ui8) { this.line.add(item: b); } else { this.hex(b: b); } }
+
+    // pqTraceOutputByte1
+    public fn void byte1(const ref DynamicArray<uint8> m) { this.text(s: " "); this.shown(b: m[this.at]); this.at = this.at + 1; }
+    // pqTraceOutputInt16 (read as unsigned, as libpq reads it)
+    public fn int32 word16(const ref DynamicArray<uint8> m) {
+        int32 v = (cast<int32>(m[this.at]) << 8) | cast<int32>(m[this.at + 1]);
+        this.at = this.at + 2;
+        this.text(s: " ${v}");
+        return v;
+    }
+    // pqTraceOutputInt32, NNNN when suppressed
+    public fn int64 word32(const ref DynamicArray<uint8> m, bool suppress) {
+        uint32 u = (cast<uint32>(m[this.at]) << 24) | (cast<uint32>(m[this.at + 1]) << 16) | (cast<uint32>(m[this.at + 2]) << 8) | cast<uint32>(m[this.at + 3]);
+        this.at = this.at + 4;
+        int64 v = cast<int64>(u);
+        if (v > 2147483647i64) { v = v - 4294967296i64; }
+        if (suppress) { this.text(s: " NNNN"); } else { this.text(s: " ${v}"); }
+        return v;
+    }
+    // pqTraceOutputString: the bytes as they are, between quotes
+    public fn void cstring(const ref DynamicArray<uint8> m) {
+        this.text(s: " \"");
+        while (this.at < m.length() && m[this.at] != 0ui8) { this.line.add(item: m[this.at]); this.at = this.at + 1; }
+        this.at = this.at + 1;
+        this.text(s: "\"");
+    }
+    // pqTraceOutputNchar
+    public fn void nchar(const ref DynamicArray<uint8> m, isize n) {
+        this.text(s: " '");
+        isize i = 0;
+        while (i < n) { this.shown(b: m[this.at + i]); i = i + 1; }
+        this.at = this.at + n;
+        this.text(s: "'");
+    }
+    public unsafe fn string finish() {
+        Result<string, Utf8Error> s = utf8Decode(bytes: this.line.view());
+        return match (give s) { case Ok(value: t): give t; case Err(error: e): "(not UTF-8)"; };
+    }
+}
+
+// The trace line for a frontend message: its type byte and its body (after the length).
+unsafe fn string traceFrontend(uint8 tag, const ref DynamicArray<uint8> body) {
+    Line l = Line.make();
+    isize length = body.length() + 4;
+    l.text(s: "F\t${length}\t");
+    if (tag == 80ui8) {          // 'P' Parse
+        l.text(s: "Parse\t");
+        l.cstring(m: body); l.cstring(m: body);
+        int32 n = l.word16(m: body);
+        int32 i = 0;
+        while (i < n) { int64 t = l.word32(m: body, suppress: true); i = i + 1; }
+    } else if (tag == 66ui8) {   // 'B' Bind
+        l.text(s: "Bind\t");
+        l.cstring(m: body); l.cstring(m: body);
+        int32 formats = l.word16(m: body);
+        int32 i = 0;
+        while (i < formats) { int32 x = l.word16(m: body); i = i + 1; }
+        int32 params = l.word16(m: body);
+        i = 0;
+        while (i < params) {
+            int64 n = l.word32(m: body, suppress: false);
+            if (n >= 0i64) { l.nchar(m: body, n: cast<isize>(n)); }
+            i = i + 1;
+        }
+        int32 results = l.word16(m: body);
+        i = 0;
+        while (i < results) { int32 x = l.word16(m: body); i = i + 1; }
+    } else if (tag == 68ui8) {   // 'D' Describe
+        l.text(s: "Describe\t");
+        l.byte1(m: body); l.cstring(m: body);
+    } else if (tag == 69ui8) {   // 'E' Execute
+        l.text(s: "Execute\t");
+        l.cstring(m: body);
+        int64 rows = l.word32(m: body, suppress: false);
+    } else if (tag == 67ui8) {   // 'C' Close
+        l.text(s: "Close\t");
+        l.byte1(m: body); l.cstring(m: body);
+    } else if (tag == 81ui8) {   // 'Q' Query
+        l.text(s: "Query\t");
+        l.cstring(m: body);
+    } else if (tag == 83ui8) {   // 'S' Sync
+        l.text(s: "Sync");
+    } else if (tag == 72ui8) {   // 'H' Flush
+        l.text(s: "Flush");
+    } else if (tag == 88ui8) {   // 'X' Terminate
+        l.text(s: "Terminate");
+    } else {
+        l.text(s: "(a message this renderer does not know)");
+    }
+    return l.finish();
+}

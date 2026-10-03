@@ -134,9 +134,16 @@ fn bool parse(ref MessageWriter w, const ref string name, const ref string sql, 
     if (!body.putCString(s: name) || !body.putCString(s: sql)) { return false; }
     w.begin(tag: 80ui8);    // 'P'
     w.putBytes(b: body.view());
-    w.putI16(v: cast<int16>(params.count()));
+    // No type given for any parameter is said with no types at all, as libpq says it when paramTypes is NULL.
+    bool anyType = false;
     isize i = 0;
-    while (i < params.count()) { w.putU32(v: params.oidAt(i: i)); i = i + 1; }
+    while (i < params.count()) { if (params.oidAt(i: i) != 0ui32) { anyType = true; } i = i + 1; }
+    if (!anyType) { w.putI16(v: 0i16); }
+    else {
+        w.putI16(v: cast<int16>(params.count()));
+        i = 0;
+        while (i < params.count()) { w.putU32(v: params.oidAt(i: i)); i = i + 1; }
+    }
     w.end();
     return true;
 }

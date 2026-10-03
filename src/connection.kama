@@ -822,7 +822,8 @@ type resource Connection implements Sendable {
 
     // Queue `q` (PQsendQueryParams, PQsendQueryPrepared). A prepared statement's query, or one the statement cache
     // knows, goes as it would outside a pipeline, its parameters typed. Any other goes as PQsendQueryParams sends it:
-    // the unnamed statement with no types, its parameters as text, its portal described, its columns as text.
+    // the unnamed statement with each parameter's natural type (Query's encodedUndescribed), the values as text, the
+    // portal described, the columns as text.
     public unsafe fn Result<Unit, PgError> sendQuery(const ref Query q) {
         Result<Unit, PgError> ok = this.pipelined();
         match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
@@ -854,9 +855,8 @@ type resource Connection implements Sendable {
                 command.useColumns(fields: give columns, cached: shape.reparse() || this.fromCache);
             }
             case None: {
-                BindValues none = BindValues.make();
-                BindValues params = q.encoded(types: DynamicArray.empty());
-                if (!sendParse(w: this.outbox, name: unnamed, sql: q.sql(), params: none)) { return Result::Err(error: nulInQuery()); }
+                BindValues params = q.encodedUndescribed();
+                if (!sendParse(w: this.outbox, name: unnamed, sql: q.sql(), params: params)) { return Result::Err(error: nulInQuery()); }
                 DynamicArray<int16> text = DynamicArray.empty();
                 text.add(item: 0i16);
                 if (!sendBind(w: this.outbox, portal: unnamed, statement: unnamed, params: params, resultFormats: text)) { return Result::Err(error: nulInQuery()); }

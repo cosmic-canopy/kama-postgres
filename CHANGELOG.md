@@ -64,7 +64,11 @@ All notable changes to this package are recorded here. The format follows
   - after a failed command, the rest up to the next sync are `Aborted`, and the segment's implicit transaction is
     rolled back. An error at the sync itself (a deferred constraint) is a result of its own.
   - A query the cache knows, or a prepared statement's, goes typed, as outside a pipeline. Any other goes as libpq's
-    PQsendQueryParams sends it (the unnamed statement, text parameters, the portal described, text columns).
+    PQsendQueryParams sends it: the unnamed statement; each parameter's natural type (int2/int4/int8 by width,
+    float4/float8, bool, bytea, numeric past int64; none for a string or NULL); the values as text; the portal
+    described; text columns.
+  - Seven of libpq_pipeline's nine traces replay message for message (`tools/gen-pipeline-vectors.sh`). The other two
+    name their own statements and portals, which this API does not do.
   - libpq's refusals, verbatim: "synchronous command execution functions are not allowed in pipeline mode", "cannot
     enter pipeline mode, connection not idle", "cannot exit pipeline mode with uncollected results", "cannot send
     pipeline when not in pipeline mode".
@@ -79,7 +83,8 @@ All notable changes to this package are recorded here. The format follows
 - **Breaking:** `TransactionStatus` gains `Active`, reported while a command's result is still being read, as libpq's
   PQtransactionStatus reports PQTRANS_ACTIVE.
 - `Config` is `Copyable`: a copy is the whole configuration, as libpq's pqCopyPGconn copies a connection's options.
-- Bind sends no format codes when every parameter is text, as libpq does (it sent a 0 for each).
+- Bind sends no format codes when every parameter is text, and Parse no types when none is given, as libpq does (each
+  sent a 0 per parameter).
 - **Queries are cached by default** (`CacheMode::Statements`): a server's error that names the statement names `sc…`
   rather than the unnamed statement. `CacheMode::Off` keeps the old exchange.
 

@@ -18,6 +18,7 @@ import { std::collections::DynamicArray, std::collections::View, std::collection
          std::encoding::base64::encode as b64encode, std::encoding::base64::decode as b64decode,
          std::encoding::base64::DecodeError, std::encoding::utf8::decode as utf8Decode,
          std::encoding::utf8::Utf8Error, std::encoding::hex::encode as hexEncode, std::digest::pbkdf2, std::digest::sha256::Sha256,
+         postgres_unit_tests::traceFrontend,
          std::digest::sha256::hmacSha256, std::digest::sha256::sha256,
          postgres::Transport, postgres::PgError, postgres::protocol::MessageWriter, postgres::protocol::md5Password };
 export { FakeServer, Step, Wire, ServerSide };
@@ -268,6 +269,7 @@ type resource FakeServer implements Transport, Sendable {
     // reads. -1: never.
     isize backlog = -1;
     DynamicArray<uint8> held;   // a late reply (Step::Late), given to the client after one wait in vain
+    DynamicArray<Sender<string>> tracer;   // zero or one: each message after startup, as PQtrace prints it
 
     public ctor make(DynamicArray<Step> steps, isize chunk, isize writeLimit) {
         this.steps = give steps; this.next = 0;
@@ -280,7 +282,22 @@ type resource FakeServer implements Transport, Sendable {
         this.tlsMode = false; this.established = false; this.directAccepted = false;
         this.endPoint = DynamicArray.empty(); this.sniWanted = "";
         this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
-        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+    }
+
+    // `make`, telling `tracer` each message the client sends after its startup packet, as PQtrace prints it.
+    public ctor traced(DynamicArray<Step> steps, isize chunk, isize writeLimit, Sender<string> tracer) {
+        this.steps = give steps; this.next = 0;
+        this.toClient = DynamicArray.empty(); this.readAt = 0;
+        this.fromClient = DynamicArray.empty(); this.parsedAt = 0;
+        this.startupSeen = false; this.hungUp = false;
+        this.chunk = chunk; this.writeLimit = writeLimit;
+        this.clientFirstBare = ""; this.serverFirst = ""; this.scramPassword = ""; this.gs2Header = "n,,";
+        this.tlsConfig = DynamicArray.empty(); this.engine = DynamicArray.empty();
+        this.tlsMode = false; this.established = false; this.directAccepted = false;
+        this.endPoint = DynamicArray.empty(); this.sniWanted = "";
+        this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty(); this.tracer.add(item: give tracer);
     }
 
     // `make`, blocked on its own output past `backlog` bytes of unread replies (see `backlog`).
@@ -295,7 +312,7 @@ type resource FakeServer implements Transport, Sendable {
         this.tlsMode = false; this.established = false; this.directAccepted = false;
         this.endPoint = DynamicArray.empty(); this.sniWanted = "";
         this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
-        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = backlog; this.held = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = backlog; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
     }
 
     // A server with TLS: it answers an SSLRequest 'S' and serves the script over `config` (and takes a direct
@@ -314,7 +331,7 @@ type resource FakeServer implements Transport, Sendable {
         this.tlsMode = false; this.established = false; this.directAccepted = direct;
         this.endPoint = give endPoint; this.sniWanted = give sni;
         this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
-        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
     }
 
     // A server in policy mode: TLS on (`config`, taking an SSLRequest or a direct ClientHello) or off, an injection
@@ -334,7 +351,7 @@ type resource FakeServer implements Transport, Sendable {
         this.tlsMode = false; this.established = false; this.directAccepted = sslOn;
         this.endPoint = DynamicArray.empty(); this.sniWanted = "";
         this.policy = true; this.injection = give injection; this.hbaTypes = give types; this.hbaUsers = give users;
-        this.overSocket = socket; this.events = DynamicArray.empty(); this.events.add(item: give events); this.backlog = -1; this.held = DynamicArray.empty(); this.held = DynamicArray.empty();
+        this.overSocket = socket; this.events = DynamicArray.empty(); this.events.add(item: give events); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty(); this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
     }
 
     unsafe fn void event(const ref string name) {
@@ -506,7 +523,7 @@ type resource FakeServer implements Transport, Sendable {
         if (this.held.length() > 0) {
             // This wait ends without the late reply; it is there for the next.
             foreach (uint8 b in this.held) { this.toClient.add(item: b); }
-            this.held = DynamicArray.empty();
+            this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
             return Result::Ok(value: Ready.of(readable: false, writable: !this.blocked()));
         }
         bool readable = this.readAt < this.toClient.length() || this.hungUp;
@@ -556,6 +573,7 @@ type resource FakeServer implements Transport, Sendable {
             }
             bool first = !this.startupSeen;
             this.startupSeen = true;
+            if (!first && this.tracer.length() > 0) { SendResult<string> traced = this.tracer[0].send(item: traceFrontend(tag: tag, body: body)); }
             // In policy mode the startup packet decides everything; what follows it (Terminate) gets no answer.
             if (this.policy) { if (first) { this.policyStartup(body: body); } if (this.hungUp) { return; } continue; }
             this.answer(tag: tag, body: body);

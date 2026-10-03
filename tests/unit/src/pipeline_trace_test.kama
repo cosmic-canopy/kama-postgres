@@ -1,0 +1,294 @@
+// libpq's own pipeline tests, replayed: each trace of src/test/modules/libpq_pipeline/traces/ (pipeline_vectors.kama,
+// from tools/gen-pipeline-vectors.sh) becomes a scripted server answering this client with the server's messages from
+// the trace, and the test's calls are ported from libpq_pipeline.c (line numbers below) to this client's API. Every
+// message this client sends must be the trace's, line for line as PQtrace prints it, and the results must be what the
+// test asserts.
+//
+// Two traces are not replayed, because they need calls this client has no counterpart for: `transaction` and `prepared`
+// prepare statements under names of their own (PQsendPrepare(conn, "rollback", …), "select_one"), describe and close
+// them and a cursor's portal by name (PQsendDescribePrepared, PQsendClosePortal), and bind with binary results; this
+// client names the statements it prepares, describes them as it prepares them, and has no portal by name in a pipeline.
+import { std::collections::DynamicArray, std::encoding::hex::decode as hexDecode, std::encoding::hex::DecodeError,
+         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::RecvResult,
+         std::memory::Owned,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
+         postgres::Transport, postgres::PipelineStatus, postgres::PipelineResult, postgres::CacheMode, postgres::columnOpt,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::welcome,
+         postgres_unit_tests::withInt, postgres_unit_tests::withText,
+         postgres_unit_tests::pipelineTraceNames, postgres_unit_tests::pipelineTrace };
+export { pipelineTraceTests };
+
+fn uint8 tagOf(const ref string line) {
+    if (line.contains(substring: "\tParse")) { return 80ui8; }
+    if (line.contains(substring: "\tBind")) { return 66ui8; }
+    if (line.contains(substring: "\tDescribe")) { return 68ui8; }
+    if (line.contains(substring: "\tExecute")) { return 69ui8; }
+    if (line.contains(substring: "\tSync")) { return 83ui8; }
+    if (line.contains(substring: "\tFlush")) { return 72ui8; }
+    if (line.contains(substring: "\tQuery")) { return 81ui8; }
+    if (line.contains(substring: "\tClose")) { return 67ui8; }
+    if (line.contains(substring: "\tTerminate")) { return 88ui8; }
+    return 0ui8;
+}
+
+// The trace as a script: a step for each message libpq sent (but Terminate, which gets no answer), answered with the
+// server's messages that follow it in the trace.
+unsafe fn DynamicArray<Step> scriptOf(const ref DynamicArray<string> lines) {
+    DynamicArray<Step> s = DynamicArray.empty();
+    s.add(item: Step::Send(bytes: welcome()));
+    isize i = 0;
+    while (i < lines.length()) {
+        if (!lines[i].startsWith(prefix: "F\t")) { i = i + 1; continue; }
+        uint8 tag = tagOf(line: lines[i]);
+        DynamicArray<uint8> reply = DynamicArray.empty();
+        isize j = i + 1;
+        while (j < lines.length() && lines[j].startsWith(prefix: "B\t")) {
+            string hex = lines[j].substring(start: 2, end: lines[j].length());
+            Result<DynamicArray<uint8>, DecodeError> bytes = hexDecode(text: hex);
+            match (give bytes) { case Ok(value: b): { foreach (uint8 x in b) { reply.add(item: x); } } case Err(error: e): { } };
+            j = j + 1;
+        }
+        if (tag == 88ui8) { DynamicArray<uint8> unanswered = give reply; }
+        else { s.add(item: Step::Expect(tag: tag, body: "", then: give reply)); }
+        i = j;
+    }
+    return s;
+}
+
+// What getResult gave, in a word: "rows" (with its row count), "failed", "aborted", "sync", "none", or the error.
+unsafe fn string kind(ref Connection c) {
+    Result<Optional<PipelineResult>, PgError> r = c.getResult();
+    return match (give r) {
+        case Ok(value: o): match (give o) {
+            case Some(value: p): match (give p) {
+                case Rows(rows: rows): { isize n = rows.rowCount(); return "rows${n}"; }
+                case Prepared(statement: s): "prepared";
+                case Closed: "closed";
+                case Failed(error: e): "failed";
+                case Aborted: "aborted";
+                case Sync: "sync";
+            };
+            case None: "none";
+        };
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn bool ok(const ref Result<Unit, PgError> r) { return match (r) { case Ok(value: u): true; case Err(error: e): false; }; }
+
+// ---- the tests' calls, ported ----
+
+// test_simple_pipeline, libpq_pipeline.c:1593.
+unsafe fn int32 simplePipeline(ref Connection c) {
+    int32 f = 0;
+    Result<Unit, PgError> e = c.enterPipelineMode();
+    Result<Unit, PgError> q = c.sendQuery(q: withInt(sql: "SELECT $1", n: 1));
+    f = f + check(ok: !ok(r: c.exitPipelineMode()), what: "trace simple_pipeline: exiting with work in progress fails (1625)");
+    Result<Unit, PgError> s = c.pipelineSync();
+    f = f + check(ok: kind(c: ref c).equals(other: "rows1"), what: "trace simple_pipeline: the query's result (1632)");
+    f = f + check(ok: !ok(r: c.exitPipelineMode()), what: "trace simple_pipeline: no exit before the sync (1650)");
+    f = f + check(ok: kind(c: ref c).equals(other: "sync"), what: "trace simple_pipeline: the sync (1654)");
+    f = f + check(ok: c.pipelineStatus() != PipelineStatus::Off && ok(r: c.exitPipelineMode()) && c.pipelineStatus() == PipelineStatus::Off,
+                  what: "trace simple_pipeline: still on until it is ended (1669)");
+    return f;
+}
+
+// test_multi_pipelines, libpq_pipeline.c:468.
+unsafe fn int32 multiPipelines(ref Connection c) {
+    int32 f = 0;
+    Result<Unit, PgError> e = c.enterPipelineMode();
+    Result<Unit, PgError> q1 = c.sendQuery(q: withInt(sql: "SELECT $1", n: 1));
+    Result<Unit, PgError> s1 = c.pipelineSync();
+    Result<Unit, PgError> q2 = c.sendQuery(q: withInt(sql: "SELECT $1", n: 1));
+    Result<Unit, PgError> s2 = c.sendPipelineSync();
+    Result<Unit, PgError> q3 = c.sendQuery(q: withInt(sql: "SELECT $1", n: 1));
+    Result<Unit, PgError> s3 = c.pipelineSync();
+    string seq = "";
+    isize i = 0;
+    while (i < 3) {
+        string a = kind(c: ref c);
+        bool early = !ok(r: c.exitPipelineMode());
+        string b = kind(c: ref c);
+        seq = seq.concat(other: a).concat(other: "/").concat(other: b).concat(other: " ");
+        f = f + check(ok: early, what: "trace multi_pipelines: no exit before a sync");
+        i = i + 1;
+    }
+    f = f + check(ok: seq.equals(other: "rows1/sync rows1/sync rows1/sync "), what: "trace multi_pipelines: three results, each with its sync (".concat(other: seq).concat(other: ")"));
+    f = f + check(ok: ok(r: c.exitPipelineMode()), what: "trace multi_pipelines: exits once done");
+    return f;
+}
+
+// test_pipeline_abort, libpq_pipeline.c:705.
+unsafe fn int32 pipelineAbort(ref Connection c) {
+    int32 f = 0;
+    string insert = "INSERT INTO pq_pipeline_demo(itemno) VALUES ($1)";
+    Result<DynamicArray<Rows>, PgError> dropped = c.simpleQuery(sql: "DROP TABLE IF EXISTS pq_pipeline_demo");
+    Result<DynamicArray<Rows>, PgError> created = c.simpleQuery(sql: "CREATE UNLOGGED TABLE pq_pipeline_demo(id serial primary key, itemno integer,int8filler int8);");
+    Result<Unit, PgError> e = c.enterPipelineMode();
+    Result<Unit, PgError> a = c.sendQuery(q: withInt(sql: insert, n: 1));
+    Result<Unit, PgError> b = c.sendQuery(q: withInt(sql: "SELECT no_such_function($1)", n: 1));
+    Result<Unit, PgError> d = c.sendQuery(q: withInt(sql: insert, n: 2));
+    Result<Unit, PgError> s1 = c.pipelineSync();
+    Result<Unit, PgError> g = c.sendQuery(q: withInt(sql: insert, n: 3));
+    Result<Unit, PgError> s2 = c.pipelineSync();
+    f = f + check(ok: kind(c: ref c).equals(other: "rows0"), what: "trace pipeline_abort: the first insert (771)");
+    f = f + check(ok: kind(c: ref c).equals(other: "failed") && c.pipelineStatus() == PipelineStatus::Aborted, what: "trace pipeline_abort: the error, and the pipeline aborted (783)");
+    f = f + check(ok: kind(c: ref c).equals(other: "aborted") && c.pipelineStatus() == PipelineStatus::Aborted, what: "trace pipeline_abort: the next command aborted (800)");
+    f = f + check(ok: kind(c: ref c).equals(other: "sync") && c.pipelineStatus() == PipelineStatus::On, what: "trace pipeline_abort: the sync ends it (824)");
+    f = f + check(ok: kind(c: ref c).equals(other: "rows0") && kind(c: ref c).equals(other: "sync"), what: "trace pipeline_abort: the next segment runs (839)");
+    Result<Unit, PgError> m = c.sendQuery(q: Query.make(sql: "SELECT 1; SELECT 2"));
+    Result<Unit, PgError> s3 = c.pipelineSync();
+    f = f + check(ok: kind(c: ref c).equals(other: "failed") && kind(c: ref c).equals(other: "sync"), what: "trace pipeline_abort: two statements in one prepared, refused (869)");
+    Result<Unit, PgError> z = c.sendQuery(q: Query.make(sql: "SELECT 1.0/g FROM generate_series(3, -1, -1) g"));
+    Result<Unit, PgError> s4 = c.pipelineSync();
+    f = f + check(ok: kind(c: ref c).equals(other: "failed") && kind(c: ref c).equals(other: "sync"), what: "trace pipeline_abort: rows, then division by zero (909)");
+    f = f + check(ok: ok(r: c.exitPipelineMode()) && c.pipelineStatus() == PipelineStatus::Off, what: "trace pipeline_abort: exits (956)");
+    // The first segment's implicit transaction was rolled back, the second committed: only 3 is there (972).
+    Result<DynamicArray<Rows>, PgError> items = c.simpleQuery(sql: "SELECT itemno FROM pq_pipeline_demo");
+    isize n = match (items) { case Ok(value: r): r[0].rowCount(); case Err(error: x): -1; };
+    string only = "";
+    match (give items) {
+        case Ok(value: r): {
+            if (r.length() > 0 && r[0].rowCount() == 1) {
+                Result<Optional<string>, PgError> v = columnOpt::<string>(rows: r[0], row: 0, index: 0);
+                string got = match (give v) { case Ok(value: o): match (give o) { case Some(value: t): give t; case None: "NULL"; }; case Err(error: x): x.message(); };
+                only = give got;
+            }
+        }
+        case Err(error: x): { }
+    };
+    f = f + check(ok: n == 1 && only.equals(other: "3"), what: "trace pipeline_abort: only the second segment's insert is kept (972)");
+    return f;
+}
+
+// test_pipeline_idle, libpq_pipeline.c:1526.
+unsafe fn int32 pipelineIdle(ref Connection c) {
+    int32 f = 0;
+    Result<Unit, PgError> e = c.enterPipelineMode();
+    Result<Unit, PgError> q1 = c.sendQuery(q: Query.make(sql: "SELECT 1"));
+    Result<Unit, PgError> h1 = c.sendFlushRequest();
+    f = f + check(ok: kind(c: ref c).equals(other: "rows1"), what: "trace pipeline_idle: the first result after a flush request (1541)");
+    Result<Unit, PgError> q2 = c.sendQuery(q: Query.make(sql: "SELECT 2"));
+    f = f + check(ok: !ok(r: c.exitPipelineMode()), what: "trace pipeline_idle: no exit with a command pending (1557)");
+    Result<Unit, PgError> h2 = c.sendFlushRequest();
+    f = f + check(ok: kind(c: ref c).equals(other: "rows1") && ok(r: c.exitPipelineMode()), what: "trace pipeline_idle: the second result, then exit with no sync (1566)");
+    Result<Unit, PgError> e2 = c.enterPipelineMode();
+    Result<Unit, PgError> q3 = c.sendQuery(q: Query.make(sql: "SELECT pg_catalog.pg_advisory_unlock(1,1)"));
+    Result<Unit, PgError> h3 = c.sendFlushRequest();
+    f = f + check(ok: kind(c: ref c).equals(other: "rows1") && ok(r: c.exitPipelineMode()), what: "trace pipeline_idle: a result with a notice (1580)");
+    return f;
+}
+
+// test_nosync, libpq_pipeline.c:613: ten queries and a flush request, no sync.
+unsafe fn int32 noSync(ref Connection c) {
+    int32 f = 0;
+    Result<Unit, PgError> e = c.enterPipelineMode();
+    isize i = 0;
+    while (i < 10) { Result<Unit, PgError> q = c.sendQuery(q: Query.make(sql: "SELECT repeat('xyzxz', 12)")); i = i + 1; }
+    Result<Unit, PgError> h = c.sendFlushRequest();
+    isize results = 0;
+    i = 0;
+    while (i < 10) { if (kind(c: ref c).equals(other: "rows1")) { results = results + 1; } i = i + 1; }
+    f = f + check(ok: results == 10, what: "trace nosync: ten results with no sync (${results})");
+    return f;
+}
+
+// test_singlerowmode, libpq_pipeline.c:1680. This client reads each result whole, so where the test reads one row at a
+// time (PQsetSingleRowMode, PQsetChunkedRowsMode) the result's rows are counted instead.
+unsafe fn int32 singleRow(ref Connection c) {
+    int32 f = 0;
+    Result<Unit, PgError> e = c.enterPipelineMode();
+    Result<Unit, PgError> q1 = c.sendQuery(q: withText(sql: "SELECT generate_series(42, $1)", text: "44"));
+    Result<Unit, PgError> q2 = c.sendQuery(q: withText(sql: "SELECT generate_series(42, $1)", text: "45"));
+    Result<Unit, PgError> q3 = c.sendQuery(q: withText(sql: "SELECT generate_series(42, $1)", text: "46"));
+    Result<Unit, PgError> s = c.pipelineSync();
+    string seq = kind(c: ref c).concat(other: " ").concat(other: kind(c: ref c)).concat(other: " ").concat(other: kind(c: ref c)).concat(other: " ").concat(other: kind(c: ref c));
+    f = f + check(ok: seq.equals(other: "rows3 rows4 rows5 sync"), what: "trace singlerow: 42 to 44, 45 and 46, then the sync (".concat(other: seq).concat(other: ")"));
+    Result<Unit, PgError> q4 = c.sendQuery(q: Query.make(sql: "SELECT generate_series(0, 0)"));
+    Result<Unit, PgError> h4 = c.sendFlushRequest();
+    Result<Unit, PgError> q5 = c.sendQuery(q: Query.make(sql: "SELECT 1"));
+    f = f + check(ok: kind(c: ref c).equals(other: "rows1"), what: "trace singlerow: generate_series(0, 0) (1795)");
+    Result<Unit, PgError> h5 = c.sendFlushRequest();
+    f = f + check(ok: kind(c: ref c).equals(other: "rows1"), what: "trace singlerow: SELECT 1 (1823)");
+    Result<Unit, PgError> q6 = c.sendQuery(q: Query.make(sql: "SELECT generate_series(1, 5)"));
+    Result<Unit, PgError> h6 = c.sendFlushRequest();
+    f = f + check(ok: kind(c: ref c).equals(other: "rows5") && ok(r: c.exitPipelineMode()), what: "trace singlerow: generate_series(1, 5), then exit (1840)");
+    return f;
+}
+
+// test_disallowed_in_pipeline, libpq_pipeline.c:408. PQsendQuery (a simple query sent without waiting) has no
+// counterpart here, so its refusal is not checked; PQexec's is simpleQuery's.
+unsafe fn int32 disallowed(ref Connection c) {
+    int32 f = 0;
+    Result<Unit, PgError> e = c.enterPipelineMode();
+    f = f + check(ok: c.pipelineStatus() != PipelineStatus::Off, what: "trace disallowed_in_pipeline: on (419)");
+    Result<DynamicArray<Rows>, PgError> r = c.simpleQuery(sql: "SELECT 1");
+    string why = match (r) { case Ok(value: x): "(ran)"; case Err(error: x): x.message(); };
+    f = f + check(ok: why.equals(other: "synchronous command execution functions are not allowed in pipeline mode"), what: "trace disallowed_in_pipeline: PQexec's refusal (423)");
+    f = f + check(ok: ok(r: c.enterPipelineMode()), what: "trace disallowed_in_pipeline: entering again does nothing (439)");
+    f = f + check(ok: ok(r: c.exitPipelineMode()) && c.pipelineStatus() == PipelineStatus::Off && ok(r: c.exitPipelineMode()),
+                  what: "trace disallowed_in_pipeline: exits, and exiting again does nothing (447)");
+    Result<DynamicArray<Rows>, PgError> again = c.simpleQuery(sql: "SELECT 1");
+    f = f + check(ok: match (again) { case Ok(value: x): true; case Err(error: x): false; }, what: "trace disallowed_in_pipeline: PQexec works after (458)");
+    return f;
+}
+
+unsafe fn int32 ported(const ref string name, ref Connection c) {
+    if (name.equals(other: "simple_pipeline")) { return simplePipeline(c: ref c); }
+    if (name.equals(other: "multi_pipelines")) { return multiPipelines(c: ref c); }
+    if (name.equals(other: "pipeline_abort")) { return pipelineAbort(c: ref c); }
+    if (name.equals(other: "pipeline_idle")) { return pipelineIdle(c: ref c); }
+    if (name.equals(other: "nosync")) { return noSync(c: ref c); }
+    if (name.equals(other: "singlerow")) { return singleRow(c: ref c); }
+    if (name.equals(other: "disallowed_in_pipeline")) { return disallowed(c: ref c); }
+    return -1;
+}
+
+unsafe fn int32 pipelineTraceTests() {
+    int32 f = 0;
+    isize replayed = 0;
+    DynamicArray<string> names = pipelineTraceNames();
+    foreach (string name in names) {
+        if (name.equals(other: "transaction") || name.equals(other: "prepared")) { continue; }
+        DynamicArray<string> lines = pipelineTrace(name: name);
+        Channel<string> channel = Channel.bounded(capacity: 4096);
+        Receiver<string> rx = channel.receiver();
+        Environment env = testEnvironment();
+        string none = "";
+        Result<Config, PgError> made = resolveWith(text: none, env: env);
+        Config config = match (give made) { case Ok(value: v): give v; case Err(error: e): { return check(ok: false, what: "trace: config"); } };
+        config.setStatementCache(mode: CacheMode::Off, capacity: 0);
+        Owned<Transport> fake = new FakeServer.traced(steps: scriptOf(lines: lines), chunk: 7, writeLimit: 5, tracer: channel.sender());
+        Result<Connection, PgError> opened = Connection.connectOver(transport: give fake, config: config);
+        Connection c = match (give opened) { case Ok(value: x): give x; case Err(error: e): { f = f + check(ok: false, what: "trace ".concat(other: name).concat(other: ": connect")); continue; } };
+        int32 failures = ported(name: name, c: ref c);
+        if (failures < 0) { f = f + check(ok: false, what: "trace ".concat(other: name).concat(other: ": no port of its calls")); continue; }
+        f = f + failures;
+        c.close();
+        DynamicArray<string> sent = DynamicArray.empty();
+        while (true) {
+            RecvResult<string> got = rx.tryRecv();
+            match (give got) { case Received(item: s): { sent.add(item: give s); } case _: { break; } };
+        }
+        DynamicArray<string> expected = DynamicArray.empty();
+        foreach (string line in lines) { if (line.startsWith(prefix: "F\t")) { expected.add(item: copy line); } }
+        isize i = 0;
+        isize first = -1;
+        while (i < expected.length() || i < sent.length()) {
+            bool same = i < expected.length() && i < sent.length() && expected[i].equals(other: sent[i]);
+            if (!same && first < 0) { first = i; }
+            i = i + 1;
+        }
+        if (first < 0) { replayed = replayed + 1; }
+        else {
+            string want = "(nothing)";
+            string got = "(nothing)";
+            if (first < expected.length()) { want = copy expected[first]; }
+            if (first < sent.length()) { got = copy sent[first]; }
+            f = f + check(ok: false, what: "trace ".concat(other: name).concat(other: ": message ${first} differs\n      libpq: ").concat(other: want).concat(other: "\n      here:  ").concat(other: got));
+        }
+    }
+    f = f + check(ok: replayed == 7, what: "trace: seven traces replayed message for message (${replayed})");
+    return f;
+}

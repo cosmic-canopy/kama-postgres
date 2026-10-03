@@ -9,7 +9,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::memor
          postgres::types::encodeInt8, postgres::types::encodeOid, postgres::types::encodeFloat4,
          postgres::types::encodeFloat8,
          postgres::types::BOOL, postgres::types::INT2, postgres::types::INT4, postgres::types::INT8,
-         postgres::types::OID, postgres::types::FLOAT4, postgres::types::FLOAT8, postgres::types::BYTEA };
+         postgres::types::OID, postgres::types::FLOAT4, postgres::types::FLOAT8, postgres::types::BYTEA, postgres::types::NUMERIC };
 export { Query, PgParam, pg };
 
 // A statement to run and its parameters: SQL text with $1, $2, …, or a prepared Statement, and one value for each,
@@ -56,7 +56,7 @@ type adapter <Optional> implements PgParam when [T: PgParam] {
 // One parameter's value, as it was serialized.
 type enum Param implements Sendable {
     Null,
-    Int(int64 value),
+    Int(int64 value, int32 bits),      // bits: the smallest PostgreSQL integer that holds its kama type (16, 32, 64)
     Unsigned(uint64 value),            // a uint64 past int64's range
     Float(float64 value, int32 bits),
     Bool(bool value),
@@ -120,20 +120,20 @@ type resource ParamSerializer implements Serializer {
         }
         this.values.add(item: Param::Array(first: 0, count: this.elements.length()));
     }
-    public fn void writeI8(int8 v) { this.put(p: Param::Int(value: cast<int64>(v))); }
-    public fn void writeI16(int16 v) { this.put(p: Param::Int(value: cast<int64>(v))); }
-    public fn void writeI32(int32 v) { this.put(p: Param::Int(value: cast<int64>(v))); }
-    public fn void writeI64(int64 v) { this.put(p: Param::Int(value: v)); }
+    public fn void writeI8(int8 v) { this.put(p: Param::Int(value: cast<int64>(v), bits: 16)); }
+    public fn void writeI16(int16 v) { this.put(p: Param::Int(value: cast<int64>(v), bits: 16)); }
+    public fn void writeI32(int32 v) { this.put(p: Param::Int(value: cast<int64>(v), bits: 32)); }
+    public fn void writeI64(int64 v) { this.put(p: Param::Int(value: v, bits: 64)); }
     public fn void writeU8(uint8 v) {
         if (this.depth == 2) { this.bytes.add(item: v); return; }
         if (this.depth == 1 && this.onlyBytes) { this.bytes.add(item: v); return; }
-        this.put(p: Param::Int(value: cast<int64>(v)));
+        this.put(p: Param::Int(value: cast<int64>(v), bits: 16));
     }
-    public fn void writeU16(uint16 v) { this.put(p: Param::Int(value: cast<int64>(v))); }
-    public fn void writeU32(uint32 v) { this.put(p: Param::Int(value: cast<int64>(v))); }
+    public fn void writeU16(uint16 v) { this.put(p: Param::Int(value: cast<int64>(v), bits: 32)); }
+    public fn void writeU32(uint32 v) { this.put(p: Param::Int(value: cast<int64>(v), bits: 64)); }
     public fn void writeU64(uint64 v) {
         if (v > 9223372036854775807ui64) { this.put(p: Param::Unsigned(value: v)); return; }
-        this.put(p: Param::Int(value: cast<int64>(v)));
+        this.put(p: Param::Int(value: cast<int64>(v), bits: 64));
     }
     public fn void writeF32(float32 v) { this.put(p: Param::Float(value: cast<float64>(v), bits: 32)); }
     public fn void writeF64(float64 v) { this.put(p: Param::Float(value: v, bits: 64)); }
@@ -213,8 +213,30 @@ type resource Query implements Sendable {
     const fn const ref DynamicArray<FieldDescription> columns() { return this.fields; }
     friend postgres::Connection::describe[problem, statement, parameterTypes, columns];
     friend postgres::Connection::bindAndExecute[encoded];
-    friend postgres::Connection::sendQuery[problem, encoded];
+    friend postgres::Connection::sendQuery[problem, encoded, encodedUndescribed];
     friend postgres::Connection::knownShape[statement, parameterTypes, columns];
+
+    // For a query sent before the server has described it (in a pipeline): each parameter's natural type, from its
+    // kama value (int2, int4 or int8 by width, float4 or float8, bool, bytea, numeric past int64), or none for the
+    // server to infer (a string, NULL, an array); and every value as text, as libpq's PQsendQueryParams callers send
+    // them. A text value is valid input for its declared type, so the server never misreads one.
+    unsafe const fn BindValues encodedUndescribed() {
+        BindValues bound = BindValues.make();
+        isize i = 0;
+        while (i < this.values.length()) {
+            uint32 oid = naturalType(p: this.values[i]);
+            bool isNull = match (this.values[i]) { case Null: true; case _: false; };
+            bool isArray = match (this.values[i]) { case Array(first: f, count: c): true; case _: false; };
+            if (isNull) { bound.addNull(oid: oid); }
+            else if (isArray) {
+                isize first = match (this.values[i]) { case Array(first: f, count: c): f; case _: 0; };
+                isize count = match (this.values[i]) { case Array(first: f, count: c): c; case _: 0; };
+                bound.addText(oid: oid, text: arrayText(elements: this.elements, first: first, count: count, oid: oid));
+            } else { bound.addText(oid: oid, text: scalarText(p: this.values[i])); }
+            i = i + 1;
+        }
+        return bound;
+    }
 
     // Every parameter, each as the type in `types` (0 where the server described none). A value goes binary when
     // it is the type's own kind, else as text.
@@ -254,13 +276,30 @@ fn Query pg(Template<PgParam> t) {
 // The text of a scalar value, as PostgreSQL's input functions read it.
 unsafe fn string scalarText(const ref Param p) {
     return match (p) {
-        case Int(value: v): "${v}";
+        case Int(value: v, bits: b): "${v}";
         case Unsigned(value: v): "${v}";
         case Float(value: v, bits: b): floatInput(v: v, bits: b);
         case Bool(value: v): formatBool(v: v);
         case Text(text: t): copy t;
         case Bytes(bytes: b): formatBytea(v: b.view());
         case _: "";
+    };
+}
+
+// The type a value is by itself, for a query sent undescribed: 0 lets the server infer it.
+fn uint32 naturalType(const ref Param p) {
+    int32 intBits = match (p) { case Int(value: v, bits: b): b; case _: 0; };
+    if (intBits == 16) { return INT2; }
+    if (intBits == 32) { return INT4; }
+    if (intBits == 64) { return INT8; }
+    int32 floatBits = match (p) { case Float(value: v, bits: b): b; case _: 0; };
+    if (floatBits == 32) { return FLOAT4; }
+    if (floatBits == 64) { return FLOAT8; }
+    return match (p) {
+        case Unsigned(value: v): NUMERIC;
+        case Bool(value: v): BOOL;
+        case Bytes(bytes: x): BYTEA;
+        case _: 0ui32;
     };
 }
 
@@ -283,9 +322,9 @@ unsafe fn void encodeOne(ref BindValues into, const ref DynamicArray<Param> elem
     }
     DynamicArray<uint8> b = DynamicArray.empty();
     bool binary = false;
-    bool isInt = match (value) { case Int(value: x): true; case _: false; };
+    bool isInt = match (value) { case Int(value: x, bits: w): true; case _: false; };
     if (isInt) {
-        int64 v = match (value) { case Int(value: x): x; case _: 0i64; };
+        int64 v = match (value) { case Int(value: x, bits: w): x; case _: 0i64; };
         if (oid == INT8) { encodeInt8(to: ref b, v: v); binary = true; }
         else if (oid == INT4 && v >= -2147483648i64 && v <= 2147483647i64) { encodeInt4(to: ref b, v: cast<int32>(v)); binary = true; }
         else if (oid == INT2 && v >= -32768i64 && v <= 32767i64) { encodeInt2(to: ref b, v: cast<int16>(v)); binary = true; }

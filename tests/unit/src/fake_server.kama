@@ -13,7 +13,8 @@
 // than 17 does.
 import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView,
          std::collections::FixedArray, std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready,
-         std::net::ReliableStream, tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress,
+         std::net::ReliableStream, std::concurrent::Sender, std::concurrent::SendResult,
+         tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress,
          std::encoding::base64::encode as b64encode, std::encoding::base64::decode as b64decode,
          std::encoding::base64::DecodeError, std::encoding::utf8::decode as utf8Decode,
          std::encoding::utf8::Utf8Error, std::encoding::hex::encode as hexEncode, std::digest::pbkdf2, std::digest::sha256::Sha256,
@@ -237,6 +238,14 @@ type resource FakeServer implements Transport, Sendable {
     bool directAccepted = false;
     DynamicArray<uint8> endPoint;                    // the server certificate's tls-server-end-point hash
     string sniWanted;                                // "" checks nothing; "-" wants no SNI; else that name
+    // Policy mode: a server as 005_negotiate_encryption.pl configures one, with no script. Each step of the
+    // negotiation is decided by its settings and pg_hba lines, and logged as an event to `events`.
+    bool policy = false;
+    string injection;                                // an injection point attached, "none" for none
+    DynamicArray<string> hbaTypes;
+    DynamicArray<string> hbaUsers;
+    bool overSocket = false;
+    DynamicArray<Sender<string>> events;             // zero or one
 
     public ctor make(DynamicArray<Step> steps, isize chunk, isize writeLimit) {
         this.steps = give steps; this.next = 0;
@@ -248,6 +257,8 @@ type resource FakeServer implements Transport, Sendable {
         this.tlsConfig = DynamicArray.empty(); this.engine = DynamicArray.empty();
         this.tlsMode = false; this.established = false; this.directAccepted = false;
         this.endPoint = DynamicArray.empty(); this.sniWanted = "";
+        this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty();
     }
 
     // A server with TLS: it answers an SSLRequest 'S' and serves the script over `config` (and takes a direct
@@ -265,6 +276,98 @@ type resource FakeServer implements Transport, Sendable {
         this.engine = DynamicArray.empty();
         this.tlsMode = false; this.established = false; this.directAccepted = direct;
         this.endPoint = give endPoint; this.sniWanted = give sni;
+        this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty();
+    }
+
+    // A server in policy mode: TLS on (`config`, taking an SSLRequest or a direct ClientHello) or off, an injection
+    // point ("none", "backend-initialize", "backend-initialize-v2-error", "backend-ssl-startup"), and pg_hba lines (a
+    // connection type and a user, each trust). `socket`: the client came over a Unix socket.
+    public ctor policyServer(TlsConfig config, bool sslOn, string injection, DynamicArray<string> types, DynamicArray<string> users,
+                             bool socket, Sender<string> events) {
+        this.steps = DynamicArray.empty(); this.next = 0;
+        this.toClient = DynamicArray.empty(); this.readAt = 0;
+        this.fromClient = DynamicArray.empty(); this.parsedAt = 0;
+        this.startupSeen = false; this.hungUp = false;
+        this.chunk = 1; this.writeLimit = 3;
+        this.clientFirstBare = ""; this.serverFirst = ""; this.scramPassword = ""; this.gs2Header = "n,,";
+        this.tlsConfig = DynamicArray.empty();
+        if (sslOn) { this.tlsConfig.add(item: give config); } else { TlsConfig unused = give config; }
+        this.engine = DynamicArray.empty();
+        this.tlsMode = false; this.established = false; this.directAccepted = sslOn;
+        this.endPoint = DynamicArray.empty(); this.sniWanted = "";
+        this.policy = true; this.injection = give injection; this.hbaTypes = give types; this.hbaUsers = give users;
+        this.overSocket = socket; this.events = DynamicArray.empty(); this.events.add(item: give events);
+    }
+
+    unsafe fn void event(const ref string name) {
+        if (this.events.length() == 0) { return; }
+        SendResult<string> r = this.events[0].send(item: copy name);
+    }
+
+    // As the backend errors out when an injection point fires: an ErrorResponse (or protocol 2's error text) to
+    // whatever the client sent first, then gone.
+    unsafe fn bool injected() {
+        if (this.injection.equals(other: "backend-initialize")) {
+            this.event(name: "backenderror");
+            Wire m = Wire.make();
+            m.report(tag: 69ui8, severity: "FATAL", code: "XX000", message: "error triggered for injection point backend-initialize");
+            this.queue(b: m.bytes().view());
+            this.hungUp = true;
+            return true;
+        }
+        if (this.injection.equals(other: "backend-initialize-v2-error")) {
+            this.event(name: "v2error");
+            string text = "Eprotocol version 2 error triggered";
+            DynamicArray<uint8> bytes = DynamicArray.empty();
+            foreach (uint8 b in text) { bytes.add(item: b); }
+            bytes.add(item: 0ui8);
+            this.queue(b: bytes.view());
+            this.hungUp = true;
+            return true;
+        }
+        return false;
+    }
+
+    // pg_hba: the first line whose type and user match decides; every line is trust.
+    fn bool admitted(const ref string user) {
+        isize i = 0;
+        while (i < this.hbaTypes.length()) {
+            string kind = copy this.hbaTypes[i];
+            bool typeMatches = false;
+            if (kind.equals(other: "local")) { typeMatches = this.overSocket; }
+            else if (kind.equals(other: "host") || kind.equals(other: "hostnogssenc")) { typeMatches = !this.overSocket; }
+            else if (kind.equals(other: "hostssl")) { typeMatches = !this.overSocket && this.tlsMode; }
+            else if (kind.equals(other: "hostnossl")) { typeMatches = !this.overSocket && !this.tlsMode; }
+            if (typeMatches && this.hbaUsers[i].equals(other: user)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // The startup packet in policy mode: authenticated (trust) or refused as the server refuses with no pg_hba entry.
+    unsafe fn void policyStartup(const ref DynamicArray<uint8> body) {
+        if (this.injected()) { return; }
+        string user = startupValue(body: body, name: "user");
+        if (this.admitted(user: user)) {
+            this.event(name: "authok");
+            Wire m = Wire.make();
+            m.auth(code: 0);
+            m.parameter(name: "client_encoding", value: "UTF8");
+            m.parameter(name: "server_version", value: "18.0");
+            m.backendKey(pid: 77, keyLength: 4);
+            m.ready(status: 73ui8);
+            this.queue(b: m.bytes().view());
+            return;
+        }
+        this.event(name: "authfail");
+        string encryption = "no encryption";
+        if (this.tlsMode) { encryption = "SSL encryption"; }
+        Wire m = Wire.make();
+        m.report(tag: 69ui8, severity: "FATAL", code: "28000",
+                 message: "no pg_hba.conf entry for host \"127.0.0.1\", user \"".concat(other: user).concat(other: "\", database \"postgres\", ").concat(other: encryption));
+        this.queue(b: m.bytes().view());
+        this.hungUp = true;
     }
 
     public unsafe fn Result<isize, IoError> read(View<uint8> into) {
@@ -375,7 +478,14 @@ type resource FakeServer implements Transport, Sendable {
             isize have = this.fromClient.length() - start;
             // A TLS ClientHello (record type 22) where a startup packet belongs: direct negotiation.
             if (!this.startupSeen && !this.tlsMode && have > 0 && this.fromClient[start] == 22ui8) {
-                if (this.directAccepted && this.tlsConfig.length() > 0) { this.startTls(); } else { this.hungUp = true; this.discarding = true; }
+                if (this.directAccepted && this.tlsConfig.length() > 0) {
+                    if (this.policy) { this.event(name: "directsslaccept"); }
+                    this.startTls();
+                } else {
+                    if (this.policy) { this.event(name: "directsslreject"); }
+                    this.hungUp = true;
+                    this.discarding = true;
+                }
                 return;
             }
             isize header = 5;
@@ -398,7 +508,10 @@ type resource FakeServer implements Transport, Sendable {
                 if (this.tlsMode || this.hungUp) { return; }
                 continue;
             }
+            bool first = !this.startupSeen;
             this.startupSeen = true;
+            // In policy mode the startup packet decides everything; what follows it (Terminate) gets no answer.
+            if (this.policy) { if (first) { this.policyStartup(body: body); } if (this.hungUp) { return; } continue; }
             this.answer(tag: tag, body: body);
         }
     }
@@ -532,6 +645,28 @@ type resource FakeServer implements Transport, Sendable {
     }
 
     unsafe fn void answerSslRequest() {
+        if (this.policy) {
+            if (this.injected()) { return; }
+            DynamicArray<uint8> one = DynamicArray.empty();
+            if (this.tlsConfig.length() == 0) {
+                this.event(name: "sslreject");
+                one.add(item: 78ui8);
+                this.queue(b: one.view());
+                return;
+            }
+            this.event(name: "sslaccept");
+            one.add(item: 83ui8);
+            this.queue(b: one.view());
+            if (this.injection.equals(other: "backend-ssl-startup")) {
+                // The backend fails setting up TLS: it logs, and the connection is gone.
+                this.event(name: "backenderror");
+                this.hungUp = true;
+                this.discarding = true;
+                return;
+            }
+            this.startTls();
+            return;
+        }
         bool scripted = false;
         if (this.next < this.steps.length()) { scripted = match (this.steps[this.next]) { case SslAnswer(bytes: b): true; case _: false; }; }
         if (scripted) {
@@ -589,6 +724,19 @@ unsafe fn string cString(const ref DynamicArray<uint8> body, isize from) {
 unsafe fn string textFrom(const ref DynamicArray<uint8> body, isize from) {
     Result<string, Utf8Error> t = utf8Decode(bytes: body.slice(from: from, count: body.length() - from));
     return match (give t) { case Ok(value: s): give s; case Err(error: e): ""; };
+}
+
+// A startup packet's parameter: after the protocol version, name and value pairs, each NUL-terminated.
+unsafe fn string startupValue(const ref DynamicArray<uint8> body, const ref string name) {
+    isize at = 4;
+    while (at < body.length() && body[at] != 0ui8) {
+        string key = cString(body: body, from: at);
+        at = at + key.length() + 1;
+        string value = cString(body: body, from: at);
+        at = at + value.length() + 1;
+        if (key.equals(other: name)) { return value; }
+    }
+    return "";
 }
 
 fn string attribute(const ref string message, const ref string name) {

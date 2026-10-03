@@ -1,0 +1,116 @@
+// libpq's own negotiation matrix: every case of src/interfaces/libpq/t/005_negotiate_encryption.pl that a libpq
+// without GSSAPI runs (tests/unit/src/negotiate_vectors.kama, from tools/gen-ssl-vectors.sh), replayed through
+// Connection.connectWith. A dialer opens each connection to a fake server set up as the test sets up PostgreSQL (TLS
+// on or off, an injection point, the test's pg_hba lines), and the events the server would log (connect, sslaccept,
+// authfail, reconnect, …) are compared with upstream's, as is the outcome: plain, ssl, or fail. So the order of
+// methods, the fallbacks, and the reconnects are checked case by case, not just where a connection ends up.
+import { std::collections::DynamicArray, std::memory::Owned, std::io::IoError, std::net::Interest,
+         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::RecvResult,
+         std::concurrent::SendResult,
+         tls::TlsConfig, tls::TlsError,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Transport,
+         postgres::Dialer, postgres::DialTarget,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::certPath,
+         postgres_unit_tests::negotiateSsl, postgres_unit_tests::negotiateInjection, postgres_unit_tests::negotiateConninfo,
+         postgres_unit_tests::negotiateEvents, postgres_unit_tests::negotiateOutcome, postgres_unit_tests::hbaTypes,
+         postgres_unit_tests::hbaUsers };
+export { negotiateTests };
+
+// Opens a fake server for each connection, as the test's PostgreSQL accepts one, and logs "connect" for the first and
+// "reconnect" for every later one, as the server's log shows them.
+type resource FakeDialer implements Dialer, Sendable {
+    Channel<string> channel;
+    Sender<string> log;
+    TlsConfig config;
+    bool sslOn = false;
+    string injection;
+    isize dials = 0;
+
+    public ctor make(Channel<string> channel, TlsConfig config, bool sslOn, string injection) {
+        this.log = channel.sender();
+        this.channel = give channel;
+        this.config = give config;
+        this.sslOn = sslOn;
+        this.injection = give injection;
+        this.dials = 0;
+    }
+
+    public unsafe fn Result<Owned<Transport>, IoError> dial(const ref DialTarget target, int32 timeoutMs) {
+        string event = "connect";
+        if (this.dials > 0) { event = "reconnect"; }
+        this.dials = this.dials + 1;
+        SendResult<string> sent = this.log.send(item: give event);
+        Owned<Transport> server = new FakeServer.policyServer(config: this.config.share(), sslOn: this.sslOn, injection: copy this.injection,
+                                                              types: hbaTypes(), users: hbaUsers(), socket: target.isSocket(),
+                                                              events: this.channel.sender());
+        return Result::Ok(value: give server);
+    }
+}
+
+unsafe fn TlsConfig serverTls() {
+    Result<TlsConfig, TlsError> made = TlsConfig.server();
+    TlsConfig c = match (give made) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "server config"); return serverTls(); } };
+    string nopw = "";
+    Result<Unit, TlsError> id = c.identityFiles(certificate: certPath(name: "server.crt"), key: certPath(name: "server.key"), password: nopw);
+    string pg = "postgresql";
+    Result<Unit, TlsError> a = c.alpn(protocol: pg);
+    return give c;
+}
+
+// One case: the events the servers logged, and how the connection ended, as 005 writes them.
+unsafe fn string replay(bool sslOn, const ref string injection, const ref string conninfo) {
+    Channel<string> channel = Channel::<string>.bounded(capacity: 256);
+    Receiver<string> events = channel.receiver();
+    Environment vars = testEnvironment();
+    Result<Config, PgError> resolved = resolveWith(text: conninfo, env: vars);
+    string outcome = "fail";
+    match (give resolved) {
+        case Ok(value: config): {
+            Owned<Dialer> dialer = new FakeDialer.make(channel: give channel, config: serverTls(), sslOn: sslOn, injection: copy injection);
+            Result<Connection, PgError> opened = Connection.connectWith(dialer: give dialer, config: config);
+            match (give opened) {
+                case Ok(value: c): { if (c.sslInUse()) { outcome = "ssl"; } else { outcome = "plain"; } }
+                case Err(error: e): { }
+            };
+        }
+        case Err(error: e): { Channel<string> unused = give channel; }
+    };
+    string line = "";
+    bool more = true;
+    while (more) {
+        RecvResult<string> r = events.tryRecv();
+        match (give r) {
+            case Received(item: event): {
+                if (line.length() > 0) { line = line.concat(other: ", "); }
+                line = line.concat(other: event);
+            }
+            case Empty: { more = false; }
+            case Closed: { more = false; }
+        };
+    }
+    if (line.length() == 0) { line = "-"; }
+    return line.concat(other: " -> ").concat(other: outcome);
+}
+
+unsafe fn int32 negotiateTests() {
+    int32 f = 0;
+    DynamicArray<bool> ssl = negotiateSsl();
+    DynamicArray<string> injections = negotiateInjection();
+    DynamicArray<string> conninfos = negotiateConninfo();
+    DynamicArray<string> events = negotiateEvents();
+    DynamicArray<string> outcomes = negotiateOutcome();
+    isize i = 0;
+    while (i < conninfos.length()) {
+        string want = events[i].concat(other: " -> ").concat(other: outcomes[i]);
+        string got = replay(sslOn: ssl[i], injection: injections[i], conninfo: conninfos[i]);
+        string server = "ssl off";
+        if (ssl[i]) { server = "ssl on"; }
+        if (!injections[i].equals(other: "none")) { server = server.concat(other: ", ").concat(other: injections[i]); }
+        f = f + check(ok: got.equals(other: want), what: "negotiate (".concat(other: server).concat(other: ") '").concat(other: conninfos[i])
+                      .concat(other: "': want ").concat(other: want).concat(other: ", got ").concat(other: got));
+        i = i + 1;
+    }
+    f = f + check(ok: conninfos.length() >= 50, what: "negotiate: upstream's cases are all there");
+    return f;
+}

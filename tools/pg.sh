@@ -61,6 +61,7 @@ PGTEST_MD5_PASSWORD=kp_md5_pw
 PGTEST_MD5_SCRAM_PASSWORD=kp_md5_scram_pw
 PGTEST_SSL_ONLY_PASSWORD=kp_ssl_only_pw
 PGTEST_NOSSL_PASSWORD=kp_nossl_pw
+PGTEST_CLIENT_KEY_PASSWORD=kp_client_key_pw
 PGTEST_SASLPREP_PASSWORD='$SASLPREP_PW'
 EOF
 }
@@ -80,6 +81,12 @@ wait_ready() {
 case "$cmd" in
     up)
         "$ROOT/tools/gen-test-certs.sh"
+        # A server keeps the certificates it was created with (they are copied into PGDATA once). After a new PKI,
+        # it would serve a certificate from a CA the tests no longer have: recreate it.
+        if running && ! "$RT" exec "$NAME" sh -c 'cmp -s /certs/ca.crt "$PGDATA/ca.crt"' 2>/dev/null; then
+            echo "pg.sh: $NAME has an older test PKI; recreating it"
+            "$RT" rm -f "$NAME" >/dev/null 2>&1 || true
+        fi
         if running; then
             echo "pg.sh: $NAME already running on 127.0.0.1:$PORT"
         else

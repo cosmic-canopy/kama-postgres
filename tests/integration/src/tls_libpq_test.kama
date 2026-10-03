@@ -1,0 +1,175 @@
+// TLS as libpq does it, case by case: every case tools/gen-libpq-test-cases.sh asked the container's libpq (sslmode
+// against each pg_hba method, verification, client certificates and keys, CRLs, sslrootcert=system, sslcertmode,
+// protocol versions, channel binding), run here against the same server with the same files. A case libpq connected
+// must connect, encrypted exactly when libpq's was (pg_stat_ssl); a case libpq refused must be refused with libpq's
+// message, every attempt of it. Where libpq quotes OpenSSL ("SSL error: %s", "could not load private key file \"%s\":
+// %s", …), the frame is compared and the reason must be there; everywhere else the text is libpq's, compared exactly.
+import { std::collections::DynamicArray, std::io::IoError, std::fs::readFile, std::fs::writeFile, std::fs::createDirAll,
+         std::fs::setPermissions, std::fs::Permissions,
+         postgres::Connection, postgres::PgError, postgres::Environment,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::openWith,
+         postgres_integration_tests::quietEnvironment, postgres_integration_tests::scalar,
+         postgres_integration_tests::tlsNames, postgres_integration_tests::tlsEnvironments, postgres_integration_tests::tlsSettings,
+         postgres_integration_tests::tlsConnects, postgres_integration_tests::tlsEncrypted, postgres_integration_tests::tlsMessages };
+export { tlsLibpqTests, sameAsLibpq };
+
+// libpq's messages that quote the TLS library: the frame up to its ": ", after which OpenSSL's words go.
+fn DynamicArray<string> frames() {
+    DynamicArray<string> v = DynamicArray.empty();
+    v.add(item: "SSL error: ");
+    v.add(item: "could not read root certificate file \"");
+    v.add(item: "could not read certificate file \"");
+    v.add(item: "could not load private key file \"");
+    v.add(item: "could not load system root certificate paths: ");
+    v.add(item: "could not load SSL engine \"");
+    v.add(item: "certificate does not match private key file \"");
+    v.add(item: "could not create SSL context: ");
+    v.add(item: "could not establish SSL connection: ");
+    return v;
+}
+
+// Where the library's words start in a line of libpq's: after the frame, and for a frame naming a file, after the
+// file's closing quote and ": ". -1 for a line that quotes nothing.
+fn isize libraryWordsAt(const ref string line) {
+    DynamicArray<string> known = frames();
+    foreach (string frame in known) {
+        Optional<usize> at = line.find(substring: frame);
+        match (at) {
+            case Some(value: i): {
+                isize start = cast<isize>(i) + frame.length();
+                if (!frame.endsWith(suffix: "\"")) { return start; }
+                string rest = line.substring(start: start, end: line.length());
+                Optional<usize> close = rest.find(substring: "\": ");
+                match (close) { case Some(value: c): { return start + cast<isize>(c) + 3; } case None: { return -1; } };
+            }
+            case None: { }
+        };
+    }
+    return -1;
+}
+
+// Whether `actual` says what libpq's `expected` says: the same lines, each exactly the same, or for a line that quotes
+// the TLS library, the same up to the library's words and some words of its own after them.
+fn bool sameAsLibpq(const ref string expected, const ref string actual) {
+    DynamicArray<string> want = linesOf(text: expected);
+    DynamicArray<string> got = linesOf(text: actual);
+    if (want.length() != got.length()) { return false; }
+    isize i = 0;
+    while (i < want.length()) {
+        isize words = libraryWordsAt(line: want[i]);
+        if (words < 0) {
+            if (!want[i].equals(other: got[i])) { return false; }
+        } else {
+            string frame = want[i].substring(start: 0, end: words);
+            if (!got[i].startsWith(prefix: frame) || got[i].length() <= words) { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn DynamicArray<string> linesOf(const ref string text) {
+    DynamicArray<string> v = DynamicArray.empty();
+    foreach (string line in text.split(separator: "\n")) { v.add(item: copy line); }
+    return v;
+}
+
+// The client address a server names in a pg_hba refusal, as the generator wrote it.
+fn string maskClient(const ref string text) {
+    string marker = "no pg_hba.conf entry for host \"";
+    string result = "";
+    string rest = copy text;
+    bool more = true;
+    while (more) {
+        Optional<usize> at = rest.find(substring: marker);
+        match (at) {
+            case Some(value: i): {
+                isize start = cast<isize>(i) + marker.length();
+                result = result.concat(other: rest.substring(start: 0, end: start)).concat(other: "@CLIENT@");
+                string after = rest.substring(start: start, end: rest.length());
+                Optional<usize> close = after.find(substring: "\"");
+                isize end = match (close) { case Some(value: c): cast<isize>(c); case None: 0; };
+                rest = after.substring(start: end, end: after.length());
+            }
+            case None: { more = false; }
+        };
+    }
+    return result.concat(other: rest);
+}
+
+unsafe fn string fill(const ref string text, const ref string certDir, const ref string keyDir) {
+    string port = setting(name: "PGTEST_PORT");
+    return text.replace(old: "@CERTDIR@", with: certDir).replace(old: "@KEYDIR@", with: keyDir).replace(old: "@PORT@", with: port);
+}
+
+// The client keys as the generator gave them to libpq: private copies, and one others can read.
+unsafe fn bool copyKey(const ref string certDir, const ref string keyDir, const ref string from, const ref string to, bool shared) {
+    Result<DynamicArray<uint8>, IoError> bytes = readFile(path: certDir.concat(other: "/").concat(other: from));
+    DynamicArray<uint8> key = match (give bytes) { case Ok(value: b): give b; case Err(error: e): { return false; } };
+    string path = keyDir.concat(other: "/").concat(other: to);
+    Result<isize, IoError> w = writeFile(path: path, bytes: key);
+    Permissions mode = Permissions::OwnerRead | Permissions::OwnerWrite;
+    if (shared) { mode = mode | Permissions::GroupRead | Permissions::OtherRead; }
+    Result<Unit, IoError> p = setPermissions(path: path, permissions: mode);
+    return match (w) { case Ok(value: n): true; case Err(error: e): false; };
+}
+
+unsafe fn int32 tlsLibpqTests() {
+    int32 f = 0;
+    string certDir = setting(name: "PGTEST_CERTDIR");
+    string keyDir = setting(name: "PGTEST_TMP").concat(other: "/keys");
+    Result<Unit, IoError> made = createDirAll(path: keyDir);
+    bool keys = copyKey(certDir: certDir, keyDir: keyDir, from: "client.key", to: "client.key", shared: false)
+             && copyKey(certDir: certDir, keyDir: keyDir, from: "client-pkcs8.key", to: "client-pkcs8.key", shared: false)
+             && copyKey(certDir: certDir, keyDir: keyDir, from: "client-trad.key", to: "client-trad.key", shared: false)
+             && copyKey(certDir: certDir, keyDir: keyDir, from: "client-other.key", to: "client-other.key", shared: false)
+             && copyKey(certDir: certDir, keyDir: keyDir, from: "client.key", to: "client-0644.key", shared: true);
+    f = f + check(ok: keys, what: "tls (libpq): the key copies");
+    DynamicArray<string> names = tlsNames();
+    DynamicArray<string> environments = tlsEnvironments();
+    DynamicArray<string> settings = tlsSettings();
+    DynamicArray<bool> connects = tlsConnects();
+    DynamicArray<string> encrypted = tlsEncrypted();
+    DynamicArray<string> messages = tlsMessages();
+    string host = setting(name: "PGTEST_HOST");
+    string port = setting(name: "PGTEST_PORT");
+    isize i = 0;
+    while (i < names.length()) {
+        string conninfo = "host=".concat(other: host).concat(other: " port=").concat(other: port).concat(other: " dbname=kp_test ")
+                          .concat(other: fill(text: settings[i], certDir: certDir, keyDir: keyDir));
+        Environment vars = quietEnvironment();
+        if (!environments[i].equals(other: "-")) {
+            string assignment = fill(text: environments[i], certDir: certDir, keyDir: keyDir);
+            Optional<usize> eq = assignment.find(substring: "=");
+            isize at = match (eq) { case Some(value: e): cast<isize>(e); case None: 0; };
+            vars.set(name: assignment.substring(start: 0, end: at), value: assignment.substring(start: at + 1, end: assignment.length()));
+        }
+        string what = "tls (libpq) ".concat(other: names[i]).concat(other: ": ");
+        Result<Connection, PgError> opened = openWith(conninfo: conninfo, env: vars);
+        match (give opened) {
+            case Ok(value: c): {
+                Connection conn = give c;
+                string server = scalar(c: conn, sql: "select coalesce((select ssl::text from pg_stat_ssl where pid = pg_backend_pid()), 'false')");
+                string mine = "false";
+                if (conn.sslInUse()) { mine = "true"; }
+                f = f + check(ok: connects[i], what: what.concat(other: "connected, where libpq was refused: ").concat(other: fill(text: messages[i], certDir: certDir, keyDir: keyDir)));
+                if (connects[i]) {
+                    f = f + check(ok: server.equals(other: encrypted[i]) && mine.equals(other: encrypted[i]),
+                                  what: what.concat(other: "encrypted ").concat(other: mine).concat(other: " (server ").concat(other: server).concat(other: "), libpq ").concat(other: encrypted[i]));
+                }
+            }
+            case Err(error: e): {
+                string got = maskClient(text: e.message());
+                string want = fill(text: messages[i], certDir: certDir, keyDir: keyDir);
+                if (!connects[i]) {
+                    f = f + check(ok: sameAsLibpq(expected: want, actual: got), what: what.concat(other: "\n    libpq: ").concat(other: want).concat(other: "\n    here:  ").concat(other: got));
+                } else {
+                    f = f + check(ok: false, what: what.concat(other: "refused, where libpq connected: ").concat(other: got));
+                }
+            }
+        };
+        i = i + 1;
+    }
+    f = f + check(ok: names.length() >= 40, what: "tls (libpq): the cases are all there");
+    return f;
+}

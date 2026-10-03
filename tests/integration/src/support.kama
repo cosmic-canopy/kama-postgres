@@ -1,21 +1,33 @@
 // What every live test shares: connection strings for the test server, a hermetic environment, a log sink that
 // counts what the client logs, and a notice handler that hands notices back to the test.
-import { std::collections::DynamicArray, std::concurrent::Sender, std::concurrent::SendResult, std::fs::writeText,
+import { core::env as getenv, std::collections::DynamicArray, std::concurrent::Sender, std::concurrent::SendResult, std::fs::writeText,
          std::fs::setPermissions, std::fs::Permissions, std::io::IoError,
          postgres::Config, postgres::Connection, postgres::PgError, postgres::Environment, postgres::Rows, postgres::columnOpt,
          postgres::NoticeHandler, postgres::ServerError, postgres::conninfo::ConnInfo,
          postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
          postgres_integration_tests::setting };
-export { conninfoFor, passwordFor, quietEnvironment, openWith, open, scalar, writePrivate, writeShared, capture,
+export { conninfoFor, plainConninfoFor, passwordFor, quietEnvironment, openWith, open, scalar, writePrivate, writeShared, capture,
          warningsLogged, infosLogged, NoticeCollector, scratchDir };
 
-// The connection string for `user` on the test server, over plain TCP (TLS arrives in phase 6).
+// The connection string for `user` on the test server, with the sslmode of this run: PGTEST_SSLMODE, which
+// tools/test-integration.sh sets to require for its second pass, so every query path runs over TLS too; disable by
+// default.
 unsafe fn string conninfoFor(const ref string user) {
+    Optional<string> chosen = getenv(name: "PGTEST_SSLMODE");
+    string mode = match (give chosen) { case Some(value: m): give m; case None: "disable"; };
+    return hostPart().concat(other: " sslmode=").concat(other: mode).concat(other: " user=").concat(other: user);
+}
+
+// The same over plain TCP whatever the run: for a test whose point is that there is no TLS.
+unsafe fn string plainConninfoFor(const ref string user) {
+    return hostPart().concat(other: " sslmode=disable user=").concat(other: user);
+}
+
+unsafe fn string hostPart() {
     string host = setting(name: "PGTEST_HOST");
     string port = setting(name: "PGTEST_PORT");
     string db = setting(name: "PGTEST_DATABASE");
-    return "host=".concat(other: host).concat(other: " port=").concat(other: port).concat(other: " dbname=").concat(other: db)
-        .concat(other: " sslmode=disable user=").concat(other: user);
+    return "host=".concat(other: host).concat(other: " port=").concat(other: port).concat(other: " dbname=").concat(other: db);
 }
 
 // The test password of each role (tools/pg.sh writes them into the environment file).

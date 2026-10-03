@@ -216,8 +216,7 @@ EOF
 # ---- settings: libpq's verdict on each -----------------------------------------------------------------------------
 # Inputs only: a connection string, and the stage libpq checks it at ("config" for pqConnectOptions2 and the integer
 # settings, "connect" for what it checks host by host). libpq connects as kp_trust over TCP, and the expected value
-# is "ok" or its error. sslmode, sslrootcert, sslcertmode and gssencmode values that need TLS or GSSAPI are not
-# here: this libpq has them, and this client does not yet.
+# is "ok" or its error. gssencmode=require is not here: this libpq has GSSAPI, and this client is built without it.
 cat > "$tmp/settings_inputs" <<'EOF'
 config|sslmode=bogus
 config|channel_binding=maybe
@@ -241,6 +240,11 @@ config|ssl_min_protocol_version=TLSv1.3 ssl_max_protocol_version=TLSv1.2
 config|ssl_min_protocol_version=TLSv1 ssl_max_protocol_version=TLSv1
 config|ssl_min_protocol_version=TLSv1.1 ssl_max_protocol_version=TLSv1
 config|sslcertmode=bogus
+config|sslmode=require
+config|sslrootcert=system
+config|sslnegotiation=direct
+config|sslnegotiation=direct sslmode=require
+connect|sslcertmode=require
 config|keepalives=x
 config|keepalives=0
 config|keepalives_idle=1x
@@ -362,6 +366,84 @@ emit() {  # emit <output> <header text> — reads `name|tsv-file|columns…` spe
 }
 
 mkdir -p "$ROOT/tests/integration/src"
+# ---- TLS: libpq's verdict on each ---------------------------------------------------------------------------------
+# Inputs only: a name, an environment setting ("-" for none), and a connection string for the test server (host and
+# port are added). The container's libpq connects with the test PKI at /certs, client keys copied to a private
+# directory (0600, and one 0644 copy for the permission check), and a home directory with no ~/.postgresql. Its
+# verdict is "ok" and whether the session is encrypted (pg_stat_ssl), or "fail" and its whole message, every attempt
+# of it. Placeholders keep the test's own paths out: @CERTDIR@ (the PKI), @KEYDIR@ (the key copies), @PORT@, and
+# @CLIENT@ for the client address a server names in a pg_hba refusal.
+cat > "$tmp/tls_inputs" <<'EOF'
+require|-|user=kp_scram password=kp_scram_pw sslmode=require
+prefer_nossl|-|user=kp_nossl password=kp_nossl_pw sslmode=prefer
+allow_sslonly|-|user=kp_ssl_only password=kp_ssl_only_pw sslmode=allow
+require_nossl|-|user=kp_nossl password=kp_nossl_pw sslmode=require
+disable_sslonly|-|user=kp_ssl_only password=kp_ssl_only_pw sslmode=disable
+prefer_cert_without|-|user=kp_cert sslmode=prefer
+allow_cert_without|-|user=kp_cert sslmode=allow
+verify_full|-|host=localhost hostaddr=127.0.0.1 user=kp_scram password=kp_scram_pw sslmode=verify-full sslrootcert=@CERTDIR@/ca.crt
+verify_full_wrong|-|host=wrong.example hostaddr=127.0.0.1 user=kp_scram password=kp_scram_pw sslmode=verify-full sslrootcert=@CERTDIR@/ca.crt
+verify_full_noname|-|host='' hostaddr=127.0.0.1 user=kp_scram password=kp_scram_pw sslmode=verify-full sslrootcert=@CERTDIR@/ca.crt
+verify_ca_untrusted|-|user=kp_scram password=kp_scram_pw sslmode=verify-ca sslrootcert=@CERTDIR@/other-ca.crt
+require_untrusted|-|user=kp_scram password=kp_scram_pw sslmode=require sslrootcert=@CERTDIR@/other-ca.crt
+prefer_untrusted|-|user=kp_scram password=kp_scram_pw sslmode=prefer sslrootcert=@CERTDIR@/other-ca.crt
+verify_ca_missing|-|user=kp_scram password=kp_scram_pw sslmode=verify-ca sslrootcert=@KEYDIR@/no-such-root.crt
+verify_ca_directory|-|user=kp_scram password=kp_scram_pw sslmode=verify-ca sslrootcert=@CERTDIR@
+cert|-|user=kp_cert sslmode=require sslcert=@CERTDIR@/client.crt sslkey=@KEYDIR@/client.key
+cert_key_shared|-|user=kp_cert sslmode=require sslcert=@CERTDIR@/client.crt sslkey=@KEYDIR@/client-0644.key
+cert_key_missing|-|user=kp_cert sslmode=require sslcert=@CERTDIR@/client.crt sslkey=@KEYDIR@/no-such.key
+cert_key_directory|-|user=kp_cert sslmode=require sslcert=@CERTDIR@/client.crt sslkey=@KEYDIR@
+cert_key_engine|-|user=kp_cert sslmode=require sslcert=@CERTDIR@/client.crt sslkey=engine:key
+cert_mismatch|-|user=kp_cert sslmode=require sslcert=@CERTDIR@/client.crt sslkey=@KEYDIR@/client-other.key
+cert_missing|-|user=kp_cert sslmode=require sslcert=@KEYDIR@/no-such.crt
+cert_pkcs8|-|user=kp_cert sslmode=require sslcert=@CERTDIR@/client.crt sslkey=@KEYDIR@/client-pkcs8.key sslpassword=kp_client_key_pw
+cert_trad|-|user=kp_cert sslmode=require sslcert=@CERTDIR@/client.crt sslkey=@KEYDIR@/client-trad.key sslpassword=kp_client_key_pw
+cert_pkcs8_wrong|-|user=kp_cert sslmode=require sslcert=@CERTDIR@/client.crt sslkey=@KEYDIR@/client-pkcs8.key sslpassword=wrong
+cert_untrusted|-|user=kp_cert sslmode=require sslcert=@CERTDIR@/client-other.crt sslkey=@KEYDIR@/client-other.key
+cert_untrusted_tls12_prefer|-|user=kp_cert sslmode=prefer ssl_max_protocol_version=TLSv1.2 sslcert=@CERTDIR@/client-other.crt sslkey=@KEYDIR@/client-other.key
+certmode_disable|-|user=kp_cert sslmode=require sslcertmode=disable sslcert=@CERTDIR@/client.crt sslkey=@KEYDIR@/client.key
+certmode_require_without|-|user=kp_scram password=kp_scram_pw sslmode=require sslcertmode=require
+certmode_require|-|user=kp_cert sslmode=require sslcertmode=require sslcert=@CERTDIR@/client.crt sslkey=@KEYDIR@/client.key
+crl_revoked|-|user=kp_scram password=kp_scram_pw sslmode=verify-ca sslrootcert=@CERTDIR@/ca.crt sslcrl=@CERTDIR@/server-revoked.crl
+crl_empty|-|user=kp_scram password=kp_scram_pw sslmode=verify-ca sslrootcert=@CERTDIR@/ca.crt sslcrl=@CERTDIR@/empty.crl
+crldir_revoked|-|user=kp_scram password=kp_scram_pw sslmode=verify-ca sslrootcert=@CERTDIR@/ca.crt sslcrldir=@CERTDIR@/crldir
+crl_missing|-|user=kp_scram password=kp_scram_pw sslmode=verify-ca sslrootcert=@CERTDIR@/ca.crt sslcrl=@KEYDIR@/no-such.crl
+system|SSL_CERT_FILE=@CERTDIR@/ca.crt|host=localhost hostaddr=127.0.0.1 user=kp_scram password=kp_scram_pw sslrootcert=system
+system_wrong_host|SSL_CERT_FILE=@CERTDIR@/ca.crt|host=wrong.example hostaddr=127.0.0.1 user=kp_scram password=kp_scram_pw sslrootcert=system
+system_untrusted|SSL_CERT_FILE=@CERTDIR@/other-ca.crt|host=localhost hostaddr=127.0.0.1 user=kp_scram password=kp_scram_pw sslrootcert=system
+tls12|-|user=kp_scram password=kp_scram_pw sslmode=require ssl_max_protocol_version=TLSv1.2
+tls13|-|user=kp_scram password=kp_scram_pw sslmode=require ssl_min_protocol_version=TLSv1.3
+binding_password|-|user=kp_password password=kp_password_pw sslmode=require channel_binding=require
+binding_trust|-|user=kp_trust sslmode=require channel_binding=require
+binding_scram|-|user=kp_scram password=kp_scram_pw sslmode=require channel_binding=require
+EOF
+cat > "$tmp/check_tls.sh" <<'EOF'
+err=$(mktemp)
+keys=$(mktemp -d)
+home=$(mktemp -d)
+cp /certs/client.key /certs/client-pkcs8.key /certs/client-trad.key /certs/client-other.key "$keys/"
+chmod 0600 "$keys"/*.key
+cp /certs/client.key "$keys/client-0644.key" && chmod 0644 "$keys/client-0644.key"
+while IFS="|" read -r name envset settings; do
+    real=$(printf '%s' "$settings" | sed -e "s|@CERTDIR@|/certs|g" -e "s|@KEYDIR@|$keys|g")
+    extra=""
+    if [ "$envset" != "-" ]; then extra=$(printf '%s' "$envset" | sed -e "s|@CERTDIR@|/certs|g"); fi
+    if out=$(env HOME="$home" $extra psql -X -A -t -q -w -d "host=127.0.0.1 port=5432 dbname=kp_test $real" \
+             -c "select coalesce((select ssl::text from pg_stat_ssl where pid = pg_backend_pid()), 'false')" 2>"$err"); then
+        printf '%s\t%s\t%s\tok\t%s\t\n' "$name" "$envset" "$settings" "$out"
+    else
+        # The whole message, every line, in hex so its newlines survive.
+        text=$(sed -e 's/^psql: error: //' -e "s|$keys|@KEYDIR@|g" -e 's|/certs|@CERTDIR@|g' -e 's/, port 5432 failed/, port @PORT@ failed/' \
+                   -e 's/no pg_hba.conf entry for host "[^"]*"/no pg_hba.conf entry for host "@CLIENT@"/' "$err")
+        printf '%s\t%s\t%s\tfail\t\t%s\n' "$name" "$envset" "$settings" "$(printf '%s' "$text" | od -An -tx1 -v | tr -d ' \n')"
+    fi
+done
+rm -rf "$err" "$keys" "$home"
+EOF
+"$RT" exec -i -u postgres "$NAME" sh -c 'cat > /tmp/check_tls.sh' < "$tmp/check_tls.sh"
+"$RT" exec -i -u postgres "$NAME" sh /tmp/check_tls.sh < "$tmp/tls_inputs" > "$tmp/tls_verdicts.tsv"
+[ "$(wc -l < "$tmp/tls_verdicts.tsv")" -eq "$(wc -l < "$tmp/tls_inputs")" ] || { echo "gen-libpq-test-cases: a TLS case gave no verdict" >&2; exit 1; }
+
 emit "$ROOT/tests/unit/src/libpq_cases.kama" "require_auth: each value of 001_password.pl's cases, and the parse error libpq reports for it (\"\" when it
 parses; the cases that fail later fail on a live server and are in tests/integration).
 .pgpass: 001_password.pl's file and its cases (the role, whether its password \"pass\" is found), then this
@@ -395,7 +477,10 @@ Service files: each scenario of 006_service.pl, as it ran: PGSERVICEFILE (unset,
 PGSYSCONFDIR file (valid or none), PGSERVICE (set or not, and its value), the connection string, the outcome, and
 libpq\x27s message as upstream\x27s pattern (\".*\" matches anything). The valid file\x27s @HOST@, @PORT@, @DATABASE@ and
 @USER@ stand for the test server.
-Settings: as in tests/unit, and the ones libpq checks host by host are run here." <<EOF
+Settings: as in tests/unit, and the ones libpq checks host by host are run here.
+TLS: each case's name, environment (\"-\" for none) and connection string (host and port are added), whether libpq
+connected and then whether pg_stat_ssl showed TLS, or else libpq\x27s whole message. @CERTDIR@, @KEYDIR@, @PORT@ and
+@CLIENT@ stand for the test PKI, the client key copies, the server\x27s port and the client\x27s address." <<EOF
 requireAuthMethods|$tmp/require_auth.tsv|0|string
 requireAuthSettings|$tmp/require_auth.tsv|1|string
 requireAuthConnects|$tmp/require_auth.tsv|2|bool
@@ -412,6 +497,12 @@ settingStages|$tmp/settings_verdicts.tsv|0|string
 settingStrings|$tmp/settings_verdicts.tsv|1|string
 settingAccepted|$tmp/settings_verdicts.tsv|2|bool
 settingErrors|$tmp/settings_verdicts.tsv|3|string
+tlsNames|$tmp/tls_verdicts.tsv|0|string
+tlsEnvironments|$tmp/tls_verdicts.tsv|1|string
+tlsSettings|$tmp/tls_verdicts.tsv|2|string
+tlsConnects|$tmp/tls_verdicts.tsv|3|bool
+tlsEncrypted|$tmp/tls_verdicts.tsv|4|string
+tlsMessages|$tmp/tls_verdicts.tsv|5|string|hex
 EOF
 
 echo "gen-libpq-test-cases: $(wc -l < "$tmp/require_auth.tsv" | tr -d ' ') require_auth cases (libpq agrees), $(wc -l < "$tmp/pgpass_upstream.tsv" | tr -d ' ')+$(wc -l < "$tmp/pgpass_verdicts.tsv" | tr -d ' ') .pgpass cases, $(wc -l < "$tmp/service_verdicts.tsv" | tr -d ' ') service files, $(wc -l < "$tmp/service_scenarios.tsv" | tr -d ' ') service scenarios, $(wc -l < "$tmp/settings_verdicts.tsv" | tr -d ' ') settings (PostgreSQL ${COMMIT%${COMMIT#????????}}, libpq $VERSION)"

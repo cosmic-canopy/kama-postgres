@@ -5,7 +5,7 @@ import { std::collections::DynamicArray, std::fs::createDirAll, std::fs::remove,
          postgres::Connection, postgres::PgError, postgres::Environment,
          postgres::sqlstate::INVALID_PASSWORD, postgres::sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
          postgres::sqlstate::INVALID_CATALOG_NAME,
-         postgres_integration_tests::check, postgres_integration_tests::setting,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::plainConninfoFor,
          postgres_integration_tests::conninfoFor, postgres_integration_tests::passwordFor,
          postgres_integration_tests::quietEnvironment, postgres_integration_tests::openWith,
          postgres_integration_tests::open, postgres_integration_tests::scalar,
@@ -74,7 +74,9 @@ unsafe fn int32 loginTests() {
     users.add(item: "kp_md5_scram"); users.add(item: "kp_nossl"); users.add(item: "kp_saslprep");
     isize i = 0;
     while (i < users.length()) {
+        // kp_nossl is admitted only without TLS (hostnossl), whatever sslmode this run uses.
         string conninfo = conninfoFor(user: users[i]);
+        if (users[i].equals(other: "kp_nossl")) { conninfo = plainConninfoFor(user: users[i]); }
         string pw = passwordFor(user: users[i]);
         if (pw.length() > 0) { conninfo = conninfo.concat(other: " password=").concat(other: pw); }
         Result<Connection, PgError> r = open(conninfo: conninfo);
@@ -88,7 +90,9 @@ unsafe fn int32 loginTests() {
         };
         if (pw.length() > 0) {
             // The wrong password: the server's refusal, as psql prints it.
-            Result<Connection, PgError> wrong = open(conninfo: conninfoFor(user: users[i]).concat(other: " password=wrong"));
+            string wrongInfo = conninfoFor(user: users[i]);
+            if (users[i].equals(other: "kp_nossl")) { wrongInfo = plainConninfoFor(user: users[i]); }
+            Result<Connection, PgError> wrong = open(conninfo: wrongInfo.concat(other: " password=wrong"));
             match (give wrong) {
                 case Ok(value: c): { f = f + check(ok: false, what: "login: ".concat(other: users[i]).concat(other: " with a wrong password connects")); }
                 case Err(error: e): {
@@ -100,15 +104,17 @@ unsafe fn int32 loginTests() {
             };
             // No password at all: libpq's message, without asking the server twice.
             Environment env = quietEnvironment();
-            string none = attempt(conninfo: conninfoFor(user: users[i]), env: env);
+            string noneInfo = conninfoFor(user: users[i]);
+            if (users[i].equals(other: "kp_nossl")) { noneInfo = plainConninfoFor(user: users[i]); }
+            string none = attempt(conninfo: noneInfo, env: env);
             f = f + check(ok: none.contains(substring: "fe_sendauth: no password supplied"), what: "login: ".concat(other: users[i]).concat(other: " without a password: ").concat(other: none));
         }
         i = i + 1;
     }
     Environment env = quietEnvironment();
-    Result<Connection, PgError> ssl = openWith(conninfo: conninfoFor(user: "kp_ssl_only").concat(other: " password=").concat(other: passwordFor(user: "kp_ssl_only")), env: env);
+    Result<Connection, PgError> ssl = openWith(conninfo: plainConninfoFor(user: "kp_ssl_only").concat(other: " password=").concat(other: passwordFor(user: "kp_ssl_only")), env: env);
     f = f + check(ok: match (ssl) { case Ok(value: c): false; case Err(error: e): e.sqlstate() == INVALID_AUTHORIZATION_SPECIFICATION; }, what: "login: a hostssl-only role is refused over plain TCP (28000)");
-    Result<Connection, PgError> cert = openWith(conninfo: conninfoFor(user: "kp_cert"), env: env);
+    Result<Connection, PgError> cert = openWith(conninfo: plainConninfoFor(user: "kp_cert"), env: env);
     f = f + check(ok: match (cert) { case Ok(value: c): false; case Err(error: e): e.sqlstate() == INVALID_AUTHORIZATION_SPECIFICATION; }, what: "login: a certificate role is refused without TLS (28000)");
     Result<Connection, PgError> nodb = openWith(conninfo: conninfoFor(user: "kp_trust").concat(other: " dbname=kp_no_such_db"), env: env);
     f = f + check(ok: match (nodb) { case Ok(value: c): false; case Err(error: e): e.sqlstate() == INVALID_CATALOG_NAME; }, what: "login: an unknown database is 3D000");
@@ -148,7 +154,7 @@ unsafe fn int32 channelBindingTests() {
     Environment env = quietEnvironment();
     string clear = attempt(conninfo: conninfoFor(user: "kp_password").concat(other: " channel_binding=require password=").concat(other: passwordFor(user: "kp_password")), env: env);
     f = f + check(ok: clear.contains(substring: "channel binding required but not supported by server's authentication request"), what: "channel binding: a cleartext request is refused: ".concat(other: clear));
-    string scram = attempt(conninfo: conninfoFor(user: "kp_scram").concat(other: " channel_binding=require password=").concat(other: passwordFor(user: "kp_scram")), env: env);
+    string scram = attempt(conninfo: plainConninfoFor(user: "kp_scram").concat(other: " channel_binding=require password=").concat(other: passwordFor(user: "kp_scram")), env: env);
     f = f + check(ok: scram.contains(substring: "channel binding required, but SSL not in use"), what: "channel binding: SCRAM without TLS is refused: ".concat(other: scram));
     return f;
 }
@@ -256,8 +262,11 @@ unsafe fn int32 settingTests() {
     isize i = 0;
     while (i < settings.length()) {
         if (stages[i].equals(other: "connect")) {
-            string got = attempt(conninfo: conninfoFor(user: "kp_trust").concat(other: " ").concat(other: settings[i]), env: env);
-            string want = copy errors[i];
+            // libpq gave its verdicts with sslmode=disable before the setting.
+            string got = attempt(conninfo: plainConninfoFor(user: "kp_trust").concat(other: " ").concat(other: settings[i]), env: env);
+            // libpq ran against the container's port; this client runs against the published one.
+            string port = setting(name: "PGTEST_PORT");
+            string want = errors[i].replace(old: ", port 5432 failed", with: ", port ".concat(other: port).concat(other: " failed"));
             // What follows the name is the operating system's resolver text, which differs between libcs.
             if (want.startsWith(prefix: "could not translate host name") || want.startsWith(prefix: "could not parse network address")) {
                 want = want.substring(start: 0, end: lastSeparator(text: want));

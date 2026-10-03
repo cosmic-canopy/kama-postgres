@@ -390,6 +390,11 @@ fn DynamicArray<string> settingStages() {
     v.add(item: "config");
     v.add(item: "config");
     v.add(item: "config");
+    v.add(item: "connect");
+    v.add(item: "config");
+    v.add(item: "config");
+    v.add(item: "config");
+    v.add(item: "config");
     v.add(item: "config");
     v.add(item: "config");
     v.add(item: "config");
@@ -440,6 +445,11 @@ fn DynamicArray<string> settingStrings() {
     v.add(item: "ssl_min_protocol_version=TLSv1 ssl_max_protocol_version=TLSv1");
     v.add(item: "ssl_min_protocol_version=TLSv1.1 ssl_max_protocol_version=TLSv1");
     v.add(item: "sslcertmode=bogus");
+    v.add(item: "sslmode=require");
+    v.add(item: "sslrootcert=system");
+    v.add(item: "sslnegotiation=direct");
+    v.add(item: "sslnegotiation=direct sslmode=require");
+    v.add(item: "sslcertmode=require");
     v.add(item: "keepalives=x");
     v.add(item: "keepalives=0");
     v.add(item: "keepalives_idle=1x");
@@ -493,6 +503,11 @@ fn DynamicArray<bool> settingAccepted() {
     v.add(item: false);
     v.add(item: true);
     v.add(item: false);
+    v.add(item: false);
+    v.add(item: true);
+    v.add(item: false);
+    v.add(item: false);
+    v.add(item: true);
     v.add(item: false);
     v.add(item: false);
     v.add(item: true);
@@ -548,6 +563,11 @@ fn DynamicArray<string> settingErrors() {
     v.add(item: "");
     v.add(item: "invalid SSL protocol version range");
     v.add(item: "invalid sslcertmode value: \"bogus\"");
+    v.add(item: "");
+    v.add(item: "weak sslmode \"disable\" may not be used with sslrootcert=system (use \"verify-full\")");
+    v.add(item: "weak sslmode \"disable\" may not be used with sslnegotiation=direct (use \"require\", \"verify-ca\", or \"verify-full\")");
+    v.add(item: "");
+    v.add(item: "connection to server at \"127.0.0.1\", port 5432 failed: server did not request an SSL certificate");
     v.add(item: "connection to server at \"127.0.0.1\", port 5432 failed: invalid integer value \"x\" for connection option \"keepalives\"");
     v.add(item: "");
     v.add(item: "connection to server at \"127.0.0.1\", port 5432 failed: invalid integer value \"1x\" for connection option \"keepalives_idle\"");

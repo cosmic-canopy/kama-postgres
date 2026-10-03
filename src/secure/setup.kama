@@ -248,12 +248,12 @@ unsafe fn Result<Unit, PgError> loadKey(ref TlsConfig config, const ref TlsSetti
         case Err(error: e): { return Result::Err(error: tlsFailure(detail: "could not load private key file \"".concat(other: keyFile).concat(other: "\": ").concat(other: strerror(e: e)))); }
     };
     Result<Unit, TlsError> paired = config.privateKey(bytes: key.view(), password: settings.password().bytes());
+    // A key that does not pair with the certificate fails here too: OpenSSL compares them as it loads the key, so
+    // libpq says "could not load private key file …: key values mismatch", and its later check never runs.
     return match (give paired) {
         case Ok(value: u): Result::Ok(value: Unit::Unit);
         case Err(error: e): {
             string why = e.reason();
-            bool mismatch = match (e) { case Config(code: c, detail: d): c == -8; case _: false; };
-            if (mismatch) { return Result::Err(error: tlsFailureFrom(detail: "certificate does not match private key file \"".concat(other: keyFile).concat(other: "\": ").concat(other: why), cause: give e)); }
             return Result::Err(error: tlsFailureFrom(detail: "could not load private key file \"".concat(other: keyFile).concat(other: "\": ").concat(other: why), cause: give e));
         }
     };

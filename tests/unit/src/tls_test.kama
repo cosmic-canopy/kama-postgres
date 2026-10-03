@@ -5,7 +5,7 @@
 // messages are libpq's, from its source at REL_18_STABLE (fe-connect.c, fe-secure-openssl.c, fe-auth.c).
 // Certificates come from tools/gen-test-certs.sh (PGTEST_CERTDIR, set by tools/test.sh).
 import { core::env, std::collections::DynamicArray, std::memory::Owned, std::io::IoError, std::fs::readFile, std::fs::writeFile,
-         std::fs::setPermissions, std::fs::Permissions,
+         std::fs::setPermissions, std::fs::Permissions, std::fs::readText, std::fs::stat, std::fs::Metadata, std::fs::remove,
          tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion, tls::Certificate,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Transport,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
@@ -273,8 +273,39 @@ unsafe fn int32 certificateTests() {
     return f;
 }
 
+// sslkeylogfile: the session's secrets, as NSS key-log lines, in a file only its owner can read; a file that cannot be
+// written is a warning, and the connection goes on.
+unsafe fn int32 keylogTests() {
+    int32 f = 0;
+    string path = scratch(name: "keys.log");
+    Result<Unit, IoError> fresh = remove(path: path);   // the log appends, and the scratch directory outlives a run
+    string conninfo = "host=localhost user=u dbname=d sslmode=require sslkeylogfile=".concat(other: path);
+    string got = messageOf(r: overTls(script: trustScript(), conninfo: conninfo, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: ""));
+    f = f + check(ok: got.equals(other: "(connected)"), what: "tls keylog: connects (".concat(other: got).concat(other: ")"));
+    Result<string, IoError> text = readText(path: path);
+    string log = match (give text) { case Ok(value: t): give t; case Err(error: e): ""; };
+    isize lines = 0;
+    bool labelled = true;
+    foreach (string line in log.split(separator: "\n")) {
+        if (line.length() > 0) {
+            lines = lines + 1;
+            labelled = labelled && (line.startsWith(prefix: "CLIENT_HANDSHAKE_TRAFFIC_SECRET ") || line.startsWith(prefix: "SERVER_HANDSHAKE_TRAFFIC_SECRET ")
+                                    || line.startsWith(prefix: "CLIENT_TRAFFIC_SECRET_0 ") || line.startsWith(prefix: "SERVER_TRAFFIC_SECRET_0 "));
+        }
+    }
+    f = f + check(ok: lines == 4 && labelled, what: "tls keylog: the four TLS 1.3 traffic secrets (".concat(other: log).concat(other: ")"));
+    Result<Metadata, IoError> m = stat(path: path);
+    bool owner = match (m) { case Ok(value: x): x.permissions.mode() == 384ui32; case Err(error: e): false; };   // 0600
+    f = f + check(ok: owner, what: "tls keylog: the file is readable by its owner alone");
+    string nowhere = "host=localhost user=u dbname=d sslmode=require sslkeylogfile=".concat(other: scratch(name: "no-such-dir/keys.log"));
+    string gn = messageOf(r: overTls(script: trustScript(), conninfo: nowhere, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: ""));
+    f = f + check(ok: gn.equals(other: "(connected)"), what: "tls keylog: a file that cannot be written does not stop the connection (".concat(other: gn).concat(other: ")"));
+    return f;
+}
+
 unsafe fn int32 tlsTests() {
     int32 f = 0;
+    f = f + keylogTests();
     f = f + answerTests();
     f = f + sessionTests();
     f = f + bindingTests();

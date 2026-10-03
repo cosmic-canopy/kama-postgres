@@ -3,12 +3,13 @@
 // view in pg_stat_ssl; verification by chain and by name; channel binding by authentication method; and the
 // protocol and key size against what the server negotiated. Where libpq's message is its own, it is compared
 // exactly; where it quotes the TLS library, its frame is.
-import { std::collections::DynamicArray, std::collections::FixedArray, std::fs::exists, std::io::IoError, std::io::writeAll,
+import { std::collections::DynamicArray, std::collections::FixedArray, std::fs::exists, std::fs::readText, std::fs::remove, std::io::IoError, std::io::writeAll,
          std::net::TcpStream, std::time::Duration, std::time::sleep,
          tls::TlsConfig, tls::TlsStream, tls::TlsError, tls::Verify, tls::Progress,
          postgres::Connection, postgres::PgError, postgres::Rows,
          postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::conninfoFor,
-         postgres_integration_tests::passwordFor, postgres_integration_tests::open, postgres_integration_tests::scalar };
+         postgres_integration_tests::passwordFor, postgres_integration_tests::open, postgres_integration_tests::scalar,
+         postgres_integration_tests::warningsLogged };
 export { tlsTests };
 
 // The connection string for `user` with `extra` settings after it (a later setting wins over conninfoFor's
@@ -299,8 +300,38 @@ unsafe fn int32 sha384BindingTests() {
     return f;
 }
 
+// sslkeylogfile against the server: TLS 1.3's four traffic secrets, or TLS 1.2's master secret; an unwritable file is a
+// warning (logged under "postgres"), and the connection goes on.
+unsafe fn int32 keylogTests() {
+    int32 f = 0;
+    string scram = "kp_scram";
+    DynamicArray<string> extras = DynamicArray.empty();
+    DynamicArray<isize> counts = DynamicArray.empty();
+    extras.add(item: "sslmode=require"); counts.add(item: 4);
+    extras.add(item: "sslmode=require ssl_max_protocol_version=TLSv1.2"); counts.add(item: 1);
+    isize i = 0;
+    while (i < extras.length()) {
+        string path = setting(name: "PGTEST_TMP").concat(other: "/keys-${i}.log");
+        Result<Unit, IoError> fresh = remove(path: path);   // the log appends
+        string extra = extras[i].concat(other: " sslkeylogfile=").concat(other: path);
+        f = f + connects(user: scram, extra: extra, encrypted: true, what: "tls keylog (".concat(other: extras[i]).concat(other: ")"));
+        Result<string, IoError> text = readText(path: path);
+        string log = match (give text) { case Ok(value: t): give t; case Err(error: e): ""; };
+        isize lines = 0;
+        foreach (string line in log.split(separator: "\n")) { if (line.length() > 0) { lines = lines + 1; } }
+        f = f + check(ok: lines == counts[i], what: "tls keylog (".concat(other: extras[i]).concat(other: "): the lines (").concat(other: log).concat(other: ")"));
+        i = i + 1;
+    }
+    int32 before = warningsLogged();
+    string nowhere = "sslmode=require sslkeylogfile=".concat(other: setting(name: "PGTEST_TMP")).concat(other: "/no-such-dir/keys.log");
+    f = f + connects(user: scram, extra: nowhere, encrypted: true, what: "tls keylog: an unwritable file does not stop the connection");
+    f = f + check(ok: warningsLogged() > before, what: "tls keylog: an unwritable file is a warning");
+    return f;
+}
+
 unsafe fn int32 tlsTests() {
     int32 f = 0;
+    f = f + keylogTests();
     f = f + directTests();
     f = f + sha384BindingTests();
     f = f + matrixTests();

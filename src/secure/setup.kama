@@ -1,5 +1,5 @@
 import { std::collections::DynamicArray, std::fs::stat, std::fs::Metadata, std::fs::File, std::fs::OpenMode, std::io::IoError,
-         std::io::IoErrorKind, std::log::logWarn,
+         std::io::IoErrorKind,
          tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion, tls::Revocation,
          postgres::TlsSettings, postgres::SslMode, postgres::SslCertMode, postgres::PgError, postgres::wire::strerror };
 export { ClientTls, prepareTls };
@@ -43,8 +43,6 @@ fn bool versionIs(const ref string v, const ref string name) { return v.toLower(
 // The TLS settings for `host`, libpq's connhost[].host: the name the server's certificate is checked against and the
 // SNI comes from, "" when only hostaddr was given.
 unsafe fn Result<ClientTls, PgError> prepareTls(const ref TlsSettings settings, const ref string host) {
-    // sslkeylogfile is not written yet: libpq built without the keylog callback says so, and goes on.
-    if (settings.keyLogFile().length() > 0) { logWarn(tag: "postgres", msg: "libpq was not built with sslkeylogfile support"); }
     Result<TlsConfig, TlsError> made = TlsConfig.client();
     TlsConfig config = match (give made) {
         case Ok(value: c): give c;

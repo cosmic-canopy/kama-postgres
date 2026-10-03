@@ -198,7 +198,11 @@ unsafe fn Secured secure(Owned<Transport> link, const ref TlsSettings settings, 
     ClientTls client = match (give prepared) { case Ok(value: c): give c; case Err(error: e): { return Secured::Failed(error: give e); } };
     Result<Owned<TlsTransport>, PgError> started = new TlsTransport.start(link: give transport, config: client.config(), sni: client.sni());
     Owned<TlsTransport> tls = match (give started) { case Ok(value: t): give t; case Err(error: e): { return Secured::Failed(error: give e); } };
+    // sslkeylogfile: the secrets are written as the handshake made them, whether or not it then succeeded.
+    bool logging = settings.keyLogFile().length() > 0;
+    if (logging) { tls.logKeys(); }
     Result<Unit, PgError> shaken = tls.handshake(deadline: deadline, versionHint: settings.versionHint());
+    if (logging) { tls.writeKeyLog(path: settings.keyLogFile()); }
     match (give shaken) { case Ok(value: u): { } case Err(error: e): { return Secured::Failed(error: give e); } };
     TlsSession session = tls.session(certificateLoaded: client.certificateLoaded());
 

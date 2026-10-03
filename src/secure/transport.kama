@@ -1,5 +1,6 @@
 import { std::collections::View, std::collections::ConstView, std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind,
          std::net::ReliableStream, std::net::Interest, std::net::Ready, std::memory::Owned, std::time::Duration,
+         std::fs::File, std::fs::OpenMode, std::fs::Permissions, std::log::logWarn,
          tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress, tls::TlsVersion, tls::CertificateNames,
          postgres::Transport, postgres::PgError, postgres::wire::Deadline, postgres::wire::strerror };
 export { TransportStream, TlsTransport, TlsSession };
@@ -144,6 +145,32 @@ type resource TlsTransport implements Transport, Sendable {
         bool requested = this.engine.certificateRequested();
         return TlsSession.make(protocol: give protocol, cipher: this.engine.cipherSuite(), keyBits: this.engine.keyBits(), alpn: give alpn,
                                endPoint: this.engine.tlsServerEndPoint(), requested: requested, sent: requested && certificateLoaded);
+    }
+
+    // sslkeylogfile: collect this session's secrets from the handshake on.
+    public unsafe fn void logKeys() { this.engine.logKeys(); }
+
+    // libpq's SSL_CTX_keylog_cb: each NSS key-log line appended to `path`, which is created readable by its owner
+    // alone. std's openWith sets those permissions on a file that already exists too, where libpq leaves its mode as
+    // it is: stricter, for a file of secrets. A file that cannot be opened or written is a warning, as libpq prints it,
+    // and the connection goes on.
+    public unsafe fn void writeKeyLog(const ref string path) {
+        DynamicArray<string> lines = this.engine.takeKeyLog();
+        foreach (string line in lines) {
+            Result<File, IoError> opened = File.openWith(path: path, mode: OpenMode::Append, permissions: Permissions::OwnerRead | Permissions::OwnerWrite);
+            match (give opened) {
+                case Ok(value: f): {
+                    File file = give f;
+                    string text = line.concat(other: "\n");
+                    Result<isize, IoError> w = file.write(bytes: text.bytes());
+                    match (w) {
+                        case Ok(value: n): { }
+                        case Err(error: e): { logWarn(tag: "postgres", msg: "could not write to SSL key logging file \"".concat(other: path).concat(other: "\": ").concat(other: strerror(e: e))); }
+                    };
+                }
+                case Err(error: e): { logWarn(tag: "postgres", msg: "could not open SSL key logging file \"".concat(other: path).concat(other: "\": ").concat(other: strerror(e: e))); }
+            };
+        }
     }
 
     // The names on the server's certificate, for libpq's host-name check.

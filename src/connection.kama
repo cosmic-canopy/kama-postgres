@@ -24,7 +24,9 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::CopyInfo, postgres::CopyChunk, postgres::protocol::CopyFormats,
          postgres::protocol::copyData as sendCopyData, postgres::protocol::copyDone as sendCopyDone,
          std::io::Reader, std::io::Writer, std::io::writeAll, std::collections::FixedArray,
-         postgres::sqlstate::QUERY_CANCELED,
+         postgres::sqlstate::QUERY_CANCELED, postgres::sqlstate::FEATURE_NOT_SUPPORTED,
+         postgres::CacheMode, postgres::session::StatementCache, postgres::session::CachedStatement,
+         postgres::protocol::describePortal as sendDescribePortal,
          postgres::protocol::BindValues,
          postgres::Query, postgres::Statement, postgres::Portal, postgres::hasBinaryCodec,
          postgres::Dialer, postgres::DialTarget, postgres::SslCertMode, postgres::sqlstate::sqlstateCode,
@@ -85,6 +87,16 @@ type resource Connection implements Sendable {
     bool cancelling = false;
     int64 savepoints = 0i64;   // the names given so far: sp_1, sp_2, …
     uint8 copyMode = 0ui8;     // a COPY in progress: 1 FROM STDIN (copy-in), 2 TO STDOUT (copy-out); 0 none
+    // The statement cache (Config.setStatementCache), the statements it let go that the server is still to close,
+    // the CloseCompletes owed for those sent, and for the command in hand whether its statement came from the cache.
+    StatementCache cache;
+    DynamicArray<string> closing;
+    isize closesOwed = 0;
+    bool fromCache = false;
+    string cachedSql;
+    // For a describe-only cache's run: its Parse is sent with the Bind, and the portal is described.
+    bool parsePending = false;
+    bool portalDescribing = false;
 
     ctor over(Owned<Transport> transport) {
         this.wire = Wire.over(transport: give transport);
@@ -115,6 +127,13 @@ type resource Connection implements Sendable {
         this.cancelling = false;
         this.savepoints = 0i64;
         this.copyMode = 0ui8;
+        this.cache = StatementCache.make(mode: CacheMode::Off, capacity: 0);
+        this.closing = DynamicArray.empty();
+        this.closesOwed = 0;
+        this.fromCache = false;
+        this.cachedSql = "";
+        this.parsePending = false;
+        this.portalDescribing = false;
     }
 
     // Over a transport some of whose bytes were read already: what the server sent after its 'N' to an SSLRequest.
@@ -147,6 +166,13 @@ type resource Connection implements Sendable {
         this.cancelling = false;
         this.savepoints = 0i64;
         this.copyMode = 0ui8;
+        this.cache = StatementCache.make(mode: CacheMode::Off, capacity: 0);
+        this.closing = DynamicArray.empty();
+        this.closesOwed = 0;
+        this.fromCache = false;
+        this.cachedSql = "";
+        this.parsePending = false;
+        this.portalDescribing = false;
     }
 
     // Connect as `config` says, as libpq's PQconnectPoll does: each host in order, each of its addresses in turn,
@@ -403,7 +429,10 @@ type resource Connection implements Sendable {
         }
         Result<Unit, PgError> started = session.startup(config: config, hostIndex: hostIndex, deadline: deadline);
         match (give started) {
-            case Ok(value: u): { return Attempt::Ready(connection: give session); }
+            case Ok(value: u): {
+                session.cache = StatementCache.make(mode: config.statementCacheMode(), capacity: config.statementCacheCapacity());
+                return Attempt::Ready(connection: give session);
+            }
             case Err(error: e): {
                 bool refusedEarly = session.refusedBeforeAuth;
                 session.lose();
@@ -473,6 +502,7 @@ type resource Connection implements Sendable {
                     results[results.length() - 1].addRow(row: give r);
                 }
                 case CommandComplete(commandTag: t): {
+                    this.noteTag(tag: t);
                     if (columns >= 0) { results[results.length() - 1].complete(tag: give t); }
                     else { results.add(item: Rows.make(fields: DynamicArray.empty(), rows: DynamicArray.empty(), tag: give t)); }
                     columns = -1;
@@ -524,18 +554,39 @@ type resource Connection implements Sendable {
     // for it; each column of a type this client reads in binary comes in binary, every other one as text. A server
     // error is returned once the server is ready again, and the session goes on.
     public unsafe fn Result<Rows, PgError> query(const ref Query q) {
+        bool retryable = this.txStatus == 73ui8;   // 'I': nothing has run yet that a retry could repeat
         Result<Unit, PgError> started = this.start(q: q, portal: "", run: true);
         match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        return this.readRows(limit: -1, keep: true);
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true);
+        if (retryable && this.stalePlan(r: r)) {
+            Result<Unit, PgError> again = this.start(q: q, portal: "", run: true);
+            match (give again) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+            return this.readRows(limit: -1, keep: true);
+        }
+        return r;
     }
 
     // Run `q`, one statement, for its effect: the rows it affected or returned, as PQcmdTuples reads the command
     // tag (None for a command that reports no count). Any rows are read and dropped as they arrive.
     public unsafe fn Result<Optional<int64>, PgError> execute(const ref Query q) {
+        bool retryable = this.txStatus == 73ui8;
         Result<Unit, PgError> started = this.start(q: q, portal: "", run: true);
         match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         Result<Rows, PgError> r = this.readRows(limit: -1, keep: false);
+        if (retryable && this.stalePlan(r: r)) {
+            Result<Unit, PgError> again = this.start(q: q, portal: "", run: true);
+            match (give again) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+            r = this.readRows(limit: -1, keep: false);
+        }
         return match (give r) { case Ok(value: rows): Result::Ok(value: rows.rowsAffected()); case Err(error: e): Result::Err(error: give e); };
+    }
+
+    // A cached statement whose plan the server will no longer run, because what it returns has changed (ALTER TABLE):
+    // "cached plan must not change result type" (0A000). Its entry was let go when the error came; outside a
+    // transaction the query is run again once, as pgjdbc does, since nothing ran.
+    fn bool stalePlan(const ref Result<Rows, PgError> r) {
+        if (!this.fromCache || !this.live) { return false; }
+        return match (r) { case Ok(value: rows): false; case Err(error: e): isStalePlan(e: e); };
     }
 
     // Prepare `sql` as a named statement ("s0", "s1", … on this connection), with the parameter types and columns
@@ -1116,6 +1167,7 @@ type resource Connection implements Sendable {
         Result<Unit, PgError> ok = this.idle();
         match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         this.arm();
+        this.fromCache = false;
         Result<Described, PgError> d = this.describe(q: q);
         Described shape = match (give d) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
         return this.bindAndExecute(q: q, shape: shape, portal: portal, run: run);
@@ -1130,13 +1182,60 @@ type resource Connection implements Sendable {
             return Result::Ok(value: Described.make(name: copy q.statement(), types: copy q.parameterTypes(), fields: copy q.columns()));
         }
         string unnamed = "";
-        return this.parseAndDescribe(name: unnamed, sql: q.sql());
+        CacheMode mode = this.cache.mode();
+        bool off = match (mode) { case Off: true; case _: false; };
+        if (off) { return this.parseAndDescribe(name: unnamed, sql: q.sql()); }
+        bool named = match (mode) { case Statements: true; case _: false; };
+        if (this.cache.lookup(sql: q.sql())) {
+            this.fromCache = true;
+            this.cachedSql = copy q.sql();
+            Described hit = Described.make(name: copy this.cache.entry(sql: q.sql()).name(), types: copy this.cache.entry(sql: q.sql()).types(),
+                                           fields: copy this.cache.entry(sql: q.sql()).columns());
+            if (!named) { hit.reparseAs(sql: q.sql()); }
+            return Result::Ok(value: give hit);
+        }
+        string name = "";
+        if (named) { name = this.cache.nextName(); }
+        this.cache.makeRoom(closing: ref this.closing);
+        Result<Described, PgError> d = this.parseAndDescribe(name: name, sql: q.sql());
+        match (d) {
+            case Ok(value: shape): {
+                this.cache.add(sql: copy q.sql(), statement: CachedStatement.make(name: copy name, types: copy shape.types(), fields: copy shape.fields()), closing: ref this.closing);
+            }
+            case Err(error: e): { }
+        };
+        return d;
+    }
+
+    // Close messages for the statements the cache let go, ahead of the next exchange; their CloseCompletes are owed.
+    unsafe fn void queueCloses() {
+        foreach (string name in this.closing) {
+            bool framed = sendCloseStatement(w: this.outbox, name: name);
+            this.closesOwed = this.closesOwed + 1;
+        }
+        this.closing = DynamicArray.empty();
+    }
+
+    // A CloseComplete for a Close queued by the cache, which may come ahead of an exchange's own messages.
+    fn bool owedClose() {
+        if (this.closesOwed == 0) { return false; }
+        this.closesOwed = this.closesOwed - 1;
+        return true;
+    }
+
+    // What a command tag means for the cache: DISCARD ALL and DEALLOCATE ALL drop every prepared statement.
+    fn void noteTag(const ref string tag) {
+        if (tag.equals(other: "DISCARD ALL") || tag.equals(other: "DEALLOCATE ALL")) {
+            this.cache.clear();
+            this.closing = DynamicArray.empty();
+        }
     }
 
     // Parse `sql` as statement `name`, and describe it: ParseComplete, ParameterDescription, then RowDescription
     // or NoData, then ReadyForQuery.
     unsafe fn Result<Described, PgError> parseAndDescribe(const ref string name, const ref string sql) {
         this.outbox.clear();
+        this.queueCloses();
         BindValues none = BindValues.make();
         if (!sendParse(w: this.outbox, name: name, sql: sql, params: none)) {
             return Result::Err(error: PgError::Usage(detail: "the query text holds a NUL byte, which the protocol cannot carry"));
@@ -1158,6 +1257,7 @@ type resource Connection implements Sendable {
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
             if (background(m: m)) { this.absorb(m: give m); continue; }
             match (give m) {
+                case CloseComplete: { if (parsed || !this.owedClose()) { return Result::Err(error: this.broken(detail: unexpected(tag: 51ui8))); } }
                 case ParseComplete: {
                     if (parsed || failed.length() > 0) { return Result::Err(error: this.broken(detail: unexpected(tag: 49ui8))); }
                     parsed = true;
@@ -1205,15 +1305,24 @@ type resource Connection implements Sendable {
             i = i + 1;
         }
         this.outbox.clear();
+        this.queueCloses();
+        if (shape.reparse()) {
+            if (!sendParse(w: this.outbox, name: shape.name(), sql: shape.sql(), params: params)) {
+                return Result::Err(error: PgError::Usage(detail: "the query text holds a NUL byte, which the protocol cannot carry"));
+            }
+        }
         if (!sendBind(w: this.outbox, portal: portal, statement: shape.name(), params: params, resultFormats: formats)) {
             return Result::Err(error: PgError::Usage(detail: "a portal or statement name holds a NUL byte"));
         }
+        if (shape.reparse()) { bool described = sendDescribePortal(w: this.outbox, name: portal); }
         if (run) { bool framed = sendExecute(w: this.outbox, portal: portal, maxRows: 0); }
         sendSync(w: this.outbox);
         Result<Unit, PgError> sent = this.flush(deadline: this.due);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         this.openFields = give columns;
         this.bindPending = true;
+        this.parsePending = shape.reparse();
+        this.portalDescribing = shape.reparse();
         this.rowLimited = false;
         this.busy = true;
         return Result::Ok(value: Unit::Unit);
@@ -1242,12 +1351,34 @@ type resource Connection implements Sendable {
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
             if (background(m: m)) { this.absorb(m: give m); continue; }
             match (give m) {
+                case CloseComplete: { if (!this.bindPending || !this.owedClose()) { return Result::Err(error: this.broken(detail: unexpected(tag: 51ui8))); } }
+                case ParseComplete: {
+                    if (!this.parsePending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 49ui8))); }
+                    this.parsePending = false;
+                }
                 case BindComplete: {
-                    if (!this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 50ui8))); }
+                    if (!this.bindPending || this.parsePending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 50ui8))); }
                     this.bindPending = false;
                 }
+                case RowDescription(fields: f): {
+                    // The portal's own description (a describe-only cache's run): the columns as the server has them now.
+                    if (!this.portalDescribing || this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 84ui8))); }
+                    this.portalDescribing = false;
+                    if (!sameColumns(a: this.openFields, b: f)) { this.cache.forget(sql: this.cachedSql, closing: ref this.closing); }
+                    this.openFields = give f;
+                    formats = DynamicArray.withCapacity(capacity: this.openFields.length());
+                    isize c = 0;
+                    while (c < this.openFields.length()) { formats.add(item: this.openFields[c].format()); c = c + 1; }
+                }
+                case NoData: {
+                    if (!this.portalDescribing || this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 110ui8))); }
+                    this.portalDescribing = false;
+                    if (this.openFields.length() > 0) { this.cache.forget(sql: this.cachedSql, closing: ref this.closing); }
+                    this.openFields = DynamicArray.empty();
+                    formats = DynamicArray.empty();
+                }
                 case DataRow(row: r): {
-                    if (this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 68ui8))); }
+                    if (this.bindPending || this.portalDescribing || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 68ui8))); }
                     if (r.columnCount() != this.openFields.length()) { return Result::Err(error: this.broken(detail: "unexpected field count in \"D\" message")); }
                     if (!textValid(row: r, formats: formats)) {
                         this.lose();
@@ -1256,7 +1387,8 @@ type resource Connection implements Sendable {
                     if (keep) { rows.add(item: give r); } else { RowValues dropped = give r; }
                 }
                 case CommandComplete(commandTag: t): {
-                    if (this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 67ui8))); }
+                    if (this.bindPending || this.portalDescribing || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 67ui8))); }
+                    this.noteTag(tag: t);
                     tag = give t;
                     ended = true;
                 }
@@ -1301,7 +1433,12 @@ type resource Connection implements Sendable {
         this.busy = false;
         this.streaming = false;
         this.bindPending = false;
-        if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
+        this.parsePending = false;
+        this.portalDescribing = false;
+        if (failed.length() > 0) {
+            if (this.fromCache && isStalePlan(e: failed[0])) { this.cache.forget(sql: this.cachedSql, closing: ref this.closing); }
+            return Result::Err(error: failed.remove(index: 0));
+        }
         if (copyRefused) { return Result::Err(error: PgError::Usage(detail: "COPY runs through startCopyIn/startCopyOut (or copyFrom/copyTo), not query; the statement was not run, or its output was discarded")); }
         Rows result = Rows.make(fields: copy this.openFields, rows: give rows, tag: give tag);
         if (suspended) { result.suspend(); }
@@ -1793,6 +1930,8 @@ type resource Connection implements Sendable {
         this.streaming = false;
         this.bindPending = false;
         this.copyMode = 0ui8;
+        this.parsePending = false;
+        this.portalDescribing = false;
         if (!this.live) { return; }
         this.live = false;
         this.wire.shutdown();
@@ -1806,9 +1945,14 @@ type resource Described {
     string label;
     DynamicArray<uint32> paramTypes;
     DynamicArray<FieldDescription> columns;
+    bool parseAgain = false;   // a describe-only cache's entry: Parse the unnamed statement with the Bind
+    string text;
     public ctor make(string name, DynamicArray<uint32> types, DynamicArray<FieldDescription> fields) {
-        this.label = give name; this.paramTypes = give types; this.columns = give fields;
+        this.label = give name; this.paramTypes = give types; this.columns = give fields; this.parseAgain = false; this.text = "";
     }
+    public fn void reparseAs(const ref string sql) { this.parseAgain = true; this.text = copy sql; }
+    public const fn bool reparse() { return this.parseAgain; }
+    public const fn const ref string sql() { return this.text; }
     public const fn const ref string name() { return this.label; }
     public const fn const ref DynamicArray<uint32> types() { return this.paramTypes; }
     public const fn const ref DynamicArray<FieldDescription> fields() { return this.columns; }
@@ -1830,6 +1974,25 @@ type resource Errand {
 }
 
 fn bool isTimeout(const ref PgError e) { return match (e) { case Timeout: true; case _: false; }; }
+
+// The server's refusal to run a cached plan whose result has changed shape (RevalidateCachedQuery).
+fn bool isStalePlan(const ref PgError e) {
+    return match (e) {
+        case Server(error: s): s.sqlstate() == FEATURE_NOT_SUPPORTED && s.primary().equals(other: "cached plan must not change result type");
+        case _: false;
+    };
+}
+
+// The same columns, by type: what a cached description said, against what the portal says now.
+fn bool sameColumns(const ref DynamicArray<FieldDescription> a, const ref DynamicArray<FieldDescription> b) {
+    if (a.length() != b.length()) { return false; }
+    isize i = 0;
+    while (i < a.length()) {
+        if (a[i].typeOid() != b[i].typeOid()) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
 
 // COPY data goes out once 64 KiB is queued, in CopyData messages of at most 1 MiB.
 comptime isize COPY_FLUSH = 65536;

@@ -1,0 +1,114 @@
+import { std::collections::DynamicArray, std::collections::Map, std::collections::SortedMap,
+         postgres::CacheMode, postgres::protocol::FieldDescription };
+export { StatementCache, CachedStatement };
+
+// A connection's statement cache (pgx's statement and describe caches): what the server said about each SQL text it
+// has run, and, under CacheMode::Statements, the name of the statement it is prepared as. At most `capacity` entries;
+// the least recently used is let go when one more is needed. std has no LRU, so the order is a SortedMap from each
+// entry's last use to its SQL.
+
+// One SQL text the server described: the statement it is prepared as ("" when only its description is kept), its
+// parameters' types, and its result columns (as described, format 0).
+type resource CachedStatement implements Sendable {
+    string label;
+    DynamicArray<uint32> paramTypes;
+    DynamicArray<FieldDescription> fields;
+    uint64 used = 0ui64;
+
+    public ctor make(string name, DynamicArray<uint32> types, DynamicArray<FieldDescription> fields) {
+        this.label = give name; this.paramTypes = give types; this.fields = give fields; this.used = 0ui64;
+    }
+    public const fn const ref string name() { return this.label; }
+    public const fn const ref DynamicArray<uint32> types() { return this.paramTypes; }
+    public const fn const ref DynamicArray<FieldDescription> columns() { return this.fields; }
+    public const fn uint64 lastUse() { return this.used; }
+    fn void touch(uint64 at) { this.used = at; }
+    friend postgres::session::StatementCache::lookup[touch];
+    friend postgres::session::StatementCache::add[touch];
+}
+
+type resource StatementCache implements Sendable {
+    CacheMode modeSetting = CacheMode::Off;
+    isize limit = 0;
+    Map<string, CachedStatement> bySql;
+    SortedMap<uint64, string> byUse;     // each entry's last use, oldest first
+    uint64 clock = 0ui64;
+    int64 names = 0i64;                  // the names given so far: sc0, sc1, …
+
+    public ctor make(CacheMode mode, isize capacity) {
+        this.modeSetting = mode; this.limit = capacity;
+        if (capacity < 1) { this.modeSetting = CacheMode::Off; this.limit = 0; }
+        this.bySql = Map.empty(); this.byUse = SortedMap.empty(); this.clock = 0ui64; this.names = 0i64;
+    }
+
+    public const fn CacheMode mode() { return this.modeSetting; }
+    public const fn isize length() { return this.bySql.length(); }
+
+    // Whether `sql` is kept, and if so marks it used now. Read it with `entry`.
+    public unsafe fn bool lookup(const ref string sql) {
+        if (!this.bySql.contains(key: sql)) { return false; }
+        uint64 before = this.bySql.getRef(key: sql).lastUse();
+        Optional<string> gone = this.byUse.remove(key: before);
+        this.clock = this.clock + 1ui64;
+        this.bySql.getRefMut(key: sql).touch(at: this.clock);
+        this.byUse.put(key: this.clock, value: copy sql);
+        return true;
+    }
+
+    // The entry for `sql`, which `lookup` found.
+    public unsafe const fn const ref CachedStatement entry(const ref string sql) { return this.bySql.getRef(key: sql); }
+
+    // A name for a statement to prepare under CacheMode::Statements.
+    public fn string nextName() {
+        int64 n = this.names;
+        this.names = n + 1i64;
+        return "sc${n}";
+    }
+
+    // Let the least recently used go until there is room for one more, so the server never holds more statements than
+    // the cache: their names are added to `closing`, for the server to close ahead of the next Parse.
+    public unsafe fn void makeRoom(ref DynamicArray<string> closing) {
+        while (this.bySql.length() >= this.limit && this.bySql.length() > 0) {
+            Optional<uint64> oldest = this.byUse.first();
+            uint64 at = match (oldest) { case Some(value: t): t; case None: 0ui64; };
+            Optional<string> gone = this.byUse.remove(key: at);
+            match (give gone) {
+                case Some(value: s): { this.release(sql: s, closing: ref closing); }
+                case None: { break; }
+            };
+        }
+    }
+
+    // Keep `sql`'s statement, making room for it if `makeRoom` did not.
+    public unsafe fn void add(string sql, CachedStatement statement, ref DynamicArray<string> closing) {
+        this.forget(sql: sql, closing: ref closing);
+        this.makeRoom(closing: ref closing);
+        this.clock = this.clock + 1ui64;
+        CachedStatement kept = give statement;
+        kept.touch(at: this.clock);
+        this.byUse.put(key: this.clock, value: copy sql);
+        this.bySql.put(key: give sql, value: give kept);
+    }
+
+    // Let `sql` go, its statement's name added to `closing` if it has one.
+    public unsafe fn void forget(const ref string sql, ref DynamicArray<string> closing) {
+        if (!this.bySql.contains(key: sql)) { return; }
+        uint64 at = this.bySql.getRef(key: sql).lastUse();
+        Optional<string> gone = this.byUse.remove(key: at);
+        this.release(sql: sql, closing: ref closing);
+    }
+
+    // Everything is gone on the server already (DISCARD ALL, DEALLOCATE ALL): forget it all, with nothing to close.
+    public fn void clear() {
+        this.bySql = Map.empty();
+        this.byUse = SortedMap.empty();
+    }
+
+    unsafe fn void release(const ref string sql, ref DynamicArray<string> closing) {
+        Optional<CachedStatement> was = this.bySql.remove(key: sql);
+        match (give was) {
+            case Some(value: c): { if (c.name().length() > 0) { closing.add(item: copy c.name()); } }
+            case None: { }
+        };
+    }
+}

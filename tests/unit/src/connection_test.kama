@@ -3,13 +3,13 @@
 // bytes at a time, so every case also exercises framing and partial writes. No network, no clock.
 import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::columnOpt,
-         postgres::Transport, postgres::TransactionStatus, postgres::Notification,
+         postgres::Transport, postgres::TransactionStatus, postgres::Notification, postgres::CacheMode,
          postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2, postgres::protocol::md5Password,
          postgres::sqlstate::INVALID_PASSWORD, postgres::sqlstate::ADMIN_SHUTDOWN, postgres::sqlstate::DIVISION_BY_ZERO,
          postgres::sqlstate::TOO_MANY_CONNECTIONS, postgres::sqlstate::QUERY_CANCELED,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire };
-export { connectionTests, over, overJammed, welcome };
+export { connectionTests, over, overUncached, overJammed, welcome };
 
 // What every successful startup ends with: AuthenticationOk, the parameters a server reports, a cancel key,
 // ReadyForQuery.
@@ -41,6 +41,17 @@ unsafe fn Result<Connection, PgError> over(DynamicArray<Step> script, const ref 
     Environment env = testEnvironment();
     Result<Config, PgError> c = resolveWith(text: conninfo, env: env);
     Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    Owned<Transport> fake = new FakeServer.make(steps: give script, chunk: 1, writeLimit: 3);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+// `over`, with no statement cache: each query is described, then run (CacheMode::Off), the exchange the extended
+// protocol's tests check byte for byte.
+unsafe fn Result<Connection, PgError> overUncached(DynamicArray<Step> script, const ref string conninfo) {
+    Environment env = testEnvironment();
+    Result<Config, PgError> c = resolveWith(text: conninfo, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    config.setStatementCache(mode: CacheMode::Off, capacity: 0);
     Owned<Transport> fake = new FakeServer.make(steps: give script, chunk: 1, writeLimit: 3);
     return Connection.connectOver(transport: give fake, config: config);
 }

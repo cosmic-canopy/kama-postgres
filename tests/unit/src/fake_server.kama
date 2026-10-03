@@ -202,6 +202,17 @@ type resource Wire {
         }
         this.w.end();
     }
+    // A RowDescription as a portal's Describe gives it: each column in the format it was bound for.
+    public fn void boundColumns(const ref DynamicArray<string> names, const ref DynamicArray<uint32> oids, int16 format) {
+        this.w.begin(tag: 84ui8); this.w.putI16(v: cast<int16>(names.length()));
+        isize i = 0;
+        while (i < names.length()) {
+            bool ok = this.w.putCString(s: names[i]);
+            this.w.putI32(v: 0); this.w.putI16(v: 0i16); this.w.putU32(v: oids[i]); this.w.putI16(v: -1i16); this.w.putI32(v: -1); this.w.putI16(v: format);
+            i = i + 1;
+        }
+        this.w.end();
+    }
     // A DataRow of int4 values in binary.
     public fn void intRow(const ref DynamicArray<int32> values) {
         this.w.begin(tag: 68ui8); this.w.putI16(v: cast<int16>(values.length()));

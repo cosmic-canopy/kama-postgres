@@ -7,8 +7,8 @@ import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode
          postgres::Portal, postgres::pg, postgres::column, postgres::columnOpt,
          postgres::sqlstate::SYNTAX_ERROR, postgres::sqlstate::DIVISION_BY_ZERO,
          postgres_unit_tests::check, postgres_unit_tests::Step, postgres_unit_tests::Wire,
-         postgres_unit_tests::over, postgres_unit_tests::overJammed, postgres_unit_tests::welcome };
-export { extendedTests };
+         postgres_unit_tests::overUncached, postgres_unit_tests::overJammed, postgres_unit_tests::welcome };
+export { extendedTests, sevenQuery };
 
 comptime uint8 PARSE = 80ui8;      // 'P'
 comptime uint8 BIND = 66ui8;       // 'B'
@@ -51,14 +51,23 @@ unsafe fn DynamicArray<Step> opening() {
     return s;
 }
 
+// The extended protocol's own exchange, with no statement cache: describe, then run (cache_test.kama has the cache).
 unsafe fn Result<Connection, PgError> connected(DynamicArray<Step> s) {
     string none = "";
-    return over(script: give s, conninfo: none);
+    return overUncached(script: give s, conninfo: none);
 }
 
 fn int32 unconnected(const ref PgError e) { string m = e.message(); return check(ok: false, what: "extended: connect: ".concat(other: m)); }
 
 fn string errorText(const ref Result<Rows, PgError> r) { return match (r) { case Ok(value: v): "ok"; case Err(error: e): e.message(); }; }
+
+// `sql` with the int4 parameter 7. Other test files build their queries here, so one file holds the int32 adapter's
+// use: a release build fails when two do (KPG-38).
+fn Query sevenQuery(const ref string sql) {
+    Query q = Query.make(sql: copy sql);
+    q.add(value: 7);
+    return q;
+}
 
 unsafe fn int32 queryTests() {
     int32 f = 0;

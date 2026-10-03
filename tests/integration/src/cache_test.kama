@@ -1,0 +1,105 @@
+// The statement cache on a real server: named statements kept and reused (pg_prepared_statements shows them), the
+// least recently used closed when the cache is full, a table altered under a cached statement (run again outside a
+// transaction, returned inside one), DISCARD ALL, the describe-only mode (no named statements, and the columns as they
+// are now), and no cache at all.
+import { std::collections::DynamicArray,
+         postgres::Connection, postgres::Config, postgres::PgError, postgres::Rows, postgres::Query, postgres::CacheMode,
+         postgres::conninfo::ConnInfo, postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
+         postgres::sqlstate::FEATURE_NOT_SUPPORTED,
+         postgres_integration_tests::check, postgres_integration_tests::conninfoFor, postgres_integration_tests::quietEnvironment,
+         postgres_integration_tests::scalar };
+export { cacheTests };
+
+unsafe fn Result<Connection, PgError> openCached(CacheMode mode, isize capacity) {
+    Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: conninfoFor(user: "kp_trust"));
+    ConnInfo info = match (give parsed) { case Ok(value: i): give i; case Err(error: e): { return Result::Err(error: PgError::Config(detail: e.message())); } };
+    Result<Config, PgError> c = Config.resolve(info: give info, environment: quietEnvironment());
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    config.setStatementCache(mode: mode, capacity: capacity);
+    return Connection.connect(config: config);
+}
+
+// The columns `sql` returns through the extended protocol, or its error.
+unsafe fn string columnsOf(ref Connection c, const ref string sql) {
+    Query q = Query.make(sql: copy sql);
+    Result<Rows, PgError> r = c.query(q: q);
+    isize n = match (r) { case Ok(value: rows): rows.columnCount(); case Err(error: e): -1; };
+    return match (give r) { case Ok(value: rows): "${n}"; case Err(error: e): e.message(); };
+}
+
+unsafe fn string prepared(ref Connection c) { return scalar(c: c, sql: "select count(*) from pg_prepared_statements"); }
+
+unsafe fn int32 cacheTests() {
+    int32 f = 0;
+    // Statements, the default: one named statement per SQL text, reused.
+    Result<Connection, PgError> m1 = openCached(mode: CacheMode::Statements, capacity: 512);
+    Connection c = match (give m1) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "cache: connect (".concat(other: e.message()).concat(other: ")")); } };
+    string one = columnsOf(c: ref c, sql: "select 1, 2");
+    string again = columnsOf(c: ref c, sql: "select 1, 2");
+    f = f + check(ok: one.equals(other: "2") && again.equals(other: "2") && prepared(c: ref c).equals(other: "1"), what: "cache: one statement kept, and run twice (".concat(other: prepared(c: ref c)).concat(other: ")"));
+
+    // A table altered under a cached statement: run again, transparently, outside a transaction.
+    string made = scalar(c: c, sql: "create temp table kp_cache (a int)");
+    string first = columnsOf(c: ref c, sql: "select * from kp_cache");
+    string altered = scalar(c: c, sql: "alter table kp_cache add column b int");
+    string second = columnsOf(c: ref c, sql: "select * from kp_cache");
+    f = f + check(ok: first.equals(other: "1") && second.equals(other: "2"), what: "cache: a table altered under it, run again outside a transaction (".concat(other: second).concat(other: ")"));
+    // Inside one, the error is the call's: the transaction has failed, and must not be run again behind its back.
+    string begun = scalar(c: c, sql: "begin");
+    string cached = columnsOf(c: ref c, sql: "select * from kp_cache");
+    string alteredAgain = scalar(c: c, sql: "alter table kp_cache add column c int");
+    Query q = Query.make(sql: "select * from kp_cache");
+    Result<Rows, PgError> inTx = c.query(q: q);
+    bool stale = match (inTx) { case Ok(value: r): false; case Err(error: e): e.sqlstate() == FEATURE_NOT_SUPPORTED; };
+    string rolled = scalar(c: c, sql: "rollback");
+    string afterTx = columnsOf(c: ref c, sql: "select * from kp_cache");
+    f = f + check(ok: stale && afterTx.equals(other: "2"), what: "cache: inside a transaction the stale plan is returned, and the next run prepares again (".concat(other: afterTx).concat(other: ")"));
+
+    // DISCARD ALL drops the server's statements; the cache follows.
+    string discarded = scalar(c: c, sql: "discard all");
+    string fresh = columnsOf(c: ref c, sql: "select 1, 2");
+    f = f + check(ok: fresh.equals(other: "2") && prepared(c: ref c).equals(other: "1"), what: "cache: DISCARD ALL, then prepared again (".concat(other: prepared(c: ref c)).concat(other: ")"));
+
+    // A cache of two: the third statement closes the least recently used.
+    Result<Connection, PgError> m2 = openCached(mode: CacheMode::Statements, capacity: 2);
+    match (give m2) {
+        case Ok(value: x): {
+            Connection d = give x;
+            string a1 = columnsOf(c: ref d, sql: "select 1");
+            string a2 = columnsOf(c: ref d, sql: "select 1, 2");
+            string a3 = columnsOf(c: ref d, sql: "select 1, 2, 3");
+            string names = scalar(c: d, sql: "select string_agg(statement, ' | ' order by statement) from pg_prepared_statements");
+            f = f + check(ok: prepared(c: ref d).equals(other: "2") && names.equals(other: "select 1, 2 | select 1, 2, 3"), what: "cache: full at two, the oldest closed (".concat(other: names).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cache: connect, capacity 2"); }
+    };
+
+    // Describe: no named statement; the portal's own columns, even after the table changes.
+    Result<Connection, PgError> m3 = openCached(mode: CacheMode::Describe, capacity: 512);
+    match (give m3) {
+        case Ok(value: x): {
+            Connection g = give x;
+            string made2 = scalar(c: g, sql: "create temp table kp_cache_d (a int)");
+            string d1 = columnsOf(c: ref g, sql: "select * from kp_cache_d");
+            string d2 = columnsOf(c: ref g, sql: "select * from kp_cache_d");
+            string alter2 = scalar(c: g, sql: "alter table kp_cache_d add column b text");
+            string d3 = columnsOf(c: ref g, sql: "select * from kp_cache_d");
+            f = f + check(ok: d1.equals(other: "1") && d2.equals(other: "1") && d3.equals(other: "2") && prepared(c: ref g).equals(other: "0"),
+                          what: "cache: describe-only, no named statements, the columns as they are now (".concat(other: d3).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cache: connect, describe mode"); }
+    };
+
+    // Off: describe, then run, every time.
+    Result<Connection, PgError> m4 = openCached(mode: CacheMode::Off, capacity: 0);
+    match (give m4) {
+        case Ok(value: x): {
+            Connection h = give x;
+            string o1 = columnsOf(c: ref h, sql: "select 1, 2");
+            string o2 = columnsOf(c: ref h, sql: "select 1, 2");
+            f = f + check(ok: o1.equals(other: "2") && o2.equals(other: "2") && prepared(c: ref h).equals(other: "0"), what: "cache: off, nothing kept");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cache: connect, off"); }
+    };
+    return f;
+}

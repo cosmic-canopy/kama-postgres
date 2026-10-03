@@ -43,6 +43,19 @@ All notable changes to this package are recorded here. The format follows
     the next put rather than after all the data;
   - libpq's "no COPY in progress"; any other call during a COPY is "another command is already in progress".
   `simpleQuery` and `query` still refuse COPY, and now name the calls to use.
+- **A statement cache**, pgx's design. It is set with `Config.setStatementCache(mode:, capacity:)`, not the connection
+  string, since libpq has no such keyword:
+  - `CacheMode::Statements`, the default: each SQL text is prepared as a named statement (`sc0`, `sc1`, …) the first
+    time and bound at once after, so a repeated query takes one round trip where it took two. At most `capacity`
+    (512) are kept; the least recently used is closed ahead of the next Parse.
+  - `CacheMode::Describe`: only descriptions are kept. The unnamed statement is parsed again with each run, with its
+    types, and its portal is described in the same round trip, so the columns read are the server's current ones.
+    This is for poolers without named statements.
+  - `CacheMode::Off`: describe, then run, as before.
+  - A cached plan the server will no longer run ("cached plan must not change result type", 0A000, after an ALTER
+    TABLE) is dropped. Outside a transaction the query is run again once, as pgjdbc does; inside one the error is
+    returned.
+  - DISCARD ALL and DEALLOCATE ALL empty the cache.
 - **Waiting for notifications:** `Connection.waitForNotification(timeout:)` returns the oldest LISTEN/NOTIFY
   notification already received, else the next to arrive within the time (None when none does), taking in notices
   and parameter changes on the way. libpq leaves this loop to the application (PQsocket, PQconsumeInput, PQnotifies).
@@ -54,6 +67,8 @@ All notable changes to this package are recorded here. The format follows
 - **Breaking:** `TransactionStatus` gains `Active`, reported while a command's result is still being read, as libpq's
   PQtransactionStatus reports PQTRANS_ACTIVE.
 - `Config` is `Copyable`: a copy is the whole configuration, as libpq's pqCopyPGconn copies a connection's options.
+- **Queries are cached by default** (`CacheMode::Statements`): a server's error that names the statement names `sc…`
+  rather than the unnamed statement. `CacheMode::Off` keeps the old exchange.
 
 ### Fixed
 - While a request waits to be written, whatever the server sends is read into the buffer, as libpq's pqSendSome reads

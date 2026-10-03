@@ -131,7 +131,9 @@ unsafe fn int32 parameterTests(ref Connection c) {
     few.add(value: 1);
     Result<Rows, PgError> fr = c.query(q: few);
     string fm = match (fr) { case Ok(value: v): "ok"; case Err(error: e): e.message(); };
-    f = f + check(ok: fm.contains(substring: "bind message supplies 1 parameters, but prepared statement \"\" requires 2"), what: "params: too few, in the server's words: ".concat(other: fm));
+    // The statement is the cache's (sc…), or "" with no cache: the server names whichever it was.
+    f = f + check(ok: fm.contains(substring: "bind message supplies 1 parameters, but prepared statement \"") && fm.contains(substring: "\" requires 2"),
+                  what: "params: too few, in the server's words: ".concat(other: fm));
     string after = scalar(c: c, sql: "select 'still here'");
     f = f + check(ok: after.equals(other: "still here"), what: "params: the session goes on after each error");
     return f;

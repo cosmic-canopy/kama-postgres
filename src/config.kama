@@ -9,7 +9,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::conninfo::libpqEnvironmentOptions, postgres::conninfo::pgpassLookup,
          postgres::conninfo::defaultSocketDir, postgres::conninfo::parseServiceFile,
          postgres::conninfo::ServiceEntries };
-export { Config, Environment, Host, HostKind, SslMode, SslCertMode, ChannelBindingMode, RequireAuth, TlsSettings };
+export { Config, Environment, Host, HostKind, SslMode, SslCertMode, ChannelBindingMode, RequireAuth, TlsSettings, CacheMode };
 
 // postgres::Config — everything a connection needs, resolved the way libpq resolves it:
 //   1. the connection string (postgres::conninfo);
@@ -182,6 +182,15 @@ type enum SslCertMode implements Sendable { Disable, Allow, Require }
 type enum ChannelBindingMode implements Sendable { Disable, Prefer, Require }
 // A host given by name (resolved through DNS), by numeric address (`hostaddr`), or as a Unix-socket directory.
 type enum HostKind implements Sendable { Name, Address, Socket }
+
+// What a connection keeps of the statements it runs (Config.setStatementCache; pgx's query exec modes):
+//   Statements  each SQL text is prepared as a named statement the first time, and run from it after: one round trip
+//               (Bind, Execute, Sync) where it took two. The default, as pgx's QueryExecModeCacheStatement is.
+//   Describe    only what the server said about each SQL text is kept, and the unnamed statement is parsed again with
+//               every run, in the same round trip: for a pooler that does not keep named statements (PgBouncer before
+//               1.21 in transaction mode).
+//   Off         describe, then run: two round trips each time.
+type enum CacheMode implements Sendable { Statements, Describe, Off }
 
 // One server to try, as pqConnectOptions2 lays them out: `host` and `hostaddr` paired by position, a port each.
 type resource Host implements Sendable, Copyable<This>(bare: give) {
@@ -488,6 +497,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     DynamicArray<uint8> clientKey;        // scram_client_key and scram_server_key, decoded; empty when not given
     DynamicArray<uint8> serverKey;
     TlsSettings tlsSettings;
+    CacheMode cacheModeSetting = CacheMode::Statements;
+    isize cacheCapacitySetting = 512;
 
     // A connection string, resolved under the process environment.
     public unsafe ctor Result<Config, PgError> parse(const ref string text) {
@@ -535,6 +546,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.clientKey = DynamicArray.empty();
         this.serverKey = DynamicArray.empty();
         this.tlsSettings = TlsSettings.blank();
+        this.cacheModeSetting = CacheMode::Statements;
+        this.cacheCapacitySetting = 512;
     }
 
     public ctor copy(ref Config source) {
@@ -547,7 +560,20 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.params = copy source.params; this.paramValues = copy source.paramValues;
         this.clientKey = copy source.clientKey; this.serverKey = copy source.serverKey;
         this.tlsSettings = copy source.tlsSettings;
+        this.cacheModeSetting = source.cacheModeSetting;
+        this.cacheCapacitySetting = source.cacheCapacitySetting;
     }
+
+    // How connections made with this configuration keep statements: a CacheMode, and at most `capacity` of them (the
+    // least recently used is let go when one more is needed). Not a connection-string keyword: libpq has none.
+    public fn void setStatementCache(CacheMode mode, isize capacity) {
+        this.cacheModeSetting = mode;
+        this.cacheCapacitySetting = capacity;
+        if (capacity < 1) { this.cacheModeSetting = CacheMode::Off; this.cacheCapacitySetting = 0; }
+    }
+
+    public const fn CacheMode statementCacheMode() { return this.cacheModeSetting; }
+    public const fn isize statementCacheCapacity() { return this.cacheCapacitySetting; }
 
     // ---- reading it ----
 

@@ -8,7 +8,7 @@ the published package, as it is in `@kama/sodium`.
 
 **Current compiler:** `kama 0.9.523`, the release (`v0.9.523`), and the dev build at `../cstar/out/Darwin-arm64/kama`
 (`0.9.523+gf8212db3`). KPG-31 and KPG-32 were re-run on it, with the repros as filed, before they moved to FIXED;
-KPG-33 to KPG-37 were filed on it. Earlier rounds: `0.9.519` (KPG-23 to KPG-30 verified), `0.9.506` (KPG-11 to KPG-22
+KPG-33 to KPG-38 were filed on it. Earlier rounds: `0.9.519` (KPG-23 to KPG-30 verified), `0.9.506` (KPG-11 to KPG-22
 verified, KPG-23 to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to KPG-14 filed), `0.9.477`
 (KPG-1 also on Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.470` and the public
 `0.9.440`.
@@ -17,7 +17,7 @@ verified, KPG-23 to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486`
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** KPG-37 (HIGH), KPG-33 (HIGH), KPG-34 (HIGH), KPG-35 (MED, a request) and KPG-36 (LOW). Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** KPG-38 (HIGH), KPG-37 (HIGH), KPG-33 (HIGH), KPG-34 (HIGH), KPG-35 (MED, a request) and KPG-36 (LOW). Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -27,6 +27,53 @@ changes the right design here, say so and we will follow it.
 ---
 
 ## OPEN
+
+### KPG-38 · HIGH · Two files that use the same `type adapter` fail every release build: its vtable is emitted twice
+
+**Found** adding the statement cache's tests (phase 7), on `kama 0.9.523+gf8212db3`. The unit-test program built
+debug, and its release build stopped in clang:
+
+```
+unit--release.c:92382:20: error: redefinition of 'int32__as_postgres__PgParam__writeParam__thunk'
+unit--release.c:92385:37: error: redefinition of 'int32__as_postgres__PgParam'
+```
+
+A release build is one C unit, the files' C one after another, and each file that passes an `int32` as a `PgParam`
+(through `type adapter <…, int32, …> implements PgParam`) emits its own `static` thunk and vtable for it. Reduced, with
+no package:
+
+```kama
+// src/shown.kama
+import { core::println };
+export { Shown, show };
+type contract Shown for value, resource, enum, intrinsic { const fn int64 twice(); }
+type adapter <int32> implements Shown { public const fn int64 twice() { return cast<int64>(this) * 2i64; } }
+fn int64 show(Shown v) { return v.twice(); }
+
+// src/a.kama
+import { show };
+export { fromA };
+fn int64 fromA() { return show(v: 7); }
+
+// src/b.kama
+import { show };
+export { fromB };
+fn int64 fromB() { return show(v: 8); }
+
+// src/main.kama
+import { core::println, fromA, fromB };
+fn int32 main() { int64 a = fromA(); int64 b = fromB(); println(s: "${a} ${b}"); return 0; }
+```
+
+With a manifest whose entry is `src/main.kama`, `kama build kama.json --debug` prints `14 16`, and `--release` fails
+with `redefinition of 'int32__as_adapters__Shown__twice__thunk'` and `… 'int32__as_adapters__Shown'`.
+
+**Why HIGH:** any program that passes an integer to `Query.add` (or a `pg"…"` hole) from two of its files cannot be
+built for release, and that is how an application uses this package.
+
+**Workaround** (tests/unit/src/cache_test.kama): its queries' parameter is added by `extended_test.kama`'s
+`sevenQuery`, so one file holds the int32 adapter's use. Nothing in the package itself can avoid it, since the
+conversion happens in the caller's file.
 
 ### KPG-37 · HIGH · A lock stops installing when a newer version is published, if the package is also reached through a path dependency
 

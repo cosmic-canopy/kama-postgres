@@ -1,0 +1,224 @@
+// The statement cache (Config.setStatementCache) against a scripted server: what each mode sends on a first run and
+// on a run from the cache, a statement let go when the cache is full (closed in the next exchange), a cached plan the
+// server will no longer run (dropped, and the query run again outside a transaction, returned inside one), DISCARD
+// ALL, and a describe-only entry whose columns changed.
+import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
+         postgres::Transport, postgres::CacheMode, postgres::column, postgres::sqlstate::FEATURE_NOT_SUPPORTED,
+         std::memory::Owned,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome,
+         postgres_unit_tests::sevenQuery };
+export { cacheTests };
+
+comptime uint8 PARSE = 80ui8;      // 'P'
+comptime uint8 BIND = 66ui8;       // 'B'
+comptime uint8 DESCRIBE = 68ui8;   // 'D'
+comptime uint8 EXECUTE = 69ui8;    // 'E'
+comptime uint8 SYNC = 83ui8;       // 'S'
+comptime uint8 CLOSE = 67ui8;      // 'C'
+comptime uint8 QUERY = 81ui8;      // 'Q'
+
+unsafe fn string hexOf(const ref string s) { return hexEncode(bytes: s.bytes()); }
+fn Step quiet(uint8 tag, const ref string body) { return Step::Expect(tag: tag, body: copy body, then: DynamicArray.empty()); }
+fn Step answer(uint8 tag, Wire reply) { return Step::Expect(tag: tag, body: "", then: reply.bytes()); }
+fn DynamicArray<uint32> oids(uint32 a) { DynamicArray<uint32> v = DynamicArray.empty(); v.add(item: a); return v; }
+fn DynamicArray<string> names(const ref string a) { DynamicArray<string> v = DynamicArray.empty(); v.add(item: copy a); return v; }
+fn DynamicArray<int32> ints(int32 a) { DynamicArray<int32> v = DynamicArray.empty(); v.add(item: a); return v; }
+
+fn DynamicArray<Step> opening() { DynamicArray<Step> s = DynamicArray.empty(); s.add(item: Step::Send(bytes: welcome())); return s; }
+
+unsafe fn Result<Connection, PgError> cached(DynamicArray<Step> script, CacheMode mode, isize capacity) {
+    Environment env = testEnvironment();
+    string none = "";
+    Result<Config, PgError> c = resolveWith(text: none, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    config.setStatementCache(mode: mode, capacity: capacity);
+    Owned<Transport> fake = new FakeServer.make(steps: give script, chunk: 1, writeLimit: 3);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+// The server's description of `select $1 + 1`: an int4 parameter, an int4 column; with CloseCompletes first for
+// `closes` statements let go.
+fn Wire description(isize closes) {
+    Wire d = Wire.make();
+    isize i = 0;
+    while (i < closes) { d.closeComplete(); i = i + 1; }
+    d.parseComplete();
+    d.parameterTypes(oids: oids(a: 23ui32));
+    d.typedColumns(names: names(a: "n"), oids: oids(a: 23ui32));
+    d.ready(status: 73ui8);
+    return d;
+}
+
+fn Wire result(int32 v) { Wire e = Wire.make(); e.bindComplete(); e.intRow(values: ints(a: v)); e.complete(tag: "SELECT 1"); e.ready(status: 73ui8); return e; }
+
+// Parse of statement `name` with no types, and Describe of it.
+unsafe fn void prepares(ref DynamicArray<Step> s, const ref string name, const ref string sql, isize closes) {
+    s.add(item: quiet(tag: PARSE, body: hexOf(s: name).concat(other: "00").concat(other: hexOf(s: sql)).concat(other: "000000")));
+    s.add(item: quiet(tag: DESCRIBE, body: "53".concat(other: hexOf(s: name)).concat(other: "00")));
+    s.add(item: answer(tag: SYNC, reply: description(closes: closes)));
+}
+
+// Bind of statement `name` with the int4 parameter 7, binary result, then Execute and Sync.
+unsafe fn void runs(ref DynamicArray<Step> s, const ref string name, Wire reply) {
+    s.add(item: quiet(tag: BIND, body: "00".concat(other: hexOf(s: name)).concat(other: "00 0001 0001 0001 00000004 00000007 0001 0001")));
+    s.add(item: quiet(tag: EXECUTE, body: "00 00000000"));
+    s.add(item: answer(tag: SYNC, reply: give reply));
+}
+
+unsafe fn string ran(ref Connection c, const ref string sql) {
+    Query q = sevenQuery(sql: sql);   // KPG-38: the int32 adapter's use stays in one file
+    Result<Rows, PgError> r = c.query(q: q);
+    return match (give r) {
+        case Ok(value: rows): {
+            Result<int32, PgError> v = column::<int32>(rows: rows, row: 0, index: 0);
+            return match (give v) { case Ok(value: n): "${n}"; case Err(error: e): e.message(); };
+        }
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn int32 cacheTests() {
+    int32 f = 0;
+    string a = "select $1 + 1";
+    string b = "select $1 + 2";
+
+    // Statements: the first run prepares sc0 (two round trips), the second binds it at once (one).
+    DynamicArray<Step> s1 = opening();
+    prepares(s: ref s1, name: "sc0", sql: a, closes: 0);
+    runs(s: ref s1, name: "sc0", reply: result(v: 8));
+    runs(s: ref s1, name: "sc0", reply: result(v: 8));
+    Result<Connection, PgError> m1 = cached(script: give s1, mode: CacheMode::Statements, capacity: 512);
+    Connection c = match (give m1) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "cache: connect (".concat(other: e.message()).concat(other: ")")); } };
+    string first = ran(c: ref c, sql: a);
+    string second = ran(c: ref c, sql: a);
+    f = f + check(ok: first.equals(other: "8") && second.equals(other: "8"), what: "cache: prepared as sc0, then run from it with no Parse (".concat(other: first).concat(other: ", ").concat(other: second).concat(other: ")"));
+
+    // A cache of one: a second statement lets the first go, and its Close goes ahead of the next Parse.
+    DynamicArray<Step> s2 = opening();
+    prepares(s: ref s2, name: "sc0", sql: a, closes: 0);
+    runs(s: ref s2, name: "sc0", reply: result(v: 8));
+    s2.add(item: quiet(tag: CLOSE, body: "53".concat(other: hexOf(s: "sc0")).concat(other: "00")));
+    prepares(s: ref s2, name: "sc1", sql: b, closes: 1);
+    runs(s: ref s2, name: "sc1", reply: result(v: 9));
+    Result<Connection, PgError> m2 = cached(script: give s2, mode: CacheMode::Statements, capacity: 1);
+    match (give m2) {
+        case Ok(value: x): {
+            Connection d = give x;
+            string one = ran(c: ref d, sql: a);
+            string two = ran(c: ref d, sql: b);
+            f = f + check(ok: one.equals(other: "8") && two.equals(other: "9"), what: "cache: full, the oldest closed in the next exchange (".concat(other: one).concat(other: ", ").concat(other: two).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cache: connect 2"); }
+    };
+
+    // A cached plan the server will no longer run (ALTER TABLE): outside a transaction, closed, prepared again, and run.
+    Wire stale = Wire.make();
+    stale.report(tag: 69ui8, severity: "ERROR", code: "0A000", message: "cached plan must not change result type");
+    stale.ready(status: 73ui8);
+    DynamicArray<Step> s3 = opening();
+    prepares(s: ref s3, name: "sc0", sql: a, closes: 0);
+    runs(s: ref s3, name: "sc0", reply: result(v: 8));
+    runs(s: ref s3, name: "sc0", reply: give stale);
+    s3.add(item: quiet(tag: CLOSE, body: "53".concat(other: hexOf(s: "sc0")).concat(other: "00")));
+    prepares(s: ref s3, name: "sc1", sql: a, closes: 1);
+    runs(s: ref s3, name: "sc1", reply: result(v: 8));
+    Result<Connection, PgError> m3 = cached(script: give s3, mode: CacheMode::Statements, capacity: 512);
+    match (give m3) {
+        case Ok(value: x): {
+            Connection g = give x;
+            string once = ran(c: ref g, sql: a);
+            string retried = ran(c: ref g, sql: a);
+            f = f + check(ok: retried.equals(other: "8"), what: "cache: a stale plan is prepared again and run, outside a transaction (".concat(other: retried).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cache: connect 3"); }
+    };
+
+    // Inside a transaction the error is returned (the transaction has failed), and the entry is let go.
+    Wire staleTx = Wire.make();
+    staleTx.report(tag: 69ui8, severity: "ERROR", code: "0A000", message: "cached plan must not change result type");
+    staleTx.ready(status: 69ui8);
+    Wire begun = Wire.make(); begun.complete(tag: "BEGIN"); begun.ready(status: 84ui8);
+    DynamicArray<Step> s4 = opening();
+    prepares(s: ref s4, name: "sc0", sql: a, closes: 0);
+    runs(s: ref s4, name: "sc0", reply: result(v: 8));
+    s4.add(item: answer(tag: QUERY, reply: give begun));
+    runs(s: ref s4, name: "sc0", reply: give staleTx);
+    Result<Connection, PgError> m4 = cached(script: give s4, mode: CacheMode::Statements, capacity: 512);
+    match (give m4) {
+        case Ok(value: x): {
+            Connection h = give x;
+            string once = ran(c: ref h, sql: a);
+            Result<DynamicArray<Rows>, PgError> bg = h.simpleQuery(sql: "BEGIN");
+            Query q = sevenQuery(sql: a);
+            Result<Rows, PgError> r = h.query(q: q);
+            bool returned = match (r) { case Ok(value: rows): false; case Err(error: e): e.sqlstate() == FEATURE_NOT_SUPPORTED; };
+            f = f + check(ok: returned, what: "cache: a stale plan inside a transaction is returned");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cache: connect 4"); }
+    };
+
+    // DISCARD ALL drops every statement: the next run prepares again, with nothing to close.
+    Wire discarded = Wire.make(); discarded.complete(tag: "DISCARD ALL"); discarded.ready(status: 73ui8);
+    DynamicArray<Step> s5 = opening();
+    prepares(s: ref s5, name: "sc0", sql: a, closes: 0);
+    runs(s: ref s5, name: "sc0", reply: result(v: 8));
+    s5.add(item: answer(tag: QUERY, reply: give discarded));
+    prepares(s: ref s5, name: "sc1", sql: a, closes: 0);
+    runs(s: ref s5, name: "sc1", reply: result(v: 8));
+    Result<Connection, PgError> m5 = cached(script: give s5, mode: CacheMode::Statements, capacity: 512);
+    match (give m5) {
+        case Ok(value: x): {
+            Connection k = give x;
+            string once = ran(c: ref k, sql: a);
+            Result<DynamicArray<Rows>, PgError> d = k.simpleQuery(sql: "DISCARD ALL");
+            string after = ran(c: ref k, sql: a);
+            f = f + check(ok: after.equals(other: "8"), what: "cache: DISCARD ALL drops the statements (".concat(other: after).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cache: connect 5"); }
+    };
+
+    // Describe: a run from the cache parses the unnamed statement with the described types, and describes the portal,
+    // in the one round trip; a portal whose columns changed lets the entry go, so the next run describes again.
+    DynamicArray<Step> s6 = opening();
+    prepares(s: ref s6, name: "", sql: a, closes: 0);
+    runs(s: ref s6, name: "", reply: result(v: 8));
+    s6.add(item: quiet(tag: PARSE, body: "00".concat(other: hexOf(s: a)).concat(other: "00 0001 00000017")));
+    s6.add(item: quiet(tag: BIND, body: "00 00 0001 0001 0001 00000004 00000007 0001 0001"));
+    s6.add(item: quiet(tag: DESCRIBE, body: "5000"));
+    s6.add(item: quiet(tag: EXECUTE, body: "00 00000000"));
+    Wire fromCache = Wire.make();
+    fromCache.parseComplete(); fromCache.bindComplete(); fromCache.boundColumns(names: names(a: "n"), oids: oids(a: 20ui32), format: 1i16);
+    DynamicArray<uint8> eight = DynamicArray.empty();
+    isize z = 0;
+    while (z < 7) { eight.add(item: 0ui8); z = z + 1; }
+    eight.add(item: 8ui8);
+    fromCache.rawRow(value: eight.view()); fromCache.complete(tag: "SELECT 1"); fromCache.ready(status: 73ui8);
+    s6.add(item: answer(tag: SYNC, reply: give fromCache));
+    prepares(s: ref s6, name: "", sql: a, closes: 0);
+    runs(s: ref s6, name: "", reply: result(v: 8));
+    Result<Connection, PgError> m6 = cached(script: give s6, mode: CacheMode::Describe, capacity: 512);
+    match (give m6) {
+        case Ok(value: x): {
+            Connection p = give x;
+            string once = ran(c: ref p, sql: a);
+            Query q = sevenQuery(sql: a);
+            Result<Rows, PgError> r = p.query(q: q);
+            string widened = "";
+            match (give r) {
+                case Ok(value: rows): {
+                    Result<int64, PgError> v = column::<int64>(rows: rows, row: 0, index: 0);
+                    string got = match (give v) { case Ok(value: n): "${n}"; case Err(error: e): e.message(); };
+                    widened = give got;
+                }
+                case Err(error: e): { widened = e.message(); }
+            };
+            string again = ran(c: ref p, sql: a);
+            f = f + check(ok: once.equals(other: "8") && widened.equals(other: "8") && again.equals(other: "8"),
+                          what: "cache: describe-only, re-parsed with its types and the portal described; a changed column describes again (".concat(other: widened).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cache: connect 6"); }
+    };
+    return f;
+}

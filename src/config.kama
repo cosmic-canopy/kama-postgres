@@ -389,10 +389,12 @@ type resource TlsSettings implements Sendable {
     bool sniSetting = true;
     string minText;
     string maxText;
+    string hintText;
     string passwordText;
     string keylogText;
     string certPath;
     string keyPath;
+    bool keyGiven = false;
     string rootPath;
     string crlPath;
     string crlDirPath;
@@ -401,13 +403,13 @@ type resource TlsSettings implements Sendable {
 
     ctor blank() {
         this.modeSetting = SslMode::Prefer; this.directSetting = false; this.certModeSetting = SslCertMode::Allow;
-        this.sniSetting = true; this.minText = ""; this.maxText = ""; this.passwordText = ""; this.keylogText = "";
-        this.certPath = ""; this.keyPath = ""; this.rootPath = ""; this.crlPath = ""; this.crlDirPath = "";
+        this.sniSetting = true; this.minText = ""; this.maxText = ""; this.hintText = ""; this.passwordText = ""; this.keylogText = "";
+        this.certPath = ""; this.keyPath = ""; this.keyGiven = false; this.rootPath = ""; this.crlPath = ""; this.crlDirPath = "";
         this.homeKnown = false; this.systemCertFile = Optional::None;
     }
 
-    friend Config::resolveTls[blank, modeSetting, directSetting, certModeSetting, sniSetting, minText, maxText, passwordText,
-                         keylogText, certPath, keyPath, rootPath, crlPath, crlDirPath, homeKnown, systemCertFile];
+    friend Config::resolveTls[blank, modeSetting, directSetting, certModeSetting, sniSetting, minText, maxText, hintText, passwordText,
+                         keylogText, certPath, keyPath, keyGiven, rootPath, crlPath, crlDirPath, homeKnown, systemCertFile];
     friend Config::blank[blank];
 
     public const fn SslMode mode() { return this.modeSetting; }
@@ -419,6 +421,9 @@ type resource TlsSettings implements Sendable {
     // ssl_min_protocol_version and ssl_max_protocol_version as written ("TLSv1.2"), "" when unset.
     public const fn const ref string minVersion() { return this.minText; }
     public const fn const ref string maxVersion() { return this.maxText; }
+    // libpq's second line for a handshake that failed over protocol versions, naming the range asked for (the
+    // settings, or OpenSSL's whole range, TLSv1 to TLSv1.3, for a bound not set).
+    public const fn const ref string versionHint() { return this.hintText; }
     // sslpassword: the client key's passphrase, "" for none.
     public const fn const ref string password() { return this.passwordText; }
     // sslkeylogfile, "" for none.
@@ -427,6 +432,8 @@ type resource TlsSettings implements Sendable {
     // sslrootcert may be "system".
     public const fn const ref string certFile() { return this.certPath; }
     public const fn const ref string keyFile() { return this.keyPath; }
+    // Whether sslkey was given rather than defaulted: only a given one can name an OpenSSL engine ("engine:key").
+    public const fn bool keyFileGiven() { return this.keyGiven; }
     public const fn const ref string rootCert() { return this.rootPath; }
     // sslcrl and sslcrldir. When neither is set, sslcrl is the home directory's root.crl.
     public const fn const ref string crlFile() { return this.crlPath; }
@@ -692,19 +699,29 @@ type resource Config implements Sendable {
         else if (cb.equals(other: "require")) { this.binding = ChannelBindingMode::Require; }
         else { return Result::Err(error: fail(detail: invalidValue(keyword: "channel_binding", value: cb))); }
 
-        // TLS arrives with @kama/tls. Until then this client is libpq built without SSL, and says what libpq says.
-        string rootcert = this.text(keyword: "sslrootcert");
-        if (rootcert.equals(other: "system")) { return Result::Err(error: fail(detail: notCompiledIn(keyword: "sslrootcert", value: rootcert, what: "SSL"))); }
+        // TLS, as pqConnectOptions2 checks it in a libpq built with SSL.
         string mode = this.text(keyword: "sslmode");
         if (mode.equals(other: "disable")) { this.ssl = SslMode::Disable; }
         else if (mode.equals(other: "allow")) { this.ssl = SslMode::Allow; }
         else if (mode.equals(other: "prefer")) { this.ssl = SslMode::Prefer; }
-        else if (mode.equals(other: "require") || mode.equals(other: "verify-ca") || mode.equals(other: "verify-full")) {
-            return Result::Err(error: fail(detail: notCompiledIn(keyword: "sslmode", value: mode, what: "SSL")));
-        } else { return Result::Err(error: fail(detail: invalidValue(keyword: "sslmode", value: mode))); }
+        else if (mode.equals(other: "require")) { this.ssl = SslMode::Require; }
+        else if (mode.equals(other: "verify-ca")) { this.ssl = SslMode::VerifyCa; }
+        else if (mode.equals(other: "verify-full")) { this.ssl = SslMode::VerifyFull; }
+        else { return Result::Err(error: fail(detail: invalidValue(keyword: "sslmode", value: mode))); }
         string negotiation = this.text(keyword: "sslnegotiation");
-        if (negotiation.equals(other: "direct")) { return Result::Err(error: fail(detail: notCompiledIn(keyword: "sslnegotiation", value: negotiation, what: "SSL"))); }
-        if (!negotiation.equals(other: "postgres")) { return Result::Err(error: fail(detail: invalidValue(keyword: "sslnegotiation", value: negotiation))); }
+        if (!negotiation.equals(other: "postgres") && !negotiation.equals(other: "direct")) {
+            return Result::Err(error: fail(detail: invalidValue(keyword: "sslnegotiation", value: negotiation)));
+        }
+        // Direct negotiation with a mode that may end in plaintext would fall back silently against a server older
+        // than 17, which does not speak it.
+        bool strong = mode.startsWith(prefix: "require") || mode.startsWith(prefix: "verify");
+        if (negotiation.equals(other: "direct") && !strong) {
+            return Result::Err(error: fail(detail: "weak sslmode \"".concat(other: mode).concat(other: "\" may not be used with sslnegotiation=direct (use \"require\", \"verify-ca\", or \"verify-full\")")));
+        }
+        string rootcert = this.text(keyword: "sslrootcert");
+        if (rootcert.equals(other: "system") && !mode.equals(other: "verify-full")) {
+            return Result::Err(error: fail(detail: "weak sslmode \"".concat(other: mode).concat(other: "\" may not be used with sslrootcert=system (use \"verify-full\")")));
+        }
         string tlsMin = this.text(keyword: "ssl_min_protocol_version");
         string tlsMax = this.text(keyword: "ssl_max_protocol_version");
         if (!tlsVersionValid(v: tlsMin)) { return Result::Err(error: fail(detail: "invalid \"ssl_min_protocol_version\" value: \"".concat(other: tlsMin).concat(other: "\""))); }
@@ -715,7 +732,9 @@ type resource Config implements Sendable {
             if (!certmode.equals(other: "disable") && !certmode.equals(other: "allow") && !certmode.equals(other: "require")) {
                 return Result::Err(error: fail(detail: invalidValue(keyword: "sslcertmode", value: certmode)));
             }
-            if (certmode.equals(other: "require")) { return Result::Err(error: fail(detail: notCompiledIn(keyword: "sslcertmode", value: certmode, what: "SSL"))); }
+        } else {
+            // DefaultSSLCertMode in a libpq built with SSL, set here as pqConnectOptions2 sets it.
+            this.setAt(i: this.indexOf(keyword: "sslcertmode"), value: "allow");
         }
         string gss = this.text(keyword: "gssencmode");
         if (!gss.equals(other: "disable") && !gss.equals(other: "prefer") && !gss.equals(other: "require")) {
@@ -770,6 +789,12 @@ type resource Config implements Sendable {
         t.sniSetting = this.text(keyword: "sslsni").startsWith(prefix: "1");
         t.minText = this.text(keyword: "ssl_min_protocol_version");
         t.maxText = this.text(keyword: "ssl_max_protocol_version");
+        string shownMin = "TLSv1";
+        string shownMax = "TLSv1.3";
+        if (this.has(keyword: "ssl_min_protocol_version")) { shownMin = copy t.minText; }
+        if (this.has(keyword: "ssl_max_protocol_version")) { shownMax = copy t.maxText; }
+        t.hintText = "This may indicate that the server does not support any SSL protocol version between ".concat(other: shownMin)
+                     .concat(other: " and ").concat(other: shownMax).concat(other: ".");
         t.passwordText = this.text(keyword: "sslpassword");
         t.keylogText = this.text(keyword: "sslkeylogfile");
         string cert = this.text(keyword: "sslcert");
@@ -784,6 +809,7 @@ type resource Config implements Sendable {
             match (give found) { case Some(value: h): { home = give h; t.homeKnown = true; } case None: { } };
         }
         if (cert.length() == 0 && t.homeKnown) { cert = home.concat(other: "/").concat(other: userCertFile()); }
+        t.keyGiven = key.length() > 0;
         if (key.length() == 0 && t.homeKnown) { key = home.concat(other: "/").concat(other: userKeyFile()); }
         if (root.length() == 0 && t.homeKnown) { root = home.concat(other: "/").concat(other: rootCertFile()); }
         if (crl.length() == 0 && crldir.length() == 0 && t.homeKnown) { crl = home.concat(other: "/").concat(other: rootCrlFile()); }
@@ -996,9 +1022,6 @@ fn string invalidValue(const ref string keyword, const ref string value) {
     return "invalid ".concat(other: keyword).concat(other: " value: \"").concat(other: value).concat(other: "\"");
 }
 
-fn string notCompiledIn(const ref string keyword, const ref string value, const ref string what) {
-    return keyword.concat(other: " value \"").concat(other: value).concat(other: "\" invalid when ").concat(other: what).concat(other: " support is not compiled in");
-}
 
 // count_comma_separated_elems.
 fn isize commaCount(const ref string s) {

@@ -20,7 +20,10 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::protocol::execute as sendExecute, postgres::protocol::closeStatement as sendCloseStatement,
          postgres::protocol::closePortal as sendClosePortal, postgres::protocol::sync as sendSync,
          postgres::protocol::BindValues,
-         postgres::Query, postgres::Statement, postgres::Portal, postgres::hasBinaryCodec };
+         postgres::Query, postgres::Statement, postgres::Portal, postgres::hasBinaryCodec,
+         postgres::Dialer, postgres::DialTarget, postgres::SslCertMode, postgres::sqlstate::sqlstateCode,
+         postgres::secure::EncryptionPlan, postgres::secure::Fallback, postgres::secure::Secured, postgres::secure::secure,
+         postgres::secure::TlsSession };
 export { Connection, TransactionStatus };
 
 // postgres::Connection — one session with a server: connecting as libpq connects (every host and address in
@@ -59,6 +62,8 @@ type resource Connection implements Sendable {
     DynamicArray<FieldDescription> openFields;
     int64 statements = 0i64;  // the names given so far: s0, s1, …
     int64 portals = 0i64;     // p0, p1, …
+    Optional<TlsSession> tls;          // what TLS settled, when the session is encrypted
+    bool refusedBeforeAuth = false;    // startup ended on an ErrorResponse before AuthenticationOk
 
     ctor over(Owned<Transport> transport) {
         this.wire = Wire.over(transport: give transport);
@@ -79,151 +84,90 @@ type resource Connection implements Sendable {
         this.openFields = DynamicArray.empty();
         this.statements = 0i64;
         this.portals = 0i64;
+        this.tls = Optional::None;
+        this.refusedBeforeAuth = false;
     }
 
-    // Connect as `config` says: each host in order, each of its addresses in turn. A failure to reach an address,
-    // or connect_timeout passing, moves on to the next address; once a server has answered, its refusal is final,
-    // as libpq's is. Every attempt is kept in the error.
+    // Over a transport some of whose bytes were read already: what the server sent after its 'N' to an SSLRequest.
+    ctor resumed(Owned<Transport> transport, ConstView<uint8> preread) {
+        this.wire = Wire.resume(transport: give transport, preread: preread);
+        this.outbox = MessageWriter.make();
+        this.live = true;
+        this.pid = 0;
+        this.cancelKey = DynamicArray.empty();
+        this.protocol = 0;
+        this.txStatus = 73ui8;
+        this.paramNames = DynamicArray.empty();
+        this.paramValues = DynamicArray.empty();
+        this.handler = Optional::None;
+        this.pending = DynamicArray.empty();
+        this.busy = false;
+        this.streaming = false;
+        this.bindPending = false;
+        this.rowLimited = false;
+        this.openFields = DynamicArray.empty();
+        this.statements = 0i64;
+        this.portals = 0i64;
+        this.tls = Optional::None;
+        this.refusedBeforeAuth = false;
+    }
+
+    // Connect as `config` says, as libpq's PQconnectPoll does: each host in order, each of its addresses in turn,
+    // and at each address the encryption sslmode allows, in its order (prefer: TLS, then plaintext; allow: the other
+    // way round). A failure to reach an address, or connect_timeout passing, moves to the next address. A refusal
+    // tries the next encryption method on a new connection to the same address while one is left; then, or for a
+    // failure no other method could cure, the connect ends, and no further host is tried. A server that cannot
+    // accept connections yet (57P03) moves to the next host. Every attempt is kept in the error, each with libpq's
+    // lead ("connection to server at …").
     public unsafe ctor Result<Connection, PgError> connect(const ref Config config) {
+        Opener opener = Opener.builtIn();
+        return Connection.establish(config: config, opener: opener);
+    }
+
+    // `connect`, with each connection opened by `dialer` (a tunnel, a proxy) rather than a socket of this client's.
+    public unsafe ctor Result<Connection, PgError> connectWith(Owned<Dialer> dialer, const ref Config config) {
+        Opener opener = Opener.with(dialer: give dialer);
+        return Connection.establish(config: config, opener: opener);
+    }
+
+    // Start a session over a transport the caller opened (tokio-postgres's connect_raw). `config` supplies everything
+    // but the hosts: the transport stands in for a connection to its first host, so sslmode applies as it would there
+    // (a socket host: plaintext), and that host's name is the one TLS sends as SNI and verify-full checks. There is one
+    // transport, so there is one attempt: a fallback that needs a new connection is reported as the failure.
+    // connect_timeout bounds the startup.
+    public unsafe ctor Result<Connection, PgError> connectOver(Owned<Transport> transport, const ref Config config) {
+        Deadline deadline = Deadline.none();
+        if (config.connectTimeout() > 0) { deadline = Deadline.after(span: Duration.fromSecs(s: cast<int64>(config.connectTimeout()))); }
+        bool socket = config.hostCount() == 0 || config.host(index: 0).kind() == HostKind::Socket;
+        string host = "";
+        if (config.hostCount() > 0 && !socket) { host = copy config.host(index: 0).name(); }
+        EncryptionPlan plan = EncryptionPlan.forAddress(mode: config.tls().mode(), socket: socket);
+        Attempt tried = Connection::attempt(link: give transport, config: config, hostIndex: -1, host: host, plan: plan, deadline: deadline);
+        return match (give tried) {
+            case Ready(connection: c): Result::Ok(value: give c);
+            case Retry(error: e): Result::Err(error: give e);
+            case Final(error: e): Result::Err(error: give e);
+            case TimedOut(error: e): Result::Err(error: give e);
+            case NextHost(error: e): Result::Err(error: give e);
+        };
+    }
+
+    unsafe ctor Result<Connection, PgError> establish(const ref Config config, ref Opener opener) {
         ConnectError failures = ConnectError.make();
-        bool refused = false;   // a server answered and refused: libpq tries no further host
+        bool stop = false;
         isize h = 0;
-        while (h < config.hostCount() && !refused) {
-            string shown = config.host(index: h).display();
-            string portText = copy config.host(index: h).port();
-            if (portText.length() == 0) { portText = "5432"; }
-            Optional<int32> parsedPort = config.host(index: h).portNumber();
-            int32 portValue = match (parsedPort) {
-                case Some(value: p): p;
-                case None: {
-                    return Result::Err(error: PgError::Config(detail: "invalid integer value \"".concat(other: config.host(index: h).port()).concat(other: "\" for connection option \"port\"")));
-                }
-            };
-            if (portValue < 1 || portValue > 65535) {
-                failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: "",
-                    error: PgError::Config(detail: "invalid port number: \"".concat(other: config.host(index: h).port()).concat(other: "\"")), passfile: "", note: ""));
-                h = h + 1;
-                continue;
-            }
-            uint16 port = cast<uint16>(portValue);
-            if (config.host(index: h).kind() == HostKind::Socket) {
-                // UNIXSOCK_PATH: the directory and the port make the path; "@name" is Linux's abstract namespace.
-                string dir = copy config.host(index: h).name();
-                string path = dir.concat(other: "/.s.PGSQL.${portValue}");
-                if (path.length() > socketPathMax()) {
-                    isize most = socketPathMax();
-                    failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: "",
-                        error: PgError::Config(detail: "Unix-domain socket path \"".concat(other: path).concat(other: "\" is too long (maximum ${most} bytes)")), passfile: "", note: ""));
-                    h = h + 1;
-                    continue;
-                }
-                bool linuxAbstract = dir.startsWith(prefix: "@");
-                string target = copy path;
-                if (linuxAbstract) { target = path.substring(start: 1, end: path.length()); }
-                string lead = "connection to server on socket \"".concat(other: path).concat(other: "\" failed: ");
-                Deadline deadline = Deadline.none();
-                if (config.connectTimeout() > 0) { deadline = Deadline.after(span: Duration.fromSecs(s: cast<int64>(config.connectTimeout()))); }
-                Result<Owned<UnixTransport>, IoError> made = new UnixTransport.connect(path: target, linuxAbstract: linuxAbstract, timeoutMs: deadline.remainingMs());
-                Owned<UnixTransport> local = match (give made) {
-                    case Ok(value: t): give t;
-                    case Err(error: e): {
-                        // As for TCP: the reason and libpq's hint, or for connect_timeout just that.
-                        PgError cause = PgError::Io(error: e);
-                        string hint = "\tIs the server running locally and accepting connections on that socket?";
-                        match (e.kind()) { case TimedOut: { cause = PgError::Timeout; hint = ""; } case _: { } };
-                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: copy lead, error: give cause,
-                            passfile: "", note: give hint));
-                        h = h + 1;
-                        continue;
-                    }
-                };
-                // requirepeer: the server must run as this account, by the socket's peer credentials.
-                string peer = config.requirePeer();
-                if (peer.length() > 0) {
-                    Result<string, IoError> who = local.peerUserName();
-                    string refusal = match (give who) {
-                        case Ok(value: name): peerMismatch(wanted: peer, actual: name);
-                        case Err(error: e): "could not get peer credentials: ".concat(other: strerror(e: e));
-                    };
-                    if (refusal.length() > 0) {
-                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: copy lead, error: PgError::Auth(detail: give refusal), passfile: "", note: ""));
-                        refused = true;
-                        continue;
-                    }
-                }
-                Owned<Transport> socket = give local;
-                Result<Connection, PgError> started = Connection.opened(transport: give socket, config: config, hostIndex: h, deadline: deadline);
-                match (give started) {
-                    case Ok(value: c): { return Result::Ok(value: give c); }
-                    case Err(error: e): {
-                        bool timedOut = match (e) { case Timeout: true; case _: false; };
-                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: copy lead, error: give e, passfile: passfileFor(config: config, hostIndex: h), note: ""));
-                        if (!timedOut) { refused = true; }
-                    }
-                };
-                h = h + 1;
-                continue;
-            }
-            DynamicArray<SocketAddr> addresses = DynamicArray.empty();
-            if (config.host(index: h).kind() == HostKind::Address) {
-                Optional<IpAddr> ip = parseIp(text: config.host(index: h).address());
-                match (ip) {
-                    case Some(value: a): { addresses.add(item: SocketAddr.of(ip: a, port: port)); }
-                    case None: {
-                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText,
-                            lead: "could not parse network address \"".concat(other: config.host(index: h).address()).concat(other: "\": "),
-                            error: PgError::Io(error: IoError.of(kind: IoErrorKind::InvalidInput)), passfile: "", note: ""));
-                    }
-                };
-            } else {
-                Result<DynamicArray<SocketAddr>, IoError> found = resolve(host: config.host(index: h).name(), port: port);
-                match (give found) {
-                    case Ok(value: list): { addresses = give list; }
-                    case Err(error: e): {
-                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText,
-                            lead: "could not translate host name \"".concat(other: config.host(index: h).name()).concat(other: "\" to address: "),
-                            error: PgError::Io(error: e), passfile: "", note: ""));
-                    }
-                };
-            }
+        while (h < config.hostCount() && !stop) {
+            Result<DynamicArray<DialTarget>, PgError> listed = Connection::targetsOf(config: config, hostIndex: h, failures: failures);
+            DynamicArray<DialTarget> targets = match (give listed) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+            bool nextHost = false;
             isize a = 0;
-            while (a < addresses.length() && !refused) {
-                IpAddr ip = addresses[a].ip;
-                string addressText = "${ip}";
-                string lead = identity(host: shown, address: addressText, port: portText);
-                Deadline deadline = Deadline.none();
-                if (config.connectTimeout() > 0) { deadline = Deadline.after(span: Duration.fromSecs(s: cast<int64>(config.connectTimeout()))); }
-                Result<Owned<TcpTransport>, IoError> made = new TcpTransport.connect(address: addresses[a], timeoutMs: deadline.remainingMs());
-                Owned<TcpTransport> tcp = match (give made) {
-                    case Ok(value: t): give t;
-                    case Err(error: e): {
-                        // libpq's connectFailureMessage: the reason, and a hint; a connect_timeout is just that.
-                        PgError cause = PgError::Io(error: e);
-                        string hint = "\tIs the server running on that host and accepting TCP/IP connections?";
-                        match (e.kind()) { case TimedOut: { cause = PgError::Timeout; hint = ""; } case _: { } };
-                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: copy addressText, port: copy portText, lead: copy lead, error: give cause, passfile: "", note: give hint));
-                        a = a + 1;
-                        continue;
-                    }
-                };
-                Result<Owned<TcpTransport>, PgError> configured = socketOptions(tcp: give tcp, config: config);
-                Owned<TcpTransport> ready = match (give configured) {
-                    case Ok(value: t): give t;
-                    case Err(error: e): {
-                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: copy addressText, port: copy portText, lead: copy lead, error: give e, passfile: "", note: ""));
-                        a = a + 1;
-                        continue;
-                    }
-                };
-                Owned<Transport> transport = give ready;
-                Result<Connection, PgError> started = Connection.opened(transport: give transport, config: config, hostIndex: h, deadline: deadline);
-                match (give started) {
-                    case Ok(value: c): { return Result::Ok(value: give c); }
-                    case Err(error: e): {
-                        bool timedOut = match (e) { case Timeout: true; case _: false; };
-                        failures.add(attempt: ConnectAttempt.make(host: copy shown, address: copy addressText, port: copy portText, lead: copy lead, error: give e, passfile: passfileFor(config: config, hostIndex: h), note: ""));
-                        if (!timedOut) { refused = true; }
-                    }
+            while (a < targets.length() && !stop && !nextHost) {
+                Visit v = Connection::visit(config: config, hostIndex: h, target: targets[a], opener: opener, failures: failures);
+                match (give v) {
+                    case Connected(connection: c): { return Result::Ok(value: give c); }
+                    case NextAddress: { }
+                    case ToNextHost: { nextHost = true; }
+                    case Stop: { stop = true; }
                 };
                 a = a + 1;
             }
@@ -232,21 +176,182 @@ type resource Connection implements Sendable {
         return Result::Err(error: PgError::Connect(error: give failures));
     }
 
-    // Start a session over a transport the caller opened: a tunnel, a proxy, a test's scripted server
-    // (tokio-postgres's connect_raw). `config` supplies everything but the hosts; connect_timeout bounds the startup.
-    public unsafe ctor Result<Connection, PgError> connectOver(Owned<Transport> transport, const ref Config config) {
-        Deadline deadline = Deadline.none();
-        if (config.connectTimeout() > 0) { deadline = Deadline.after(span: Duration.fromSecs(s: cast<int64>(config.connectTimeout()))); }
-        return Connection.opened(transport: give transport, config: config, hostIndex: -1, deadline: deadline);
+    // The places host `hostIndex` can be reached: its socket, its hostaddr, or every address its name resolves to. A
+    // host that has none (a bad port, a path too long, a name that does not resolve) is recorded and has no targets.
+    // A port that is not an integer ends the connect, as libpq's does.
+    static unsafe fn Result<DynamicArray<DialTarget>, PgError> targetsOf(const ref Config config, isize hostIndex, ref ConnectError failures) {
+        DynamicArray<DialTarget> targets = DynamicArray.empty();
+        string shown = config.host(index: hostIndex).display();
+        string portText = copy config.host(index: hostIndex).port();
+        if (portText.length() == 0) { portText = "5432"; }
+        Optional<int32> parsedPort = config.host(index: hostIndex).portNumber();
+        int32 portValue = match (parsedPort) {
+            case Some(value: p): p;
+            case None: {
+                return Result::Err(error: PgError::Config(detail: "invalid integer value \"".concat(other: config.host(index: hostIndex).port()).concat(other: "\" for connection option \"port\"")));
+            }
+        };
+        if (portValue < 1 || portValue > 65535) {
+            failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: "",
+                error: PgError::Config(detail: "invalid port number: \"".concat(other: config.host(index: hostIndex).port()).concat(other: "\"")), passfile: "", note: ""));
+            return Result::Ok(value: give targets);
+        }
+        uint16 port = cast<uint16>(portValue);
+        if (config.host(index: hostIndex).kind() == HostKind::Socket) {
+            // UNIXSOCK_PATH: the directory and the port make the path; "@name" is Linux's abstract namespace.
+            string dir = copy config.host(index: hostIndex).name();
+            string path = dir.concat(other: "/.s.PGSQL.${portValue}");
+            if (path.length() > socketPathMax()) {
+                isize most = socketPathMax();
+                failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText, lead: "",
+                    error: PgError::Config(detail: "Unix-domain socket path \"".concat(other: path).concat(other: "\" is too long (maximum ${most} bytes)")), passfile: "", note: ""));
+                return Result::Ok(value: give targets);
+            }
+            bool linuxAbstract = dir.startsWith(prefix: "@");
+            targets.add(item: DialTarget.overSocket(host: copy shown, port: copy portText, path: give path, linuxAbstract: linuxAbstract));
+            return Result::Ok(value: give targets);
+        }
+        if (config.host(index: hostIndex).kind() == HostKind::Address) {
+            Optional<IpAddr> ip = parseIp(text: config.host(index: hostIndex).address());
+            match (ip) {
+                case Some(value: a): { targets.add(item: DialTarget.overTcp(host: copy shown, port: copy portText, address: SocketAddr.of(ip: a, port: port))); }
+                case None: {
+                    failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText,
+                        lead: "could not parse network address \"".concat(other: config.host(index: hostIndex).address()).concat(other: "\": "),
+                        error: PgError::Io(error: IoError.of(kind: IoErrorKind::InvalidInput)), passfile: "", note: ""));
+                }
+            };
+            return Result::Ok(value: give targets);
+        }
+        Result<DynamicArray<SocketAddr>, IoError> found = resolve(host: config.host(index: hostIndex).name(), port: port);
+        match (give found) {
+            case Ok(value: list): {
+                foreach (SocketAddr address in list) { targets.add(item: DialTarget.overTcp(host: copy shown, port: copy portText, address: address)); }
+            }
+            case Err(error: e): {
+                failures.add(attempt: ConnectAttempt.make(host: copy shown, address: "", port: copy portText,
+                    lead: "could not translate host name \"".concat(other: config.host(index: hostIndex).name()).concat(other: "\" to address: "),
+                    error: PgError::Io(error: e), passfile: "", note: ""));
+            }
+        };
+        return Result::Ok(value: give targets);
     }
 
-    // A session over a connected transport, through startup. `hostIndex` is the host whose password-file entry
-    // applies (-1 for a caller's transport).
-    unsafe ctor Result<Connection, PgError> opened(Owned<Transport> transport, const ref Config config, isize hostIndex, Deadline deadline) {
-        Connection c = Connection.over(transport: give transport);
-        Result<Unit, PgError> started = c.startup(config: config, hostIndex: hostIndex, deadline: deadline);
-        match (give started) { case Ok(value: u): { } case Err(error: e): { c.lose(); return Result::Err(error: give e); } };
-        return Result::Ok(value: give c);
+    // One address: a connection for each encryption method sslmode allows, until one starts a session or a failure
+    // decides otherwise. connect_timeout runs from the first connection and bounds them all, as it bounds libpq's
+    // attempts at one address. libpq prints its lead again for every new connection.
+    static unsafe fn Visit visit(const ref Config config, isize hostIndex, const ref DialTarget target, ref Opener opener, ref ConnectError failures) {
+        string addressText = "";
+        string lead = "";
+        if (target.isSocket()) {
+            lead = "connection to server on socket \"".concat(other: target.socketPath()).concat(other: "\" failed: ");
+        } else {
+            Optional<SocketAddr> at = target.address();
+            match (at) { case Some(value: a): { IpAddr ip = a.ip; addressText = "${ip}"; } case None: { } };
+            lead = identity(host: target.host(), address: addressText, port: target.port());
+        }
+        Deadline deadline = Deadline.none();
+        if (config.connectTimeout() > 0) { deadline = Deadline.after(span: Duration.fromSecs(s: cast<int64>(config.connectTimeout()))); }
+        EncryptionPlan plan = EncryptionPlan.forAddress(mode: config.tls().mode(), socket: target.isSocket());
+        // libpq's connhost[].host: the name TLS sends as SNI and verify-full checks, "" when only hostaddr was given.
+        string host = "";
+        if (!target.isSocket()) { host = copy config.host(index: hostIndex).name(); }
+        while (true) {
+            Opened opened = opener.open(target: target, config: config, deadline: deadline);
+            Owned<Transport> link = match (give opened) {
+                case Link(transport: t): give t;
+                case Unreachable(error: e, note: n): {
+                    failures.add(attempt: ConnectAttempt.make(host: copy target.host(), address: copy addressText, port: copy target.port(), lead: copy lead,
+                        error: give e, passfile: "", note: give n));
+                    return Visit::NextAddress;
+                }
+                case Refused(error: e): {
+                    failures.add(attempt: ConnectAttempt.make(host: copy target.host(), address: copy addressText, port: copy target.port(), lead: copy lead,
+                        error: give e, passfile: "", note: ""));
+                    return Visit::Stop;
+                }
+            };
+            Attempt tried = Connection::attempt(link: give link, config: config, hostIndex: hostIndex, host: host, plan: plan, deadline: deadline);
+            string passfile = passfileFor(config: config, hostIndex: hostIndex);
+            match (give tried) {
+                case Ready(connection: c): { return Visit::Connected(connection: give c); }
+                case Retry(error: e): {
+                    failures.add(attempt: ConnectAttempt.make(host: copy target.host(), address: copy addressText, port: copy target.port(), lead: copy lead, error: give e, passfile: give passfile, note: ""));
+                }
+                case Final(error: e): {
+                    failures.add(attempt: ConnectAttempt.make(host: copy target.host(), address: copy addressText, port: copy target.port(), lead: copy lead, error: give e, passfile: give passfile, note: ""));
+                    return Visit::Stop;
+                }
+                case TimedOut(error: e): {
+                    failures.add(attempt: ConnectAttempt.make(host: copy target.host(), address: copy addressText, port: copy target.port(), lead: copy lead, error: give e, passfile: "", note: ""));
+                    return Visit::NextAddress;
+                }
+                case NextHost(error: e): {
+                    failures.add(attempt: ConnectAttempt.make(host: copy target.host(), address: copy addressText, port: copy target.port(), lead: copy lead, error: give e, passfile: give passfile, note: ""));
+                    return Visit::ToNextHost;
+                }
+            };
+        }
+        return Visit::Stop;
+    }
+
+    // One connection: encryption as `plan` has it now, then startup. What a failure leads to is libpq's: a TLS failure
+    // or the server's refusal before authentication tries the next method (Retry) while one is left; 57P03 moves on
+    // to the next host; connect_timeout to the next address; anything else ends the connect.
+    static unsafe fn Attempt attempt(Owned<Transport> link, const ref Config config, isize hostIndex, const ref string host, ref EncryptionPlan plan, Deadline deadline) {
+        bool ssl = match (plan.current()) { case Ssl: true; case Plain: false; };
+        if (!ssl) {
+            Connection plain = Connection.over(transport: give link);
+            return Connection::finish(c: give plain, config: config, hostIndex: hostIndex, plan: plan, deadline: deadline);
+        }
+        Secured secured = secure(link: give link, settings: config.tls(), host: host, deadline: deadline);
+        match (give secured) {
+            case Encrypted(link: l, session: s): {
+                Connection c = Connection.over(transport: give l);
+                c.tls = Optional::Some(value: give s);
+                return Connection::finish(c: give c, config: config, hostIndex: hostIndex, plan: plan, deadline: deadline);
+            }
+            case Declined(link: l, preread: p): {
+                Fallback next = plan.refused();
+                bool same = match (next) { case SameConnection: true; case _: false; };
+                if (!same) { return Attempt::Final(error: PgError::Tls(detail: "server does not support SSL, but SSL was required", cause: Optional::None)); }
+                Connection c = Connection.resumed(transport: give l, preread: p.view());
+                return Connection::finish(c: give c, config: config, hostIndex: hostIndex, plan: plan, deadline: deadline);
+            }
+            case Failed(error: e): {
+                bool timedOut = match (e) { case Timeout: true; case _: false; };
+                if (timedOut) { return Attempt::TimedOut(error: give e); }
+                Fallback next = plan.failed();
+                bool again = match (next) { case NewConnection: true; case _: false; };
+                if (again) { return Attempt::Retry(error: give e); }
+                return Attempt::Final(error: give e);
+            }
+            case Fatal(error: e): { return Attempt::Final(error: give e); }
+        };
+        return Attempt::Final(error: PgError::Closed);
+    }
+
+    // Startup over a connection whose encryption is settled.
+    static unsafe fn Attempt finish(Connection c, const ref Config config, isize hostIndex, ref EncryptionPlan plan, Deadline deadline) {
+        Connection session = give c;
+        Result<Unit, PgError> started = session.startup(config: config, hostIndex: hostIndex, deadline: deadline);
+        match (give started) {
+            case Ok(value: u): { return Attempt::Ready(connection: give session); }
+            case Err(error: e): {
+                bool refusedEarly = session.refusedBeforeAuth;
+                session.lose();
+                bool timedOut = match (e) { case Timeout: true; case _: false; };
+                if (timedOut) { return Attempt::TimedOut(error: give e); }
+                if (refusedEarly) {
+                    if (e.sqlstate() == sqlstateCode(text: "57P03")) { return Attempt::NextHost(error: give e); }
+                    Fallback next = plan.failed();
+                    bool again = match (next) { case NewConnection: true; case _: false; };
+                    if (again) { return Attempt::Retry(error: give e); }
+                }
+                return Attempt::Final(error: give e);
+            }
+        };
+        return Attempt::Final(error: PgError::Closed);
     }
 
     // ---- the session ----
@@ -808,7 +913,8 @@ type resource Connection implements Sendable {
             if (!authenticated) {
                 match (give m) {
                     case AuthenticationOk: {
-                        Result<Unit, PgError> allowed = expected(config: config, code: AUTH_OK, finished: finished);
+                        bool bound = saslStage == 3 && scram.length() > 0 && scram[0].mechanism().equals(other: "SCRAM-SHA-256-PLUS");
+                        Result<Unit, PgError> allowed = this.expectedOk(config: config, finished: finished, bound: bound);
                         match (give allowed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
                         if (saslStage == 1 || saslStage == 2) {
                             return Result::Err(error: PgError::Auth(detail: "server did not complete authentication: it sent AuthenticationOk before proving that it knows the password"));
@@ -839,7 +945,7 @@ type resource Connection implements Sendable {
                     case AuthenticationSasl(mechanisms: offered): {
                         Result<Unit, PgError> allowed = expected(config: config, code: AUTH_SASL, finished: finished);
                         match (give allowed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-                        Result<Unit, PgError> begun = this.beginSasl(config: config, offered: offered, secret: secret, scram: ref scram);
+                        Result<Unit, PgError> begun = this.beginSasl(config: config, offered: offered, secret: secret, scram: ref scram, deadline: deadline);
                         match (give begun) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
                         saslStage = 1;
                     }
@@ -880,7 +986,12 @@ type resource Connection implements Sendable {
                         Result<Unit, PgError> agreed = this.negotiate(config: config, offered: v, unrecognized: names);
                         match (give agreed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
                     }
-                    case ErrorResponse(fields: f): { return Result::Err(error: PgError::Server(error: ServerError.make(fields: give f))); }
+                    case ErrorResponse(fields: f): {
+                        // Before authentication completes, libpq tries the next encryption method (or host) on a
+                        // refusal; the caller decides by this.
+                        this.refusedBeforeAuth = true;
+                        return Result::Err(error: PgError::Server(error: ServerError.make(fields: give f)));
+                    }
                     case NoticeResponse(fields: f): { this.deliver(fields: give f); }
                     case _: {
                         return Result::Err(error: violation(detail: "expected authentication request from server, but received a message of another kind"));
@@ -922,31 +1033,47 @@ type resource Connection implements Sendable {
     }
 
     // pg_SASL_init: choose a mechanism the server offered and this client may use, and send the client-first
-    // message.
-    unsafe fn Result<Unit, PgError> beginSasl(const ref Config config, const ref DynamicArray<string> offered, const ref string secret, ref DynamicArray<ScramClient> scram) {
-        if (config.channelBinding() == ChannelBindingMode::Require) { return Result::Err(error: PgError::Auth(detail: "channel binding required, but SSL not in use")); }
+    // message. Over TLS, SCRAM-SHA-256-PLUS is chosen whenever it is offered and channel_binding is not disable, and
+    // the login is bound to the server's certificate (RFC 5929 tls-server-end-point); offered over plaintext it is a
+    // sign of a stripped TLS layer, and refused.
+    unsafe fn Result<Unit, PgError> beginSasl(const ref Config config, const ref DynamicArray<string> offered, const ref string secret, ref DynamicArray<ScramClient> scram, Deadline deadline) {
+        bool ssl = this.sslInUse();
+        if (config.channelBinding() == ChannelBindingMode::Require && !ssl) { return Result::Err(error: PgError::Auth(detail: "channel binding required, but SSL not in use")); }
         if (scram.length() > 0) { return Result::Err(error: PgError::Auth(detail: "duplicate SASL authentication request")); }
         string chosen = "";
         isize i = 0;
         while (i < offered.length()) {
             if (offered[i].equals(other: "SCRAM-SHA-256-PLUS")) {
-                return Result::Err(error: PgError::Auth(detail: "server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection"));
-            }
-            if (offered[i].equals(other: "SCRAM-SHA-256") && chosen.length() == 0) { chosen = "SCRAM-SHA-256"; }
-            if (offered[i].equals(other: "OAUTHBEARER") && chosen.length() == 0) { chosen = "OAUTHBEARER"; }
+                if (!ssl) { return Result::Err(error: PgError::Auth(detail: "server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection")); }
+                if (config.channelBinding() != ChannelBindingMode::Disable) { chosen = "SCRAM-SHA-256-PLUS"; }
+            } else if (offered[i].equals(other: "SCRAM-SHA-256") && chosen.length() == 0) { chosen = "SCRAM-SHA-256"; }
+            else if (offered[i].equals(other: "OAUTHBEARER") && chosen.length() == 0) { chosen = "OAUTHBEARER"; }
             i = i + 1;
         }
         if (chosen.length() == 0) { return Result::Err(error: PgError::Auth(detail: "none of the server's SASL authentication mechanisms are supported")); }
         Optional<string> refused = config.requireAuth().refuseMechanism(mechanism: chosen);
         match (give refused) { case Some(value: r): { return Result::Err(error: PgError::Auth(detail: give r)); } case None: { } };
+        if (config.channelBinding() == ChannelBindingMode::Require && !chosen.equals(other: "SCRAM-SHA-256-PLUS")) {
+            return Result::Err(error: PgError::Auth(detail: "channel binding is required, but server did not offer an authentication method that supports channel binding"));
+        }
         if (chosen.equals(other: "OAUTHBEARER")) {
             return Result::Err(error: PgError::Auth(detail: "the server requested OAuth authentication (OAUTHBEARER), which this client does not support"));
         }
         bool keys = config.scramClientKey().length() > 0;
         if (!keys && secret.length() == 0) { return Result::Err(error: noPassword()); }
+        // build_client_first_message's GS2 header: p=tls-server-end-point for -PLUS; y over TLS when channel binding
+        // is allowed but the server did not offer it; n otherwise.
+        ChannelBinding binding = ChannelBinding::NotSupported;
+        if (chosen.equals(other: "SCRAM-SHA-256-PLUS")) {
+            DynamicArray<uint8> hash = this.endPointHash();
+            if (hash.length() == 0) { return Result::Err(error: PgError::Auth(detail: "could not generate peer certificate hash")); }
+            binding = ChannelBinding::TlsServerEndPoint(hash: give hash);
+        } else if (ssl && config.channelBinding() != ChannelBindingMode::Disable) {
+            binding = ChannelBinding::NotOffered;
+        }
         // The client name in SCRAM is empty: the server takes the user from the StartupMessage.
         string anonymous = "";
-        ScramClient client = ScramClient.make(user: anonymous, password: secret, binding: ChannelBinding::NotSupported);
+        ScramClient client = ScramClient.make(user: anonymous, password: secret, binding: give binding);
         if (keys) { client.useKeys(clientKey: config.scramClientKey().view(), serverKey: config.scramServerKey().view()); }
         string first = client.clientFirst();
         string mechanism = client.mechanism();
@@ -955,7 +1082,66 @@ type resource Connection implements Sendable {
         if (!saslInitialResponse(w: this.outbox, mechanism: mechanism, data: first.bytes())) {
             return Result::Err(error: PgError::Usage(detail: "the SASL mechanism name holds a NUL byte"));
         }
-        return this.flush(deadline: Deadline.none());
+        return this.flush(deadline: deadline);
+    }
+
+    // The server certificate's tls-server-end-point hash, empty without TLS.
+    fn DynamicArray<uint8> endPointHash() {
+        DynamicArray<uint8> hash = DynamicArray.empty();
+        match (this.tls) {
+            case Some(value: t): { isize i = 0; while (i < t.endPoint().length()) { hash.add(item: t.endPoint()[i]); i = i + 1; } }
+            case None: { }
+        };
+        return hash;
+    }
+
+    // check_expected_areq for AuthenticationOk, in libpq's order: sslcertmode=require (the server must have asked for
+    // a certificate, and been sent one), require_auth, then channel_binding=require (the SCRAM exchange must have
+    // finished bound to the channel).
+    fn Result<Unit, PgError> expectedOk(const ref Config config, bool finished, bool bound) {
+        bool requireCert = match (config.tls().certMode()) { case Require: true; case _: false; };
+        if (requireCert) {
+            bool requested = match (this.tls) { case Some(value: t): t.certificateRequested(); case None: false; };
+            bool sent = match (this.tls) { case Some(value: t): t.certificateSent(); case None: false; };
+            if (!requested) { return Result::Err(error: PgError::Auth(detail: "server did not request an SSL certificate")); }
+            if (!sent) { return Result::Err(error: PgError::Auth(detail: "server accepted connection without a valid SSL certificate")); }
+        }
+        Optional<string> refused = config.requireAuth().refuse(code: AUTH_OK, finished: finished);
+        match (give refused) { case Some(value: r): { return Result::Err(error: PgError::Auth(detail: give r)); } case None: { } };
+        if (config.channelBinding() == ChannelBindingMode::Require && !bound) {
+            return Result::Err(error: PgError::Auth(detail: "channel binding required, but server authenticated client without channel binding"));
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Whether the session is encrypted (libpq's PQsslInUse).
+    public const fn bool sslInUse() { return match (this.tls) { case Some(value: t): true; case None: false; }; }
+
+    // libpq's PQsslAttribute: "library" ("Mbed TLS"), "key_bits", "cipher" (Mbed TLS's name for it), "compression"
+    // (always "off": TLS compression is never negotiated), "protocol" ("TLSv1.2", "TLSv1.3") and "alpn" ("" when none
+    // was agreed). None for every attribute of an unencrypted session, and for a name it does not know.
+    public const fn Optional<string> sslAttribute(const ref string name) {
+        return match (this.tls) {
+            case None: Optional::None;
+            case Some(value: t): {
+                if (name.equals(other: "library")) { return Optional::Some(value: "Mbed TLS"); }
+                if (name.equals(other: "key_bits")) { isize bits = t.keyBits(); return Optional::Some(value: "${bits}"); }
+                if (name.equals(other: "cipher")) { return Optional::Some(value: copy t.cipher()); }
+                if (name.equals(other: "compression")) { return Optional::Some(value: "off"); }
+                if (name.equals(other: "protocol")) { return Optional::Some(value: copy t.protocol()); }
+                if (name.equals(other: "alpn")) { return Optional::Some(value: copy t.alpn()); }
+                return Optional::None;
+            }
+        };
+    }
+
+    // libpq's PQsslAttributeNames: the attributes `sslAttribute` answers, none for an unencrypted session.
+    public const fn DynamicArray<string> sslAttributeNames() {
+        DynamicArray<string> names = DynamicArray.empty();
+        if (!this.sslInUse()) { return names; }
+        names.add(item: "library"); names.add(item: "key_bits"); names.add(item: "cipher");
+        names.add(item: "compression"); names.add(item: "protocol"); names.add(item: "alpn");
+        return names;
     }
 
     // pqGetNegotiateProtocolVersion3: the server's newest version must be one this client asked for or below, and
@@ -1086,16 +1272,87 @@ fn string passfileFor(const ref Config config, isize hostIndex) {
     return match (fromFile) { case Some(value: p): copy config.passfile(); case None: ""; };
 }
 
-// check_expected_areq, in libpq's order: require_auth first, then channel_binding=require.
+// check_expected_areq for an authentication request other than AuthenticationOk (Connection.expectedOk has that one):
+// require_auth, then channel_binding=require, which allows only SASL.
 fn Result<Unit, PgError> expected(const ref Config config, int32 code, bool finished) {
     Optional<string> refused = config.requireAuth().refuse(code: code, finished: finished);
     match (give refused) { case Some(value: r): { return Result::Err(error: PgError::Auth(detail: give r)); } case None: { } };
     if (config.channelBinding() == ChannelBindingMode::Require) {
         if (code == AUTH_SASL || code == AUTH_SASL_CONT || code == AUTH_SASL_FIN) { return Result::Ok(value: Unit::Unit); }
-        if (code == AUTH_OK) { return Result::Err(error: PgError::Auth(detail: "channel binding required, but server authenticated client without channel binding")); }
         return Result::Err(error: PgError::Auth(detail: "channel binding required but not supported by server's authentication request"));
     }
     return Result::Ok(value: Unit::Unit);
+}
+
+// What one address came to: a session, the next address, the next host, or the end of the connect (libpq's
+// try_next_addr, try_next_host and error_return).
+type enum Visit { Connected(Connection connection), NextAddress, ToNextHost, Stop }
+
+// What one connection came to: a session, or a failure and what libpq does next.
+type enum Attempt { Ready(Connection connection), Retry(PgError error), Final(PgError error), TimedOut(PgError error), NextHost(PgError error) }
+
+// A connection opened, or why not: an address that could not be reached (the next is tried; `note` is libpq's hint
+// after a failed connect), or a server refused before a message was sent (requirepeer: nothing more is tried).
+type enum Opened { Link(Owned<Transport> transport), Unreachable(PgError error, string note), Refused(PgError error) }
+
+// How connections are opened: by this client, as libpq opens them (a TCP socket with its options, a Unix socket with
+// requirepeer), or by a caller's Dialer.
+type resource Opener {
+    DynamicArray<Owned<Dialer>> dialers;   // empty: this client's own sockets; one: the caller's dialer
+
+    public ctor builtIn() { this.dialers = DynamicArray.empty(); }
+    public ctor with(Owned<Dialer> dialer) { this.dialers = DynamicArray.empty(); this.dialers.add(item: give dialer); }
+
+    public unsafe fn Opened open(const ref DialTarget target, const ref Config config, Deadline deadline) {
+        string hint = "\tIs the server running on that host and accepting TCP/IP connections?";
+        if (target.isSocket()) { hint = "\tIs the server running locally and accepting connections on that socket?"; }
+        if (this.dialers.length() > 0) {
+            if (target.isSocket() && config.requirePeer().length() > 0) {
+                return Opened::Refused(error: PgError::Auth(detail: "requirepeer cannot be checked on a transport a Dialer opened"));
+            }
+            Result<Owned<Transport>, IoError> dialed = this.dialers[0].dial(target: target, timeoutMs: deadline.remainingMs());
+            return match (give dialed) {
+                case Ok(value: t): Opened::Link(transport: give t);
+                case Err(error: e): unreachable(e: e, hint: hint);
+            };
+        }
+        if (target.isSocket()) {
+            string path = copy target.socketPath();
+            if (target.linuxAbstract()) { path = path.substring(start: 1, end: path.length()); }
+            Result<Owned<UnixTransport>, IoError> made = new UnixTransport.connect(path: path, linuxAbstract: target.linuxAbstract(), timeoutMs: deadline.remainingMs());
+            Owned<UnixTransport> local = match (give made) { case Ok(value: t): give t; case Err(error: e): { return unreachable(e: e, hint: hint); } };
+            // requirepeer: the server must run as this account, by the socket's peer credentials.
+            string peer = config.requirePeer();
+            if (peer.length() > 0) {
+                Result<string, IoError> who = local.peerUserName();
+                string refusal = match (give who) {
+                    case Ok(value: name): peerMismatch(wanted: peer, actual: name);
+                    case Err(error: e): "could not get peer credentials: ".concat(other: strerror(e: e));
+                };
+                if (refusal.length() > 0) { return Opened::Refused(error: PgError::Auth(detail: give refusal)); }
+            }
+            Owned<Transport> socket = give local;
+            return Opened::Link(transport: give socket);
+        }
+        Optional<SocketAddr> at = target.address();
+        SocketAddr address = match (at) { case Some(value: a): a; case None: { return Opened::Refused(error: PgError::Closed); } };
+        Result<Owned<TcpTransport>, IoError> made = new TcpTransport.connect(address: address, timeoutMs: deadline.remainingMs());
+        Owned<TcpTransport> tcp = match (give made) { case Ok(value: t): give t; case Err(error: e): { return unreachable(e: e, hint: hint); } };
+        Result<Owned<TcpTransport>, PgError> configured = socketOptions(tcp: give tcp, config: config);
+        Owned<TcpTransport> ready = match (give configured) {
+            case Ok(value: t): give t;
+            case Err(error: e): { return Opened::Unreachable(error: give e, note: ""); }
+        };
+        Owned<Transport> transport = give ready;
+        return Opened::Link(transport: give transport);
+    }
+}
+
+// libpq's connectFailureMessage: the reason and its hint; for connect_timeout, just "timeout expired".
+fn Opened unreachable(const ref IoError e, const ref string hint) {
+    bool timedOut = match (e.kind()) { case TimedOut: true; case _: false; };
+    if (timedOut) { return Opened::Unreachable(error: PgError::Timeout, note: ""); }
+    return Opened::Unreachable(error: PgError::Io(error: e), note: copy hint);
 }
 
 fn PgError noPassword() { return PgError::Auth(detail: "fe_sendauth: no password supplied"); }

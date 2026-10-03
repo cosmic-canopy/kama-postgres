@@ -1,5 +1,10 @@
-import { postgres::SslMode };
-export { EncryptionPlan, Encryption, Fallback };
+import { std::collections::DynamicArray, std::collections::FixedArray, std::collections::ConstView, std::io::IoError,
+         std::io::IoErrorKind, std::memory::Owned, std::net::Interest, std::net::Ready,
+         tls::CertificateNames,
+         postgres::SslMode, postgres::TlsSettings, postgres::Transport, postgres::PgError, postgres::verifyServerName,
+         postgres::wire::Deadline, postgres::wire::strerror, postgres::protocol::MessageWriter, postgres::protocol::sslRequest,
+         postgres::secure::TlsTransport, postgres::secure::TlsSession, postgres::secure::ClientTls, postgres::secure::prepareTls };
+export { EncryptionPlan, Encryption, Fallback, Secured, secure };
 
 // postgres::secure — TLS for a connection, as libpq sets it up. Internal: a connection is the only user.
 //
@@ -85,4 +90,142 @@ type value EncryptionPlan implements Sendable {
         this.exhausted = true;
         return false;
     }
+}
+
+// ---- setting up TLS on a connection --------------------------------------------------------------------------------
+
+// Where TLS on a connected transport ended up, in the terms PQconnectPoll acts on.
+type enum Secured {
+    // TLS is up over `link`, and `session` is what it settled.
+    Encrypted(Owned<Transport> link, TlsSession session),
+    // The server answered the SSLRequest with 'N'; the connection is still good (plaintext may go on over it). `preread`
+    // is anything the server sent after the 'N', which is the start of its next message.
+    Declined(Owned<Transport> link, DynamicArray<uint8> preread),
+    // TLS failed where libpq tries the next method on a new connection (its CONNECTION_FAILED): the setup, the
+    // handshake, ALPN for direct negotiation, the server's name. `Timeout` when connect_timeout passed.
+    Failed(PgError error),
+    // A failure that ends the whole connect: 'E' or another byte in answer to the SSLRequest, plaintext bytes after
+    // the 'S', the server gone before it answered.
+    Fatal(PgError error)
+}
+
+fn PgError tlsMessage(string detail) { return PgError::Tls(detail: give detail, cause: Optional::None); }
+
+fn string serverGone() {
+    return "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request.";
+}
+
+// CONNECTION_SSL_STARTUP: with sslnegotiation=postgres, an SSLRequest and its one-byte answer, then the handshake;
+// with direct, the handshake at once. Then, as open_client_SSL checks: ALPN (direct only), the server's name (verify-full
+// only, against `host`, the configured host name), and last that nothing arrived in plaintext after the 'S'.
+unsafe fn Secured secure(Owned<Transport> link, const ref TlsSettings settings, const ref string host, Deadline deadline) {
+    Owned<Transport> transport = give link;
+    bool unencrypted = false;
+    if (!settings.direct()) {
+        MessageWriter request = MessageWriter.make();
+        sslRequest(w: request);
+        // pqPacketSend: every byte, waiting for the transport, until the deadline.
+        isize sent = 0;
+        while (sent < request.view().length()) {
+            Result<isize, IoError> w = transport.write(bytes: request.view().slice(from: sent, count: request.view().length() - sent));
+            bool full = false;
+            match (w) {
+                case Ok(value: n): { if (n > 0) { sent = sent + n; } else { full = true; } }
+                case Err(error: e): {
+                    match (e.kind()) {
+                        case WouldBlock: { full = true; }
+                        case Interrupted: { }
+                        case _: { return Secured::Fatal(error: tlsMessage(detail: "could not send SSL negotiation packet: ".concat(other: strerror(e: e)))); }
+                    };
+                }
+            };
+            if (full) {
+                Result<Ready, IoError> r = transport.wait(interest: Interest::Write, timeoutMs: deadline.remainingMs());
+                Ready ready = match (r) {
+                    case Ok(value: x): x;
+                    case Err(error: e): { return Secured::Fatal(error: tlsMessage(detail: "could not send SSL negotiation packet: ".concat(other: strerror(e: e)))); }
+                };
+                if (!ready.writable) { return Secured::Failed(error: PgError::Timeout); }
+            }
+        }
+        // The answer is one byte. A read takes whatever has arrived, so anything after the byte is kept: after 'N'
+        // it is the server's next message, after 'S' it is plaintext no server sends.
+        FixedArray<uint8> answer = FixedArray.make(size: 256);
+        isize got = 0;
+        while (got == 0) {
+            Result<isize, IoError> r = transport.read(into: answer.viewMut());
+            bool wait = false;
+            match (r) {
+                case Ok(value: n): {
+                    if (n == 0) { return Secured::Fatal(error: tlsMessage(detail: serverGone())); }
+                    got = n;
+                }
+                case Err(error: e): {
+                    match (e.kind()) {
+                        case WouldBlock: { wait = true; }
+                        case Interrupted: { }
+                        case _: { return Secured::Fatal(error: tlsMessage(detail: "could not receive data from server: ".concat(other: strerror(e: e)))); }
+                    };
+                }
+            };
+            if (wait) {
+                Result<Ready, IoError> w = transport.wait(interest: Interest::Read, timeoutMs: deadline.remainingMs());
+                Ready ready = match (w) {
+                    case Ok(value: x): x;
+                    case Err(error: e): { return Secured::Fatal(error: tlsMessage(detail: "could not receive data from server: ".concat(other: strerror(e: e)))); }
+                };
+                if (!ready.readable) { return Secured::Failed(error: PgError::Timeout); }
+            }
+        }
+        uint8 first = answer[0];
+        if (first == 78ui8) {   // 'N'
+            DynamicArray<uint8> rest = DynamicArray.empty();
+            isize i = 1;
+            while (i < got) { rest.add(item: answer[i]); i = i + 1; }
+            return Secured::Declined(link: give transport, preread: give rest);
+        }
+        if (first == 69ui8) { return Secured::Fatal(error: tlsMessage(detail: "server sent an error response during SSL exchange")); }   // 'E'
+        if (first != 83ui8) {   // not 'S'
+            DynamicArray<uint8> one = DynamicArray.empty();
+            one.add(item: first);
+            string shown = asChar(b: one.view());
+            return Secured::Fatal(error: tlsMessage(detail: "received invalid response to SSL negotiation: ".concat(other: shown)));
+        }
+        unencrypted = got > 1;
+    }
+
+    Result<ClientTls, PgError> prepared = prepareTls(settings: settings, host: host);
+    ClientTls client = match (give prepared) { case Ok(value: c): give c; case Err(error: e): { return Secured::Failed(error: give e); } };
+    Result<Owned<TlsTransport>, PgError> started = new TlsTransport.start(link: give transport, config: client.config(), sni: client.sni());
+    Owned<TlsTransport> tls = match (give started) { case Ok(value: t): give t; case Err(error: e): { return Secured::Failed(error: give e); } };
+    Result<Unit, PgError> shaken = tls.handshake(deadline: deadline, versionHint: settings.versionHint());
+    match (give shaken) { case Ok(value: u): { } case Err(error: e): { return Secured::Failed(error: give e); } };
+    TlsSession session = tls.session(certificateLoaded: client.certificateLoaded());
+
+    if (settings.direct()) {
+        if (session.alpn().length() == 0) {
+            return Secured::Failed(error: tlsMessage(detail: "direct SSL connection was established without ALPN protocol negotiation extension"));
+        }
+        if (!session.alpn().equals(other: "postgresql")) {
+            return Secured::Failed(error: tlsMessage(detail: "SSL connection was established with unexpected ALPN protocol"));
+        }
+    }
+    bool full = match (settings.mode()) { case VerifyFull: true; case _: false; };
+    if (full) {
+        CertificateNames names = tls.peerNames();
+        Optional<string> mismatch = verifyServerName(names: names, host: host);
+        match (give mismatch) { case Some(value: m): { return Secured::Failed(error: tlsMessage(detail: give m)); } case None: { } };
+    }
+    if (unencrypted) { return Secured::Fatal(error: tlsMessage(detail: "received unencrypted data after SSL response")); }
+    Owned<Transport> up = give tls;
+    return Secured::Encrypted(link: give up, session: give session);
+}
+
+// A byte as libpq's %c prints it: itself when it is printable ASCII, else "?".
+fn string asChar(ConstView<uint8> b) {
+    uint8 c = b[0];
+    if (c < 32ui8 || c > 126ui8) { return "?"; }
+    string digits = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    isize at = cast<isize>(c - 32ui8);
+    return digits.substring(start: at, end: at + 1);
 }

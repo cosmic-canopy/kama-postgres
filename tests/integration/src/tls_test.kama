@@ -1,0 +1,203 @@
+// TLS against a live server: every sslmode against a role pg_hba admits over any connection (kp_scram, `host`), only
+// over TLS (kp_ssl_only, `hostssl`) and only without it (kp_nossl, `hostnossl`), each compared with the server's own
+// view in pg_stat_ssl; verification by chain and by name; channel binding by authentication method; and the
+// protocol and key size against what the server negotiated. Where libpq's message is its own, it is compared
+// exactly; where it quotes the TLS library, its frame is.
+import { std::collections::DynamicArray, std::fs::exists,
+         postgres::Connection, postgres::PgError,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::conninfoFor,
+         postgres_integration_tests::passwordFor, postgres_integration_tests::open, postgres_integration_tests::scalar };
+export { tlsTests };
+
+// The connection string for `user` with `extra` settings after it (a later setting wins over conninfoFor's
+// sslmode=disable).
+unsafe fn string with(const ref string user, const ref string extra) {
+    string password = passwordFor(user: user);
+    string text = conninfoFor(user: user).concat(other: " connect_timeout=10 ").concat(other: extra);
+    if (password.length() > 0) { text = text.concat(other: " password='").concat(other: password).concat(other: "'"); }
+    return text;
+}
+
+unsafe fn string certFile(const ref string name) { return setting(name: "PGTEST_CERTDIR").concat(other: "/").concat(other: name); }
+
+// Whether the session is encrypted, by the server's own account.
+unsafe fn string serverSsl(ref Connection c) { return scalar(c: c, sql: "select ssl::text from pg_stat_ssl where pid = pg_backend_pid()"); }
+
+// Connects with `extra`, and checks it is (or is not) encrypted, by the client and by the server.
+unsafe fn int32 connects(const ref string user, const ref string extra, bool encrypted, const ref string what) {
+    Result<Connection, PgError> opened = open(conninfo: with(user: user, extra: extra));
+    return match (give opened) {
+        case Ok(value: c): {
+            Connection conn = give c;
+            string want = "false";
+            if (encrypted) { want = "true"; }
+            string server = serverSsl(c: conn);
+            int32 f = check(ok: conn.sslInUse() == encrypted, what: what.concat(other: ": the client's sslInUse() is ").concat(other: want));
+            return f + check(ok: server.equals(other: want), what: what.concat(other: ": pg_stat_ssl says ssl ").concat(other: want).concat(other: " (").concat(other: server).concat(other: ")"));
+        }
+        case Err(error: e): check(ok: false, what: what.concat(other: ": connects (").concat(other: e.message()).concat(other: ")"));
+    };
+}
+
+// Fails with `extra`, and the message holds each of `parts`, in order, and libpq's lead `leads` times.
+unsafe fn int32 fails(const ref string user, const ref string extra, const ref DynamicArray<string> parts, isize leads, const ref string what) {
+    Result<Connection, PgError> opened = open(conninfo: with(user: user, extra: extra));
+    string message = match (give opened) { case Ok(value: c): "(connected)"; case Err(error: e): e.message(); };
+    isize at = 0;
+    bool inOrder = true;
+    foreach (string part in parts) {
+        string rest = message.substring(start: at, end: message.length());
+        Optional<usize> found = rest.find(substring: part);
+        match (found) { case Some(value: i): { at = at + cast<isize>(i) + part.length(); } case None: { inOrder = false; } };
+    }
+    isize count = 0;
+    string scan = copy message;
+    bool more = true;
+    while (more) {
+        Optional<usize> lead = scan.find(substring: "connection to server at");
+        match (lead) {
+            case Some(value: i): { count = count + 1; scan = scan.substring(start: cast<isize>(i) + 1, end: scan.length()); }
+            case None: { more = false; }
+        };
+    }
+    int32 f = check(ok: inOrder, what: what.concat(other: ": the message (").concat(other: message).concat(other: ")"));
+    return f + check(ok: count == leads, what: what.concat(other: ": libpq's lead ${leads} time(s), not ${count}"));
+}
+
+fn DynamicArray<string> one(const ref string a) { DynamicArray<string> v = DynamicArray.empty(); v.add(item: copy a); return v; }
+fn DynamicArray<string> two(const ref string a, const ref string b) { DynamicArray<string> v = one(a: a); v.add(item: copy b); return v; }
+
+// sslmode × pg_hba, as libpq walks it: allow tries plaintext first, prefer TLS first, each falling back on a
+// refusal; disable and require try one method.
+unsafe fn int32 matrixTests() {
+    int32 f = 0;
+    string scram = "kp_scram";
+    string sslOnly = "kp_ssl_only";
+    string nossl = "kp_nossl";
+    string disable = "sslmode=disable";
+    string allow = "sslmode=allow";
+    string prefer = "sslmode=prefer";
+    string require = "sslmode=require";
+    f = f + connects(user: scram, extra: disable, encrypted: false, what: "tls: disable, host role");
+    f = f + connects(user: scram, extra: allow, encrypted: false, what: "tls: allow, host role: plaintext first");
+    f = f + connects(user: scram, extra: prefer, encrypted: true, what: "tls: prefer, host role: TLS first");
+    f = f + connects(user: scram, extra: require, encrypted: true, what: "tls: require, host role");
+    f = f + connects(user: sslOnly, extra: allow, encrypted: true, what: "tls: allow, hostssl role: refused in plaintext, then TLS");
+    f = f + connects(user: sslOnly, extra: prefer, encrypted: true, what: "tls: prefer, hostssl role");
+    f = f + connects(user: sslOnly, extra: require, encrypted: true, what: "tls: require, hostssl role");
+    f = f + connects(user: nossl, extra: disable, encrypted: false, what: "tls: disable, hostnossl role");
+    f = f + connects(user: nossl, extra: allow, encrypted: false, what: "tls: allow, hostnossl role");
+    f = f + connects(user: nossl, extra: prefer, encrypted: false, what: "tls: prefer, hostnossl role: refused over TLS, then plaintext");
+    string noEntry = "FATAL:  no pg_hba.conf entry for host";
+    f = f + fails(user: sslOnly, extra: disable, parts: two(a: noEntry, b: "user \"kp_ssl_only\", database \"kp_test\", no encryption"), leads: 1,
+                  what: "tls: disable, hostssl role is refused");
+    f = f + fails(user: nossl, extra: require, parts: two(a: noEntry, b: "user \"kp_nossl\", database \"kp_test\", SSL encryption"), leads: 1,
+                  what: "tls: require, hostnossl role is refused");
+    // kp_cert is admitted only over TLS with a client certificate: under prefer both methods are refused, each
+    // with its own lead, TLS first.
+    string cert = "kp_cert";
+    DynamicArray<string> both = two(a: "FATAL:  connection requires a valid client certificate", b: "no encryption");
+    f = f + fails(user: cert, extra: prefer, parts: both, leads: 2, what: "tls: prefer, kp_cert without a certificate fails both ways");
+    return f;
+}
+
+// Verification: by chain (verify-ca, or any mode once a root file is given) and by name (verify-full).
+unsafe fn int32 verificationTests() {
+    int32 f = 0;
+    string scram = "kp_scram";
+    string ca = certFile(name: "ca.crt");
+    string other = certFile(name: "other-ca.crt");
+    string port = setting(name: "PGTEST_PORT");
+    string good = "host=localhost hostaddr=127.0.0.1 sslrootcert=".concat(other: ca);
+    f = f + connects(user: scram, extra: "sslmode=verify-full ".concat(other: good), encrypted: true, what: "tls: verify-full by name");
+    f = f + connects(user: scram, extra: "sslmode=verify-ca ".concat(other: good), encrypted: true, what: "tls: verify-ca");
+    string wrong = "host=wrong.example hostaddr=127.0.0.1 sslrootcert=".concat(other: ca);
+    f = f + connects(user: scram, extra: "sslmode=verify-ca ".concat(other: wrong), encrypted: true, what: "tls: verify-ca ignores the name");
+    f = f + fails(user: scram, extra: "sslmode=verify-full ".concat(other: wrong),
+                  parts: one(a: "server certificate for \"localhost\" (and 2 other names) does not match host name \"wrong.example\""), leads: 1,
+                  what: "tls: verify-full refuses another name");
+    f = f + fails(user: scram, extra: "sslmode=verify-full hostaddr=127.0.0.1 host='' sslrootcert=".concat(other: ca),
+                  parts: one(a: "host name must be specified for a verified SSL connection"), leads: 1,
+                  what: "tls: verify-full needs a host name");
+    string untrusted = "host=localhost hostaddr=127.0.0.1 sslrootcert=".concat(other: other);
+    f = f + fails(user: scram, extra: "sslmode=verify-ca ".concat(other: untrusted), parts: one(a: "SSL error: certificate verify failed: "), leads: 1,
+                  what: "tls: verify-ca refuses an untrusted chain");
+    f = f + fails(user: scram, extra: "sslmode=require ".concat(other: untrusted), parts: one(a: "SSL error: certificate verify failed: "), leads: 1,
+                  what: "tls: require with a root file verifies the chain, as libpq does");
+    f = f + connects(user: scram, extra: "sslmode=prefer ".concat(other: untrusted), encrypted: false,
+                     what: "tls: prefer falls back to plaintext when the chain does not verify");
+    string missing = setting(name: "PGTEST_TMP").concat(other: "/no-such-root.crt");
+    f = f + fails(user: scram, extra: "sslmode=verify-ca sslrootcert=".concat(other: missing),
+                  parts: one(a: "root certificate file \"".concat(other: missing).concat(other: "\" does not exist\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification.")),
+                  leads: 1, what: "tls: verify-ca with a root file that is not there");
+    return f;
+}
+
+// SCRAM-SHA-256-PLUS: channel_binding=require logs in only through it, and refuses a method that cannot bind.
+unsafe fn int32 channelBindingTests() {
+    int32 f = 0;
+    string scram = "kp_scram";
+    f = f + connects(user: scram, extra: "sslmode=require channel_binding=require", encrypted: true, what: "tls: channel_binding=require with SCRAM over TLS");
+    f = f + connects(user: scram, extra: "sslmode=require channel_binding=disable", encrypted: true, what: "tls: channel_binding=disable over TLS");
+    string password = "kp_password";
+    f = f + fails(user: password, extra: "sslmode=require channel_binding=require",
+                  parts: one(a: "channel binding required but not supported by server's authentication request"), leads: 1,
+                  what: "tls: channel binding refuses a cleartext password");
+    string md5 = "kp_md5";
+    f = f + fails(user: md5, extra: "sslmode=require channel_binding=require",
+                  parts: one(a: "channel binding required but not supported by server's authentication request"), leads: 1,
+                  what: "tls: channel binding refuses md5");
+    string trust = "kp_trust";
+    f = f + fails(user: trust, extra: "sslmode=require channel_binding=require",
+                  parts: one(a: "channel binding required, but server authenticated client without channel binding"), leads: 1,
+                  what: "tls: channel binding refuses trust");
+    return f;
+}
+
+// What the session settled, against the server's own view.
+unsafe fn int32 attributeTests() {
+    int32 f = 0;
+    string scram = "kp_scram";
+    DynamicArray<string> extras = DynamicArray.empty();
+    extras.add(item: "sslmode=require");
+    extras.add(item: "sslmode=require ssl_max_protocol_version=TLSv1.2");
+    foreach (string extra in extras) {
+        Result<Connection, PgError> opened = open(conninfo: with(user: scram, extra: extra));
+        match (give opened) {
+            case Ok(value: c): {
+                Connection conn = give c;
+                string version = scalar(c: conn, sql: "select version from pg_stat_ssl where pid = pg_backend_pid()");
+                string bits = scalar(c: conn, sql: "select bits::text from pg_stat_ssl where pid = pg_backend_pid()");
+                Optional<string> p = conn.sslAttribute(name: "protocol");
+                string protocol = match (give p) { case Some(value: v): give v; case None: ""; };
+                Optional<string> b = conn.sslAttribute(name: "key_bits");
+                string keyBits = match (give b) { case Some(value: v): give v; case None: ""; };
+                f = f + check(ok: protocol.equals(other: version), what: "tls attributes (".concat(other: extra).concat(other: "): protocol ").concat(other: protocol).concat(other: " is the server's ").concat(other: version));
+                f = f + check(ok: keyBits.equals(other: bits), what: "tls attributes (".concat(other: extra).concat(other: "): key_bits ").concat(other: keyBits).concat(other: " is the server's ").concat(other: bits));
+                Optional<string> lib = conn.sslAttribute(name: "library");
+                bool mbed = match (give lib) { case Some(value: v): v.equals(other: "Mbed TLS"); case None: false; };
+                f = f + check(ok: mbed, what: "tls attributes: library is Mbed TLS");
+            }
+            case Err(error: e): { f = f + check(ok: false, what: "tls attributes: connects (".concat(other: e.message()).concat(other: ")")); }
+        };
+    }
+    Result<Connection, PgError> plain = open(conninfo: with(user: scram, extra: "sslmode=disable"));
+    match (give plain) {
+        case Ok(value: c): {
+            Optional<string> none = c.sslAttribute(name: "protocol");
+            bool absent = match (give none) { case Some(value: v): false; case None: true; };
+            f = f + check(ok: absent && c.sslAttributeNames().length() == 0, what: "tls attributes: none for a plaintext session");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "tls attributes: plaintext connects"); }
+    };
+    return f;
+}
+
+unsafe fn int32 tlsTests() {
+    int32 f = 0;
+    f = f + matrixTests();
+    f = f + verificationTests();
+    f = f + channelBindingTests();
+    f = f + attributeTests();
+    return f;
+}

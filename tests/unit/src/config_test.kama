@@ -234,20 +234,32 @@ fn int32 environmentTests() {
     Optional<string> none = neither.homeDirectory();
     f = f + check(ok: match (none) { case Some(value: h): false; case None: true; }, what: "config: no HOME and no account home, no home directory");
 
+    // A libpq built with SSL (pqConnectOptions2, fe-connect.c at c45ba888): PGREQUIRESSL=1 is sslmode=require,
+    // sslrootcert=system makes verify-full the default and refuses a weaker mode, and direct negotiation needs
+    // require or stronger.
     Environment requiressl = testEnvironment();
     requiressl.set(name: "PGREQUIRESSL", value: "1");
     Result<Config, PgError> rq = resolveWith(text: "host=h", env: requiressl);
-    string rm = errorOf(r: rq);
-    f = f + check(ok: rm.equals(other: "sslmode value \"require\" invalid when SSL support is not compiled in"), what: "config: PGREQUIRESSL=1 means sslmode require, which needs TLS");
+    bool required = match (rq) { case Ok(value: c): match (c.sslMode()) { case Require: true; case _: false; }; case Err(error: e): false; };
+    f = f + check(ok: required, what: "config: PGREQUIRESSL=1 means sslmode require");
     Result<Config, PgError> prefer = resolveWith(text: "host=h sslmode=prefer", env: requiressl);
-    f = f + check(ok: resolved(r: prefer), what: "config: an explicit sslmode beats PGREQUIRESSL");
+    bool preferred = match (prefer) { case Ok(value: c): match (c.sslMode()) { case Prefer: true; case _: false; }; case Err(error: e): false; };
+    f = f + check(ok: preferred, what: "config: an explicit sslmode beats PGREQUIRESSL");
 
     Result<Config, PgError> system = resolveWith(text: "host=h sslrootcert=system", env: testEnvironment());
-    string sm = errorOf(r: system);
-    f = f + check(ok: sm.equals(other: "sslrootcert value \"system\" invalid when SSL support is not compiled in"), what: "config: sslrootcert=system needs TLS");
+    bool full = match (system) { case Ok(value: c): match (c.sslMode()) { case VerifyFull: true; case _: false; }; case Err(error: e): false; };
+    f = f + check(ok: full, what: "config: sslrootcert=system with no sslmode is verify-full");
+    Result<Config, PgError> weakSystem = resolveWith(text: "host=h sslrootcert=system sslmode=verify-ca", env: testEnvironment());
+    string wsm = errorOf(r: weakSystem);
+    f = f + check(ok: wsm.equals(other: "weak sslmode \"verify-ca\" may not be used with sslrootcert=system (use \"verify-full\")"), what: "config: sslrootcert=system refuses a weaker sslmode (".concat(other: wsm).concat(other: ")"));
     Result<Config, PgError> direct = resolveWith(text: "host=h sslnegotiation=direct", env: testEnvironment());
     string dm = errorOf(r: direct);
-    f = f + check(ok: dm.equals(other: "sslnegotiation value \"direct\" invalid when SSL support is not compiled in"), what: "config: sslnegotiation=direct needs TLS");
+    f = f + check(ok: dm.equals(other: "weak sslmode \"prefer\" may not be used with sslnegotiation=direct (use \"require\", \"verify-ca\", or \"verify-full\")"), what: "config: direct negotiation refuses sslmode prefer (".concat(other: dm).concat(other: ")"));
+    Result<Config, PgError> strong = resolveWith(text: "host=h sslnegotiation=direct sslmode=require", env: testEnvironment());
+    f = f + check(ok: resolved(r: strong), what: "config: direct negotiation with sslmode require");
+    Result<Config, PgError> certmode = resolveWith(text: "host=h", env: testEnvironment());
+    bool allow = match (certmode) { case Ok(value: c): match (c.get(keyword: "sslcertmode")) { case Some(value: v): v.equals(other: "allow"); case None: false; }; case Err(error: e): false; };
+    f = f + check(ok: allow, what: "config: sslcertmode defaults to allow, as PQconninfo reports it");
     Result<Config, PgError> gss = resolveWith(text: "host=h gssencmode=require", env: testEnvironment());
     string gm = errorOf(r: gss);
     f = f + check(ok: gm.equals(other: "gssencmode value \"require\" invalid when GSSAPI support is not compiled in"), what: "config: gssencmode=require needs GSSAPI");

@@ -1,0 +1,282 @@
+import { std::collections::DynamicArray, std::fs::stat, std::fs::Metadata, std::fs::File, std::fs::OpenMode, std::io::IoError,
+         std::io::IoErrorKind, std::log::logWarn,
+         tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion, tls::Revocation,
+         postgres::TlsSettings, postgres::SslMode, postgres::SslCertMode, postgres::PgError, postgres::wire::strerror };
+export { ClientTls, prepareTls };
+
+// libpq's initialize_SSL, step for step (src/interfaces/libpq/fe-secure-openssl.c at REL_18_STABLE c45ba888): the
+// configuration one connection attempt's TLS session is made from, built fresh for each attempt as libpq builds an
+// SSL_CTX per connection, so every file is read again and every failure belongs to the attempt that met it. In
+// libpq's order, each failure with libpq's message:
+//   1. the protocol versions;
+//   2. the root certificates: sslrootcert=system, a file that exists, or none (an error under verify-ca and
+//      verify-full only); a root that loads turns on chain verification under EVERY sslmode, and brings the CRLs
+//      with it;
+//   3. the client certificate, unless sslcertmode=disable; a file that is not there is no certificate, silently;
+//   4. SNI (a host name, never an address, and only with sslsni=1), and ALPN "postgresql", always;
+//   5. the key for that certificate: present, a regular file, not readable by others, decrypted with sslpassword;
+//   6. that the key pairs with the certificate.
+// Where libpq quotes OpenSSL (the ": %s" after "could not read …"), the words are @kama/tls's.
+
+// What initialize_SSL leaves: the configuration, the name to send as SNI ("" for none), and whether a client
+// certificate was loaded (libpq's have_cert, which sslcertmode=require reads).
+type resource ClientTls implements Sendable {
+    TlsConfig cfg;
+    string sniName;
+    bool certLoaded = false;
+
+    ctor make(TlsConfig config, string sni, bool cert) { this.cfg = give config; this.sniName = give sni; this.certLoaded = cert; }
+    friend postgres::secure::prepareTls[make];
+
+    public const fn const ref TlsConfig config() { return this.cfg; }
+    public const fn const ref string sni() { return this.sniName; }
+    public const fn bool certificateLoaded() { return this.certLoaded; }
+}
+
+fn PgError tlsFailure(string detail) { return PgError::Tls(detail: give detail, cause: Optional::None); }
+
+fn PgError tlsFailureFrom(string detail, TlsError cause) { return PgError::Tls(detail: give detail, cause: Optional::Some(value: give cause)); }
+
+// pg_strcasecmp on a version name.
+fn bool versionIs(const ref string v, const ref string name) { return v.toLower().equals(other: name.toLower()); }
+
+// The TLS settings for `host`, libpq's connhost[].host: the name the server's certificate is checked against and the
+// SNI comes from, "" when only hostaddr was given.
+unsafe fn Result<ClientTls, PgError> prepareTls(const ref TlsSettings settings, const ref string host) {
+    // sslkeylogfile is not written yet: libpq built without the keylog callback says so, and goes on.
+    if (settings.keyLogFile().length() > 0) { logWarn(tag: "postgres", msg: "libpq was not built with sslkeylogfile support"); }
+    Result<TlsConfig, TlsError> made = TlsConfig.client();
+    TlsConfig config = match (give made) {
+        case Ok(value: c): give c;
+        case Err(error: e): { string why = e.reason(); return Result::Err(error: tlsFailureFrom(detail: "could not create SSL context: ".concat(other: why), cause: give e)); }
+    };
+
+    // 1. Versions. Mbed TLS speaks TLS 1.2 and 1.3 only: a minimum of TLSv1 or TLSv1.1 asks for nothing it lacks,
+    // and starts at 1.2; a maximum below 1.2 is a version this library does not have, which libpq reports as
+    // ssl_protocol_version_to_openssl failing.
+    TlsVersion low = TlsVersion::Tls12;
+    TlsVersion high = TlsVersion::Tls13;
+    string min = copy settings.minVersion();
+    string max = copy settings.maxVersion();
+    if (versionIs(v: min, name: "TLSv1.3")) { low = TlsVersion::Tls13; }
+    if (max.length() > 0) {
+        if (versionIs(v: max, name: "TLSv1.2")) { high = TlsVersion::Tls12; }
+        else if (!versionIs(v: max, name: "TLSv1.3")) {
+            return Result::Err(error: tlsFailure(detail: "invalid value \"".concat(other: max).concat(other: "\" for maximum SSL protocol version")));
+        }
+    }
+    Result<Unit, TlsError> versions = config.versions(min: low, max: high);
+    match (give versions) {
+        case Ok(value: u): { }
+        case Err(error: e): { string why = e.reason(); return Result::Err(error: tlsFailureFrom(detail: "could not set maximum SSL protocol version: ".concat(other: why), cause: give e)); }
+    };
+
+    // 2. Roots, and with a root file the CRLs.
+    bool haveRoot = false;
+    string root = copy settings.rootCert();
+    bool verifying = match (settings.mode()) { case VerifyCa: true; case VerifyFull: true; case _: false; };
+    if (root.equals(other: "system")) {
+        Optional<string> bundle = match (settings.sslCertFile()) { case Some(value: v): Optional::Some(value: copy v); case None: Optional::None; };
+        Result<isize, TlsError> loaded = config.trustSystemWith(certFile: give bundle);
+        match (give loaded) {
+            case Ok(value: n): { }
+            case Err(error: e): { string why = e.reason(); return Result::Err(error: tlsFailureFrom(detail: "could not load system root certificate paths: ".concat(other: why), cause: give e)); }
+        };
+        haveRoot = true;
+    } else if (root.length() > 0 && exists(path: root)) {
+        Result<Unit, TlsError> loaded = config.trustFile(path: root);
+        match (give loaded) {
+            case Ok(value: u): { }
+            case Err(error: e): {
+                string why = e.reason();
+                return Result::Err(error: tlsFailureFrom(detail: "could not read root certificate file \"".concat(other: root).concat(other: "\": ").concat(other: why), cause: give e));
+            }
+        };
+        loadRevocation(config: config, settings: settings);
+        haveRoot = true;
+    } else if (verifying) {
+        string advice = "\nEither provide the file, use the system's trusted roots with sslrootcert=system, or change sslmode to disable server certificate verification.";
+        if (root.length() == 0) { return Result::Err(error: tlsFailure(detail: "could not get home directory to locate root certificate file".concat(other: advice))); }
+        return Result::Err(error: tlsFailure(detail: "root certificate file \"".concat(other: root).concat(other: "\" does not exist").concat(other: advice)));
+    }
+
+    // 3. The client certificate.
+    bool haveCert = false;
+    string certFile = copy settings.certFile();
+    bool disabled = match (settings.certMode()) { case Disable: true; case _: false; };
+    if (!disabled && certFile.length() > 0) {
+        Result<Metadata, IoError> found = stat(path: certFile);
+        bool present = true;
+        match (found) {
+            case Ok(value: m): { }
+            case Err(error: e): {
+                if (!absent(e: e)) {
+                    return Result::Err(error: tlsFailure(detail: "could not open certificate file \"".concat(other: certFile).concat(other: "\": ").concat(other: strerror(e: e))));
+                }
+                present = false;
+            }
+        };
+        if (present) {
+            Result<DynamicArray<uint8>, IoError> bytes = readAll(path: certFile);
+            DynamicArray<uint8> pem = match (give bytes) {
+                case Ok(value: b): give b;
+                case Err(error: e): { return Result::Err(error: tlsFailure(detail: "could not read certificate file \"".concat(other: certFile).concat(other: "\": ").concat(other: strerror(e: e)))); }
+            };
+            Result<Unit, TlsError> chain = config.certificateChain(bytes: pem.view());
+            match (give chain) {
+                case Ok(value: u): { }
+                case Err(error: e): {
+                    string why = e.reason();
+                    return Result::Err(error: tlsFailureFrom(detail: "could not read certificate file \"".concat(other: certFile).concat(other: "\": ").concat(other: why), cause: give e));
+                }
+            };
+            haveCert = true;
+        }
+    }
+
+    // 4. SNI for a host name (RFC 6066: never an address), and ALPN.
+    string sni = "";
+    if (settings.sni() && host.length() > 0 && !looksLikeAddress(host: host)) { sni = copy host; }
+    string pg = "postgresql";
+    Result<Unit, TlsError> alpn = config.alpn(protocol: pg);
+    match (give alpn) {
+        case Ok(value: u): { }
+        case Err(error: e): { string why = e.reason(); return Result::Err(error: tlsFailureFrom(detail: "could not set SSL ALPN extension: ".concat(other: why), cause: give e)); }
+    };
+
+    // 5 and 6. The key, then the pair.
+    if (haveCert) {
+        Result<Unit, PgError> keyed = loadKey(config: config, settings: settings);
+        match (give keyed) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+    }
+
+    // A root that loaded means the server's chain is verified, whatever sslmode says; without one, nothing is. The
+    // name is compared after the handshake, under verify-full only, by libpq's own rules (postgres::verifyServerName).
+    Verify mode = Verify::None;
+    if (haveRoot) { mode = Verify::Chain; }
+    Result<Unit, TlsError> verify = config.verify(mode: mode);
+    match (give verify) {
+        case Ok(value: u): { }
+        case Err(error: e): { string why = e.reason(); return Result::Err(error: tlsFailureFrom(detail: "could not create SSL context: ".concat(other: why), cause: give e)); }
+    };
+    return Result::Ok(value: ClientTls.make(config: give config, sni: give sni, cert: haveCert));
+}
+
+// libpq's SNI rule: an address is a host made of digits and dots, or one holding a colon.
+fn bool looksLikeAddress(const ref string host) {
+    if (host.contains(substring: ":")) { return true; }
+    foreach (uint8 b in host) { if (b != 46ui8 && (b < 48ui8 || b > 57ui8)) { return false; } }
+    return true;
+}
+
+// stat failing with ENOENT or ENOTDIR: the file is not there, which for the client certificate means none.
+fn bool absent(const ref IoError e) {
+    bool notFound = match (e.kind()) { case NotFound: true; case _: false; };
+    if (notFound) { return true; }
+    return match (e.rawOsError()) { case Some(value: code): code == 20; case None: false; };   // ENOTDIR
+}
+
+unsafe fn bool exists(const ref string path) {
+    Result<Metadata, IoError> m = stat(path: path);
+    return match (m) { case Ok(value: x): true; case Err(error: e): false; };
+}
+
+unsafe fn Result<DynamicArray<uint8>, IoError> readAll(const ref string path) {
+    Result<File, IoError> opened = File.open(path: path, mode: OpenMode::Read);
+    File file = match (give opened) { case Ok(value: f): give f; case Err(error: e): { return Result::Err(error: e); } };
+    return file.readAll();
+}
+
+// The CRLs beside a root file: sslcrl, sslcrldir, or (with neither set) the home directory's root.crl. libpq hands
+// them to X509_STORE_load_locations, which fails when the file does not load (then nothing is checked) and accepts
+// any directory; once it succeeds every certificate in the chain needs its issuer's CRL (CRL_CHECK_ALL). A file that
+// is not there is ignored, silently, as libpq ignores it.
+unsafe fn void loadRevocation(ref TlsConfig config, const ref TlsSettings settings) {
+    string file = copy settings.crlFile();
+    string dir = copy settings.crlDir();
+    if (file.length() == 0 && dir.length() == 0) { return; }
+    if (file.length() > 0) {
+        Result<Unit, TlsError> loaded = config.revocationFile(path: file);
+        bool ok = match (give loaded) { case Ok(value: u): true; case Err(error: e): false; };
+        if (!ok) { return; }
+    }
+    if (dir.length() > 0) {
+        Result<isize, TlsError> fromDir = config.revocationDir(path: dir);
+    }
+    Result<Unit, TlsError> complete = config.revocation(mode: Revocation::Complete);
+}
+
+// The client key, as initialize_SSL reads it after the certificate: an engine name refused, then the file present,
+// regular and private, then decrypted and paired.
+unsafe fn Result<Unit, PgError> loadKey(ref TlsConfig config, const ref TlsSettings settings) {
+    string keyFile = copy settings.keyFile();
+    if (keyFile.length() == 0) {
+        return Result::Err(error: tlsFailure(detail: "certificate does not match private key file \"\": no private key file was found for the certificate"));
+    }
+    if (settings.keyFileGiven() && engineKey(key: keyFile)) {
+        isize colon = engineColon(key: keyFile);
+        string engine = keyFile.substring(start: 0, end: colon);
+        return Result::Err(error: tlsFailure(detail: "could not load SSL engine \"".concat(other: engine).concat(other: "\": this client does not support OpenSSL engines")));
+    }
+    Result<Metadata, IoError> found = stat(path: keyFile);
+    match (found) {
+        case Ok(value: m): { }
+        case Err(error: e): {
+            bool notFound = match (e.kind()) { case NotFound: true; case _: false; };
+            if (notFound) { return Result::Err(error: tlsFailure(detail: "certificate present, but not private key file \"".concat(other: keyFile).concat(other: "\""))); }
+            return Result::Err(error: tlsFailure(detail: "could not stat private key file \"".concat(other: keyFile).concat(other: "\": ").concat(other: strerror(e: e))));
+        }
+    };
+    // The checks are made on the file that is read, through its descriptor, as the password file's are.
+    Result<File, IoError> opened = File.open(path: keyFile, mode: OpenMode::Read);
+    File file = match (give opened) {
+        case Ok(value: f): give f;
+        case Err(error: e): { return Result::Err(error: tlsFailure(detail: "could not load private key file \"".concat(other: keyFile).concat(other: "\": ").concat(other: strerror(e: e)))); }
+    };
+    Result<Metadata, IoError> meta = file.metadata();
+    Metadata m = match (meta) {
+        case Ok(value: x): x;
+        case Err(error: e): { return Result::Err(error: tlsFailure(detail: "could not stat private key file \"".concat(other: keyFile).concat(other: "\": ").concat(other: strerror(e: e)))); }
+    };
+    if (!m.isFile()) { return Result::Err(error: tlsFailure(detail: "private key file \"".concat(other: keyFile).concat(other: "\" is not a regular file"))); }
+    if (keyTooOpen(m: m)) {
+        return Result::Err(error: tlsFailure(detail: "private key file \"".concat(other: keyFile).concat(other: "\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root")));
+    }
+    Result<DynamicArray<uint8>, IoError> bytes = file.readAll();
+    DynamicArray<uint8> key = match (give bytes) {
+        case Ok(value: b): give b;
+        case Err(error: e): { return Result::Err(error: tlsFailure(detail: "could not load private key file \"".concat(other: keyFile).concat(other: "\": ").concat(other: strerror(e: e)))); }
+    };
+    Result<Unit, TlsError> paired = config.privateKey(bytes: key.view(), password: settings.password().bytes());
+    return match (give paired) {
+        case Ok(value: u): Result::Ok(value: Unit::Unit);
+        case Err(error: e): {
+            string why = e.reason();
+            bool mismatch = match (e) { case Config(code: c, detail: d): c == -8; case _: false; };
+            if (mismatch) { return Result::Err(error: tlsFailureFrom(detail: "certificate does not match private key file \"".concat(other: keyFile).concat(other: "\": ").concat(other: why), cause: give e)); }
+            return Result::Err(error: tlsFailureFrom(detail: "could not load private key file \"".concat(other: keyFile).concat(other: "\": ").concat(other: why), cause: give e));
+        }
+    };
+}
+
+// libpq's rule for a key file: one its owner alone can read (0600 or less), or, owned by root, readable by its group
+// too (0640). std::fs::Metadata has no owner (KPG-31), so every key gets the first rule: a root-owned key at 0640 is
+// refused here where libpq takes it. Stricter, never looser. Windows has no such bits, and libpq checks nothing there.
+@compileFor(!OS_WINDOWS)
+fn bool keyTooOpen(const ref Metadata m) { return (m.permissions.mode() & 63ui32) != 0ui32; }   // S_IRWXG | S_IRWXO
+
+@compileFor(OS_WINDOWS)
+fn bool keyTooOpen(const ref Metadata m) { return false; }
+
+// An sslkey naming an OpenSSL engine ("engine:key"): a colon, except as a Windows drive letter's.
+@compileFor(!OS_WINDOWS)
+fn bool engineKey(const ref string key) { return key.contains(substring: ":"); }
+
+@compileFor(OS_WINDOWS)
+fn bool engineKey(const ref string key) { return key.contains(substring: ":") && !(key.length() > 1 && key[1] == 58ui8); }
+
+fn isize engineColon(const ref string key) {
+    isize i = 0;
+    while (i < key.length()) { if (key[i] == 58ui8) { return i; } i = i + 1; }
+    return key.length();
+}

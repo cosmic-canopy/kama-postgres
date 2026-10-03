@@ -1,0 +1,253 @@
+import { std::collections::View, std::collections::ConstView, std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind,
+         std::net::ReliableStream, std::net::Interest, std::net::Ready, std::memory::Owned, std::time::Duration,
+         tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress, tls::TlsVersion, tls::CertificateNames,
+         postgres::Transport, postgres::PgError, postgres::wire::Deadline, postgres::wire::strerror };
+export { TransportStream, TlsTransport, TlsSession };
+
+// TLS over any transport. @kama/tls runs a session over a `ReliableStream`; `TransportStream` makes a `Transport`
+// one, so the same TlsTransport serves TCP, a caller's tunnel and the unit tests' scripted server, as pgx runs TLS
+// over whatever its dialer returns.
+//
+// The transport stays non-blocking end to end. A write may leave ciphertext queued in the engine, and a read may
+// leave plaintext there; neither must strand a connection waiting on its socket, so:
+//   - `write` sends what is queued first, and answers WouldBlock while it cannot (backpressure);
+//   - `read` sends what is queued, then reads;
+//   - `wait` is readable at once while plaintext is buffered, and while ciphertext is queued it waits to write too,
+//     sending as soon as it can, so a request is never left unsent while the client waits for its answer.
+
+// A Transport as a ReliableStream: reads and writes pass through; it is always non-blocking.
+type resource TransportStream implements ReliableStream, Sendable {
+    Owned<Transport> link;
+
+    public ctor over(Owned<Transport> link) { this.link = give link; }
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) { return this.link.read(into: into); }
+
+    // A write that takes nothing is a full transport: WouldBlock, so the engine waits rather than spins.
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
+        Result<isize, IoError> w = this.link.write(bytes: bytes);
+        bool none = match (w) { case Ok(value: n): n == 0 && bytes.length() > 0; case Err(error: e): false; };
+        if (none) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
+        return w;
+    }
+
+    public fn Result<Unit, IoError> flush() { return Result::Ok(value: Unit::Unit); }
+    public fn Result<Unit, IoError> setNonBlocking(bool on) { return Result::Ok(value: Unit::Unit); }
+
+    public unsafe fn Result<Ready, IoError> waitFor(Interest interest, int32 timeoutMs) { return this.link.wait(interest: interest, timeoutMs: timeoutMs); }
+    public unsafe fn void stop() { this.link.shutdown(); }
+}
+
+// What a TLS session settled, kept by a connection for PQsslAttribute and SCRAM-SHA-256-PLUS: the protocol, the cipher
+// and its key size, the ALPN protocol agreed, the server certificate's tls-server-end-point hash, and whether the
+// server asked for a client certificate and one was sent.
+type resource TlsSession implements Sendable {
+    string protocolName;
+    string cipherName;
+    isize bits = 0;
+    string alpnName;
+    DynamicArray<uint8> endPointHash;
+    bool requested = false;
+    bool sent = false;
+
+    ctor make(string protocol, string cipher, isize keyBits, string alpn, DynamicArray<uint8> endPoint, bool requested, bool sent) {
+        this.protocolName = give protocol; this.cipherName = give cipher; this.bits = keyBits; this.alpnName = give alpn;
+        this.endPointHash = give endPoint; this.requested = requested; this.sent = sent;
+    }
+    friend postgres::secure::TlsTransport::session[make];
+
+    // "TLSv1.2" or "TLSv1.3", as libpq names them.
+    public const fn const ref string protocol() { return this.protocolName; }
+    // Mbed TLS's name for the cipher suite ("TLS1-3-AES-256-GCM-SHA384").
+    public const fn const ref string cipher() { return this.cipherName; }
+    public const fn isize keyBits() { return this.bits; }
+    // The ALPN protocol agreed, "" when none was.
+    public const fn const ref string alpn() { return this.alpnName; }
+    // RFC 5929 tls-server-end-point, empty when the certificate's signature hash gives none.
+    public const fn const ref DynamicArray<uint8> endPoint() { return this.endPointHash; }
+    // libpq's ssl_cert_requested and ssl_cert_sent.
+    public const fn bool certificateRequested() { return this.requested; }
+    public const fn bool certificateSent() { return this.sent; }
+}
+
+fn bool isWouldBlock(const ref IoError e) { return match (e.kind()) { case WouldBlock: true; case _: false; }; }
+
+fn PgError tlsMessage(string detail) { return PgError::Tls(detail: give detail, cause: Optional::None); }
+
+// libpq's words for a connection the server dropped (pgtls_read and pgtls_write, on EPIPE and ECONNRESET).
+fn string serverClosed() {
+    return "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request.";
+}
+
+type resource TlsTransport implements Transport, Sendable {
+    TlsStream<TransportStream> engine;
+    bool orderlyEnd = false;   // a read answered 0: the server sent close_notify
+    bool truncated = false;    // the transport ended without one
+
+    ctor make(TlsStream<TransportStream> engine) { this.engine = give engine; this.orderlyEnd = false; this.truncated = false; }
+
+    // A client session over `link` with `config`, sending `sni` as SNI ("" for none). The handshake is `handshake`.
+    public unsafe ctor Result<TlsTransport, PgError> start(Owned<Transport> link, const ref TlsConfig config, const ref string sni) {
+        TransportStream stream = TransportStream.over(link: give link);
+        Result<TlsStream<TransportStream>, TlsError> opened = TlsStream::<TransportStream>.client(inner: give stream, config: config, serverName: sni);
+        return match (give opened) {
+            case Ok(value: s): Result::Ok(value: TlsTransport.make(engine: give s));
+            case Err(error: e): {
+                string why = e.reason();
+                return Result::Err(error: PgError::Tls(detail: "could not establish SSL connection: ".concat(other: why), cause: Optional::Some(value: give e)));
+            }
+        };
+    }
+
+    // libpq's open_client_SSL: the handshake, waiting on the transport as it asks, until `deadline`. A failure is
+    // libpq's message; a deadline that passes is `Timeout`. `versionHint` is libpq's second line for a failure about
+    // protocol versions ("This may indicate that the server does not support any SSL protocol version between …").
+    public unsafe fn Result<Unit, PgError> handshake(Deadline deadline, const ref string versionHint) {
+        while (true) {
+            Result<Progress, TlsError> step = this.engine.handshake();
+            Interest want = Interest::Read;
+            match (give step) {
+                case Ok(value: p): {
+                    Progress at = p;
+                    bool done = match (at) { case Done: true; case _: false; };
+                    if (done) { return Result::Ok(value: Unit::Unit); }
+                    bool writing = match (at) { case WantWrite: true; case _: false; };
+                    if (writing) { want = Interest::Write; }
+                }
+                case Err(error: e): { return Result::Err(error: handshakeFailure(e: give e, versionHint: versionHint)); }
+            };
+            Result<Ready, IoError> waited = this.engine.innerRefMut().waitFor(interest: want, timeoutMs: deadline.remainingMs());
+            Ready r = match (waited) {
+                case Ok(value: x): x;
+                case Err(error: e): { return Result::Err(error: tlsMessage(detail: "SSL SYSCALL error: ".concat(other: strerror(e: e)))); }
+            };
+            bool ready = r.readable || r.writable;
+            if (!ready) { return Result::Err(error: PgError::Timeout); }
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The settled session, once the handshake is done. `certificateLoaded`: this side had a certificate to send.
+    public unsafe fn TlsSession session(bool certificateLoaded) {
+        Optional<TlsVersion> v = this.engine.protocolVersion();
+        string protocol = "";
+        match (v) {
+            case Some(value: x): {
+                TlsVersion version = x;
+                bool twelve = match (version) { case Tls12: true; case Tls13: false; };
+                if (twelve) { protocol = "TLSv1.2"; } else { protocol = "TLSv1.3"; }
+            }
+            case None: { }
+        };
+        Optional<string> agreed = this.engine.alpnProtocol();
+        string alpn = match (give agreed) { case Some(value: a): give a; case None: ""; };
+        bool requested = this.engine.certificateRequested();
+        return TlsSession.make(protocol: give protocol, cipher: this.engine.cipherSuite(), keyBits: this.engine.keyBits(), alpn: give alpn,
+                               endPoint: this.engine.tlsServerEndPoint(), requested: requested, sent: requested && certificateLoaded);
+    }
+
+    // The names on the server's certificate, for libpq's host-name check.
+    public unsafe fn CertificateNames peerNames() { return this.engine.peerNames(); }
+
+    // ---- Transport ----
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) {
+        if (this.engine.hasPendingOutput()) { Result<Unit, IoError> sent = this.engine.flush(); }
+        Result<isize, IoError> r = this.engine.read(into: into);
+        match (r) {
+            case Ok(value: n): { if (n == 0 && into.length() > 0) { this.orderlyEnd = true; } }
+            case Err(error: e): { match (e.kind()) { case UnexpectedEof: { this.truncated = true; } case _: { } }; }
+        };
+        return r;
+    }
+
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
+        if (this.engine.hasPendingOutput()) {
+            Result<Unit, IoError> sent = this.engine.flush();
+            match (sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+        }
+        Result<isize, IoError> w = this.engine.write(bytes: bytes);
+        match (w) {
+            case Ok(value: n): {
+                // Send the record at once if the transport takes it; what it does not take waits for `wait`.
+                Result<Unit, IoError> sent = this.engine.flush();
+            }
+            case Err(error: e): { }
+        };
+        return w;
+    }
+
+    public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        bool wantRead = match (interest) { case Read: true; case ReadWrite: true; case Write: false; };
+        bool wantWrite = match (interest) { case Write: true; case ReadWrite: true; case Read: false; };
+        if (wantRead && this.engine.hasBufferedInput()) { return Result::Ok(value: Ready.of(readable: true, writable: false)); }
+        Deadline deadline = Deadline.none();
+        if (timeoutMs >= 0) { deadline = Deadline.after(span: Duration.fromMillis(ms: cast<int64>(timeoutMs))); }
+        while (this.engine.hasPendingOutput()) {
+            Result<Unit, IoError> sent = this.engine.flush();
+            bool blocked = match (sent) { case Ok(value: u): false; case Err(error: e): isWouldBlock(e: e); };
+            bool failed = match (sent) { case Ok(value: u): false; case Err(error: e): !isWouldBlock(e: e); };
+            if (failed) { return Result::Ok(value: Ready.of(readable: true, writable: true)); }   // the read or write that follows reports it
+            if (blocked) {
+                Interest both = Interest::ReadWrite;
+                if (!wantRead) { both = Interest::Write; }
+                Result<Ready, IoError> w = this.engine.innerRefMut().waitFor(interest: both, timeoutMs: deadline.remainingMs());
+                Ready r = match (w) { case Ok(value: x): x; case Err(error: e): { return Result::Err(error: e); } };
+                if (!r.readable && !r.writable) { return Result::Ok(value: Ready.of(readable: false, writable: false)); }
+                if (wantRead && r.readable) { return Result::Ok(value: Ready.of(readable: true, writable: r.writable)); }
+            }
+        }
+        if (wantWrite && !wantRead) { return Result::Ok(value: Ready.of(readable: false, writable: true)); }
+        return this.engine.innerRefMut().waitFor(interest: interest, timeoutMs: deadline.remainingMs());
+    }
+
+    // pgtls_close: close_notify (as far as the transport takes it now), then the transport itself.
+    public unsafe fn void shutdown() {
+        Result<Unit, TlsError> closed = this.engine.close();
+        this.engine.innerRefMut().stop();
+    }
+
+    // pgtls_read and pgtls_write's messages, for a failure after the handshake.
+    public unsafe fn Optional<PgError> explain(IoError error) {
+        if (this.orderlyEnd) { return Optional::Some(value: tlsMessage(detail: "SSL connection has been closed unexpectedly")); }
+        if (this.truncated) { return Optional::Some(value: tlsMessage(detail: "SSL SYSCALL error: EOF detected")); }
+        bool other = match (error.kind()) { case Other: true; case _: false; };
+        if (other) {
+            Optional<TlsError> why = this.engine.tlsError();
+            match (give why) {
+                case Some(value: t): {
+                    string words = t.reason();
+                    return Optional::Some(value: PgError::Tls(detail: "SSL error: ".concat(other: words), cause: Optional::Some(value: give t)));
+                }
+                case None: { }
+            };
+        }
+        bool dropped = match (error.kind()) { case BrokenPipe: true; case ConnectionReset: true; case _: false; };
+        if (dropped) { return Optional::Some(value: tlsMessage(detail: serverClosed())); }
+        return Optional::Some(value: tlsMessage(detail: "SSL SYSCALL error: ".concat(other: strerror(e: error))));
+    }
+}
+
+// open_client_SSL's messages for a handshake that failed: the transport ending ("EOF detected") or failing (the OS's
+// words), else "SSL error: " and what went wrong, with libpq's hint about protocol versions when the failure was
+// about them (no version in common: the peer's protocol_version alert, or Mbed TLS refusing the version offered).
+unsafe fn PgError handshakeFailure(TlsError e, const ref string versionHint) {
+    bool closed = match (e) { case Closed: true; case _: false; };
+    if (closed) { return PgError::Tls(detail: "SSL SYSCALL error: EOF detected", cause: Optional::Some(value: give e)); }
+    bool io = match (e) { case Io(error: x): true; case _: false; };
+    if (io) {
+        string words = match (e) { case Io(error: x): strerror(e: x); case _: ""; };
+        return PgError::Tls(detail: "SSL SYSCALL error: ".concat(other: words), cause: Optional::Some(value: give e));
+    }
+    string text = "SSL error: ".concat(other: e.reason());
+    bool version = match (e) {
+        case Alert(description: d, name: n, established: x): d == 70ui8;
+        case Handshake(code: c, detail: d): c == BAD_PROTOCOL_VERSION;
+        case _: false;
+    };
+    if (version) { text = text.concat(other: "\n").concat(other: versionHint); }
+    return PgError::Tls(detail: give text, cause: Optional::Some(value: give e));
+}
+
+// MBEDTLS_ERR_SSL_BAD_PROTOCOL_VERSION (-0x6E80): the server chose a version this side does not allow.
+comptime int32 BAD_PROTOCOL_VERSION = -28288;

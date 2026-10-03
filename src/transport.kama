@@ -1,8 +1,8 @@
 import { std::collections::View, std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::net::TcpStream,
          std::net::SocketAddr, std::net::Poller, std::net::Interest, std::net::Ready, std::net::Shutdown,
          std::net::UnixStream, std::net::UnixAddr, std::net::PeerCredentials, std::process::UserId,
-         std::time::Duration, postgres::PgError };
-export { Transport, TcpTransport, UnixTransport, socketPathMax };
+         std::time::Duration, std::memory::Owned, postgres::PgError };
+export { Transport, TcpTransport, UnixTransport, socketPathMax, Dialer, DialTarget };
 
 // The byte stream a connection runs over. It is non-blocking: `read` and `write` move what they can now, or say
 // `WouldBlock`, and `wait` blocks until one of them can proceed or a timeout passes. This is libpq's own shape
@@ -27,6 +27,50 @@ type contract Transport for resource implements Sendable {
     // (strerror's words, or libpq's "server closed the connection unexpectedly"). A TLS transport words its
     // failures as libpq's TLS layer does ("SSL SYSCALL error: EOF detected", "SSL error: …").
     fn Optional<PgError> explain(IoError error);
+}
+
+// Opens the connections `Connection.connectWith` makes: one for each attempt, as libpq opens a socket for each, so a
+// connection through a tunnel or a proxy still gets libpq's whole procedure: every host and address in turn, and
+// sslmode's fallback from TLS to plaintext (or back), which needs a new connection to the same address. It is pgx's
+// DialFunc. The transports a dialer opens are its own: libpq's socket options (keepalives, tcp_user_timeout) apply to
+// the sockets this client opens, and requirepeer cannot be checked on a dialer's transport.
+type contract Dialer for resource implements Sendable {
+    // A connected transport to `target`, within `timeoutMs` (< 0: no limit). A `TimedOut` error is connect_timeout
+    // passing, and the next address is tried, as for any failure to connect.
+    fn Result<Owned<Transport>, IoError> dial(const ref DialTarget target, int32 timeoutMs);
+}
+
+// One place a connection attempt goes: a TCP address of a host, or a Unix-domain socket.
+type resource DialTarget implements Sendable {
+    string hostText;
+    string portText;
+    bool socketKind = false;
+    Optional<SocketAddr> tcp;
+    string pathText;
+    bool abstractName = false;
+
+    ctor overTcp(string host, string port, SocketAddr address) {
+        this.hostText = give host; this.portText = give port; this.socketKind = false; this.tcp = Optional::Some(value: address);
+        this.pathText = ""; this.abstractName = false;
+    }
+    ctor overSocket(string host, string port, string path, bool linuxAbstract) {
+        this.hostText = give host; this.portText = give port; this.socketKind = true; this.tcp = Optional::None;
+        this.pathText = give path; this.abstractName = linuxAbstract;
+    }
+    friend postgres::Connection::targetsOf[overTcp, overSocket];
+
+    // The host as configured: its name, its hostaddr when it has no name, or the socket directory.
+    public const fn const ref string host() { return this.hostText; }
+    // The port as configured ("5432" when none was).
+    public const fn const ref string port() { return this.portText; }
+    // A Unix-domain socket rather than TCP.
+    public const fn bool isSocket() { return this.socketKind; }
+    // The TCP address to connect to; None for a socket.
+    public const fn Optional<SocketAddr> address() { return this.tcp; }
+    // The socket's path (the directory and ".s.PGSQL.<port>"), or on Linux an abstract name when `linuxAbstract()`;
+    // "" for TCP.
+    public const fn const ref string socketPath() { return this.pathText; }
+    public const fn bool linuxAbstract() { return this.abstractName; }
 }
 
 // TCP, as `Connection.connect` makes it: a non-blocking `TcpStream` and its own `Poller`.

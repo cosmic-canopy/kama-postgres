@@ -6,7 +6,12 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
-Needs **kama ≥ 0.9.519**, and `@kama/tls` (Mbed TLS 4.1.1).
+## [0.1.0] — 2026-10-02
+
+The first published version. Needs **kama ≥ 0.9.519** and `@kama/tls` ^0.1.0 (Mbed TLS 4.1.1), from the registry.
+Verified on kama 0.9.520 (the latest release), debug and release, on macOS arm64 and Linux, against PostgreSQL
+14–18 and 19 beta, in plaintext and over TLS. The "Changed" entries below record what changed while it was built,
+before anything was published.
 
 ### Added
 - **TLS**, as libpq built with SSL does it, through `@kama/tls`:

@@ -4,10 +4,18 @@ The PostgreSQL client for [kama](https://kama-lang.org). It speaks the PostgreSQ
 in kama, over `std::net`, the way pgx, tokio-postgres, pgjdbc and Npgsql do. There is no libpq and nothing to
 install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
-> **Status: under construction, not yet published.** It connects, authenticates and runs queries, with typed
-> parameters and typed rows, on PostgreSQL 14–18 and 19 beta, over TCP, a Unix-domain socket or TLS (every `sslmode`,
-> client certificates, SCRAM-SHA-256-PLUS). The statement cache, transactions and COPY come next; see
-> [docs/ROADMAP.md](docs/ROADMAP.md). Needs **kama ≥ 0.9.519**.
+```sh
+kama pkg add kama.json @kama/postgres --version ^0.1.0     # from the official registry, registry.kama-lang.org
+```
+
+Needs **kama ≥ 0.9.519**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
+release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta.
+
+> **Status: 0.1.0, early.** It connects, authenticates and runs queries, with typed parameters and typed rows, over
+> TCP, a Unix-domain socket or TLS (every `sslmode`, client certificates, SCRAM-SHA-256-PLUS). Not there yet: the
+> statement cache, helpers for transactions (plain `begin`/`commit` statements work), COPY, waiting for
+> notifications, pipelining, cancellation and query timeouts, `target_session_attrs`, `load_balance_hosts`, and a
+> pool. See [docs/ROADMAP.md](docs/ROADMAP.md). In 0.x, a minor version may break the API.
 
 ## Using it
 

@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-03: phases 0–6 are done. The client connects and queries on every supported server
+Where this is, 2026-10-02: phases 0–6 are done, and 0.1.0 is published with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -39,7 +39,7 @@ matrix.
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | next |
 | 8 | Pool (cross-isolate), examples, hardening (server restart, bounded memory), CI green, docs | |
-| — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version — only on the maintainer's word | |
+| — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
 ## Decided, and why
 

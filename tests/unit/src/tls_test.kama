@@ -1,0 +1,285 @@
+// TLS against the scripted server, which runs Mbed TLS as the server (fake_server.kama): what the client does with
+// each answer to an SSLRequest, verification, SNI, protocol versions, SCRAM-SHA-256-PLUS, direct negotiation, the
+// session failing after its handshake, and client certificates. Replies arrive a byte at a time and writes go out
+// three bytes at a time, so the TLS records are taken apart and put back together on every case. The expected
+// messages are libpq's, from its source at REL_18_STABLE (fe-connect.c, fe-secure-openssl.c, fe-auth.c).
+// Certificates come from tools/gen-test-certs.sh (PGTEST_CERTDIR, set by tools/test.sh).
+import { core::env, std::collections::DynamicArray, std::memory::Owned, std::io::IoError, std::fs::readFile, std::fs::writeFile,
+         std::fs::setPermissions, std::fs::Permissions,
+         tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion, tls::Certificate,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Transport,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome };
+export { tlsTests, certPath };
+
+unsafe fn string certPath(const ref string name) {
+    Optional<string> dir = env(name: "PGTEST_CERTDIR");
+    string d = match (give dir) { case Some(value: v): give v; case None: { panic(msg: "PGTEST_CERTDIR is not set: run tools/test.sh"); return ""; } };
+    return d.concat(other: "/").concat(other: name);
+}
+
+unsafe fn string scratch(const ref string name) {
+    Optional<string> dir = env(name: "PGTEST_TMP");
+    string d = match (give dir) { case Some(value: v): give v; case None: { panic(msg: "PGTEST_TMP is not set: run tools/test.sh"); return ""; } };
+    return d.concat(other: "/").concat(other: name);
+}
+
+// The fake's TLS: the test PKI's server certificate (CN localhost; SAN localhost, 127.0.0.1, ::1), with ALPN
+// "postgresql" when `alpn`, held to TLS 1.3 when `only13`, and asking for a client certificate when `askCert`.
+unsafe fn TlsConfig serverTls(bool alpn, bool only13, bool askCert) {
+    Result<TlsConfig, TlsError> made = TlsConfig.server();
+    TlsConfig c = match (give made) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "server config"); return serverTls(alpn: alpn, only13: only13, askCert: askCert); } };
+    string nopw = "";
+    Result<Unit, TlsError> id = c.identityFiles(certificate: certPath(name: "server.crt"), key: certPath(name: "server.key"), password: nopw);
+    match (give id) { case Ok(value: u): { } case Err(error: e): { string m = e.message(); panic(msg: "server identity: ${m}"); } };
+    if (alpn) { string pg = "postgresql"; Result<Unit, TlsError> a = c.alpn(protocol: pg); }
+    if (only13) { Result<Unit, TlsError> v = c.versions(min: TlsVersion::Tls13, max: TlsVersion::Tls13); }
+    if (askCert) { Result<Unit, TlsError> r = c.requestClientCertificate(); }
+    return give c;
+}
+
+unsafe fn DynamicArray<uint8> serverEndPoint() {
+    Result<DynamicArray<uint8>, IoError> pem = readFile(path: certPath(name: "server.crt"));
+    DynamicArray<uint8> bytes = match (give pem) { case Ok(value: b): give b; case Err(error: e): { panic(msg: "read server.crt"); return DynamicArray.empty(); } };
+    Result<Certificate, TlsError> parsed = Certificate.parse(bytes: bytes.view());
+    return match (give parsed) { case Ok(value: c): c.tlsServerEndPoint(); case Err(error: e): DynamicArray.empty(); };
+}
+
+// A secure fake running `script`, the client configured by `conninfo`.
+unsafe fn Result<Connection, PgError> overTls(DynamicArray<Step> script, const ref string conninfo, TlsConfig server, bool direct, const ref string sni) {
+    return overTlsChunked(script: give script, conninfo: conninfo, server: give server, direct: direct, sni: sni, chunk: 1);
+}
+
+// The same, handing the client `chunk` bytes per read.
+unsafe fn Result<Connection, PgError> overTlsChunked(DynamicArray<Step> script, const ref string conninfo, TlsConfig server, bool direct, const ref string sni, isize chunk) {
+    Environment vars = testEnvironment();
+    Result<Config, PgError> c = resolveWith(text: conninfo, env: vars);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    Owned<Transport> fake = new FakeServer.secure(steps: give script, chunk: chunk, writeLimit: 3, config: give server, direct: direct, endPoint: serverEndPoint(), sni: copy sni);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+// A fake without TLS, running `script`.
+unsafe fn Result<Connection, PgError> overPlain(DynamicArray<Step> script, const ref string conninfo) {
+    Environment vars = testEnvironment();
+    Result<Config, PgError> c = resolveWith(text: conninfo, env: vars);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    Owned<Transport> fake = new FakeServer.make(steps: give script, chunk: 1, writeLimit: 3);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+fn string messageOf(Result<Connection, PgError> r) { return match (give r) { case Ok(value: c): "(connected)"; case Err(error: e): e.message(); }; }
+
+fn DynamicArray<Step> trustScript() { DynamicArray<Step> s = DynamicArray.empty(); s.add(item: Step::Send(bytes: welcome())); return s; }
+
+fn DynamicArray<uint8> bytesOf(const ref string text) { DynamicArray<uint8> b = DynamicArray.empty(); foreach (uint8 x in text) { b.add(item: x); } return b; }
+
+unsafe fn string verifyAt(const ref string host) {
+    return "host=".concat(other: host).concat(other: " user=u dbname=d sslmode=verify-full sslrootcert=").concat(other: certPath(name: "ca.crt"));
+}
+
+// Each answer to an SSLRequest, by a server that does not run TLS.
+unsafe fn int32 answerTests() {
+    int32 f = 0;
+    string require = "host=localhost user=u dbname=d sslmode=require";
+    string prefer = "host=localhost user=u dbname=d sslmode=prefer";
+    string got = messageOf(r: overPlain(script: trustScript(), conninfo: require));
+    f = f + check(ok: got.equals(other: "server does not support SSL, but SSL was required"), what: "tls answer: N under require (".concat(other: got).concat(other: ")"));
+    Result<Connection, PgError> plain = overPlain(script: trustScript(), conninfo: prefer);
+    bool fellBack = match (give plain) { case Ok(value: c): !c.sslInUse(); case Err(error: e): false; };
+    f = f + check(ok: fellBack, what: "tls answer: N under prefer goes on in plaintext on the same connection");
+
+    DynamicArray<Step> e = DynamicArray.empty();
+    e.add(item: Step::SslAnswer(bytes: bytesOf(text: "E")));
+    string ge = messageOf(r: overPlain(script: give e, conninfo: prefer));
+    f = f + check(ok: ge.equals(other: "server sent an error response during SSL exchange"), what: "tls answer: E (".concat(other: ge).concat(other: ")"));
+
+    DynamicArray<Step> x = DynamicArray.empty();
+    x.add(item: Step::SslAnswer(bytes: bytesOf(text: "X")));
+    string gx = messageOf(r: overPlain(script: give x, conninfo: prefer));
+    f = f + check(ok: gx.equals(other: "received invalid response to SSL negotiation: X"), what: "tls answer: another byte (".concat(other: gx).concat(other: ")"));
+
+    // 'N' with the server's next message already behind it: an error the startup then reads.
+    Wire fatal = Wire.make();
+    fatal.report(tag: 69ui8, severity: "FATAL", code: "53300", message: "sorry, too many clients already");
+    DynamicArray<uint8> n = bytesOf(text: "N");
+    DynamicArray<uint8> after = fatal.bytes();
+    foreach (uint8 b in after) { n.add(item: b); }
+    DynamicArray<Step> np = DynamicArray.empty();
+    np.add(item: Step::SslAnswer(bytes: give n));
+    string gn = messageOf(r: overPlain(script: give np, conninfo: prefer));
+    f = f + check(ok: gn.equals(other: "FATAL:  sorry, too many clients already"), what: "tls answer: bytes after N are the next message (".concat(other: gn).concat(other: ")"));
+
+    // 'S' with plaintext behind it in the same read, from a server that does run TLS: refused once the handshake is
+    // done. (Plaintext that arrives in a later read is fed to TLS and fails the handshake, as it would in libpq.)
+    DynamicArray<Step> sx = DynamicArray.empty();
+    sx.add(item: Step::SslAnswer(bytes: bytesOf(text: "Sjunk")));
+    sx.add(item: Step::Send(bytes: welcome()));
+    string gs = messageOf(r: overTlsChunked(script: give sx, conninfo: require, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: "", chunk: 64));
+    f = f + check(ok: gs.equals(other: "received unencrypted data after SSL response"), what: "tls answer: plaintext after S (".concat(other: gs).concat(other: ")"));
+    return f;
+}
+
+// A session over the fake's TLS: verified by name, SNI as libpq sends it, versions.
+unsafe fn int32 sessionTests() {
+    int32 f = 0;
+    Result<Connection, PgError> ok = overTls(script: trustScript(), conninfo: verifyAt(host: "localhost"), server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: "localhost");
+    match (give ok) {
+        case Ok(value: c): {
+            Optional<string> p = c.sslAttribute(name: "protocol");
+            bool v13 = match (give p) { case Some(value: x): x.equals(other: "TLSv1.3"); case None: false; };
+            Optional<string> a = c.sslAttribute(name: "alpn");
+            bool pg = match (give a) { case Some(value: x): x.equals(other: "postgresql"); case None: false; };
+            f = f + check(ok: c.sslInUse() && v13 && pg, what: "tls session: verify-full, TLS 1.3, ALPN postgresql, SNI localhost");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "tls session: verify-full connects (".concat(other: e.message()).concat(other: ")")); }
+    };
+    string wrong = messageOf(r: overTls(script: trustScript(), conninfo: verifyAt(host: "wrong.example"), server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: ""));
+    f = f + check(ok: wrong.equals(other: "server certificate for \"localhost\" (and 2 other names) does not match host name \"wrong.example\""), what: "tls session: verify-full refuses another name (".concat(other: wrong).concat(other: ")"));
+    // No SNI for an address, nor with sslsni=0; the fake refuses a connection that sends one.
+    string byAddress = "host=127.0.0.1 user=u dbname=d sslmode=require";
+    string ga = messageOf(r: overTls(script: trustScript(), conninfo: byAddress, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: "-"));
+    f = f + check(ok: ga.equals(other: "(connected)"), what: "tls session: no SNI for an address (".concat(other: ga).concat(other: ")"));
+    string noSni = "host=localhost sslsni=0 user=u dbname=d sslmode=require";
+    string gz = messageOf(r: overTls(script: trustScript(), conninfo: noSni, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: "-"));
+    f = f + check(ok: gz.equals(other: "(connected)"), what: "tls session: no SNI with sslsni=0 (".concat(other: gz).concat(other: ")"));
+    // No version in common: a server held to TLS 1.3 and a client to 1.2.
+    string old = "host=localhost user=u dbname=d sslmode=require ssl_max_protocol_version=TLSv1.2";
+    string gv = messageOf(r: overTls(script: trustScript(), conninfo: old, server: serverTls(alpn: true, only13: true, askCert: false), direct: false, sni: ""));
+    f = f + check(ok: gv.equals(other: "SSL error: received fatal alert: protocol_version\nThis may indicate that the server does not support any SSL protocol version between TLSv1.2 and TLSv1.2."),
+                  what: "tls session: no common version (".concat(other: gv).concat(other: ")"));
+    // A maximum below what Mbed TLS speaks.
+    string tooOld = "host=localhost user=u dbname=d sslmode=require ssl_min_protocol_version=TLSv1 ssl_max_protocol_version=TLSv1.1";
+    string gt = messageOf(r: overTls(script: trustScript(), conninfo: tooOld, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: ""));
+    f = f + check(ok: gt.equals(other: "invalid value \"TLSv1.1\" for maximum SSL protocol version"), what: "tls session: a maximum below TLS 1.2 (".concat(other: gt).concat(other: ")"));
+    return f;
+}
+
+fn DynamicArray<uint8> saslOffer(const ref DynamicArray<string> mechanisms) { Wire m = Wire.make(); m.authSasl(mechanisms: mechanisms); return m.bytes(); }
+
+// SCRAM over TLS: -PLUS bound to the server's certificate when offered, "y" when it is not, "n" when disabled.
+unsafe fn int32 bindingTests() {
+    int32 f = 0;
+    DynamicArray<string> both = DynamicArray.empty();
+    both.add(item: "SCRAM-SHA-256-PLUS"); both.add(item: "SCRAM-SHA-256");
+    DynamicArray<string> plainOnly = DynamicArray.empty();
+    plainOnly.add(item: "SCRAM-SHA-256");
+    DynamicArray<string> modes = DynamicArray.empty();
+    DynamicArray<string> headers = DynamicArray.empty();
+    modes.add(item: "require"); headers.add(item: "p");
+    modes.add(item: "prefer"); headers.add(item: "p");
+    modes.add(item: "disable"); headers.add(item: "n");
+    isize i = 0;
+    while (i < modes.length()) {
+        DynamicArray<Step> s = DynamicArray.empty();
+        s.add(item: Step::Send(bytes: saslOffer(mechanisms: both)));
+        s.add(item: Step::ScramFirstBound(password: "secret", header: copy headers[i]));
+        s.add(item: Step::ScramFinal(signature: "right", then: welcome()));
+        string conninfo = "host=localhost user=u dbname=d password=secret sslmode=require channel_binding=".concat(other: modes[i]);
+        string got = messageOf(r: overTls(script: give s, conninfo: conninfo, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: ""));
+        f = f + check(ok: got.equals(other: "(connected)"), what: "tls binding: channel_binding=".concat(other: modes[i]).concat(other: " sends ").concat(other: headers[i]).concat(other: " (").concat(other: got).concat(other: ")"));
+        i = i + 1;
+    }
+    DynamicArray<Step> y = DynamicArray.empty();
+    y.add(item: Step::Send(bytes: saslOffer(mechanisms: plainOnly)));
+    y.add(item: Step::ScramFirstBound(password: "secret", header: "y"));
+    y.add(item: Step::ScramFinal(signature: "right", then: welcome()));
+    string gy = messageOf(r: overTls(script: give y, conninfo: "host=localhost user=u dbname=d password=secret sslmode=require", server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: ""));
+    f = f + check(ok: gy.equals(other: "(connected)"), what: "tls binding: y when the server does not offer -PLUS (".concat(other: gy).concat(other: ")"));
+    DynamicArray<Step> r = DynamicArray.empty();
+    r.add(item: Step::Send(bytes: saslOffer(mechanisms: plainOnly)));
+    string gr = messageOf(r: overTls(script: give r, conninfo: "host=localhost user=u dbname=d password=secret sslmode=require channel_binding=require", server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: ""));
+    f = f + check(ok: gr.equals(other: "channel binding is required, but server did not offer an authentication method that supports channel binding"), what: "tls binding: require without -PLUS on offer (".concat(other: gr).concat(other: ")"));
+    return f;
+}
+
+// sslnegotiation=direct: a ClientHello first, ALPN required after it.
+unsafe fn int32 directTests() {
+    int32 f = 0;
+    string direct = "host=localhost user=u dbname=d sslmode=require sslnegotiation=direct";
+    Result<Connection, PgError> ok = overTls(script: trustScript(), conninfo: direct, server: serverTls(alpn: true, only13: false, askCert: false), direct: true, sni: "");
+    bool up = match (give ok) { case Ok(value: c): c.sslInUse(); case Err(error: e): false; };
+    f = f + check(ok: up, what: "tls direct: a server that takes it");
+    string gn = messageOf(r: overTls(script: trustScript(), conninfo: direct, server: serverTls(alpn: false, only13: false, askCert: false), direct: true, sni: ""));
+    f = f + check(ok: gn.equals(other: "direct SSL connection was established without ALPN protocol negotiation extension"), what: "tls direct: no ALPN (".concat(other: gn).concat(other: ")"));
+    string gh = messageOf(r: overTls(script: trustScript(), conninfo: direct, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: ""));
+    f = f + check(ok: gh.equals(other: "SSL SYSCALL error: EOF detected"), what: "tls direct: a server older than 17 hangs up (".concat(other: gh).concat(other: ")"));
+    return f;
+}
+
+// The session failing after its handshake, as pgtls_read reports it.
+unsafe fn int32 afterTests() {
+    int32 f = 0;
+    DynamicArray<string> ways = DynamicArray.empty();
+    ways.add(item: "close"); ways.add(item: "hangup"); ways.add(item: "gone"); ways.add(item: "garble");
+    foreach (string way in ways) {
+        DynamicArray<Step> s = trustScript();
+        Wire done = Wire.make();
+        done.complete(tag: "SELECT 1");
+        done.ready(status: 73ui8);
+        if (way.equals(other: "close")) { s.add(item: Step::TlsClose(then: DynamicArray.empty())); }
+        // The query arrives, then the server is gone without a close_notify: the read sees the end.
+        else if (way.equals(other: "hangup")) { s.add(item: Step::Send(bytes: DynamicArray.empty())); s.add(item: Step::Hangup); }
+        // The server is gone before the query is written: the write fails (EPIPE).
+        else if (way.equals(other: "gone")) { s.add(item: Step::Hangup); }
+        else { s.add(item: Step::TlsGarble(then: done.bytes())); }
+        Result<Connection, PgError> opened = overTls(script: give s, conninfo: "host=localhost user=u dbname=d sslmode=require", server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: "");
+        match (give opened) {
+            case Ok(value: c): {
+                Connection conn = give c;
+                Result<DynamicArray<Rows>, PgError> r = conn.simpleQuery(sql: "select 1");
+                string got = match (give r) { case Ok(value: v): "(answered)"; case Err(error: e): e.message(); };
+                bool right = false;
+                if (way.equals(other: "close")) { right = got.equals(other: "SSL connection has been closed unexpectedly"); }
+                else if (way.equals(other: "hangup")) { right = got.equals(other: "SSL SYSCALL error: EOF detected"); }
+                else if (way.equals(other: "gone")) { right = got.equals(other: "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request."); }
+                else { right = got.startsWith(prefix: "SSL error: "); }
+                f = f + check(ok: right, what: "tls after the handshake: ".concat(other: way).concat(other: " (").concat(other: got).concat(other: ")"));
+            }
+            case Err(error: e): { f = f + check(ok: false, what: "tls after the handshake: connects (".concat(other: e.message()).concat(other: ")")); }
+        };
+    }
+    return f;
+}
+
+// sslcertmode, and the key's permissions.
+unsafe fn int32 certificateTests() {
+    int32 f = 0;
+    Result<DynamicArray<uint8>, IoError> key = readFile(path: certPath(name: "client.key"));
+    DynamicArray<uint8> keyBytes = match (give key) { case Ok(value: b): give b; case Err(error: e): { return check(ok: false, what: "tls certificate: read client.key"); } };
+    string privateKey = scratch(name: "client-0600.key");
+    string sharedKey = scratch(name: "client-0644.key");
+    Result<isize, IoError> w1 = writeFile(path: privateKey, bytes: keyBytes);
+    Result<Unit, IoError> p1 = setPermissions(path: privateKey, permissions: Permissions::OwnerRead | Permissions::OwnerWrite);
+    Result<isize, IoError> w2 = writeFile(path: sharedKey, bytes: keyBytes);
+    Result<Unit, IoError> p2 = setPermissions(path: sharedKey, permissions: Permissions::OwnerRead | Permissions::OwnerWrite | Permissions::GroupRead | Permissions::OtherRead);
+    string withCert = "host=localhost user=u dbname=d sslmode=require sslcert=".concat(other: certPath(name: "client.crt")).concat(other: " sslkey=");
+    string requireCert = withCert.concat(other: privateKey).concat(other: " sslcertmode=require");
+    string ok = messageOf(r: overTls(script: trustScript(), conninfo: requireCert, server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
+    f = f + check(ok: ok.equals(other: "(connected)"), what: "tls certificate: sslcertmode=require, asked and sent (".concat(other: ok).concat(other: ")"));
+    string notAsked = messageOf(r: overTls(script: trustScript(), conninfo: requireCert, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: ""));
+    f = f + check(ok: notAsked.equals(other: "server did not request an SSL certificate"), what: "tls certificate: sslcertmode=require, not asked (".concat(other: notAsked).concat(other: ")"));
+    string noCert = "host=localhost user=u dbname=d sslmode=require sslcertmode=require";
+    string notSent = messageOf(r: overTls(script: trustScript(), conninfo: noCert, server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
+    f = f + check(ok: notSent.equals(other: "server accepted connection without a valid SSL certificate"), what: "tls certificate: sslcertmode=require, nothing to send (".concat(other: notSent).concat(other: ")"));
+    string open = withCert.concat(other: sharedKey);
+    string tooOpen = messageOf(r: overTls(script: trustScript(), conninfo: open, server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
+    string want = "private key file \"".concat(other: sharedKey).concat(other: "\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root");
+    f = f + check(ok: tooOpen.equals(other: want), what: "tls certificate: a key others can read (".concat(other: tooOpen).concat(other: ")"));
+    string missingKey = withCert.concat(other: scratch(name: "no-such.key"));
+    string gm = messageOf(r: overTls(script: trustScript(), conninfo: missingKey, server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
+    string wantMissing = "certificate present, but not private key file \"".concat(other: scratch(name: "no-such.key")).concat(other: "\"");
+    f = f + check(ok: gm.equals(other: wantMissing), what: "tls certificate: no key file (".concat(other: gm).concat(other: ")"));
+    return f;
+}
+
+unsafe fn int32 tlsTests() {
+    int32 f = 0;
+    f = f + answerTests();
+    f = f + sessionTests();
+    f = f + bindingTests();
+    f = f + directTests();
+    f = f + afterTests();
+    f = f + certificateTests();
+    return f;
+}

@@ -7,6 +7,10 @@ KAMA=${KAMA:-kama}
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
 "$KAMA" check "$ROOT/kama.json"
+# The TLS cases run Mbed TLS against the test PKI (generated, never tracked), and write key copies to a scratch dir.
+"$ROOT/tools/gen-test-certs.sh" >/dev/null
+PGTEST_CERTDIR="$ROOT/out/test-certs"; export PGTEST_CERTDIR
+PGTEST_TMP="$tmp/scratch"; mkdir -p "$PGTEST_TMP"; export PGTEST_TMP
 "$KAMA" pkg install "$ROOT/tests/unit/kama.json" >/dev/null
 for mode in --debug --release; do
     "$KAMA" build "$ROOT/tests/unit/kama.json" $mode -o "$tmp/unit$mode"

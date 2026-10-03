@@ -5,14 +5,21 @@
 //
 // When the script has nothing more to say, a read reports WouldBlock and `wait` reports a timeout (a silent
 // server), or, after `Hangup`, a read reports the end of the stream.
+//
+// TLS: an SSLRequest is answered 'N' without taking a step, as a server with ssl=off answers it, unless the script's
+// next step is `SslAnswer`, or the server was made with `secure`: then it answers 'S' and runs Mbed TLS as the server
+// (@kama/tls, over the in-memory `ServerSide`), and the steps see the plaintext. A secure server that accepts direct
+// negotiation takes a TLS ClientHello in place of an SSLRequest; one that does not hangs up on it, as a server older
+// than 17 does.
 import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView,
          std::collections::FixedArray, std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready,
+         std::net::ReliableStream, tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress,
          std::encoding::base64::encode as b64encode, std::encoding::base64::decode as b64decode,
          std::encoding::base64::DecodeError, std::encoding::utf8::decode as utf8Decode,
          std::encoding::utf8::Utf8Error, std::encoding::hex::encode as hexEncode, std::digest::pbkdf2, std::digest::sha256::Sha256,
          std::digest::sha256::hmacSha256, std::digest::sha256::sha256,
          postgres::Transport, postgres::PgError, postgres::protocol::MessageWriter, postgres::protocol::md5Password };
-export { FakeServer, Step, Wire };
+export { FakeServer, Step, Wire, ServerSide };
 
 // What the server does with the next message from the client.
 type enum Step implements Sendable {
@@ -34,7 +41,52 @@ type enum Step implements Sendable {
     // Close the connection: right after the previous step's reply, or, as the first step, after the first message.
     Hangup,
     // Say nothing.
-    Silent
+    Silent,
+    // Answer an SSLRequest with exactly these bytes ('E', a byte that is no answer, 'S' and more, 'N' and more). An
+    // answer starting 'S' starts TLS when the server is secure.
+    SslAnswer(DynamicArray<uint8> bytes),
+    // The SASLInitialResponse must use `header` ("p" for SCRAM-SHA-256-PLUS with p=tls-server-end-point, "y" or "n"
+    // for SCRAM-SHA-256), then as ScramFirst.
+    ScramFirstBound(string password, string header),
+    // Reply with `then`, then end the TLS session in order (close_notify) and close the connection.
+    TlsClose(DynamicArray<uint8> then),
+    // Reply with `then`, damaged in transit: its last record will not authenticate.
+    TlsGarble(DynamicArray<uint8> then)
+}
+
+// The server's side of the TLS session: what the client sent waits in `inbound` for the engine, and what the engine
+// writes collects in `outbound` until the fake hands it to the client. Always non-blocking; no Shared, so the fake
+// stays Sendable.
+type resource ServerSide implements ReliableStream, Sendable {
+    DynamicArray<uint8> inbound;
+    isize inAt = 0;
+    DynamicArray<uint8> outbound;
+
+    public ctor make() { this.inbound = DynamicArray.empty(); this.inAt = 0; this.outbound = DynamicArray.empty(); }
+
+    public fn void feed(ConstView<uint8> bytes) { isize i = 0; while (i < bytes.length()) { this.inbound.add(item: bytes[i]); i = i + 1; } }
+    public fn void feedArray(const ref DynamicArray<uint8> bytes) { foreach (uint8 b in bytes) { this.inbound.add(item: b); } }
+    // Hand what the engine wrote to `into`.
+    public fn void drain(ref DynamicArray<uint8> into) { foreach (uint8 b in this.outbound) { into.add(item: b); } this.outbound = DynamicArray.empty(); }
+
+    public fn Result<isize, IoError> read(View<uint8> into) {
+        isize available = this.inbound.length() - this.inAt;
+        if (available == 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
+        isize n = available;
+        if (n > into.length()) { n = into.length(); }
+        isize i = 0;
+        while (i < n) { into[i] = this.inbound[this.inAt + i]; i = i + 1; }
+        this.inAt = this.inAt + n;
+        if (this.inAt == this.inbound.length()) { this.inbound = DynamicArray.empty(); this.inAt = 0; }
+        return Result::Ok(value: n);
+    }
+    public fn Result<isize, IoError> write(ConstView<uint8> bytes) {
+        isize i = 0;
+        while (i < bytes.length()) { this.outbound.add(item: bytes[i]); i = i + 1; }
+        return Result::Ok(value: bytes.length());
+    }
+    public fn Result<Unit, IoError> flush() { return Result::Ok(value: Unit::Unit); }
+    public fn Result<Unit, IoError> setNonBlocking(bool on) { return Result::Ok(value: Unit::Unit); }
 }
 
 // Backend messages, built as the protocol documentation lays them out.
@@ -171,11 +223,20 @@ type resource FakeServer implements Transport, Sendable {
     isize parsedAt = 0;
     bool startupSeen = false;
     bool hungUp = false;
+    bool discarding = false;   // hung up on a direct ClientHello: what the client still sends is lost, as on a socket
     isize chunk = 1;
     isize writeLimit = 3;
     string clientFirstBare;
     string serverFirst;
     string scramPassword;
+    string gs2Header;
+    DynamicArray<TlsConfig> tlsConfig;               // zero or one: a secure server's configuration
+    DynamicArray<TlsStream<ServerSide>> engine;      // zero or one: the session, once TLS has started
+    bool tlsMode = false;
+    bool established = false;
+    bool directAccepted = false;
+    DynamicArray<uint8> endPoint;                    // the server certificate's tls-server-end-point hash
+    string sniWanted;                                // "" checks nothing; "-" wants no SNI; else that name
 
     public ctor make(DynamicArray<Step> steps, isize chunk, isize writeLimit) {
         this.steps = give steps; this.next = 0;
@@ -183,7 +244,27 @@ type resource FakeServer implements Transport, Sendable {
         this.fromClient = DynamicArray.empty(); this.parsedAt = 0;
         this.startupSeen = false; this.hungUp = false;
         this.chunk = chunk; this.writeLimit = writeLimit;
-        this.clientFirstBare = ""; this.serverFirst = ""; this.scramPassword = "";
+        this.clientFirstBare = ""; this.serverFirst = ""; this.scramPassword = ""; this.gs2Header = "n,,";
+        this.tlsConfig = DynamicArray.empty(); this.engine = DynamicArray.empty();
+        this.tlsMode = false; this.established = false; this.directAccepted = false;
+        this.endPoint = DynamicArray.empty(); this.sniWanted = "";
+    }
+
+    // A server with TLS: it answers an SSLRequest 'S' and serves the script over `config` (and takes a direct
+    // ClientHello when `direct`). `endPoint` is its certificate's tls-server-end-point hash, which a bound SCRAM
+    // exchange must carry. `sni`: "" checks nothing, "-" requires that the client sent no SNI, anything else that it
+    // sent that name; a mismatch is a FATAL error once the handshake is done.
+    public ctor secure(DynamicArray<Step> steps, isize chunk, isize writeLimit, TlsConfig config, bool direct, DynamicArray<uint8> endPoint, string sni) {
+        this.steps = give steps; this.next = 0;
+        this.toClient = DynamicArray.empty(); this.readAt = 0;
+        this.fromClient = DynamicArray.empty(); this.parsedAt = 0;
+        this.startupSeen = false; this.hungUp = false;
+        this.chunk = chunk; this.writeLimit = writeLimit;
+        this.clientFirstBare = ""; this.serverFirst = ""; this.scramPassword = ""; this.gs2Header = "n,,";
+        this.tlsConfig = DynamicArray.empty(); this.tlsConfig.add(item: give config);
+        this.engine = DynamicArray.empty();
+        this.tlsMode = false; this.established = false; this.directAccepted = direct;
+        this.endPoint = give endPoint; this.sniWanted = give sni;
     }
 
     public unsafe fn Result<isize, IoError> read(View<uint8> into) {
@@ -202,13 +283,80 @@ type resource FakeServer implements Transport, Sendable {
     }
 
     public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
+        if (this.discarding) { return Result::Ok(value: bytes.length()); }
         if (this.hungUp) { return Result::Err(error: IoError.of(kind: IoErrorKind::BrokenPipe)); }
         isize n = bytes.length();
         if (n > this.writeLimit) { n = this.writeLimit; }
+        if (this.tlsMode) {
+            this.engine[0].innerRefMut().feed(bytes: bytes.slice(from: 0, count: n));
+            this.pump();
+            return Result::Ok(value: n);
+        }
         isize i = 0;
         while (i < n) { this.fromClient.add(item: bytes[i]); i = i + 1; }
         this.serve();
         return Result::Ok(value: n);
+    }
+
+    // TLS has started: the client's next bytes are the engine's.
+    unsafe fn void startTls() {
+        Result<TlsStream<ServerSide>, TlsError> opened = TlsStream::<ServerSide>.server(inner: ServerSide.make(), config: this.tlsConfig[0]);
+        match (give opened) {
+            case Ok(value: t): { this.engine.add(item: give t); this.tlsMode = true; }
+            case Err(error: e): { this.hungUp = true; }
+        };
+        // Whatever the client sent past the request (a direct ClientHello) is ciphertext.
+        DynamicArray<uint8> rest = DynamicArray.empty();
+        isize i = this.parsedAt;
+        while (i < this.fromClient.length()) { rest.add(item: this.fromClient[i]); i = i + 1; }
+        this.fromClient = DynamicArray.empty();
+        this.parsedAt = 0;
+        if (this.tlsMode) { this.engine[0].innerRefMut().feedArray(bytes: rest); this.pump(); }
+    }
+
+    // Run the engine on what the client sent: the handshake, then the plaintext through the script, then the
+    // ciphertext out to the client.
+    unsafe fn void pump() {
+        if (!this.established) {
+            Result<Progress, TlsError> step = this.engine[0].handshake();
+            match (give step) {
+                case Ok(value: p): {
+                    Progress at = p;
+                    bool done = match (at) { case Done: true; case _: false; };
+                    if (done) { this.established = true; this.checkSni(); }
+                }
+                case Err(error: e): { this.hungUp = true; }
+            };
+        }
+        if (this.established && !this.hungUp) {
+            FixedArray<uint8> buf = FixedArray.make(size: 4096);
+            bool more = true;
+            while (more) {
+                Result<isize, IoError> r = this.engine[0].read(into: buf.viewMut());
+                match (r) {
+                    case Ok(value: n): {
+                        if (n == 0) { more = false; }
+                        isize i = 0;
+                        while (i < n) { this.fromClient.add(item: buf[i]); i = i + 1; }
+                    }
+                    case Err(error: e): { more = false; }
+                };
+            }
+            this.serve();
+        }
+        this.engine[0].innerRefMut().drain(into: this.toClient);
+    }
+
+    unsafe fn void checkSni() {
+        if (this.sniWanted.length() == 0) { return; }
+        Optional<string> seen = this.engine[0].requestedServerName();
+        string got = match (give seen) { case Some(value: v): give v; case None: "-"; };
+        if (!got.equals(other: this.sniWanted)) {
+            Wire m = Wire.make();
+            m.report(tag: 69ui8, severity: "FATAL", code: "08P01", message: "fake server: SNI ".concat(other: got).concat(other: ", wanted ").concat(other: this.sniWanted));
+            this.queue(b: m.bytes().view());
+            this.hungUp = true;
+        }
     }
 
     public fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
@@ -225,6 +373,11 @@ type resource FakeServer implements Transport, Sendable {
         while (more) {
             isize start = this.parsedAt;
             isize have = this.fromClient.length() - start;
+            // A TLS ClientHello (record type 22) where a startup packet belongs: direct negotiation.
+            if (!this.startupSeen && !this.tlsMode && have > 0 && this.fromClient[start] == 22ui8) {
+                if (this.directAccepted && this.tlsConfig.length() > 0) { this.startTls(); } else { this.hungUp = true; this.discarding = true; }
+                return;
+            }
             isize header = 5;
             if (!this.startupSeen) { header = 4; }
             if (have < header) { return; }
@@ -239,6 +392,12 @@ type resource FakeServer implements Transport, Sendable {
             isize i = start + header;
             while (i < start + total) { body.add(item: this.fromClient[i]); i = i + 1; }
             this.parsedAt = start + total;
+            // An SSLRequest (length 8, code 80877103) is answered here, and the startup packet is still to come.
+            if (!this.startupSeen && total == 8 && body.length() == 4 && body[0] == 4ui8 && body[1] == 210ui8 && body[2] == 22ui8 && body[3] == 47ui8) {
+                this.answerSslRequest();
+                if (this.tlsMode || this.hungUp) { return; }
+                continue;
+            }
             this.startupSeen = true;
             this.answer(tag: tag, body: body);
         }
@@ -279,6 +438,12 @@ type resource FakeServer implements Transport, Sendable {
                 if (tag != 112ui8 || cut < 0) { this.refuse(); return; }
                 string withoutProof = clientFinal.substring(start: 0, end: cut);
                 string proof = clientFinal.substring(start: cut + 3, end: clientFinal.length());
+                // c= is the GS2 header, and for p=tls-server-end-point the server certificate's hash after it.
+                DynamicArray<uint8> binding = DynamicArray.empty();
+                foreach (uint8 b in this.gs2Header) { binding.add(item: b); }
+                if (this.gs2Header.startsWith(prefix: "p=")) { foreach (uint8 b in this.endPoint) { binding.add(item: b); } }
+                string wantC = b64encode(bytes: binding.view());
+                if (!attribute(message: withoutProof, name: "c").equals(other: wantC)) { this.refuse(); return; }
                 string authMessage = this.clientFirstBare.concat(other: ",").concat(other: this.serverFirst).concat(other: ",").concat(other: withoutProof);
                 string saltText = "kama-postgres-salt";
                 FixedArray<uint8> salted = FixedArray.make(size: 32);
@@ -320,12 +485,75 @@ type resource FakeServer implements Transport, Sendable {
             }
             case Hangup: { this.hungUp = true; }
             case Silent: { }
+            case SslAnswer(bytes: b): { this.queue(b: b.view()); }
+            case ScramFirstBound(password: pw, header: h): {
+                string mechanism = cString(body: body, from: 0);
+                isize dataAt = mechanism.length() + 1 + 4;
+                string clientFirst = textFrom(body: body, from: dataAt);
+                string wantMechanism = "SCRAM-SHA-256";
+                string wantHeader = copy h;
+                if (h.equals(other: "p")) { wantMechanism = "SCRAM-SHA-256-PLUS"; wantHeader = "p=tls-server-end-point"; }
+                wantHeader = wantHeader.concat(other: ",,");
+                if (tag != 112ui8 || !mechanism.equals(other: wantMechanism) || !clientFirst.startsWith(prefix: wantHeader)) {
+                    Wire m = Wire.make();
+                    m.report(tag: 69ui8, severity: "FATAL", code: "08P01", message: "fake server: SASL ".concat(other: mechanism).concat(other: " ").concat(other: clientFirst));
+                    this.queue(b: m.bytes().view());
+                    this.hungUp = true;
+                    return;
+                }
+                this.gs2Header = copy wantHeader;
+                this.scramPassword = copy pw;
+                this.clientFirstBare = clientFirst.substring(start: wantHeader.length(), end: clientFirst.length());
+                string clientNonce = attribute(message: this.clientFirstBare, name: "r");
+                string nonce = clientNonce.concat(other: serverNonceTail());
+                string salt = "a2FtYS1wb3N0Z3Jlcy1zYWx0";
+                this.serverFirst = "r=".concat(other: nonce).concat(other: ",s=").concat(other: salt).concat(other: ",i=4096");
+                Wire m = Wire.make();
+                m.authSaslData(code: 11, data: this.serverFirst);
+                this.queue(b: m.bytes().view());
+            }
+            case TlsClose(then: t): {
+                this.queue(b: t.view());
+                Result<Unit, TlsError> closed = this.engine[0].close();
+                this.engine[0].innerRefMut().drain(into: this.toClient);
+                this.hungUp = true;
+            }
+            case TlsGarble(then: t): {
+                this.queue(b: t.view());
+                isize last = this.toClient.length() - 1;
+                if (last >= 0) { this.toClient[last] = this.toClient[last] ^ 1ui8; }
+            }
         };
         // A Hangup after a reply closes the connection as soon as that reply is sent.
         if (this.next < this.steps.length()) {
             bool hangup = match (this.steps[this.next]) { case Hangup: true; case _: false; };
             if (hangup) { this.hungUp = true; this.next = this.next + 1; }
         }
+    }
+
+    unsafe fn void answerSslRequest() {
+        bool scripted = false;
+        if (this.next < this.steps.length()) { scripted = match (this.steps[this.next]) { case SslAnswer(bytes: b): true; case _: false; }; }
+        if (scripted) {
+            isize at = this.next;
+            this.next = this.next + 1;
+            bool yes = false;
+            match (this.steps[at]) {
+                case SslAnswer(bytes: b): { this.queue(b: b.view()); yes = b.length() > 0 && b[0] == 83ui8; }
+                case _: { }
+            };
+            if (yes && this.tlsConfig.length() > 0) { this.startTls(); }
+            return;
+        }
+        DynamicArray<uint8> one = DynamicArray.empty();
+        if (this.tlsConfig.length() > 0) {
+            one.add(item: 83ui8);   // 'S'
+            this.queue(b: one.view());
+            this.startTls();
+            return;
+        }
+        one.add(item: 78ui8);       // 'N'
+        this.queue(b: one.view());
     }
 
     unsafe fn void refuse() {
@@ -335,7 +563,17 @@ type resource FakeServer implements Transport, Sendable {
         this.hungUp = true;
     }
 
-    fn void queue(ConstView<uint8> b) {
+    // A reply: in plaintext, or once TLS is up, through the engine.
+    unsafe fn void queue(ConstView<uint8> b) {
+        if (this.tlsMode && this.established) {
+            isize sent = 0;
+            while (sent < b.length()) {
+                Result<isize, IoError> w = this.engine[0].write(bytes: b.slice(from: sent, count: b.length() - sent));
+                match (w) { case Ok(value: n): { sent = sent + n; } case Err(error: e): { sent = b.length(); } };
+            }
+            this.engine[0].innerRefMut().drain(into: this.toClient);
+            return;
+        }
         isize i = 0;
         while (i < b.length()) { this.toClient.add(item: b[i]); i = i + 1; }
     }

@@ -34,6 +34,15 @@ All notable changes to this package are recorded here. The format follows
     - inside an open transaction it nests as a savepoint.
   - `PgError::RolledBack` ("commit unexpectedly resulted in rollback", pgx's words) when COMMIT ends a failed
     transaction.
+- **COPY**, as libpq runs it over the simple protocol:
+  - in: `startCopyIn(sql)` (a `CopyInfo`: binary or text, each column's format), `putCopyData(bytes:)`, `endCopyIn()`
+    (the rows copied) or `failCopyIn(reason:)` (CopyFail, abandoned);
+  - out: `startCopyOut(sql)` and `getCopyData()`, which gives `CopyChunk::Data` per row, then `Done` with the count;
+  - std::io: `copyFrom(sql:, source: Reader)` and `copyTo(sql:, sink: Writer)`, pgx's CopyFrom and CopyTo;
+  - data goes out at 64 KiB, in messages of at most 1 MiB, and a server that has already failed the COPY stops it at
+    the next put rather than after all the data;
+  - libpq's "no COPY in progress"; any other call during a COPY is "another command is already in progress".
+  `simpleQuery` and `query` still refuse COPY, and now name the calls to use.
 - **Waiting for notifications:** `Connection.waitForNotification(timeout:)` returns the oldest LISTEN/NOTIFY
   notification already received, else the next to arrive within the time (None when none does), taking in notices
   and parameter changes on the way. libpq leaves this loop to the application (PQsocket, PQconsumeInput, PQnotifies).

@@ -1,0 +1,99 @@
+// COPY on a real server: text and CSV in, COPY OUT compared with what went in, a binary round trip the server checks,
+// a row the server cannot read, an abandoned COPY, 50 000 rows each way, and a COPY OUT that fails part-way.
+import { std::collections::DynamicArray, std::io::SliceReader, std::io::StringWriter,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::TransactionStatus, postgres::CopyInfo, postgres::CopyChunk,
+         postgres::sqlstate::INVALID_TEXT_REPRESENTATION, postgres::sqlstate::DIVISION_BY_ZERO,
+         postgres_integration_tests::check, postgres_integration_tests::conninfoFor, postgres_integration_tests::open,
+         postgres_integration_tests::scalar };
+export { copyTests };
+
+fn string shown(const ref Result<Optional<int64>, PgError> r) {
+    return match (r) {
+        case Ok(value: n): match (n) { case Some(value: v): "${v} rows"; case None: "no count"; };
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn int32 copyTests() {
+    int32 f = 0;
+    Result<Connection, PgError> opened = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection c = match (give opened) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "copy: connect (".concat(other: e.message()).concat(other: ")")); } };
+    string made = scalar(c: c, sql: "create temp table kp_copy (id int, name text)");
+
+    // Text, then CSV with a header and a quoted comma.
+    SliceReader text = SliceReader.make(src: "1\talpha\n2\tbeta\n");
+    Result<Optional<int64>, PgError> r1 = c.copyFrom(sql: "copy kp_copy from stdin", source: text);
+    SliceReader csv = SliceReader.make(src: "id,name\n3,\"gam,ma\"\n");
+    Result<Optional<int64>, PgError> r2 = c.copyFrom(sql: "copy kp_copy from stdin (format csv, header true)", source: csv);
+    string all = scalar(c: c, sql: "select string_agg(id || ':' || name, ';' order by id) from kp_copy");
+    f = f + check(ok: shown(r: r1).equals(other: "2 rows") && shown(r: r2).equals(other: "1 rows") && all.equals(other: "1:alpha;2:beta;3:gam,ma"),
+                  what: "copy: text and CSV in (".concat(other: all).concat(other: ")"));
+
+    // COPY OUT gives back what went in.
+    StringWriter sink = StringWriter.make();
+    Result<Optional<int64>, PgError> r3 = c.copyTo(sql: "copy (select * from kp_copy order by id) to stdout", sink: sink);
+    string back = sink.finish();
+    f = f + check(ok: shown(r: r3).equals(other: "3 rows") && back.equals(other: "1\talpha\n2\tbeta\n3\tgam,ma\n"), what: "copy: COPY OUT, as it went in (".concat(other: back).concat(other: ")"));
+
+    // Binary out and in again; the server compares the tables.
+    string made2 = scalar(c: c, sql: "create temp table kp_copy2 (like kp_copy)");
+    Result<CopyInfo, PgError> outStart = c.startCopyOut(sql: "copy kp_copy to stdout (format binary)");
+    bool binaryOut = match (outStart) { case Ok(value: i): i.isBinary() && i.columnCount() == 2; case Err(error: e): false; };
+    DynamicArray<uint8> binary = DynamicArray.empty();
+    bool reading = true;
+    while (reading) {
+        Result<CopyChunk, PgError> chunk = c.getCopyData();
+        match (give chunk) {
+            case Ok(value: k): {
+                match (give k) {
+                    case Data(bytes: b): { foreach (uint8 x in b) { binary.add(item: x); } }
+                    case Done(rows: n): { reading = false; }
+                };
+            }
+            case Err(error: e): { reading = false; }
+        };
+    }
+    Result<CopyInfo, PgError> inStart = c.startCopyIn(sql: "copy kp_copy2 from stdin (format binary)");
+    Result<Unit, PgError> put = c.putCopyData(bytes: binary.view());
+    Result<Optional<int64>, PgError> r4 = c.endCopyIn();
+    string same = scalar(c: c, sql: "select count(*) = 3 and not exists (select * from kp_copy except select * from kp_copy2) from kp_copy2");
+    f = f + check(ok: binaryOut && shown(r: r4).equals(other: "3 rows") && same.equals(other: "t"), what: "copy: binary out and in again, the same rows");
+
+    // A row the server cannot read: its error, nothing copied, the session idle.
+    SliceReader bad = SliceReader.make(src: "10\tok\nnot a number\tbad\n");
+    Result<Optional<int64>, PgError> r5 = c.copyFrom(sql: "copy kp_copy from stdin", source: bad);
+    bool invalid = match (r5) { case Ok(value: n): false; case Err(error: e): e.sqlstate() == INVALID_TEXT_REPRESENTATION; };
+    string count = scalar(c: c, sql: "select count(*) from kp_copy");
+    f = f + check(ok: invalid && count.equals(other: "3") && c.transactionStatus() == TransactionStatus::Idle, what: "copy: a bad row fails the COPY, nothing kept (".concat(other: shown(r: r5)).concat(other: ")"));
+
+    // Abandoned with CopyFail.
+    Result<CopyInfo, PgError> again = c.startCopyIn(sql: "copy kp_copy from stdin");
+    Result<Unit, PgError> some = c.putCopyData(bytes: "99\tnever\n".bytes());
+    Result<Unit, PgError> abandoned = c.failCopyIn(reason: "changed my mind");
+    string count2 = scalar(c: c, sql: "select count(*) from kp_copy");
+    bool asked = match (abandoned) { case Ok(value: u): true; case Err(error: e): false; };
+    f = f + check(ok: asked && count2.equals(other: "3"), what: "copy: CopyFail abandons it, nothing kept");
+
+    // 50 000 rows in, then out.
+    string many = "";
+    isize i = 0;
+    while (i < 50000) { many = many.concat(other: "${i}\trow\n"); i = i + 1; }
+    string made3 = scalar(c: c, sql: "create temp table kp_copy_many (id int, name text)");
+    SliceReader manyIn = SliceReader.make(src: copy many);
+    Result<Optional<int64>, PgError> r6 = c.copyFrom(sql: "copy kp_copy_many from stdin", source: manyIn);
+    StringWriter manyOut = StringWriter.make();
+    Result<Optional<int64>, PgError> r7 = c.copyTo(sql: "copy (select * from kp_copy_many order by id) to stdout", sink: manyOut);
+    string outText = manyOut.finish();
+    f = f + check(ok: shown(r: r6).equals(other: "50000 rows") && shown(r: r7).equals(other: "50000 rows") && outText.equals(other: many),
+                  what: "copy: 50 000 rows in and out (".concat(other: shown(r: r6)).concat(other: ", ").concat(other: shown(r: r7)).concat(other: ")"));
+
+    // A COPY OUT that fails part-way: its error, the rows before it written, the session idle.
+    StringWriter partial = StringWriter.make();
+    Result<Optional<int64>, PgError> r8 = c.copyTo(sql: "copy (select 10 / (3 - i) from generate_series(1, 5) i) to stdout", sink: partial);
+    string before = partial.finish();
+    bool divided = match (r8) { case Ok(value: n): false; case Err(error: e): e.sqlstate() == DIVISION_BY_ZERO; };
+    f = f + check(ok: divided && before.equals(other: "5\n10\n") && c.transactionStatus() == TransactionStatus::Idle, what: "copy: COPY OUT failing at row 3 (".concat(other: before).concat(other: ")"));
+    string after = scalar(c: c, sql: "select 'still here'");
+    f = f + check(ok: after.equals(other: "still here"), what: "copy: the session goes on");
+    return f;
+}

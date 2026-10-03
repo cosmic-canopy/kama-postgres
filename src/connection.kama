@@ -21,6 +21,10 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::protocol::closePortal as sendClosePortal, postgres::protocol::sync as sendSync,
          postgres::protocol::cancelRequest as sendCancelRequest, postgres::CancelToken,
          postgres::TransactionOptions, postgres::Savepoint, postgres::TransactionBody,
+         postgres::CopyInfo, postgres::CopyChunk, postgres::protocol::CopyFormats,
+         postgres::protocol::copyData as sendCopyData, postgres::protocol::copyDone as sendCopyDone,
+         std::io::Reader, std::io::Writer, std::io::writeAll, std::collections::FixedArray,
+         postgres::sqlstate::QUERY_CANCELED,
          postgres::protocol::BindValues,
          postgres::Query, postgres::Statement, postgres::Portal, postgres::hasBinaryCodec,
          postgres::Dialer, postgres::DialTarget, postgres::SslCertMode, postgres::sqlstate::sqlstateCode,
@@ -80,6 +84,7 @@ type resource Connection implements Sendable {
     Deadline due;
     bool cancelling = false;
     int64 savepoints = 0i64;   // the names given so far: sp_1, sp_2, …
+    uint8 copyMode = 0ui8;     // a COPY in progress: 1 FROM STDIN (copy-in), 2 TO STDOUT (copy-out); 0 none
 
     ctor over(Owned<Transport> transport) {
         this.wire = Wire.over(transport: give transport);
@@ -109,6 +114,7 @@ type resource Connection implements Sendable {
         this.due = Deadline.none();
         this.cancelling = false;
         this.savepoints = 0i64;
+        this.copyMode = 0ui8;
     }
 
     // Over a transport some of whose bytes were read already: what the server sent after its 'N' to an SSLRequest.
@@ -140,6 +146,7 @@ type resource Connection implements Sendable {
         this.due = Deadline.none();
         this.cancelling = false;
         this.savepoints = 0i64;
+        this.copyMode = 0ui8;
     }
 
     // Connect as `config` says, as libpq's PQconnectPoll does: each host in order, each of its addresses in turn,
@@ -488,7 +495,7 @@ type resource Connection implements Sendable {
                 case CopyInResponse(formats: cf): {
                     // COPY has its own interface; refusing it here keeps the session usable.
                     this.outbox.clear();
-                    bool framed = sendCopyFail(w: this.outbox, reason: "COPY FROM STDIN is not supported by simpleQuery");
+                    bool framed = sendCopyFail(w: this.outbox, reason: "COPY runs through startCopyIn or copyFrom, not simpleQuery");
                     Result<Unit, PgError> refusal = this.flush(deadline: this.due);
                     match (give refusal) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
                     copyRefused = true;
@@ -504,7 +511,7 @@ type resource Connection implements Sendable {
             };
         }
         if (copyRefused && this.live) {
-            return Result::Err(error: PgError::Usage(detail: "COPY is not supported by simpleQuery; the statement was not run, or its output was discarded"));
+            return Result::Err(error: PgError::Usage(detail: "COPY runs through startCopyIn/startCopyOut (or copyFrom/copyTo), not simpleQuery; the statement was not run, or its output was discarded"));
         }
         if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
         return Result::Ok(value: give results);
@@ -722,6 +729,274 @@ type resource Connection implements Sendable {
     unsafe fn Result<Unit, PgError> command(const ref string sql) {
         Result<DynamicArray<Rows>, PgError> r = this.simpleQuery(sql: sql);
         return match (give r) { case Ok(value: rows): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
+    }
+
+    // ---- COPY ----
+
+    // Run `sql`, a COPY … FROM STDIN, and stop when the server is ready for the data (libpq's PQexec of a COPY, which
+    // returns PGRES_COPY_IN). Send the data with putCopyData, then end with endCopyIn, or abandon it with failCopyIn.
+    // Until then the connection is busy. A statement that is not a COPY FROM STDIN is run and refused afterwards.
+    public unsafe fn Result<CopyInfo, PgError> startCopyIn(const ref string sql) { return this.startCopy(sql: sql, wanted: 1ui8); }
+
+    // Run `sql`, a COPY … TO STDOUT, and stop when the data starts (PGRES_COPY_OUT). Read it with getCopyData until
+    // Done. Until then the connection is busy.
+    public unsafe fn Result<CopyInfo, PgError> startCopyOut(const ref string sql) { return this.startCopy(sql: sql, wanted: 2ui8); }
+
+    // Send `bytes` of a COPY FROM STDIN (PQputCopyData): any cut of the data stream will do. Data is sent as it fills
+    // 64 KiB, in messages of at most 1 MiB. A server that has already failed the COPY (a row it could not read) has
+    // said so by then: its error is returned, and the COPY is over (the connection is ready for another command).
+    public unsafe fn Result<Unit, PgError> putCopyData(ConstView<uint8> bytes) {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.copyMode != 1ui8) { return Result::Err(error: PgError::Usage(detail: "no COPY in progress")); }
+        this.arm();
+        isize at = 0;
+        bool sent = false;
+        while (at < bytes.length()) {
+            isize n = bytes.length() - at;
+            if (n > COPY_PIECE) { n = COPY_PIECE; }
+            sendCopyData(w: this.outbox, data: bytes.slice(from: at, count: n));
+            at = at + n;
+            if (this.outbox.view().length() >= COPY_FLUSH) {
+                Result<Unit, PgError> f = this.flush(deadline: this.due);
+                match (give f) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                sent = true;
+            }
+        }
+        if (!sent) { return Result::Ok(value: Unit::Unit); }
+        return this.copyStillWanted();
+    }
+
+    // End a COPY FROM STDIN (PQputCopyEnd with no error): CopyDone, then the COPY's result, the number of rows copied.
+    public unsafe fn Result<Optional<int64>, PgError> endCopyIn() {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.copyMode != 1ui8) { return Result::Err(error: PgError::Usage(detail: "no COPY in progress")); }
+        this.arm();
+        sendCopyDone(w: this.outbox);
+        Result<Unit, PgError> f = this.flush(deadline: this.due);
+        match (give f) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.finishCopy();
+    }
+
+    // Abandon a COPY FROM STDIN (PQputCopyEnd with an error message): CopyFail with `reason`, which the server reports
+    // back ("COPY from stdin failed: reason", 57014); nothing is copied. That answer is the expected one, so it is Ok.
+    public unsafe fn Result<Unit, PgError> failCopyIn(const ref string reason) {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.copyMode != 1ui8) { return Result::Err(error: PgError::Usage(detail: "no COPY in progress")); }
+        this.arm();
+        if (!sendCopyFail(w: this.outbox, reason: reason)) { return Result::Err(error: PgError::Usage(detail: "the reason holds a NUL byte, which the protocol cannot carry")); }
+        Result<Unit, PgError> f = this.flush(deadline: this.due);
+        match (give f) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Optional<int64>, PgError> r = this.finishCopy();
+        return match (give r) {
+            case Ok(value: rows): Result::Ok(value: Unit::Unit);
+            case Err(error: e): {
+                if (e.sqlstate() == QUERY_CANCELED) { return Result::Ok(value: Unit::Unit); }
+                return Result::Err(error: give e);
+            }
+        };
+    }
+
+    // The next piece of a COPY TO STDOUT (PQgetCopyData), or Done with the number of rows once it ends. A server error
+    // ends the COPY, and is returned.
+    public unsafe fn Result<CopyChunk, PgError> getCopyData() {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.copyMode != 2ui8) { return Result::Err(error: PgError::Usage(detail: "no COPY in progress")); }
+        this.arm();
+        while (true) {
+            Result<BackendMessage, PgError> received = this.receive();
+            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            if (background(m: m)) { this.absorb(m: give m); continue; }
+            match (give m) {
+                case CopyData(data: d): { return Result::Ok(value: CopyChunk::Data(bytes: give d)); }
+                case CopyDone: {
+                    Result<Optional<int64>, PgError> r = this.finishCopy();
+                    return match (give r) { case Ok(value: n): Result::Ok(value: CopyChunk::Done(rows: n)); case Err(error: e): Result::Err(error: give e); };
+                }
+                case ErrorResponse(fields: f): {
+                    ServerError e = ServerError.make(fields: give f);
+                    if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
+                    Result<Optional<int64>, PgError> rest = this.finishCopy();
+                    return Result::Err(error: PgError::Server(error: give e));
+                }
+                case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place in COPY TO STDOUT")); }
+            };
+        }
+        return Result::Err(error: PgError::Closed);
+    }
+
+    // COPY FROM STDIN with the data read from `source` until its end (pgx's CopyFrom over an io.Reader). A read that
+    // fails abandons the COPY with CopyFail, and its error is returned. Gives the number of rows copied.
+    public unsafe fn Result<Optional<int64>, PgError> copyFrom(const ref string sql, Reader source) {
+        Result<CopyInfo, PgError> started = this.startCopyIn(sql: sql);
+        match (give started) { case Ok(value: info): { } case Err(error: e): { return Result::Err(error: give e); } };
+        FixedArray<uint8> buf = FixedArray.make(size: COPY_FLUSH);
+        while (true) {
+            Result<isize, IoError> r = source.read(into: buf.viewMut());
+            match (r) {
+                case Ok(value: n): {
+                    if (n == 0) { return this.endCopyIn(); }
+                    Result<Unit, PgError> put = this.putCopyData(bytes: buf.slice(from: 0, count: n));
+                    match (give put) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                }
+                case Err(error: e): {
+                    bool again = match (e.kind()) { case Interrupted: true; case _: false; };
+                    if (!again) {
+                        Result<Unit, PgError> abandoned = this.failCopyIn(reason: "could not read the data to copy: ".concat(other: strerror(e: e)));
+                        return Result::Err(error: PgError::Io(error: e));
+                    }
+                }
+            };
+        }
+        return Result::Err(error: PgError::Closed);
+    }
+
+    // COPY TO STDOUT with the data written to `sink` as it arrives (pgx's CopyTo). A write that fails leaves the rest
+    // read and dropped, so the session goes on, and its error is returned. Gives the number of rows copied.
+    public unsafe fn Result<Optional<int64>, PgError> copyTo(const ref string sql, Writer sink) {
+        Result<CopyInfo, PgError> started = this.startCopyOut(sql: sql);
+        match (give started) { case Ok(value: info): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Optional<IoError> failed = Optional::None;
+        while (true) {
+            Result<CopyChunk, PgError> next = this.getCopyData();
+            CopyChunk chunk = match (give next) { case Ok(value: c): give c; case Err(error: e): { return Result::Err(error: give e); } };
+            match (give chunk) {
+                case Data(bytes: b): {
+                    bool writing = match (failed) { case Some(value: x): false; case None: true; };
+                    if (writing) {
+                        Result<Unit, IoError> w = writeAll(w: sink, bytes: b.view());
+                        match (w) { case Ok(value: u): { } case Err(error: e): { failed = Optional::Some(value: e); } };
+                    }
+                }
+                case Done(rows: n): {
+                    return match (failed) { case Some(value: e): Result::Err(error: PgError::Io(error: e)); case None: Result::Ok(value: n); };
+                }
+            };
+        }
+        return Result::Err(error: PgError::Closed);
+    }
+
+    // Run `sql` and read up to the COPY's start: CopyInResponse for `wanted` 1, CopyOutResponse for 2. Anything else is
+    // read to its end (a COPY of the other direction is ended at once) and refused.
+    unsafe fn Result<CopyInfo, PgError> startCopy(const ref string sql, uint8 wanted) {
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.arm();
+        this.outbox.clear();
+        if (!sendQuery(w: this.outbox, sql: sql)) {
+            return Result::Err(error: PgError::Usage(detail: "the query text holds a NUL byte, which the protocol cannot carry"));
+        }
+        Result<Unit, PgError> sent = this.flush(deadline: this.due);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        DynamicArray<PgError> failed = DynamicArray.empty();
+        bool other = false;
+        bool draining = false;
+        bool done = false;
+        while (!done) {
+            Result<BackendMessage, PgError> received = this.receive();
+            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            if (background(m: m)) { this.absorb(m: give m); continue; }
+            match (give m) {
+                case CopyInResponse(formats: cf): {
+                    if (wanted == 1ui8 && !other && failed.length() == 0) {
+                        this.copyMode = 1ui8;
+                        this.busy = true;
+                        return Result::Ok(value: CopyInfo.of(f: cf));
+                    }
+                    this.outbox.clear();
+                    bool framed = sendCopyFail(w: this.outbox, reason: "startCopyOut was called for a COPY FROM STDIN");
+                    Result<Unit, PgError> refusal = this.flush(deadline: this.due);
+                    match (give refusal) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                    other = true;
+                }
+                case CopyOutResponse(formats: cf): {
+                    if (wanted == 2ui8 && !other && failed.length() == 0) {
+                        this.copyMode = 2ui8;
+                        this.busy = true;
+                        return Result::Ok(value: CopyInfo.of(f: cf));
+                    }
+                    other = true;
+                    draining = true;
+                }
+                case CopyData(data: d): { if (!draining) { return Result::Err(error: this.broken(detail: unexpected(tag: 100ui8))); } }
+                case CopyDone: {
+                    if (!draining) { return Result::Err(error: this.broken(detail: unexpected(tag: 99ui8))); }
+                    draining = false;
+                }
+                case RowDescription(fields: f): { other = true; }
+                case DataRow(row: r): { other = true; }
+                case CommandComplete(commandTag: t): { other = true; }
+                case EmptyQueryResponse: { other = true; }
+                case ErrorResponse(fields: f): {
+                    ServerError e = ServerError.make(fields: give f);
+                    if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
+                    failed.add(item: PgError::Server(error: give e));
+                }
+                case ReadyForQuery(status: s): { this.txStatus = s; done = true; }
+                case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place in a COPY's start")); }
+            };
+        }
+        if (other) {
+            string direction = "TO STDOUT";
+            if (wanted == 1ui8) { direction = "FROM STDIN"; }
+            return Result::Err(error: PgError::Usage(detail: "the statement did not start a COPY ".concat(other: direction)));
+        }
+        if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
+        return Result::Err(error: PgError::Usage(detail: "the statement did not start a COPY"));
+    }
+
+    // While data is still going out, a server that failed the COPY (a row it could not read) has said so, and ignores
+    // what follows: read what has arrived, without waiting. Its error ends the COPY.
+    unsafe fn Result<Unit, PgError> copyStillWanted() {
+        while (true) {
+            Result<BackendMessage, PgError> r = this.wire.receive(deadline: Deadline.after(span: Duration.zero()));
+            match (give r) {
+                case Ok(value: m): {
+                    if (background(m: m)) { this.absorb(m: give m); continue; }
+                    match (give m) {
+                        case ErrorResponse(fields: f): {
+                            ServerError e = ServerError.make(fields: give f);
+                            if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
+                            Result<Optional<int64>, PgError> rest = this.finishCopy();
+                            return Result::Err(error: PgError::Server(error: give e));
+                        }
+                        case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place in COPY FROM STDIN")); }
+                    };
+                }
+                case Err(error: e): {
+                    if (isTimeout(e: e)) { return Result::Ok(value: Unit::Unit); }
+                    this.lose();
+                    return Result::Err(error: give e);
+                }
+            };
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The end of a COPY: its CommandComplete ("COPY n"), any error, then ReadyForQuery. Gives the rows the tag reports.
+    unsafe fn Result<Optional<int64>, PgError> finishCopy() {
+        string tag = "";
+        DynamicArray<PgError> failed = DynamicArray.empty();
+        bool done = false;
+        while (!done) {
+            Result<BackendMessage, PgError> received = this.receive();
+            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            if (background(m: m)) { this.absorb(m: give m); continue; }
+            match (give m) {
+                case CommandComplete(commandTag: t): { tag = give t; }
+                case ErrorResponse(fields: f): {
+                    ServerError e = ServerError.make(fields: give f);
+                    if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
+                    failed.add(item: PgError::Server(error: give e));
+                }
+                case ReadyForQuery(status: s): { this.txStatus = s; done = true; }
+                case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place at the end of a COPY")); }
+            };
+        }
+        this.copyMode = 0ui8;
+        this.busy = false;
+        if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
+        Rows ended = Rows.make(fields: DynamicArray.empty(), rows: DynamicArray.empty(), tag: give tag);
+        return Result::Ok(value: ended.rowsAffected());
     }
 
     // ---- query timeouts ----
@@ -1003,7 +1278,7 @@ type resource Connection implements Sendable {
                 case CopyInResponse(formats: cf): {
                     // COPY has its own interface; refusing it here keeps the session usable.
                     this.outbox.clear();
-                    bool framed = sendCopyFail(w: this.outbox, reason: "COPY FROM STDIN is not supported by the extended protocol's query");
+                    bool framed = sendCopyFail(w: this.outbox, reason: "COPY runs through startCopyIn or copyFrom, not query");
                     Result<Unit, PgError> refusal = this.flush(deadline: this.due);
                     match (give refusal) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
                     copyRefused = true;
@@ -1027,7 +1302,7 @@ type resource Connection implements Sendable {
         this.streaming = false;
         this.bindPending = false;
         if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
-        if (copyRefused) { return Result::Err(error: PgError::Usage(detail: "COPY is not supported by query; the statement was not run, or its output was discarded")); }
+        if (copyRefused) { return Result::Err(error: PgError::Usage(detail: "COPY runs through startCopyIn/startCopyOut (or copyFrom/copyTo), not query; the statement was not run, or its output was discarded")); }
         Rows result = Rows.make(fields: copy this.openFields, rows: give rows, tag: give tag);
         if (suspended) { result.suspend(); }
         return Result::Ok(value: give result);
@@ -1517,6 +1792,7 @@ type resource Connection implements Sendable {
         this.busy = false;
         this.streaming = false;
         this.bindPending = false;
+        this.copyMode = 0ui8;
         if (!this.live) { return; }
         this.live = false;
         this.wire.shutdown();
@@ -1554,6 +1830,10 @@ type resource Errand {
 }
 
 fn bool isTimeout(const ref PgError e) { return match (e) { case Timeout: true; case _: false; }; }
+
+// COPY data goes out once 64 KiB is queued, in CopyData messages of at most 1 MiB.
+comptime isize COPY_FLUSH = 65536;
+comptime isize COPY_PIECE = 1048576;
 
 // A message that can come at any point of an exchange: a notice, a parameter's new value, a notification.
 fn bool background(const ref BackendMessage m) {

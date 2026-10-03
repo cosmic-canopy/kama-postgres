@@ -1,0 +1,189 @@
+// COPY against a scripted server: the messages a COPY FROM STDIN sends (the statement, CopyData, CopyDone or
+// CopyFail), what a COPY TO STDOUT reads, a server that fails the COPY while data is still going out, a statement of
+// the wrong direction or no COPY at all, libpq's "no COPY in progress", and the std::io helpers.
+import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode, std::io::SliceReader, std::io::StringWriter,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::TransactionStatus, postgres::CopyInfo, postgres::CopyChunk,
+         postgres::sqlstate::INVALID_TEXT_REPRESENTATION,
+         postgres_unit_tests::check, postgres_unit_tests::Step, postgres_unit_tests::Wire,
+         postgres_unit_tests::over, postgres_unit_tests::welcome };
+export { copyTests };
+
+comptime uint8 QUERY = 81ui8;      // 'Q'
+comptime uint8 COPY_DATA = 100ui8; // 'd'
+comptime uint8 COPY_DONE = 99ui8;  // 'c'
+comptime uint8 COPY_FAIL = 102ui8; // 'f'
+
+unsafe fn string hexText(const ref string s) { return hexEncode(bytes: s.bytes()); }
+unsafe fn string hexCString(const ref string s) { return hexText(s: s).concat(other: "00"); }
+
+fn DynamicArray<Step> opening() { DynamicArray<Step> s = DynamicArray.empty(); s.add(item: Step::Send(bytes: welcome())); return s; }
+
+unsafe fn Step statement(const ref string sql, Wire reply) { return Step::Expect(tag: QUERY, body: hexCString(s: sql), then: reply.bytes()); }
+unsafe fn Step data(const ref string text) { return Step::Expect(tag: COPY_DATA, body: hexText(s: text), then: DynamicArray.empty()); }
+
+fn Wire ending(const ref string tag) { Wire w = Wire.make(); w.complete(tag: tag); w.ready(status: 73ui8); return w; }
+
+unsafe fn Result<Connection, PgError> scripted(DynamicArray<Step> steps) { string none = ""; return over(script: give steps, conninfo: none); }
+
+fn string shown(const ref Result<Optional<int64>, PgError> r) {
+    return match (r) {
+        case Ok(value: n): match (n) { case Some(value: v): "${v} rows"; case None: "no count"; };
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn string chunkText(const ref Result<CopyChunk, PgError> r) {
+    return match (r) {
+        case Ok(value: c): match (c) {
+            case Data(bytes: b): "data:".concat(other: hexEncode(bytes: b.view()));
+            case Done(rows: n): match (n) { case Some(value: v): "done:${v}"; case None: "done"; };
+        };
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn int32 copyTests() {
+    int32 f = 0;
+    string copyIn = "COPY t FROM STDIN";
+    string copyOut = "COPY t TO STDOUT";
+
+    // COPY FROM STDIN: the statement, the data as given, CopyDone; the rows the server reports.
+    DynamicArray<Step> s1 = opening();
+    Wire g1 = Wire.make(); g1.copyResponse(tag: 71ui8);
+    s1.add(item: statement(sql: copyIn, reply: give g1));
+    s1.add(item: data(text: "1\tone\n"));
+    s1.add(item: data(text: "2\ttwo\n"));
+    s1.add(item: Step::Expect(tag: COPY_DONE, body: "", then: ending(tag: "COPY 2").bytes()));
+    Result<Connection, PgError> m1 = scripted(steps: give s1);
+    Connection c = match (give m1) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "copy: connect (".concat(other: e.message()).concat(other: ")")); } };
+    Result<CopyInfo, PgError> started = c.startCopyIn(sql: copyIn);
+    bool textCopy = match (started) { case Ok(value: i): !i.isBinary() && i.columnCount() == 1; case Err(error: e): false; };
+    f = f + check(ok: textCopy && c.transactionStatus() == TransactionStatus::Active, what: "copy: COPY FROM STDIN starts, text, one column, the session busy");
+    Result<Unit, PgError> p1 = c.putCopyData(bytes: "1\tone\n".bytes());
+    Result<Unit, PgError> p2 = c.putCopyData(bytes: "2\ttwo\n".bytes());
+    Result<DynamicArray<Rows>, PgError> refused = c.simpleQuery(sql: "select 1");
+    string refusal = match (refused) { case Ok(value: r): "(ran)"; case Err(error: e): e.message(); };
+    f = f + check(ok: refusal.equals(other: "another command is already in progress"), what: "copy: another command waits for the COPY (".concat(other: refusal).concat(other: ")"));
+    Result<Optional<int64>, PgError> ended = c.endCopyIn();
+    f = f + check(ok: shown(r: ended).equals(other: "2 rows") && c.transactionStatus() == TransactionStatus::Idle, what: "copy: CopyDone, and the server's count (".concat(other: shown(r: ended)).concat(other: ")"));
+    Result<Unit, PgError> idlePut = c.putCopyData(bytes: "x".bytes());
+    string noCopy = match (idlePut) { case Ok(value: u): "(sent)"; case Err(error: e): e.message(); };
+    f = f + check(ok: noCopy.equals(other: "no COPY in progress"), what: "copy: libpq's \"no COPY in progress\" (".concat(other: noCopy).concat(other: ")"));
+
+    // CopyFail: the server reports it back (57014), which is what was asked for.
+    DynamicArray<Step> s2 = opening();
+    Wire g2 = Wire.make(); g2.copyResponse(tag: 71ui8);
+    s2.add(item: statement(sql: copyIn, reply: give g2));
+    Wire failed = Wire.make(); failed.report(tag: 69ui8, severity: "ERROR", code: "57014", message: "COPY from stdin failed: giving up"); failed.ready(status: 73ui8);
+    s2.add(item: Step::Expect(tag: COPY_FAIL, body: hexCString(s: "giving up"), then: failed.bytes()));
+    Result<Connection, PgError> m2 = scripted(steps: give s2);
+    match (give m2) {
+        case Ok(value: x): {
+            Connection d = give x;
+            Result<CopyInfo, PgError> st = d.startCopyIn(sql: copyIn);
+            Result<Unit, PgError> abandoned = d.failCopyIn(reason: "giving up");
+            string said = match (abandoned) { case Ok(value: u): "ok"; case Err(error: e): e.message(); };
+            f = f + check(ok: said.equals(other: "ok") && d.transactionStatus() == TransactionStatus::Idle, what: "copy: CopyFail, abandoned as asked (".concat(other: said).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "copy: connect 2"); }
+    };
+
+    // A row the server cannot read fails the COPY while data is still going out: the next put returns its error,
+    // the COPY is over, and the session goes on.
+    string big = "";
+    isize n = 0;
+    while (n < 10000) { big = big.concat(other: "1234567\n"); n = n + 1; }   // 80 000 bytes: more than one flush
+    DynamicArray<Step> s3 = opening();
+    Wire g3 = Wire.make(); g3.copyResponse(tag: 71ui8);
+    s3.add(item: statement(sql: copyIn, reply: give g3));
+    Wire bad = Wire.make(); bad.report(tag: 69ui8, severity: "ERROR", code: "22P02", message: "invalid input syntax for type integer"); bad.ready(status: 73ui8);
+    s3.add(item: Step::Expect(tag: COPY_DATA, body: "", then: bad.bytes()));
+    s3.add(item: statement(sql: "select 1", reply: ending(tag: "SELECT 0")));
+    Result<Connection, PgError> m3 = scripted(steps: give s3);
+    match (give m3) {
+        case Ok(value: x): {
+            Connection e = give x;
+            Result<CopyInfo, PgError> st = e.startCopyIn(sql: copyIn);
+            Result<Unit, PgError> put = e.putCopyData(bytes: big.bytes());
+            bool invalid = match (put) { case Ok(value: u): false; case Err(error: x): x.sqlstate() == INVALID_TEXT_REPRESENTATION; };
+            f = f + check(ok: invalid && e.transactionStatus() == TransactionStatus::Idle, what: "copy: the server's error ends the COPY while data goes out");
+            Result<DynamicArray<Rows>, PgError> next = e.simpleQuery(sql: "select 1");
+            f = f + check(ok: match (next) { case Ok(value: r): true; case Err(error: x): false; }, what: "copy: the session goes on after a failed COPY");
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "copy: connect 3"); }
+    };
+
+    // COPY TO STDOUT: each piece as it arrives, then Done with the count; an error part-way ends it.
+    DynamicArray<Step> s4 = opening();
+    Wire sent = Wire.make(); sent.copyResponse(tag: 72ui8); sent.copyData(data: "1\n"); sent.copyData(data: "2\n"); sent.copyDone(); sent.complete(tag: "COPY 2"); sent.ready(status: 73ui8);
+    s4.add(item: statement(sql: copyOut, reply: give sent));
+    Wire broken = Wire.make(); broken.copyResponse(tag: 72ui8); broken.copyData(data: "1\n"); broken.report(tag: 69ui8, severity: "ERROR", code: "XX000", message: "it broke"); broken.ready(status: 73ui8);
+    s4.add(item: statement(sql: copyOut, reply: give broken));
+    Result<Connection, PgError> m4 = scripted(steps: give s4);
+    match (give m4) {
+        case Ok(value: x): {
+            Connection g = give x;
+            Result<CopyInfo, PgError> st = g.startCopyOut(sql: copyOut);
+            Result<CopyChunk, PgError> a = g.getCopyData();
+            Result<CopyChunk, PgError> b = g.getCopyData();
+            Result<CopyChunk, PgError> z = g.getCopyData();
+            string seq = chunkText(r: a).concat(other: " ").concat(other: chunkText(r: b)).concat(other: " ").concat(other: chunkText(r: z));
+            f = f + check(ok: seq.equals(other: "data:310a data:320a done:2"), what: "copy: COPY TO STDOUT, piece by piece, then the count (".concat(other: seq).concat(other: ")"));
+            Result<CopyInfo, PgError> st2 = g.startCopyOut(sql: copyOut);
+            Result<CopyChunk, PgError> a2 = g.getCopyData();
+            Result<CopyChunk, PgError> b2 = g.getCopyData();
+            string broke = chunkText(r: b2);
+            f = f + check(ok: broke.contains(substring: "it broke") && g.transactionStatus() == TransactionStatus::Idle, what: "copy: an error part-way ends the COPY (".concat(other: broke).concat(other: ")"));
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "copy: connect 4"); }
+    };
+
+    // The wrong direction is ended at once; a statement that is no COPY runs, and is refused.
+    DynamicArray<Step> s5 = opening();
+    Wire g5 = Wire.make(); g5.copyResponse(tag: 71ui8);
+    s5.add(item: statement(sql: copyIn, reply: give g5));
+    Wire cancelled = Wire.make(); cancelled.report(tag: 69ui8, severity: "ERROR", code: "57014", message: "COPY from stdin failed"); cancelled.ready(status: 73ui8);
+    s5.add(item: Step::Expect(tag: COPY_FAIL, body: "", then: cancelled.bytes()));
+    Wire rows = Wire.make();
+    DynamicArray<string> names = DynamicArray.empty(); names.add(item: "x");
+    DynamicArray<string> vals = DynamicArray.empty(); vals.add(item: "1");
+    rows.columns(names: names); rows.row(values: vals); rows.complete(tag: "SELECT 1"); rows.ready(status: 73ui8);
+    s5.add(item: statement(sql: "select 1", reply: give rows));
+    Result<Connection, PgError> m5 = scripted(steps: give s5);
+    match (give m5) {
+        case Ok(value: x): {
+            Connection h = give x;
+            Result<CopyInfo, PgError> wrong = h.startCopyOut(sql: copyIn);
+            string w = match (wrong) { case Ok(value: i): "(started)"; case Err(error: e): e.message(); };
+            f = f + check(ok: w.equals(other: "the statement did not start a COPY TO STDOUT") && h.transactionStatus() == TransactionStatus::Idle, what: "copy: the other direction is ended and refused (".concat(other: w).concat(other: ")"));
+            Result<CopyInfo, PgError> none = h.startCopyIn(sql: "select 1");
+            string nw = match (none) { case Ok(value: i): "(started)"; case Err(error: e): e.message(); };
+            f = f + check(ok: nw.equals(other: "the statement did not start a COPY FROM STDIN"), what: "copy: a statement that is no COPY (".concat(other: nw).concat(other: ")"));
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "copy: connect 5"); }
+    };
+
+    // The std::io helpers: a Reader's bytes in, a Writer's out.
+    DynamicArray<Step> s6 = opening();
+    Wire g6 = Wire.make(); g6.copyResponse(tag: 71ui8);
+    s6.add(item: statement(sql: copyIn, reply: give g6));
+    s6.add(item: data(text: "1\tone\n2\ttwo\n"));
+    s6.add(item: Step::Expect(tag: COPY_DONE, body: "", then: ending(tag: "COPY 2").bytes()));
+    Wire out6 = Wire.make(); out6.copyResponse(tag: 72ui8); out6.copyData(data: "1\tone\n"); out6.copyData(data: "2\ttwo\n"); out6.copyDone(); out6.complete(tag: "COPY 2"); out6.ready(status: 73ui8);
+    s6.add(item: statement(sql: copyOut, reply: give out6));
+    Result<Connection, PgError> m6 = scripted(steps: give s6);
+    match (give m6) {
+        case Ok(value: x): {
+            Connection k = give x;
+            SliceReader source = SliceReader.make(src: "1\tone\n2\ttwo\n");
+            Result<Optional<int64>, PgError> copied = k.copyFrom(sql: copyIn, source: source);
+            f = f + check(ok: shown(r: copied).equals(other: "2 rows"), what: "copy: copyFrom a Reader (".concat(other: shown(r: copied)).concat(other: ")"));
+            StringWriter sink = StringWriter.make();
+            Result<Optional<int64>, PgError> written = k.copyTo(sql: copyOut, sink: sink);
+            string text = sink.finish();
+            f = f + check(ok: shown(r: written).equals(other: "2 rows") && text.equals(other: "1\tone\n2\ttwo\n"), what: "copy: copyTo a Writer (".concat(other: text).concat(other: ")"));
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "copy: connect 6"); }
+    };
+    return f;
+}

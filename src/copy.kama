@@ -1,0 +1,29 @@
+import { std::collections::DynamicArray, postgres::protocol::CopyFormats };
+export { CopyInfo, CopyChunk };
+
+// COPY's data: what a COPY's response said about the data, and what reading a COPY TO STDOUT gives.
+
+// The formats a COPY uses, from its CopyInResponse or CopyOutResponse (libpq's PQbinaryTuples, PQnfields and PQfformat
+// for a COPY result): binary or text (text includes CSV), and each column's format.
+type resource CopyInfo implements Sendable {
+    bool binaryData = false;
+    DynamicArray<int16> formats;
+
+    ctor of(const ref CopyFormats f) {
+        this.binaryData = f.overall() == 1i8;
+        this.formats = DynamicArray.empty();
+        isize i = 0;
+        while (i < f.columnCount()) { this.formats.add(item: f.columnFormat(i: i)); i = i + 1; }
+    }
+    friend postgres::Connection::startCopy[of];
+
+    // The data is COPY's binary format rather than text or CSV.
+    public const fn bool isBinary() { return this.binaryData; }
+    public const fn isize columnCount() { return this.formats.length(); }
+    // 0 text, 1 binary.
+    public const fn int16 columnFormat(isize index) { return this.formats[index]; }
+}
+
+// One read of a COPY TO STDOUT: the next piece of data (the server sends a row per message: a line of text or CSV, or
+// a binary tuple), or the end, with the number of rows the COPY reported.
+type enum CopyChunk implements Sendable { Data(DynamicArray<uint8> bytes), Done(Optional<int64> rows) }

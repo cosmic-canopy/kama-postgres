@@ -144,6 +144,11 @@ try fail "ssl-only role without TLS"     "$B user=kp_ssl_only sslmode=disable" k
 try ok   "nossl role without TLS"        "$B user=kp_nossl sslmode=disable" kp_nossl_pw
 try fail "nossl role over TLS"           "$B user=kp_nossl sslmode=require" kp_nossl_pw
 try fail "wrong password"                "$B user=kp_scram sslmode=disable" wrong
+try ok   "client certificate required"   "$B user=kp_cert sslmode=require sslcertmode=require sslcert=/certs/client.crt sslkey=/tmp/client.key"
+try fail "client certificate not sent"   "$B user=kp_scram sslmode=require sslcertmode=require" kp_scram_pw
+if [ "$(psql -X -A -t -q -d "$B user=kp_trust sslmode=disable" -c "show server_version_num")" -ge 170000 ]; then
+    try ok "direct TLS negotiation"      "$B user=kp_scram sslmode=require sslnegotiation=direct" kp_scram_pw
+fi
 EOF
         echo "pg.sh: smoke OK against $NAME"
         ;;

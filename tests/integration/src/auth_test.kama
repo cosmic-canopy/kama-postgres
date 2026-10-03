@@ -135,7 +135,8 @@ unsafe fn int32 requireAuthTests() {
         if (methods[i].equals(other: "password")) { role = "kp_password"; }
         if (methods[i].equals(other: "scram-sha-256")) { role = "kp_scram"; }
         if (methods[i].equals(other: "md5")) { role = "kp_md5_scram"; }
-        string conninfo = conninfoFor(user: role);
+        // Upstream's cases ran without TLS: over TLS the mechanism libpq names is SCRAM-SHA-256-PLUS.
+        string conninfo = plainConninfoFor(user: role);
         string pw = passwordFor(user: role);
         if (pw.length() > 0) { conninfo = conninfo.concat(other: " password=").concat(other: pw); }
         conninfo = conninfo.concat(other: " ").concat(other: settings[i]);

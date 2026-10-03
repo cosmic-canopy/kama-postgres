@@ -3,8 +3,10 @@
 // view in pg_stat_ssl; verification by chain and by name; channel binding by authentication method; and the
 // protocol and key size against what the server negotiated. Where libpq's message is its own, it is compared
 // exactly; where it quotes the TLS library, its frame is.
-import { std::collections::DynamicArray, std::fs::exists,
-         postgres::Connection, postgres::PgError,
+import { std::collections::DynamicArray, std::collections::FixedArray, std::fs::exists, std::io::IoError, std::io::writeAll,
+         std::net::TcpStream, std::time::Duration, std::time::sleep,
+         tls::TlsConfig, tls::TlsStream, tls::TlsError, tls::Verify, tls::Progress,
+         postgres::Connection, postgres::PgError, postgres::Rows,
          postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::conninfoFor,
          postgres_integration_tests::passwordFor, postgres_integration_tests::open, postgres_integration_tests::scalar };
 export { tlsTests };
@@ -193,8 +195,114 @@ unsafe fn int32 attributeTests() {
     return f;
 }
 
+// sslnegotiation=direct: TLS from the first byte, ALPN "postgresql" agreed, from PostgreSQL 17. An older server reads
+// the ClientHello as a startup packet, and hangs up.
+unsafe fn int32 directTests() {
+    string version = setting(name: "PGTEST_VERSION");
+    bool old = version.equals(other: "14") || version.equals(other: "15") || version.equals(other: "16");
+    string scram = "kp_scram";
+    string direct = "sslmode=require sslnegotiation=direct";
+    if (old) {
+        return fails(user: scram, extra: direct, parts: one(a: "SSL SYSCALL error: EOF detected"), leads: 1,
+                     what: "tls direct: PostgreSQL ".concat(other: version).concat(other: " hangs up on a ClientHello"));
+    }
+    int32 f = connects(user: scram, extra: direct, encrypted: true, what: "tls direct");
+    Result<Connection, PgError> opened = open(conninfo: with(user: scram, extra: direct));
+    match (give opened) {
+        case Ok(value: c): {
+            Optional<string> a = c.sslAttribute(name: "alpn");
+            bool pg = match (give a) { case Some(value: v): v.equals(other: "postgresql"); case None: false; };
+            f = f + check(ok: pg, what: "tls direct: ALPN postgresql");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "tls direct: connects again"); }
+    };
+    return f;
+}
+
+// The length of the tls-server-end-point hash of the certificate the server serves now, read by a raw @kama/tls
+// handshake (an SSLRequest, then TLS): 32 for a SHA-256 signature, 48 for SHA-384; -1 when it cannot be read.
+unsafe fn isize endPointLength() {
+    string host = setting(name: "PGTEST_HOST");
+    Result<int32, PgError> parsed = Result::Err(error: PgError::Closed);
+    string portText = setting(name: "PGTEST_PORT");
+    int32 port = 0;
+    foreach (uint8 b in portText) { port = port * 10 + cast<int32>(b - 48ui8); }
+    Result<TcpStream, IoError> c = TcpStream.connect(host: host, port: cast<uint16>(port));
+    TcpStream stream = match (give c) { case Ok(value: s): give s; case Err(error: e): { return -1; } };
+    DynamicArray<uint8> request = DynamicArray.empty();
+    request.add(item: 0ui8); request.add(item: 0ui8); request.add(item: 0ui8); request.add(item: 8ui8);
+    request.add(item: 4ui8); request.add(item: 210ui8); request.add(item: 22ui8); request.add(item: 47ui8);
+    Result<Unit, IoError> sent = writeAll(w: stream, bytes: request.view());
+    FixedArray<uint8> answer = FixedArray.make(size: 1);
+    Result<isize, IoError> read = stream.read(into: answer.viewMut());
+    bool yes = match (read) { case Ok(value: n): n == 1 && answer[0] == 83ui8; case Err(error: e): false; };
+    if (!yes) { return -1; }
+    Result<TlsConfig, TlsError> made = TlsConfig.client();
+    TlsConfig config = match (give made) { case Ok(value: x): give x; case Err(error: e): { return -1; } };
+    Result<Unit, TlsError> none = config.verify(mode: Verify::None);
+    string noName = "";
+    Result<TlsStream<TcpStream>, TlsError> opened = TlsStream::<TcpStream>.client(inner: give stream, config: config, serverName: noName);
+    TlsStream<TcpStream> tls = match (give opened) { case Ok(value: t): give t; case Err(error: e): { return -1; } };
+    Result<Progress, TlsError> shaken = tls.handshake();
+    bool done = match (give shaken) { case Ok(value: p): true; case Err(error: e): false; };
+    if (!done) { return -1; }
+    return tls.tlsServerEndPoint().length();
+}
+
+// Waits (up to 10 s) for the server to serve a certificate whose end-point hash is `length` bytes long: a reload takes
+// effect for new connections once the postmaster has read it.
+unsafe fn bool waitForEndPoint(isize length) {
+    isize tries = 0;
+    while (tries < 100) {
+        if (endPointLength() == length) { return true; }
+        sleep(d: Duration.fromMillis(ms: 100i64));
+        tries = tries + 1;
+    }
+    return false;
+}
+
+unsafe fn string superuserRun(const ref string sql) {
+    string host = setting(name: "PGTEST_HOST");
+    string port = setting(name: "PGTEST_PORT");
+    string pw = setting(name: "PGTEST_SUPERUSER_PASSWORD");
+    string conninfo = "host=".concat(other: host).concat(other: " port=").concat(other: port).concat(other: " dbname=kp_test user=postgres sslmode=disable password=").concat(other: pw);
+    Result<Connection, PgError> opened = open(conninfo: conninfo);
+    return match (give opened) {
+        case Ok(value: c): {
+            Connection conn = give c;
+            Result<DynamicArray<Rows>, PgError> r = conn.simpleQuery(sql: sql);
+            return match (give r) { case Ok(value: v): ""; case Err(error: e): e.message(); };
+        }
+        case Err(error: e): e.message();
+    };
+}
+
+// SCRAM-SHA-256-PLUS against a certificate signed with SHA-384: its tls-server-end-point hash is SHA-384 (RFC 5929),
+// which the server computes on its side; channel_binding=require logs in only if both agree. The server's certificate
+// is switched as upstream's switch_server_cert switches it (ALTER SYSTEM and a reload), and always put back.
+unsafe fn int32 sha384BindingTests() {
+    int32 f = 0;
+    string a = superuserRun(sql: "ALTER SYSTEM SET ssl_cert_file = 'server-sha384.crt'");
+    string b = superuserRun(sql: "ALTER SYSTEM SET ssl_key_file = 'server-sha384.key'");
+    string c = superuserRun(sql: "SELECT pg_reload_conf()");
+    f = f + check(ok: a.length() == 0 && b.length() == 0 && c.length() == 0, what: "tls sha384: the server's certificate is switched (".concat(other: a).concat(other: b).concat(other: c).concat(other: ")"));
+    bool switched = waitForEndPoint(length: 48);
+    f = f + check(ok: switched, what: "tls sha384: the server serves the SHA-384 certificate (a 48-byte end-point hash)");
+    if (switched) {
+        string scram = "kp_scram";
+        f = f + connects(user: scram, extra: "sslmode=require channel_binding=require", encrypted: true, what: "tls sha384: channel_binding=require binds with SHA-384");
+    }
+    string ra = superuserRun(sql: "ALTER SYSTEM RESET ssl_cert_file");
+    string rb = superuserRun(sql: "ALTER SYSTEM RESET ssl_key_file");
+    string rc = superuserRun(sql: "SELECT pg_reload_conf()");
+    f = f + check(ok: waitForEndPoint(length: 32), what: "tls sha384: the server's own certificate is back");
+    return f;
+}
+
 unsafe fn int32 tlsTests() {
     int32 f = 0;
+    f = f + directTests();
+    f = f + sha384BindingTests();
     f = f + matrixTests();
     f = f + verificationTests();
     f = f + channelBindingTests();

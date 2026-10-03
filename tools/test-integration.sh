@@ -1,5 +1,6 @@
 #!/bin/sh
-# test-integration.sh — the live tests (tests/integration) against each supported PostgreSQL, debug and release.
+# test-integration.sh — the live tests (tests/integration) against each supported PostgreSQL, debug and release, and
+# then once more in release over TLS (PGTEST_SSLMODE=require), so every query path runs encrypted too.
 #
 #   tools/test-integration.sh                    every version: 14 15 16 17 18 19
 #   tools/test-integration.sh --version 18 …     the versions named
@@ -39,6 +40,9 @@ for v in $VERSIONS; do
         echo "== PostgreSQL $v ($mode)"
         if ( set -a; . "$ROOT/out/pgtest-$v.env"; set +a; PGTEST_TMP="$work" PGTEST_SOCKDIR="$sockets" "$tmp/integration$mode" ); then :; else failed="$failed $v$mode"; fi
     done
+    work="$tmp/work-$v-tls"; mkdir -p "$work/home"
+    echo "== PostgreSQL $v (--release, sslmode=require)"
+    if ( set -a; . "$ROOT/out/pgtest-$v.env"; set +a; PGTEST_SSLMODE=require PGTEST_TMP="$work" PGTEST_SOCKDIR="$sockets" "$tmp/integration--release" ); then :; else failed="$failed $v-tls"; fi
     [ "$DOWN" = 1 ] && "$ROOT/tools/pg.sh" down --version "$v" >/dev/null
 done
 if [ -n "$failed" ]; then echo "test-integration.sh: FAILED on$failed" >&2; exit 1; fi

@@ -1,0 +1,43 @@
+// load_balance_hosts on a real server and its hot standby (tools/pg.sh), as 003_load_balance_host_list.pl runs it on
+// three nodes (tests/unit/src/lb_test.kama replays those cases): disable always takes the first host listed, and random
+// reaches both, which pg_is_in_recovery() tells apart.
+import { postgres::Connection, postgres::PgError,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::open,
+         postgres_integration_tests::scalar };
+export { lbTests };
+
+// pg_is_in_recovery() on the server a connect reaches, or the connect's error.
+unsafe fn string landed(const ref string balance) {
+    string port = setting(name: "PGTEST_PORT");
+    string standbyPort = setting(name: "PGTEST_STANDBY_PORT");
+    string conninfo = "host=127.0.0.1,127.0.0.1 port=".concat(other: port).concat(other: ",").concat(other: standbyPort)
+                      .concat(other: " user=kp_trust dbname=kp_test sslmode=disable load_balance_hosts=").concat(other: balance);
+    Result<Connection, PgError> opened = open(conninfo: conninfo);
+    return match (give opened) {
+        case Ok(value: c): { Connection conn = give c; := scalar(c: conn, sql: "select pg_is_in_recovery()"); }
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn int32 lbTests() {
+    int32 f = 0;
+    isize primary = 0; isize standby = 0;
+    isize i = 0;
+    while (i < 5) {
+        string got = landed(balance: "disable");
+        if (got.equals(other: "f")) { primary = primary + 1; }
+        i = i + 1;
+    }
+    f = f + check(ok: primary == 5, what: "lb: disable connects to the first host every time (${primary} of 5)");
+    primary = 0;
+    isize other = 0;
+    i = 0;
+    while (i < 50) {
+        string got = landed(balance: "random");
+        if (got.equals(other: "f")) { primary = primary + 1; } else if (got.equals(other: "t")) { standby = standby + 1; }
+        else { other = other + 1; }
+        i = i + 1;
+    }
+    f = f + check(ok: primary > 0 && standby > 0 && other == 0, what: "lb: random reaches the primary and the standby (${primary}, ${standby}, ${other} failed)");
+    return f;
+}

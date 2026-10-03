@@ -1,0 +1,70 @@
+// load_balance_hosts against scripted servers, as PostgreSQL's 003_load_balance_host_list.pl runs it
+// (session_vectors.kama, from tools/gen-session-vectors.sh): three nodes, a value refused with libpq's words,
+// disable taking the first node, random spreading its connections over every node, and both falling through to the
+// one node left up.
+import { std::collections::DynamicArray, std::memory::Owned, std::io::IoError, std::io::IoErrorKind,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Transport,
+         postgres::Dialer, postgres::DialTarget,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::welcomeOf,
+         postgres_unit_tests::lbRefusedValue, postgres_unit_tests::lbRefusedMessage, postgres_unit_tests::lbRandomConnections,
+         postgres_unit_tests::lbFloor, postgres_unit_tests::lbFallThroughConnections };
+export { lbTests };
+
+// Nodes 1 to 3 at ports 5432 to 5434; a node marked down refuses, as a stopped server's port does.
+type resource NodeDialer implements Dialer, Sendable {
+    bool firstTwoDown = false;
+    public ctor make(bool firstTwoDown) { this.firstTwoDown = firstTwoDown; }
+    public unsafe fn Result<Owned<Transport>, IoError> dial(const ref DialTarget target, int32 timeoutMs) {
+        string node = "node1";
+        if (target.port().equals(other: "5433")) { node = "node2"; }
+        if (target.port().equals(other: "5434")) { node = "node3"; }
+        if (this.firstTwoDown && !node.equals(other: "node3")) { return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused)); }
+        DynamicArray<Step> steps = DynamicArray.empty();
+        steps.add(item: Step::Send(bytes: welcomeOf(name: node, reports: true)));
+        Owned<Transport> server = new FakeServer.make(steps: give steps, chunk: 64, writeLimit: 64);
+        return Result::Ok(value: give server);
+    }
+}
+
+// The node a connect with `balance` reaches, or its error.
+unsafe fn string reached(const ref string balance, bool firstTwoDown) {
+    Environment env = testEnvironment();
+    string conninfo = "host=h1,h2,h3 hostaddr=127.0.0.1,127.0.0.2,127.0.0.3 port=5432,5433,5434 user=u dbname=d sslmode=disable load_balance_hosts=".concat(other: balance);
+    Result<Config, PgError> c = resolveWith(text: conninfo, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+    Owned<Dialer> dialer = new NodeDialer.make(firstTwoDown: firstTwoDown);
+    Result<Connection, PgError> opened = Connection.connectWith(dialer: give dialer, config: config);
+    return match (opened) {
+        case Ok(value: conn): match (conn.parameter(name: "kp_node")) { case Some(value: n): copy n; case None: "(unnamed)"; };
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn int32 lbTests() {
+    int32 f = 0;
+    string refused = reached(balance: lbRefusedValue(), firstTwoDown: false);
+    f = f + check(ok: refused.equals(other: lbRefusedMessage()), what: "lb: an unknown value, in libpq's words (".concat(other: refused).concat(other: ")"));
+    string first = reached(balance: "disable", firstTwoDown: false);
+    f = f + check(ok: first.equals(other: "node1"), what: "lb: disable connects to the first node (".concat(other: first).concat(other: ")"));
+    isize a = 0; isize b = 0; isize c3 = 0; isize other = 0;
+    isize i = 0;
+    while (i < lbRandomConnections()) {
+        string node = reached(balance: "random", firstTwoDown: false);
+        if (node.equals(other: "node1")) { a = a + 1; } else if (node.equals(other: "node2")) { b = b + 1; }
+        else if (node.equals(other: "node3")) { c3 = c3 + 1; } else { other = other + 1; }
+        i = i + 1;
+    }
+    isize floor = lbFloor();
+    f = f + check(ok: a > floor && b > floor && c3 > floor && other == 0, what: "lb: random spreads its connections over every node (${a}, ${b}, ${c3})");
+    string fallen = reached(balance: "disable", firstTwoDown: true);
+    f = f + check(ok: fallen.equals(other: "node3"), what: "lb: disable goes on until a node answers (".concat(other: fallen).concat(other: ")"));
+    isize third = 0;
+    i = 0;
+    while (i < lbFallThroughConnections()) {
+        if (reached(balance: "random", firstTwoDown: true).equals(other: "node3")) { third = third + 1; }
+        i = i + 1;
+    }
+    f = f + check(ok: third == lbFallThroughConnections(), what: "lb: random goes on until a node answers (${third})");
+    return f;
+}

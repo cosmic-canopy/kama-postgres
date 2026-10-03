@@ -9,7 +9,7 @@ import { std::collections::DynamicArray, std::memory::Owned, std::io::IoError, s
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire,
          postgres_unit_tests::tsaFirst, postgres_unit_tests::tsaSecond, postgres_unit_tests::tsaMode, postgres_unit_tests::tsaReached };
-export { tsaTests };
+export { tsaTests, welcomeOf };
 
 // The welcome of node `name` (primary, standby1, standby2), reporting its role when `reports`, and its name always
 // (as the parameter kp_node), so a test can tell which it reached.

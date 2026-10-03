@@ -4,7 +4,8 @@
 // Case i: the nodes listed (tsaFirst, tsaSecond: primary, standby1 or standby2), target_session_attrs (tsaMode), and
 // the node the connect must reach (tsaReached), "" where it must fail.
 import { std::collections::DynamicArray };
-export { tsaFirst, tsaSecond, tsaMode, tsaReached };
+export { tsaFirst, tsaSecond, tsaMode, tsaReached, lbRefusedValue, lbRefusedMessage, lbRandomConnections, lbFloor,
+         lbFallThroughConnections };
 
 fn DynamicArray<string> tsaFirst() {
     DynamicArray<string> v = DynamicArray.empty();
@@ -93,3 +94,10 @@ fn DynamicArray<string> tsaReached() {
     v.add(item: "");
     return v;
 }
+
+// 003_load_balance_host_list.pl.
+fn string lbRefusedValue() { return "doesnotexist"; }
+fn string lbRefusedMessage() { return "invalid load_balance_hosts value: \"doesnotexist\""; }
+fn isize lbRandomConnections() { return 50; }
+fn isize lbFloor() { return 1; }
+fn isize lbFallThroughConnections() { return 5; }

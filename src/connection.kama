@@ -1,7 +1,7 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::validate,
          std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error, std::io::IoError, std::io::IoErrorKind,
          std::memory::Owned, std::net::SocketAddr, std::net::IpAddr, std::net::resolve, std::net::parseIp,
-         std::time::Duration,
+         std::time::Duration, std::random::Rng, std::random::shuffle,
          postgres::PgError, postgres::ServerError, postgres::ConnectError, postgres::ConnectAttempt,
          postgres::Config, postgres::HostKind, postgres::ChannelBindingMode, postgres::RequireAuth,
          postgres::Transport, postgres::socketPathMax,
@@ -241,31 +241,43 @@ type resource Connection implements Sendable {
         bool secondPass = match (config.sessionTarget()) { case PreferStandby: true; case _: false; };
         isize passes = 1;
         if (secondPass) { passes = 2; }
+        // load_balance_hosts=random: the hosts shuffled once per connect (both passes take the same order), and each host's
+        // addresses as they resolve, from one generator, as libpq does. libpq's Fisher-Yates runs inside out and std's from
+        // the end; both are uniform, and libpq's stream is not reproducible across processes either.
+        bool random = config.loadBalanceRandom();
+        Rng rng = Rng.seeded(seed: 0ui64);
+        if (random) { rng = Rng.fromEntropy(); }
+        DynamicArray<isize> order = DynamicArray.empty();
+        isize k = 0;
+        while (k < config.hostCount()) { order.add(item: k); k = k + 1; }
+        if (random) { shuffle(items: order.viewMut(), rng: ref rng); }
         bool stop = false;
         isize pass = 0;
         while (pass < passes && !stop) {
-        SessionTarget wanted = config.sessionTarget();
-        if (pass == 1) { wanted = SessionTarget::Any; }
-        Errand errand = Errand.session(target: wanted);
-        isize h = 0;
-        while (h < config.hostCount() && !stop) {
-            Result<DynamicArray<DialTarget>, PgError> listed = Connection::targetsOf(config: config, hostIndex: h, failures: failures);
-            DynamicArray<DialTarget> targets = match (give listed) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
-            bool nextHost = false;
-            isize a = 0;
-            while (a < targets.length() && !stop && !nextHost) {
-                Visit v = Connection::visit(config: config, hostIndex: h, target: targets[a], opener: opener, failures: failures, errand: errand);
-                match (give v) {
-                    case Connected(connection: c): { return Result::Ok(value: give c); }
-                    case NextAddress: { }
-                    case ToNextHost: { nextHost = true; }
-                    case Stop: { stop = true; }
-                };
-                a = a + 1;
+            SessionTarget wanted = config.sessionTarget();
+            if (pass == 1) { wanted = SessionTarget::Any; }
+            Errand errand = Errand.session(target: wanted);
+            isize at = 0;
+            while (at < order.length() && !stop) {
+                isize h = order[at];
+                Result<DynamicArray<DialTarget>, PgError> listed = Connection::targetsOf(config: config, hostIndex: h, failures: failures);
+                DynamicArray<DialTarget> targets = match (give listed) { case Ok(value: t): give t; case Err(error: e): { return Result::Err(error: give e); } };
+                if (random) { shuffle(items: targets.viewMut(), rng: ref rng); }
+                bool nextHost = false;
+                isize a = 0;
+                while (a < targets.length() && !stop && !nextHost) {
+                    Visit v = Connection::visit(config: config, hostIndex: h, target: targets[a], opener: opener, failures: failures, errand: errand);
+                    match (give v) {
+                        case Connected(connection: c): { return Result::Ok(value: give c); }
+                        case NextAddress: { }
+                        case ToNextHost: { nextHost = true; }
+                        case Stop: { stop = true; }
+                    };
+                    a = a + 1;
+                }
+                at = at + 1;
             }
-            h = h + 1;
-        }
-        pass = pass + 1;
+            pass = pass + 1;
         }
         return Result::Err(error: PgError::Connect(error: give failures));
     }

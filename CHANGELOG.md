@@ -86,6 +86,9 @@ All notable changes to this package are recorded here. The format follows
   - a server of the wrong kind gets Terminate, and the connect moves to the next host, with libpq's words ("session is
     read-only", "server is not in hot standby mode", …) as `PgError::Target`;
   - prefer-standby goes round the hosts a second time for any server.
+- **`load_balance_hosts=random`**, as libpq does it: the hosts are tried in a random order, shuffled once per
+  connect, and each host's addresses are shuffled as they resolve. A value other than `disable` or `random` is refused
+  with libpq's "invalid load_balance_hosts value". Before, `random` was refused.
 - **Waiting for notifications:** `Connection.waitForNotification(timeout:)` returns the oldest LISTEN/NOTIFY
   notification already received, else the next to arrive within the time (None when none does), taking in notices
   and parameter changes on the way. libpq leaves this loop to the application (PQsocket, PQconsumeInput, PQnotifies).

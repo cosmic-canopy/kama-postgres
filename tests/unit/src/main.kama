@@ -4,7 +4,7 @@
 // not just that.
 import { core::println, postgres_unit_tests::protocolTests, postgres_unit_tests::authTests, postgres_unit_tests::conninfoTests, postgres_unit_tests::catalogTests, postgres_unit_tests::codecTests, postgres_unit_tests::errorTests, postgres_unit_tests::configTests, postgres_unit_tests::connectionTests, postgres_unit_tests::saslprepTests, postgres_unit_tests::typedTests,
          postgres_unit_tests::extendedTests, postgres_unit_tests::tlsNameTests, postgres_unit_tests::tlsTests,
-         postgres_unit_tests::negotiateTests, postgres_unit_tests::cancelTests, postgres_unit_tests::timeoutTests, postgres_unit_tests::transactionTests, postgres_unit_tests::copyTests, postgres_unit_tests::cacheTests, postgres_unit_tests::pipelineTests, postgres_unit_tests::pipelineTraceTests, postgres_unit_tests::batchTests, postgres_unit_tests::tsaTests };
+         postgres_unit_tests::negotiateTests, postgres_unit_tests::cancelTests, postgres_unit_tests::timeoutTests, postgres_unit_tests::transactionTests, postgres_unit_tests::copyTests, postgres_unit_tests::cacheTests, postgres_unit_tests::pipelineTests, postgres_unit_tests::pipelineTraceTests, postgres_unit_tests::batchTests, postgres_unit_tests::tsaTests, postgres_unit_tests::lbTests };
 export { check };
 
 fn int32 check(bool ok, string what) {
@@ -37,6 +37,7 @@ fn int32 main() {
     failed = failed + pipelineTraceTests();
     failed = failed + batchTests();
     failed = failed + tsaTests();
+    failed = failed + lbTests();
     if (failed != 0) { println(s: "postgres unit tests: ${failed} failed"); return 1; }
     println(s: "postgres unit tests: OK");
     return 0;

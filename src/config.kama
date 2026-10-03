@@ -505,6 +505,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     CacheMode cacheModeSetting = CacheMode::Statements;
     isize cacheCapacitySetting = 512;
     SessionTarget targetSetting = SessionTarget::Any;
+    bool balanceRandom = false;    // load_balance_hosts=random
 
     // A connection string, resolved under the process environment.
     public unsafe ctor Result<Config, PgError> parse(const ref string text) {
@@ -555,6 +556,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.cacheModeSetting = CacheMode::Statements;
         this.cacheCapacitySetting = 512;
         this.targetSetting = SessionTarget::Any;
+        this.balanceRandom = false;
     }
 
     public ctor copy(ref Config source) {
@@ -570,7 +572,11 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.cacheModeSetting = source.cacheModeSetting;
         this.cacheCapacitySetting = source.cacheCapacitySetting;
         this.targetSetting = source.targetSetting;
+        this.balanceRandom = source.balanceRandom;
     }
+
+    // load_balance_hosts=random: the hosts are tried in a random order, and each host's addresses too.
+    public const fn bool loadBalanceRandom() { return this.balanceRandom; }
 
     // target_session_attrs.
     public const fn SessionTarget sessionTarget() { return this.targetSetting; }
@@ -827,10 +833,9 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         match (give keys) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
 
         string balance = this.text(keyword: "load_balance_hosts");
-        if (balance.equals(other: "random")) {
-            return Result::Err(error: fail(detail: "load_balance_hosts value \"random\" is not supported by this client yet"));
-        }
-        if (!balance.equals(other: "disable")) { return Result::Err(error: fail(detail: invalidValue(keyword: "load_balance_hosts", value: balance))); }
+        if (balance.equals(other: "random")) { this.balanceRandom = true; }
+        else if (balance.equals(other: "disable")) { this.balanceRandom = false; }
+        else { return Result::Err(error: fail(detail: invalidValue(keyword: "load_balance_hosts", value: balance))); }
 
         Result<Unit, ConnInfoError> versions = this.protocolRange();
         match (give versions) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };

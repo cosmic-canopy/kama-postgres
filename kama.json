@@ -1,7 +1,10 @@
 {
   "name": "@kama/postgres",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT OR Apache-2.0",
+  "description": "PostgreSQL client in kama: the v3 wire protocol, libpq's connection rules, TLS, COPY, pipelining and a statement cache",
+  "repository": "https://github.com/cosmic-canopy/kama-postgres",
+  "keywords": ["postgresql", "database", "sql", "libpq", "client"],
   "kind": "library",
   "kama": ">=0.9.523",
   "dependencies": {

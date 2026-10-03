@@ -6,6 +6,12 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-03
+
+Phase 7, the full session. Needs **kama ≥ 0.9.523** and `@kama/tls` ^0.1.0. Verified on kama 0.9.523, debug and
+release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta, in plaintext and over TLS, each server with a
+hot standby.
+
 ### Added
 - **Cancel requests**, as libpq's PQcancelCreate and PQcancelBlocking make them:
   - `Connection.cancelToken()` gives a `CancelToken`, Sendable and copyable, so another isolate can cancel the
@@ -95,6 +101,7 @@ All notable changes to this package are recorded here. The format follows
 
 ### Changed
 - **Needs kama ≥ 0.9.523**, the release with the fixes for KPG-31 and KPG-32.
+- The manifest gives the registry a `description`, a `repository` and `keywords`, new in kama 0.9.523.
 - A client private key owned by root may be group-readable (0640), as libpq allows. Every other key must still be 0600
   or less. Before, with no way to read a file's owner, every key had to be 0600 or less.
 - **Breaking:** `TransactionStatus` gains `Active`, reported while a command's result is still being read, as libpq's

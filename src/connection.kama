@@ -26,7 +26,8 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          std::io::Reader, std::io::Writer, std::io::writeAll, std::collections::FixedArray,
          postgres::sqlstate::QUERY_CANCELED, postgres::sqlstate::FEATURE_NOT_SUPPORTED,
          postgres::CacheMode, postgres::session::StatementCache, postgres::session::CachedStatement,
-         postgres::protocol::describePortal as sendDescribePortal,
+         postgres::protocol::describePortal as sendDescribePortal, postgres::protocol::flush as sendFlush,
+         postgres::PipelineStatus, postgres::PipelineResult,
          postgres::protocol::BindValues,
          postgres::Query, postgres::Statement, postgres::Portal, postgres::hasBinaryCodec,
          postgres::Dialer, postgres::DialTarget, postgres::SslCertMode, postgres::sqlstate::sqlstateCode,
@@ -97,6 +98,10 @@ type resource Connection implements Sendable {
     // For a describe-only cache's run: its Parse is sent with the Bind, and the portal is described.
     bool parsePending = false;
     bool portalDescribing = false;
+    // Pipeline mode: 0 off, 1 on, 2 aborted (a command failed; the rest until the next sync were skipped), and the
+    // commands sent whose results are still to be read, oldest first.
+    uint8 pipeline = 0ui8;
+    DynamicArray<PipelineCommand> queue;
 
     ctor over(Owned<Transport> transport) {
         this.wire = Wire.over(transport: give transport);
@@ -134,6 +139,8 @@ type resource Connection implements Sendable {
         this.cachedSql = "";
         this.parsePending = false;
         this.portalDescribing = false;
+        this.pipeline = 0ui8;
+        this.queue = DynamicArray.empty();
     }
 
     // Over a transport some of whose bytes were read already: what the server sent after its 'N' to an SSLRequest.
@@ -173,6 +180,8 @@ type resource Connection implements Sendable {
         this.cachedSql = "";
         this.parsePending = false;
         this.portalDescribing = false;
+        this.pipeline = 0ui8;
+        this.queue = DynamicArray.empty();
     }
 
     // Connect as `config` says, as libpq's PQconnectPoll does: each host in order, each of its addresses in turn,
@@ -557,11 +566,11 @@ type resource Connection implements Sendable {
         bool retryable = this.txStatus == 73ui8;   // 'I': nothing has run yet that a retry could repeat
         Result<Unit, PgError> started = this.start(q: q, portal: "", run: true);
         match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true);
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true, pipelined: false);
         if (retryable && this.stalePlan(r: r)) {
             Result<Unit, PgError> again = this.start(q: q, portal: "", run: true);
             match (give again) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-            return this.readRows(limit: -1, keep: true);
+            return this.readRows(limit: -1, keep: true, pipelined: false);
         }
         return r;
     }
@@ -572,11 +581,11 @@ type resource Connection implements Sendable {
         bool retryable = this.txStatus == 73ui8;
         Result<Unit, PgError> started = this.start(q: q, portal: "", run: true);
         match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        Result<Rows, PgError> r = this.readRows(limit: -1, keep: false);
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: false, pipelined: false);
         if (retryable && this.stalePlan(r: r)) {
             Result<Unit, PgError> again = this.start(q: q, portal: "", run: true);
             match (give again) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-            r = this.readRows(limit: -1, keep: false);
+            r = this.readRows(limit: -1, keep: false, pipelined: false);
         }
         return match (give r) { case Ok(value: rows): Result::Ok(value: rows.rowsAffected()); case Err(error: e): Result::Err(error: give e); };
     }
@@ -633,14 +642,14 @@ type resource Connection implements Sendable {
         if (!this.streaming) { return Result::Err(error: PgError::Usage(detail: "no rows are being read: startRows begins")); }
         if (maxRows < 1) { return Result::Err(error: PgError::Usage(detail: "nextRows needs maxRows of 1 or more")); }
         this.arm();
-        return this.readRows(limit: maxRows, keep: true);
+        return this.readRows(limit: maxRows, keep: true, pipelined: false);
     }
 
     // Read the rest of the rows and drop them, so the connection is free again.
     public unsafe fn Result<Unit, PgError> discardRows() {
         if (!this.streaming) { return Result::Ok(value: Unit::Unit); }
         this.arm();
-        Result<Rows, PgError> r = this.readRows(limit: -1, keep: false);
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: false, pipelined: false);
         return match (give r) { case Ok(value: rows): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
     }
 
@@ -662,7 +671,7 @@ type resource Connection implements Sendable {
         match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         this.portals = this.portals + 1i64;
         DynamicArray<FieldDescription> fields = copy this.openFields;
-        Result<Rows, PgError> bound = this.readRows(limit: -1, keep: false);
+        Result<Rows, PgError> bound = this.readRows(limit: -1, keep: false, pipelined: false);
         match (give bound) { case Ok(value: r): { } case Err(error: e): { return Result::Err(error: give e); } };
         return Result::Ok(value: Portal.make(name: give name, fields: give fields));
     }
@@ -683,7 +692,7 @@ type resource Connection implements Sendable {
         this.bindPending = false;
         this.rowLimited = maxRows > 0;
         this.busy = true;
-        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true);
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true, pipelined: false);
         bool finished = match (r) { case Ok(value: rows): !rows.suspended(); case Err(error: e): false; };
         if (finished) { portal.finish(); }
         return r;
@@ -780,6 +789,278 @@ type resource Connection implements Sendable {
     unsafe fn Result<Unit, PgError> command(const ref string sql) {
         Result<DynamicArray<Rows>, PgError> r = this.simpleQuery(sql: sql);
         return match (give r) { case Ok(value: rows): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
+    }
+
+    // ---- pipeline mode ----
+
+    // libpq's PQpipelineStatus.
+    public const fn PipelineStatus pipelineStatus() {
+        if (this.pipeline == 1ui8) { return PipelineStatus::On; }
+        if (this.pipeline == 2ui8) { return PipelineStatus::Aborted; }
+        return PipelineStatus::Off;
+    }
+
+    // PQenterPipelineMode: from now on commands are sent without waiting (sendQuery, sendPrepare, …) and their results
+    // read with getResult; synchronous calls are refused until exitPipelineMode. Entering again does nothing.
+    public fn Result<Unit, PgError> enterPipelineMode() {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.pipeline != 0ui8) { return Result::Ok(value: Unit::Unit); }
+        if (this.busy || this.streaming || this.copyMode != 0ui8) { return Result::Err(error: PgError::Usage(detail: "cannot enter pipeline mode, connection not idle")); }
+        this.pipeline = 1ui8;
+        this.outbox.clear();
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // PQexitPipelineMode: only once every result has been read.
+    public unsafe fn Result<Unit, PgError> exitPipelineMode() {
+        if (this.pipeline == 0ui8) { return Result::Ok(value: Unit::Unit); }
+        if (this.queue.length() > 0) { return Result::Err(error: PgError::Usage(detail: "cannot exit pipeline mode with uncollected results")); }
+        this.pipeline = 0ui8;
+        if (this.outbox.view().length() > 0) { return this.flush(deadline: Deadline.none()); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Queue `q` (PQsendQueryParams, PQsendQueryPrepared). A prepared statement's query, or one the statement cache
+    // knows, goes as it would outside a pipeline, its parameters typed. Any other goes as PQsendQueryParams sends it:
+    // the unnamed statement with no types, its parameters as text, its portal described, its columns as text.
+    public unsafe fn Result<Unit, PgError> sendQuery(const ref Query q) {
+        Result<Unit, PgError> ok = this.pipelined();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        if (q.problem().length() > 0) { return Result::Err(error: PgError::Value(detail: copy q.problem())); }
+        if (q.parameterCount() > 65535) { return Result::Err(error: PgError::Usage(detail: "number of parameters must be between 0 and 65535")); }
+        this.queueCloses();
+        PipelineCommand command = PipelineCommand.query(sql: copy q.sql());
+        Optional<Described> known = this.knownShape(q: q);
+        string unnamed = "";
+        match (give known) {
+            case Some(value: shape): {
+                BindValues params = q.encoded(types: shape.types());
+                DynamicArray<int16> formats = DynamicArray.withCapacity(capacity: shape.fields().length());
+                DynamicArray<FieldDescription> columns = DynamicArray.withCapacity(capacity: shape.fields().length());
+                isize i = 0;
+                while (i < shape.fields().length()) {
+                    int16 format = 0i16;
+                    if (hasBinaryCodec(oid: shape.fields()[i].typeOid())) { format = 1i16; }
+                    formats.add(item: format);
+                    columns.add(item: shape.fields()[i].withFormat(format: format));
+                    i = i + 1;
+                }
+                if (shape.reparse()) {
+                    if (!sendParse(w: this.outbox, name: shape.name(), sql: shape.sql(), params: params)) { return Result::Err(error: nulInQuery()); }
+                    command.expectParse();
+                }
+                if (!sendBind(w: this.outbox, portal: unnamed, statement: shape.name(), params: params, resultFormats: formats)) { return Result::Err(error: nulInQuery()); }
+                if (shape.reparse()) { bool d = sendDescribePortal(w: this.outbox, name: unnamed); command.expectPortalDescription(); }
+                command.useColumns(fields: give columns, cached: shape.reparse() || this.fromCache);
+            }
+            case None: {
+                BindValues none = BindValues.make();
+                BindValues params = q.encoded(types: DynamicArray.empty());
+                if (!sendParse(w: this.outbox, name: unnamed, sql: q.sql(), params: none)) { return Result::Err(error: nulInQuery()); }
+                DynamicArray<int16> text = DynamicArray.empty();
+                text.add(item: 0i16);
+                if (!sendBind(w: this.outbox, portal: unnamed, statement: unnamed, params: params, resultFormats: text)) { return Result::Err(error: nulInQuery()); }
+                bool d = sendDescribePortal(w: this.outbox, name: unnamed);
+                command.expectParse();
+                command.expectPortalDescription();
+            }
+        };
+        bool e = sendExecute(w: this.outbox, portal: unnamed, maxRows: 0);
+        this.queue.add(item: give command);
+        return this.flushPast(bytes: PIPELINE_FLUSH);
+    }
+
+    // Queue a Parse of `sql` as a named statement, and its Describe (PQsendPrepare and PQsendDescribePrepared in one):
+    // its result is the Statement.
+    public unsafe fn Result<Unit, PgError> sendPrepare(const ref string sql) {
+        Result<Unit, PgError> ok = this.pipelined();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        int64 n = this.statements;
+        this.statements = this.statements + 1i64;
+        string name = "s${n}";
+        BindValues none = BindValues.make();
+        if (!sendParse(w: this.outbox, name: name, sql: sql, params: none)) { return Result::Err(error: nulInQuery()); }
+        bool d = sendDescribeStatement(w: this.outbox, name: name);
+        this.queue.add(item: PipelineCommand.prepare(name: give name, sql: copy sql));
+        return this.flushPast(bytes: PIPELINE_FLUSH);
+    }
+
+    // Queue a Close of `statement` (PQsendClosePrepared): its result is Closed.
+    public unsafe fn Result<Unit, PgError> sendClosePrepared(Statement statement) {
+        Result<Unit, PgError> ok = this.pipelined();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        bool framed = sendCloseStatement(w: this.outbox, name: statement.name());
+        this.queue.add(item: PipelineCommand.close());
+        return this.flushPast(bytes: PIPELINE_FLUSH);
+    }
+
+    // PQpipelineSync: a sync point, and everything queued is sent. Its result is Sync, after the results before it.
+    public unsafe fn Result<Unit, PgError> pipelineSync() {
+        Result<Unit, PgError> queued = this.sendPipelineSync();
+        match (give queued) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.flush(deadline: this.due);
+    }
+
+    // PQsendPipelineSync: a sync point, sent with the next flush (or once enough is queued).
+    public unsafe fn Result<Unit, PgError> sendPipelineSync() {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.pipeline == 0ui8) { return Result::Err(error: PgError::Usage(detail: "cannot send pipeline when not in pipeline mode")); }
+        sendSync(w: this.outbox);
+        this.queue.add(item: PipelineCommand.sync());
+        return this.flushPast(bytes: PIPELINE_FLUSH);
+    }
+
+    // PQsendFlushRequest: ask the server to send what it has for the commands so far, without a sync point; and send
+    // everything queued.
+    public unsafe fn Result<Unit, PgError> sendFlushRequest() {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.pipeline == 0ui8) { return Result::Err(error: PgError::Usage(detail: "sendFlushRequest asks for a pipeline's results: enterPipelineMode begins one")); }
+        sendFlush(w: this.outbox);
+        return this.flush(deadline: this.due);
+    }
+
+    // The next result, in the order the commands were sent (PQgetResult), or None when none is pending. Commands up to
+    // the next sync after one that failed are Aborted, and nothing is read for them. Anything still queued is sent
+    // first; a result needs a sync point or a flush request after its command, or the server keeps it.
+    public unsafe fn Result<Optional<PipelineResult>, PgError> getResult() {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.pipeline == 0ui8) { return Result::Err(error: PgError::Usage(detail: "getResult reads a pipeline's results: enterPipelineMode begins one")); }
+        if (this.queue.length() == 0) { return Result::Ok(value: Optional::None); }
+        this.arm();
+        if (this.outbox.view().length() > 0) {
+            Result<Unit, PgError> sent = this.flush(deadline: this.due);
+            match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        }
+        PipelineCommand head = this.queue.remove(index: 0);
+        if (this.pipeline == 2ui8 && !head.isSync()) { return Result::Ok(value: Optional::Some(value: PipelineResult::Aborted)); }
+        if (head.isSync()) {
+            Result<Unit, PgError> synced = this.readSync();
+            match (give synced) {
+                case Ok(value: u): { }
+                case Err(error: e): {
+                    if (this.live) { this.queue.insertAt(index: 0, item: PipelineCommand.sync()); }
+                    return this.failedInPipeline(e: give e);
+                }
+            };
+            this.pipeline = 1ui8;
+            return Result::Ok(value: Optional::Some(value: PipelineResult::Sync));
+        }
+        if (head.isClose()) {
+            Result<Unit, PgError> closed = this.readClose();
+            return match (give closed) {
+                case Ok(value: u): Result::Ok(value: Optional::Some(value: PipelineResult::Closed));
+                case Err(error: e): this.failedInPipeline(e: give e);
+            };
+        }
+        if (head.isPrepare()) {
+            Result<Statement, PgError> made = this.readPrepared(name: head.name(), sql: head.sql());
+            return match (give made) {
+                case Ok(value: st): Result::Ok(value: Optional::Some(value: PipelineResult::Prepared(statement: give st)));
+                case Err(error: e): this.failedInPipeline(e: give e);
+            };
+        }
+        this.openFields = copy head.columns();
+        this.bindPending = true;
+        this.parsePending = head.parses();
+        this.portalDescribing = head.describesPortal();
+        this.rowLimited = false;
+        this.fromCache = head.cached();
+        this.cachedSql = copy head.sql();
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true, pipelined: true);
+        return match (give r) {
+            case Ok(value: rows): Result::Ok(value: Optional::Some(value: PipelineResult::Rows(rows: give rows)));
+            case Err(error: e): this.failedInPipeline(e: give e);
+        };
+    }
+
+    // A command's error: the server's is the command's result, and the pipeline is aborted until the next sync; any
+    // other failure (the connection, the protocol) is the call's.
+    fn Result<Optional<PipelineResult>, PgError> failedInPipeline(PgError e) {
+        bool server = match (e) { case Server(error: s): true; case _: false; };
+        if (!server) { return Result::Err(error: give e); }
+        if (this.live) { this.pipeline = 2ui8; }
+        return match (give e) {
+            case Server(error: s): Result::Ok(value: Optional::Some(value: PipelineResult::Failed(error: give s)));
+            case _: Result::Err(error: PgError::Closed);
+        };
+    }
+
+    // A command can be queued: the connection is open and in pipeline mode.
+    fn Result<Unit, PgError> pipelined() {
+        if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.pipeline == 0ui8) { return Result::Err(error: PgError::Usage(detail: "sendQuery, sendPrepare and sendClosePrepared queue commands in pipeline mode: enterPipelineMode begins one")); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // What is known of `q` without asking the server: a prepared statement's description, or the cache's.
+    unsafe fn Optional<Described> knownShape(const ref Query q) {
+        this.fromCache = false;
+        if (q.isPrepared()) {
+            return Optional::Some(value: Described.make(name: copy q.statement(), types: copy q.parameterTypes(), fields: copy q.columns()));
+        }
+        CacheMode mode = this.cache.mode();
+        bool off = match (mode) { case Off: true; case _: false; };
+        if (off || !this.cache.lookup(sql: q.sql())) { return Optional::None; }
+        this.fromCache = true;
+        Described hit = Described.make(name: copy this.cache.entry(sql: q.sql()).name(), types: copy this.cache.entry(sql: q.sql()).types(),
+                                       fields: copy this.cache.entry(sql: q.sql()).columns());
+        bool named = match (mode) { case Statements: true; case _: false; };
+        if (!named) { hit.reparseAs(sql: q.sql()); }
+        return Optional::Some(value: give hit);
+    }
+
+    // Send what is queued once it passes `bytes` (libpq's pipeline flushes at its output buffer's threshold).
+    unsafe fn Result<Unit, PgError> flushPast(isize bytes) {
+        if (this.outbox.view().length() < bytes) { return Result::Ok(value: Unit::Unit); }
+        return this.flush(deadline: this.due);
+    }
+
+    // A pipeline's sync point: ReadyForQuery, and any CloseCompletes owed before it.
+    unsafe fn Result<Unit, PgError> readSync() {
+        while (true) {
+            Result<BackendMessage, PgError> received = this.receive();
+            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            if (background(m: m)) { this.absorb(m: give m); continue; }
+            match (give m) {
+                case ReadyForQuery(status: s): { this.txStatus = s; return Result::Ok(value: Unit::Unit); }
+                case CloseComplete: { if (!this.owedClose()) { return Result::Err(error: this.broken(detail: unexpected(tag: 51ui8))); } }
+                case ErrorResponse(fields: f): {
+                    // An error at the sync itself (a deferred constraint at the implicit commit): a result of its own,
+                    // before the sync's, as libpq returns it. The caller puts the sync back to be read next.
+                    ServerError e = ServerError.make(fields: give f);
+                    if (e.isFatal()) { this.lose(); }
+                    return Result::Err(error: PgError::Server(error: give e));
+                }
+                case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place at a pipeline's sync")); }
+            };
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // A pipeline's Close: CloseComplete, or an error.
+    unsafe fn Result<Unit, PgError> readClose() {
+        while (true) {
+            Result<BackendMessage, PgError> received = this.receive();
+            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
+            if (background(m: m)) { this.absorb(m: give m); continue; }
+            match (give m) {
+                case CloseComplete: { if (!this.owedClose()) { return Result::Ok(value: Unit::Unit); } }
+                case ErrorResponse(fields: f): {
+                    ServerError e = ServerError.make(fields: give f);
+                    if (e.isFatal()) { this.lose(); }
+                    return Result::Err(error: PgError::Server(error: give e));
+                }
+                case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place after a Close")); }
+            };
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // A pipeline's Parse and Describe of statement `name`: the Statement.
+    unsafe fn Result<Statement, PgError> readPrepared(const ref string name, const ref string sql) {
+        Result<Described, PgError> d = this.readDescription(name: name, pipelined: true);
+        Described shape = match (give d) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        return Result::Ok(value: Statement.make(name: copy name, sql: copy sql, types: copy shape.types(), fields: copy shape.fields()));
     }
 
     // ---- COPY ----
@@ -1157,6 +1438,7 @@ type resource Connection implements Sendable {
     // Ready for a command: open, and not reading another's result.
     fn Result<Unit, PgError> idle() {
         if (!this.live) { return Result::Err(error: PgError::Closed); }
+        if (this.pipeline != 0ui8) { return Result::Err(error: PgError::Usage(detail: "synchronous command execution functions are not allowed in pipeline mode")); }
         if (this.busy) { return Result::Err(error: PgError::Usage(detail: "another command is already in progress")); }
         return Result::Ok(value: Unit::Unit);
     }
@@ -1244,7 +1526,12 @@ type resource Connection implements Sendable {
         sendSync(w: this.outbox);
         Result<Unit, PgError> sent = this.flush(deadline: this.due);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return this.readDescription(name: name, pipelined: false);
+    }
 
+    // ParseComplete, ParameterDescription, then RowDescription or NoData: the server's description of statement `name`,
+    // then (outside a pipeline) ReadyForQuery. In a pipeline the description ends it, or an error does.
+    unsafe fn Result<Described, PgError> readDescription(const ref string name, bool pipelined) {
         bool parsed = false;
         bool described = false;
         bool shaped = false;   // RowDescription or NoData
@@ -1253,6 +1540,7 @@ type resource Connection implements Sendable {
         DynamicArray<PgError> failed = DynamicArray.empty();
         bool done = false;
         while (!done) {
+            if (pipelined && (shaped || failed.length() > 0)) { break; }
             Result<BackendMessage, PgError> received = this.receive();
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
             if (background(m: m)) { this.absorb(m: give m); continue; }
@@ -1281,7 +1569,11 @@ type resource Connection implements Sendable {
                     if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
                     failed.add(item: PgError::Server(error: give e));
                 }
-                case ReadyForQuery(status: s): { this.txStatus = s; done = true; }
+                case ReadyForQuery(status: s): {
+                    if (pipelined) { return Result::Err(error: this.broken(detail: unexpected(tag: 90ui8))); }
+                    this.txStatus = s;
+                    done = true;
+                }
                 case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place while describing a statement")); }
             };
         }
@@ -1332,7 +1624,7 @@ type resource Connection implements Sendable {
     // EmptyQueryResponse or PortalSuspended), then ReadyForQuery. With `limit` > 0, return once that many rows have
     // come and leave the rest open for the next call. A server error ends the result and is returned once the
     // server is ready; `keep` false drops the rows as they arrive.
-    unsafe fn Result<Rows, PgError> readRows(isize limit, bool keep) {
+    unsafe fn Result<Rows, PgError> readRows(isize limit, bool keep, bool pipelined) {
         DynamicArray<RowValues> rows = DynamicArray.empty();
         DynamicArray<int16> formats = DynamicArray.withCapacity(capacity: this.openFields.length());
         isize k = 0;
@@ -1347,6 +1639,8 @@ type resource Connection implements Sendable {
         bool done = false;
         while (!done) {
             if (!ended && limit > 0 && rows.length() >= limit) { chunk = true; break; }
+            // In a pipeline a command's result ends with the command: its ReadyForQuery belongs to a sync of its own.
+            if (ended && pipelined) { break; }
             Result<BackendMessage, PgError> received = this.receive();
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
             if (background(m: m)) { this.absorb(m: give m); continue; }
@@ -1364,7 +1658,7 @@ type resource Connection implements Sendable {
                     // The portal's own description (a describe-only cache's run): the columns as the server has them now.
                     if (!this.portalDescribing || this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 84ui8))); }
                     this.portalDescribing = false;
-                    if (!sameColumns(a: this.openFields, b: f)) { this.cache.forget(sql: this.cachedSql, closing: ref this.closing); }
+                    if (this.fromCache && !sameColumns(a: this.openFields, b: f)) { this.cache.forget(sql: this.cachedSql, closing: ref this.closing); }
                     this.openFields = give f;
                     formats = DynamicArray.withCapacity(capacity: this.openFields.length());
                     isize c = 0;
@@ -1373,7 +1667,7 @@ type resource Connection implements Sendable {
                 case NoData: {
                     if (!this.portalDescribing || this.bindPending || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 110ui8))); }
                     this.portalDescribing = false;
-                    if (this.openFields.length() > 0) { this.cache.forget(sql: this.cachedSql, closing: ref this.closing); }
+                    if (this.fromCache && this.openFields.length() > 0) { this.cache.forget(sql: this.cachedSql, closing: ref this.closing); }
                     this.openFields = DynamicArray.empty();
                     formats = DynamicArray.empty();
                 }
@@ -1422,7 +1716,7 @@ type resource Connection implements Sendable {
                     copying = false;
                 }
                 case ReadyForQuery(status: s): {
-                    if (this.bindPending && failed.length() == 0) { return Result::Err(error: this.broken(detail: unexpected(tag: 90ui8))); }
+                    if (pipelined || (this.bindPending && failed.length() == 0)) { return Result::Err(error: this.broken(detail: unexpected(tag: 90ui8))); }
                     this.txStatus = s;
                     done = true;
                 }
@@ -1521,7 +1815,7 @@ type resource Connection implements Sendable {
 
     public const fn TransactionStatus transactionStatus() {
         if (!this.live) { return TransactionStatus::Unknown; }
-        if (this.busy || this.streaming) { return TransactionStatus::Active; }
+        if (this.busy || this.streaming || this.queue.length() > 0) { return TransactionStatus::Active; }
         if (this.txStatus == 84ui8) { return TransactionStatus::InTransaction; }
         if (this.txStatus == 69ui8) { return TransactionStatus::Failed; }
         return TransactionStatus::Idle;
@@ -1932,6 +2226,8 @@ type resource Connection implements Sendable {
         this.copyMode = 0ui8;
         this.parsePending = false;
         this.portalDescribing = false;
+        this.pipeline = 0ui8;
+        this.queue = DynamicArray.empty();
         if (!this.live) { return; }
         this.live = false;
         this.wire.shutdown();
@@ -1992,6 +2288,42 @@ fn bool sameColumns(const ref DynamicArray<FieldDescription> a, const ref Dynami
         i = i + 1;
     }
     return true;
+}
+
+// A pipeline's commands go out once this much is queued (libpq's OUTBUFFER_THRESHOLD).
+comptime isize PIPELINE_FLUSH = 65536;
+
+fn PgError nulInQuery() { return PgError::Usage(detail: "the query text or a name holds a NUL byte, which the protocol cannot carry"); }
+
+// A command sent in pipeline mode whose result is still to be read: what the reader must expect for it.
+type resource PipelineCommand implements Sendable {
+    uint8 kind = 0ui8;          // 0 query, 1 prepare, 2 close, 3 sync
+    DynamicArray<FieldDescription> fields;
+    bool parseFirst = false;    // a Parse went ahead of its Bind
+    bool portalDescribed = false;
+    bool fromCache = false;
+    string text;
+    string label;
+    ctor blank(uint8 kind) {
+        this.kind = kind; this.fields = DynamicArray.empty(); this.parseFirst = false; this.portalDescribed = false;
+        this.fromCache = false; this.text = ""; this.label = "";
+    }
+    public ctor query(string sql) { this.kind = 0ui8; this.fields = DynamicArray.empty(); this.parseFirst = false; this.portalDescribed = false; this.fromCache = false; this.text = give sql; this.label = ""; }
+    public ctor prepare(string name, string sql) { this.kind = 1ui8; this.fields = DynamicArray.empty(); this.parseFirst = false; this.portalDescribed = false; this.fromCache = false; this.text = give sql; this.label = give name; }
+    public ctor close() { this.kind = 2ui8; this.fields = DynamicArray.empty(); this.parseFirst = false; this.portalDescribed = false; this.fromCache = false; this.text = ""; this.label = ""; }
+    public ctor sync() { this.kind = 3ui8; this.fields = DynamicArray.empty(); this.parseFirst = false; this.portalDescribed = false; this.fromCache = false; this.text = ""; this.label = ""; }
+    public fn void expectParse() { this.parseFirst = true; }
+    public fn void expectPortalDescription() { this.portalDescribed = true; }
+    public fn void useColumns(DynamicArray<FieldDescription> fields, bool cached) { this.fields = give fields; this.fromCache = cached; }
+    public const fn bool isSync() { return this.kind == 3ui8; }
+    public const fn bool isClose() { return this.kind == 2ui8; }
+    public const fn bool isPrepare() { return this.kind == 1ui8; }
+    public const fn bool parses() { return this.parseFirst; }
+    public const fn bool describesPortal() { return this.portalDescribed; }
+    public const fn bool cached() { return this.fromCache; }
+    public const fn const ref DynamicArray<FieldDescription> columns() { return this.fields; }
+    public const fn const ref string sql() { return this.text; }
+    public const fn const ref string name() { return this.label; }
 }
 
 // COPY data goes out once 64 KiB is queued, in CopyData messages of at most 1 MiB.

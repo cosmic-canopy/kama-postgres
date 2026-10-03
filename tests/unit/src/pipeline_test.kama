@@ -1,0 +1,251 @@
+// Pipeline mode against a scripted server: what each queued command sends (an unknown query exactly as libpq's
+// PQsendQueryParams sends it), the results in order, an error and the commands it aborts up to the next sync, libpq's
+// refusals, a statement prepared and run in the pipeline, an error at the sync itself, and a flush request.
+import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::Query, postgres::Statement,
+         postgres::TransactionStatus, postgres::PipelineStatus, postgres::PipelineResult, postgres::CacheMode,
+         postgres::columnOpt, postgres::column,
+         postgres_unit_tests::check, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome,
+         postgres_unit_tests::overUncached, postgres_unit_tests::sevenOf };
+export { pipelineTests };
+
+comptime uint8 PARSE = 80ui8;      // 'P'
+comptime uint8 BIND = 66ui8;       // 'B'
+comptime uint8 DESCRIBE = 68ui8;   // 'D'
+comptime uint8 EXECUTE = 69ui8;    // 'E'
+comptime uint8 SYNC = 83ui8;       // 'S'
+comptime uint8 FLUSH = 72ui8;      // 'H'
+comptime uint8 QUERY = 81ui8;      // 'Q'
+
+unsafe fn string hexOf(const ref string s) { return hexEncode(bytes: s.bytes()); }
+fn Step quiet(uint8 tag, const ref string body) { return Step::Expect(tag: tag, body: copy body, then: DynamicArray.empty()); }
+fn Step answer(uint8 tag, Wire reply) { return Step::Expect(tag: tag, body: "", then: reply.bytes()); }
+fn DynamicArray<string> one(const ref string a) { DynamicArray<string> v = DynamicArray.empty(); v.add(item: copy a); return v; }
+fn DynamicArray<Step> opening() { DynamicArray<Step> s = DynamicArray.empty(); s.add(item: Step::Send(bytes: welcome())); return s; }
+
+// PQsendQueryParams's messages for `sql` with no parameters: Parse of the unnamed statement with no types, Bind with
+// text results, Describe of the portal, Execute; the server's answer goes with the Execute.
+unsafe fn void queried(ref DynamicArray<Step> s, const ref string sql, Wire reply) {
+    s.add(item: quiet(tag: PARSE, body: "00".concat(other: hexOf(s: sql)).concat(other: "00 0000")));
+    s.add(item: quiet(tag: BIND, body: "00 00 0000 0000 0001 0000"));
+    s.add(item: quiet(tag: DESCRIBE, body: "5000"));
+    s.add(item: answer(tag: EXECUTE, reply: give reply));
+}
+
+// The answer to an unknown query's messages: ParseComplete, BindComplete, its columns, one row, the tag.
+fn Wire oneValue(const ref string value) {
+    Wire w = Wire.make();
+    w.parseComplete(); w.bindComplete(); w.columns(names: one(a: "v")); w.row(values: one(a: value)); w.complete(tag: "SELECT 1");
+    return w;
+}
+
+fn Wire ready(uint8 status) { Wire w = Wire.make(); w.ready(status: status); return w; }
+
+unsafe fn Result<Connection, PgError> scripted(DynamicArray<Step> steps) { string none = ""; return overUncached(script: give steps, conninfo: none); }
+
+// A result as text: "rows:<first value>", "prepared", "closed", "failed:<SQLSTATE message>", "aborted", "sync", "none",
+// or the call's error.
+unsafe fn string shown(Result<Optional<PipelineResult>, PgError> r) {
+    Result<Optional<PipelineResult>, PgError> got = give r;
+    return match (give got) {
+        case Ok(value: o): match (give o) {
+            case Some(value: p): match (give p) {
+                case Rows(rows: rows): {
+                    Result<Optional<string>, PgError> v = columnOpt::<string>(rows: rows, row: 0, index: 0);
+                    string text = match (give v) { case Ok(value: x): match (give x) { case Some(value: t): give t; case None: "NULL"; }; case Err(error: e): e.message(); };
+                    return "rows:".concat(other: text);
+                }
+                case Prepared(statement: st): "prepared";
+                case Closed: "closed";
+                case Failed(error: e): "failed:".concat(other: e.primary());
+                case Aborted: "aborted";
+                case Sync: "sync";
+            };
+            case None: "none";
+        };
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn int32 pipelineTests() {
+    int32 f = 0;
+
+    // Two queries and a sync: the results in order, then Sync.
+    DynamicArray<Step> s1 = opening();
+    queried(s: ref s1, sql: "select 1", reply: oneValue(value: "1"));
+    queried(s: ref s1, sql: "select 2", reply: oneValue(value: "2"));
+    s1.add(item: answer(tag: SYNC, reply: ready(status: 73ui8)));
+    Wire simple = Wire.make();
+    simple.columns(names: one(a: "v")); simple.row(values: one(a: "after")); simple.complete(tag: "SELECT 1"); simple.ready(status: 73ui8);
+    s1.add(item: answer(tag: QUERY, reply: give simple));
+    Result<Connection, PgError> m1 = scripted(steps: give s1);
+    Connection c = match (give m1) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pipeline: connect (".concat(other: e.message()).concat(other: ")")); } };
+    Result<Unit, PgError> entered = c.enterPipelineMode();
+    Result<Unit, PgError> q1 = c.sendQuery(q: Query.make(sql: "select 1"));
+    Result<Unit, PgError> q2 = c.sendQuery(q: Query.make(sql: "select 2"));
+    Result<Unit, PgError> synced = c.pipelineSync();
+    f = f + check(ok: c.pipelineStatus() == PipelineStatus::On && c.transactionStatus() == TransactionStatus::Active, what: "pipeline: on, and Active while results are pending");
+    Result<DynamicArray<Rows>, PgError> refused = c.simpleQuery(sql: "select 3");
+    string refusal = match (refused) { case Ok(value: r): "(ran)"; case Err(error: e): e.message(); };
+    f = f + check(ok: refusal.equals(other: "synchronous command execution functions are not allowed in pipeline mode"), what: "pipeline: libpq's refusal of a synchronous call (".concat(other: refusal).concat(other: ")"));
+    Result<Unit, PgError> early = c.exitPipelineMode();
+    string notYet = match (early) { case Ok(value: u): "(exited)"; case Err(error: e): e.message(); };
+    f = f + check(ok: notYet.equals(other: "cannot exit pipeline mode with uncollected results"), what: "pipeline: libpq's refusal to exit with results pending (".concat(other: notYet).concat(other: ")"));
+    string r1 = shown(r: c.getResult());
+    string r2 = shown(r: c.getResult());
+    string r3 = shown(r: c.getResult());
+    string r4 = shown(r: c.getResult());
+    string seq = r1.concat(other: " ").concat(other: r2).concat(other: " ").concat(other: r3).concat(other: " ").concat(other: r4);
+    f = f + check(ok: seq.equals(other: "rows:1 rows:2 sync none"), what: "pipeline: two results, the sync, then none (".concat(other: seq).concat(other: ")"));
+    Result<Unit, PgError> exited = c.exitPipelineMode();
+    Result<DynamicArray<Rows>, PgError> after = c.simpleQuery(sql: "select 'after'");
+    bool ranAfter = match (after) { case Ok(value: r): true; case Err(error: e): false; };
+    f = f + check(ok: ranAfter && c.pipelineStatus() == PipelineStatus::Off, what: "pipeline: off again, and a synchronous call runs");
+    Result<Unit, PgError> outside = c.pipelineSync();
+    string notIn = match (outside) { case Ok(value: u): "(sent)"; case Err(error: e): e.message(); };
+    f = f + check(ok: notIn.equals(other: "cannot send pipeline when not in pipeline mode"), what: "pipeline: libpq's refusal of a sync outside one (".concat(other: notIn).concat(other: ")"));
+
+    // An error aborts the rest up to the sync; the sync ends it.
+    DynamicArray<Step> s2 = opening();
+    Wire bad = Wire.make(); bad.report(tag: 69ui8, severity: "ERROR", code: "42601", message: "syntax error at or near \"selec\"");
+    s2.add(item: answer(tag: PARSE, reply: give bad));
+    s2.add(item: quiet(tag: BIND, body: "")); s2.add(item: quiet(tag: DESCRIBE, body: "")); s2.add(item: quiet(tag: EXECUTE, body: ""));
+    s2.add(item: quiet(tag: PARSE, body: "")); s2.add(item: quiet(tag: BIND, body: "")); s2.add(item: quiet(tag: DESCRIBE, body: "")); s2.add(item: quiet(tag: EXECUTE, body: ""));
+    s2.add(item: answer(tag: SYNC, reply: ready(status: 73ui8)));
+    queried(s: ref s2, sql: "select 3", reply: oneValue(value: "3"));
+    s2.add(item: answer(tag: SYNC, reply: ready(status: 73ui8)));
+    Result<Connection, PgError> m2 = scripted(steps: give s2);
+    match (give m2) {
+        case Ok(value: x): {
+            Connection d = give x;
+            Result<Unit, PgError> e = d.enterPipelineMode();
+            Result<Unit, PgError> a = d.sendQuery(q: Query.make(sql: "selec 1"));
+            Result<Unit, PgError> b = d.sendQuery(q: Query.make(sql: "select 2"));
+            Result<Unit, PgError> s = d.pipelineSync();
+            Result<Unit, PgError> c3 = d.sendQuery(q: Query.make(sql: "select 3"));
+            Result<Unit, PgError> s2b = d.pipelineSync();
+            string a1 = shown(r: d.getResult());
+            bool abortedNow = d.pipelineStatus() == PipelineStatus::Aborted;
+            string a2 = shown(r: d.getResult());
+            string a3 = shown(r: d.getResult());
+            bool onAgain = d.pipelineStatus() == PipelineStatus::On;
+            string a4 = shown(r: d.getResult());
+            string a5 = shown(r: d.getResult());
+            string seq2 = a1.concat(other: " | ").concat(other: a2).concat(other: " | ").concat(other: a3).concat(other: " | ").concat(other: a4).concat(other: " | ").concat(other: a5);
+            f = f + check(ok: seq2.equals(other: "failed:syntax error at or near \"selec\" | aborted | sync | rows:3 | sync") && abortedNow && onAgain,
+                          what: "pipeline: failed, aborted to the sync, then on again (".concat(other: seq2).concat(other: ")"));
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "pipeline: connect 2"); }
+    };
+
+    // A statement prepared in the pipeline, then run from it in the next: typed, binary.
+    DynamicArray<Step> s3 = opening();
+    s3.add(item: quiet(tag: PARSE, body: hexOf(s: "s0").concat(other: "00").concat(other: hexOf(s: "select $1")).concat(other: "00 0000")));
+    Wire described = Wire.make();
+    DynamicArray<uint32> int4 = DynamicArray.empty(); int4.add(item: 23ui32);
+    described.parseComplete(); described.parameterTypes(oids: int4); described.typedColumns(names: one(a: "v"), oids: int4);
+    s3.add(item: answer(tag: DESCRIBE, reply: give described));
+    s3.add(item: answer(tag: SYNC, reply: ready(status: 73ui8)));
+    s3.add(item: quiet(tag: BIND, body: "00".concat(other: hexOf(s: "s0")).concat(other: "00 0001 0001 0001 00000004 00000007 0001 0001")));
+    DynamicArray<int32> seven = DynamicArray.empty(); seven.add(item: 7);
+    Wire ran = Wire.make(); ran.bindComplete(); ran.intRow(values: seven); ran.complete(tag: "SELECT 1");
+    s3.add(item: answer(tag: EXECUTE, reply: give ran));
+    s3.add(item: answer(tag: SYNC, reply: ready(status: 73ui8)));
+    Result<Connection, PgError> m3 = scripted(steps: give s3);
+    match (give m3) {
+        case Ok(value: x): {
+            Connection g = give x;
+            Result<Unit, PgError> e = g.enterPipelineMode();
+            Result<Unit, PgError> p = g.sendPrepare(sql: "select $1");
+            Result<Unit, PgError> s = g.pipelineSync();
+            Result<Optional<PipelineResult>, PgError> got = g.getResult();
+            string sync1 = shown(r: g.getResult());
+            match (give got) {
+                case Ok(value: o): {
+                    match (give o) {
+                        case Some(value: pr): {
+                            match (give pr) {
+                                case Prepared(statement: st): {
+                                    Statement stmt = give st;
+                                    Result<Unit, PgError> q = g.sendQuery(q: sevenOf(statement: stmt));
+                                    Result<Unit, PgError> s2c = g.pipelineSync();
+                                    Result<Optional<PipelineResult>, PgError> rr = g.getResult();
+                                    int32 value = -1;
+                                    match (give rr) {
+                                        case Ok(value: o2): {
+                                            match (give o2) {
+                                                case Some(value: p2): {
+                                                    match (give p2) {
+                                                        case Rows(rows: rows): {
+                                                            Result<int32, PgError> v = column::<int32>(rows: rows, row: 0, index: 0);
+                                                            value = match (give v) { case Ok(value: n): n; case Err(error: x2): -2; };
+                                                        }
+                                                        case _: { }
+                                                    };
+                                                }
+                                                case None: { }
+                                            };
+                                        }
+                                        case Err(error: x2): { }
+                                    };
+                                    string sync2 = shown(r: g.getResult());
+                                    f = f + check(ok: stmt.name().equals(other: "s0") && value == 7 && sync1.equals(other: "sync") && sync2.equals(other: "sync"),
+                                                  what: "pipeline: prepared in one segment, run from it in the next (${value})");
+                                }
+                                case _: { f = f + check(ok: false, what: "pipeline: the prepare's result is Prepared"); }
+                            };
+                        }
+                        case None: { f = f + check(ok: false, what: "pipeline: a prepare's result"); }
+                    };
+                }
+                case Err(error: x2): { f = f + check(ok: false, what: "pipeline: prepare (".concat(other: x2.message()).concat(other: ")")); }
+            };
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "pipeline: connect 3"); }
+    };
+
+    // An error at the sync itself (a deferred constraint at the implicit commit): its own result, then the sync.
+    DynamicArray<Step> s4 = opening();
+    queried(s: ref s4, sql: "insert into t values (1)", reply: oneValue(value: "1"));
+    Wire atSync = Wire.make();
+    atSync.report(tag: 69ui8, severity: "ERROR", code: "23505", message: "duplicate key value violates unique constraint \"t_id_key\"");
+    atSync.ready(status: 73ui8);
+    s4.add(item: answer(tag: SYNC, reply: give atSync));
+    Result<Connection, PgError> m4 = scripted(steps: give s4);
+    match (give m4) {
+        case Ok(value: x): {
+            Connection h = give x;
+            Result<Unit, PgError> e = h.enterPipelineMode();
+            Result<Unit, PgError> i = h.sendQuery(q: Query.make(sql: "insert into t values (1)"));
+            Result<Unit, PgError> s = h.pipelineSync();
+            string b1 = shown(r: h.getResult());
+            string b2 = shown(r: h.getResult());
+            string b3 = shown(r: h.getResult());
+            string seq4 = b1.concat(other: " | ").concat(other: b2).concat(other: " | ").concat(other: b3);
+            f = f + check(ok: seq4.equals(other: "rows:1 | failed:duplicate key value violates unique constraint \"t_id_key\" | sync") && h.pipelineStatus() == PipelineStatus::On,
+                          what: "pipeline: an error at the sync, then the sync (".concat(other: seq4).concat(other: ")"));
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "pipeline: connect 4"); }
+    };
+
+    // A flush request: the result comes without a sync point.
+    DynamicArray<Step> s5 = opening();
+    queried(s: ref s5, sql: "select 5", reply: oneValue(value: "5"));
+    s5.add(item: quiet(tag: FLUSH, body: ""));
+    s5.add(item: answer(tag: SYNC, reply: ready(status: 73ui8)));
+    Result<Connection, PgError> m5 = scripted(steps: give s5);
+    match (give m5) {
+        case Ok(value: x): {
+            Connection k = give x;
+            Result<Unit, PgError> e = k.enterPipelineMode();
+            Result<Unit, PgError> q = k.sendQuery(q: Query.make(sql: "select 5"));
+            Result<Unit, PgError> fl = k.sendFlushRequest();
+            string c1 = shown(r: k.getResult());
+            Result<Unit, PgError> s = k.pipelineSync();
+            string c2 = shown(r: k.getResult());
+            f = f + check(ok: c1.equals(other: "rows:5") && c2.equals(other: "sync"), what: "pipeline: a flush request brings the result before the sync (".concat(other: c1).concat(other: ")"));
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "pipeline: connect 5"); }
+    };
+    return f;
+}

@@ -150,9 +150,16 @@ fn bool bind(ref MessageWriter w, const ref string portal, const ref string stat
     w.begin(tag: 66ui8);    // 'B'
     w.putBytes(b: body.view());
     isize n = params.count();
-    w.putI16(v: cast<int16>(n));
+    // Every parameter in text is said with no format codes at all, as libpq says it (PQsendQueryGuts).
+    bool allText = true;
     isize i = 0;
-    while (i < n) { w.putI16(v: params.formatAt(i: i)); i = i + 1; }
+    while (i < n) { if (params.formatAt(i: i) != 0i16) { allText = false; } i = i + 1; }
+    if (allText) { w.putI16(v: 0i16); }
+    else {
+        w.putI16(v: cast<int16>(n));
+        i = 0;
+        while (i < n) { w.putI16(v: params.formatAt(i: i)); i = i + 1; }
+    }
     w.putI16(v: cast<int16>(n));
     isize offset = 0;
     i = 0;

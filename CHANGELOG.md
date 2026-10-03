@@ -56,6 +56,18 @@ All notable changes to this package are recorded here. The format follows
     TABLE) is dropped. Outside a transaction the query is run again once, as pgjdbc does; inside one the error is
     returned.
   - DISCARD ALL and DEALLOCATE ALL empty the cache.
+- **Pipeline mode**, libpq's:
+  - `enterPipelineMode()` and `exitPipelineMode()`; `sendQuery(q:)`, `sendPrepare(sql:)` and `sendClosePrepared(statement:)`;
+    `pipelineSync()`, `sendPipelineSync()` and `sendFlushRequest()`; `pipelineStatus()`;
+  - `getResult()` returns each command's `PipelineResult` in order: `Rows`, `Prepared`, `Closed`, `Failed`, `Aborted`
+    or `Sync`;
+  - after a failed command, the rest up to the next sync are `Aborted`, and the segment's implicit transaction is
+    rolled back. An error at the sync itself (a deferred constraint) is a result of its own.
+  - A query the cache knows, or a prepared statement's, goes typed, as outside a pipeline. Any other goes as libpq's
+    PQsendQueryParams sends it (the unnamed statement, text parameters, the portal described, text columns).
+  - libpq's refusals, verbatim: "synchronous command execution functions are not allowed in pipeline mode", "cannot
+    enter pipeline mode, connection not idle", "cannot exit pipeline mode with uncollected results", "cannot send
+    pipeline when not in pipeline mode".
 - **Waiting for notifications:** `Connection.waitForNotification(timeout:)` returns the oldest LISTEN/NOTIFY
   notification already received, else the next to arrive within the time (None when none does), taking in notices
   and parameter changes on the way. libpq leaves this loop to the application (PQsocket, PQconsumeInput, PQnotifies).
@@ -67,6 +79,7 @@ All notable changes to this package are recorded here. The format follows
 - **Breaking:** `TransactionStatus` gains `Active`, reported while a command's result is still being read, as libpq's
   PQtransactionStatus reports PQTRANS_ACTIVE.
 - `Config` is `Copyable`: a copy is the whole configuration, as libpq's pqCopyPGconn copies a connection's options.
+- Bind sends no format codes when every parameter is text, as libpq does (it sent a 0 for each).
 - **Queries are cached by default** (`CacheMode::Statements`): a server's error that names the statement names `sc…`
   rather than the unnamed statement. `CacheMode::Off` keeps the old exchange.
 

@@ -8,7 +8,7 @@ import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode
          postgres::sqlstate::SYNTAX_ERROR, postgres::sqlstate::DIVISION_BY_ZERO,
          postgres_unit_tests::check, postgres_unit_tests::Step, postgres_unit_tests::Wire,
          postgres_unit_tests::overUncached, postgres_unit_tests::overJammed, postgres_unit_tests::welcome };
-export { extendedTests, sevenQuery };
+export { extendedTests, sevenQuery, sevenOf };
 
 comptime uint8 PARSE = 80ui8;      // 'P'
 comptime uint8 BIND = 66ui8;       // 'B'
@@ -65,6 +65,13 @@ fn string errorText(const ref Result<Rows, PgError> r) { return match (r) { case
 // use: a release build fails when two do (KPG-38).
 fn Query sevenQuery(const ref string sql) {
     Query q = Query.make(sql: copy sql);
+    q.add(value: 7);
+    return q;
+}
+
+// `statement`'s query with the int4 parameter 7 (see sevenQuery: KPG-38).
+fn Query sevenOf(const ref Statement statement) {
+    Query q = Query.of(statement: statement);
     q.add(value: 7);
     return q;
 }

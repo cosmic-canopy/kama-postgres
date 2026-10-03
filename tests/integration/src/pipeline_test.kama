@@ -1,0 +1,172 @@
+// Pipeline mode on a real server, after libpq_pipeline's tests: results in order; an error and the commands it aborts
+// (the segment's implicit transaction rolled back); independent segments; a transaction across syncs; a statement
+// prepared and run; 2000 inserts in one pipeline; a deferred constraint failing at the sync; a cached statement; and
+// a query timeout in a pipeline.
+import { std::collections::DynamicArray, std::time::Duration,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::Query, postgres::Statement,
+         postgres::PipelineStatus, postgres::PipelineResult, postgres::columnOpt,
+         postgres::sqlstate::DIVISION_BY_ZERO, postgres::sqlstate::UNIQUE_VIOLATION, postgres::sqlstate::QUERY_CANCELED,
+         postgres_integration_tests::check, postgres_integration_tests::conninfoFor, postgres_integration_tests::open,
+         postgres_integration_tests::scalar };
+export { pipelineTests };
+
+// A result as text: "rows:<first value or tag>", "prepared", "closed", "failed:<SQLSTATE>", "aborted", "sync", "none".
+unsafe fn string shown(Result<Optional<PipelineResult>, PgError> r) {
+    Result<Optional<PipelineResult>, PgError> got = give r;
+    return match (give got) {
+        case Ok(value: o): match (give o) {
+            case Some(value: p): match (give p) {
+                case Rows(rows: rows): {
+                    if (rows.rowCount() == 0) { return "rows:".concat(other: rows.commandTag()); }
+                    Result<Optional<string>, PgError> v = columnOpt::<string>(rows: rows, row: 0, index: 0);
+                    string text = match (give v) { case Ok(value: x): match (give x) { case Some(value: t): give t; case None: "NULL"; }; case Err(error: e): e.message(); };
+                    return "rows:".concat(other: text);
+                }
+                case Prepared(statement: st): "prepared";
+                case Closed: "closed";
+                case Failed(error: e): {
+                    int32 code = e.sqlstate();
+                    if (code == DIVISION_BY_ZERO) { return "failed:22012"; }
+                    if (code == UNIQUE_VIOLATION) { return "failed:23505"; }
+                    if (code == QUERY_CANCELED) { return "failed:57014"; }
+                    return "failed:".concat(other: e.primary());
+                }
+                case Aborted: "aborted";
+                case Sync: "sync";
+            };
+            case None: "none";
+        };
+        case Err(error: e): e.message();
+    };
+}
+
+// Every result until none is left, joined by " | ".
+unsafe fn string drained(ref Connection c) {
+    string all = "";
+    bool first = true;
+    while (true) {
+        string one = shown(r: c.getResult());
+        if (one.equals(other: "none")) { break; }
+        if (!first) { all = all.concat(other: " | "); }
+        all = all.concat(other: one);
+        first = false;
+    }
+    return all;
+}
+
+unsafe fn void queue(ref Connection c, const ref string sql) { Result<Unit, PgError> r = c.sendQuery(q: Query.make(sql: copy sql)); }
+
+unsafe fn int32 pipelineTests() {
+    int32 f = 0;
+    Result<Connection, PgError> opened = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection c = match (give opened) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pipeline: connect (".concat(other: e.message()).concat(other: ")")); } };
+    string made = scalar(c: c, sql: "create temp table kp_pipe (id int)");
+
+    // Results in order.
+    Result<Unit, PgError> on = c.enterPipelineMode();
+    queue(c: ref c, sql: "select 1");
+    queue(c: ref c, sql: "select 'two'");
+    queue(c: ref c, sql: "select 3.5");
+    Result<Unit, PgError> s1 = c.pipelineSync();
+    string seq1 = drained(c: ref c);
+    f = f + check(ok: seq1.equals(other: "rows:1 | rows:two | rows:3.5 | sync"), what: "pipeline: three results in order, then the sync (".concat(other: seq1).concat(other: ")"));
+
+    // An error aborts the rest of its segment, and the segment's implicit transaction is rolled back; the next segment
+    // is its own.
+    queue(c: ref c, sql: "insert into kp_pipe values (1)");
+    queue(c: ref c, sql: "select 1/0");
+    queue(c: ref c, sql: "insert into kp_pipe values (2)");
+    Result<Unit, PgError> s2 = c.pipelineSync();
+    queue(c: ref c, sql: "insert into kp_pipe values (3)");
+    Result<Unit, PgError> s3 = c.pipelineSync();
+    string seq2 = drained(c: ref c);
+    f = f + check(ok: seq2.equals(other: "rows:INSERT 0 1 | failed:22012 | aborted | sync | rows:INSERT 0 1 | sync"), what: "pipeline: failed, aborted to the sync, the next segment its own (".concat(other: seq2).concat(other: ")"));
+    queue(c: ref c, sql: "select string_agg(id::text, ',' order by id) from kp_pipe");
+    Result<Unit, PgError> s4 = c.pipelineSync();
+    string kept = drained(c: ref c);
+    f = f + check(ok: kept.equals(other: "rows:3 | sync"), what: "pipeline: the failed segment rolled back, the next kept (".concat(other: kept).concat(other: ")"));
+
+    // An explicit transaction spans syncs.
+    queue(c: ref c, sql: "begin");
+    queue(c: ref c, sql: "insert into kp_pipe values (4)");
+    Result<Unit, PgError> s5 = c.pipelineSync();
+    queue(c: ref c, sql: "insert into kp_pipe values (5)");
+    queue(c: ref c, sql: "commit");
+    Result<Unit, PgError> s6 = c.pipelineSync();
+    string tx = drained(c: ref c);
+    f = f + check(ok: tx.equals(other: "rows:BEGIN | rows:INSERT 0 1 | sync | rows:INSERT 0 1 | rows:COMMIT | sync"), what: "pipeline: a transaction across syncs (".concat(other: tx).concat(other: ")"));
+
+    // Prepared in the pipeline, then run from it.
+    Result<Unit, PgError> p = c.sendPrepare(sql: "select count(*) from kp_pipe");
+    Result<Unit, PgError> s7 = c.pipelineSync();
+    Result<Optional<PipelineResult>, PgError> pr = c.getResult();
+    string afterPrepare = shown(r: c.getResult());
+    match (give pr) {
+        case Ok(value: o): {
+            match (give o) {
+                case Some(value: res): {
+                    match (give res) {
+                        case Prepared(statement: st): {
+                            Statement stmt = give st;
+                            Result<Unit, PgError> q = c.sendQuery(q: Query.of(statement: stmt));
+                            Result<Unit, PgError> s8 = c.pipelineSync();
+                            string counted = drained(c: ref c);
+                            f = f + check(ok: counted.equals(other: "rows:3 | sync") && afterPrepare.equals(other: "sync"), what: "pipeline: prepared, then run from it (".concat(other: counted).concat(other: ")"));
+                        }
+                        case _: { f = f + check(ok: false, what: "pipeline: the prepare's result"); }
+                    };
+                }
+                case None: { f = f + check(ok: false, what: "pipeline: a prepare result"); }
+            };
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "pipeline: prepare (".concat(other: e.message()).concat(other: ")")); }
+    };
+
+    // 2000 inserts in one pipeline: sent while the server's answers come back.
+    isize i = 0;
+    while (i < 2000) { queue(c: ref c, sql: "insert into kp_pipe values (100)"); i = i + 1; }
+    Result<Unit, PgError> s9 = c.pipelineSync();
+    isize inserted = 0;
+    bool synced = false;
+    while (!synced) {
+        string one = shown(r: c.getResult());
+        if (one.equals(other: "rows:INSERT 0 1")) { inserted = inserted + 1; }
+        else { synced = true; }
+    }
+    queue(c: ref c, sql: "select count(*) from kp_pipe where id = 100");
+    Result<Unit, PgError> s10 = c.pipelineSync();
+    string many = drained(c: ref c);
+    f = f + check(ok: inserted == 2000 && many.equals(other: "rows:2000 | sync"), what: "pipeline: 2000 inserts in one pipeline (${inserted}; ".concat(other: many).concat(other: ")"));
+
+    // A deferred constraint fails at the sync (the implicit commit): its own result, then the sync.
+    Result<Unit, PgError> off = c.exitPipelineMode();
+    string made2 = scalar(c: c, sql: "create temp table kp_pipe_d (id int unique deferrable initially deferred)");
+    Result<Unit, PgError> on2 = c.enterPipelineMode();
+    queue(c: ref c, sql: "insert into kp_pipe_d values (1)");
+    queue(c: ref c, sql: "insert into kp_pipe_d values (1)");
+    Result<Unit, PgError> s11 = c.pipelineSync();
+    string deferred = drained(c: ref c);
+    f = f + check(ok: deferred.equals(other: "rows:INSERT 0 1 | rows:INSERT 0 1 | failed:23505 | sync"), what: "pipeline: a deferred constraint fails at the sync (".concat(other: deferred).concat(other: ")"));
+
+    // A statement the cache knows goes as it would outside a pipeline: typed, its columns in binary.
+    Result<Unit, PgError> off2 = c.exitPipelineMode();
+    Query warm = Query.make(sql: "select count(*) from kp_pipe_d");
+    Result<Rows, PgError> warmed = c.query(q: warm);
+    Result<Unit, PgError> on3 = c.enterPipelineMode();
+    queue(c: ref c, sql: "select count(*) from kp_pipe_d");
+    Result<Unit, PgError> s12 = c.pipelineSync();
+    string cachedRun = drained(c: ref c);
+    f = f + check(ok: cachedRun.equals(other: "rows:0 | sync"), what: "pipeline: a cached statement in a pipeline (".concat(other: cachedRun).concat(other: ")"));
+
+    // A query timeout in a pipeline: the command is cancelled, its 57014 is its result, and the session goes on.
+    c.setQueryTimeout(timeout: Optional::Some(value: Duration.fromMillis(ms: 200i64)), grace: Duration.fromSecs(s: 5i64));
+    queue(c: ref c, sql: "select pg_sleep(30)");
+    Result<Unit, PgError> s13 = c.pipelineSync();
+    string slept = drained(c: ref c);
+    c.setQueryTimeout(timeout: Optional::None, grace: Duration.fromSecs(s: 2i64));
+    Result<Unit, PgError> off3 = c.exitPipelineMode();
+    string after = scalar(c: c, sql: "select 'still here'");
+    f = f + check(ok: slept.equals(other: "failed:57014 | sync") && after.equals(other: "still here") && c.pipelineStatus() == PipelineStatus::Off,
+                  what: "pipeline: a query timeout cancels the command in a pipeline (".concat(other: slept).concat(other: ")"));
+    return f;
+}

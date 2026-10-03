@@ -213,6 +213,8 @@ type resource Query implements Sendable {
     const fn const ref DynamicArray<FieldDescription> columns() { return this.fields; }
     friend postgres::Connection::describe[problem, statement, parameterTypes, columns];
     friend postgres::Connection::bindAndExecute[encoded];
+    friend postgres::Connection::sendQuery[problem, encoded];
+    friend postgres::Connection::knownShape[statement, parameterTypes, columns];
 
     // Every parameter, each as the type in `types` (0 where the server described none). A value goes binary when
     // it is the type's own kind, else as text.

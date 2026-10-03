@@ -1,0 +1,17 @@
+import { postgres::Rows, postgres::Statement, postgres::ServerError };
+export { PipelineStatus, PipelineResult };
+
+// Pipeline mode, libpq's (PQenterPipelineMode, PQpipelineSync, PQgetResult): commands are sent without waiting for
+// their results, and the results are read afterwards, in order.
+
+// libpq's PQpipelineStatus: off, on, or aborted (a command failed, and the server skips the rest until the next sync).
+type enum PipelineStatus implements Sendable { Off, On, Aborted }
+
+// One result of a pipeline, in the order the commands were sent (libpq's result statuses):
+//   Rows      a query's result: its rows, or a command's tag (PGRES_TUPLES_OK, PGRES_COMMAND_OK)
+//   Prepared  sendPrepare's statement, described
+//   Closed    sendClosePrepared's statement is closed
+//   Failed    the server's error for the command (PGRES_FATAL_ERROR); the rest until the next sync are Aborted
+//   Aborted   a command the server skipped after an earlier one failed (PGRES_PIPELINE_ABORTED)
+//   Sync      a sync point is reached: the pipeline is no longer aborted (PGRES_PIPELINE_SYNC)
+type enum PipelineResult { Rows(Rows rows), Prepared(Statement statement), Closed, Failed(ServerError error), Aborted, Sync }

@@ -15,6 +15,7 @@ type resource Statement implements Sendable {
         this.label = give name; this.text = give sql; this.types = give types; this.fields = give fields;
     }
     friend postgres::Connection::prepare[make];
+    friend postgres::Connection::readPrepared[make];
 
     // The name the server knows it by: "s0", "s1", … in the order the connection prepared them.
     public const fn const ref string name() { return this.label; }

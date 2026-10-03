@@ -80,7 +80,8 @@ fn int32 frontendTests() {
     DynamicArray<int16> allBinary = DynamicArray.empty();
     allBinary.add(item: 1i16);
     bool b = bind(w: w, portal: unnamed, statement: s1, params: two, resultFormats: allBinary);
-    f = f + check(ok: b && sameHex(got: w.view(), want: "42 0000001e 00 733100 0002 0000 0000 0002 00000002 3432 ffffffff 0001 0001"), what: "frontend: Bind with a value, a NULL, binary results");
+    // Both parameters in text: no format codes at all, as libpq's PQsendQueryGuts writes it.
+    f = f + check(ok: b && sameHex(got: w.view(), want: "42 0000001a 00 733100 0000 0002 00000002 3432 ffffffff 0001 0001"), what: "frontend: Bind with a value, a NULL, binary results");
     w.clear();
     DynamicArray<int16> perColumn = DynamicArray.empty();
     perColumn.add(item: 0i16); perColumn.add(item: 1i16);

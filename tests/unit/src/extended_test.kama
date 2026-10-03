@@ -3,11 +3,11 @@
 // it makes of every reply, including the ones a broken or hostile server would send. Replies arrive a byte at a
 // time and writes go three bytes at a time.
 import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode,
-         postgres::Connection, postgres::PgError, postgres::Rows, postgres::Query, postgres::Statement,
+         postgres::Connection, postgres::TransactionStatus, postgres::PgError, postgres::Rows, postgres::Query, postgres::Statement,
          postgres::Portal, postgres::pg, postgres::column, postgres::columnOpt,
          postgres::sqlstate::SYNTAX_ERROR, postgres::sqlstate::DIVISION_BY_ZERO,
          postgres_unit_tests::check, postgres_unit_tests::Step, postgres_unit_tests::Wire,
-         postgres_unit_tests::over, postgres_unit_tests::welcome };
+         postgres_unit_tests::over, postgres_unit_tests::overJammed, postgres_unit_tests::welcome };
 export { extendedTests };
 
 comptime uint8 PARSE = 80ui8;      // 'P'
@@ -254,6 +254,7 @@ unsafe fn int32 streamTests() {
     Connection c = match (give cMade) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
     Query q = Query.make(sql: copy sql); q.add(value: 1);
     Result<Unit, PgError> started = c.startRows(q: q);
+    f = f + check(ok: c.transactionStatus() == TransactionStatus::Active, what: "stream: Active while the result is open, as PQtransactionStatus says");
     Result<Rows, PgError> busy = c.query(q: Query.make(sql: "select 1"));
     f = f + check(ok: errorText(r: busy).equals(other: "another command is already in progress"), what: "stream: refused while busy");
     DynamicArray<isize> sizes = DynamicArray.empty();
@@ -265,6 +266,38 @@ unsafe fn int32 streamTests() {
         guard = guard + 1;
     }
     f = f + check(ok: sizes.length() == 3 && sizes[0] == 2 && sizes[1] == 2 && sizes[2] == 1 && tag.equals(other: "SELECT 5"), what: "stream: five rows in chunks of 2, 2 and 1, the tag on the last");
+    f = f + check(ok: c.transactionStatus() == TransactionStatus::Idle, what: "stream: Idle once the result is read");
+    return f;
+}
+
+// A server blocked on its own output takes nothing more until its replies are read. This client reads while it
+// writes, as libpq's pqSendSome does, so a request goes out whole however much the server has answered already:
+// here a Bind is answered with 2000 rows before its Execute and Sync can be sent.
+unsafe fn int32 drainTests() {
+    int32 f = 0;
+    string sql = "select $1";
+    DynamicArray<Step> s = opening();
+    s.add(item: quiet(tag: PARSE, body: ""));
+    s.add(item: quiet(tag: DESCRIBE, body: ""));
+    s.add(item: answer(tag: SYNC, reply: intDescription()));
+    Wire rows = Wire.make();
+    rows.bindComplete();
+    isize i = 0;
+    while (i < 2000) { rows.intRow(values: ints(a: 7)); i = i + 1; }
+    s.add(item: answer(tag: BIND, reply: give rows));
+    s.add(item: quiet(tag: EXECUTE, body: ""));
+    Wire end = Wire.make(); end.complete(tag: "SELECT 2000"); end.ready(status: 73ui8);
+    s.add(item: answer(tag: SYNC, reply: give end));
+    Result<Connection, PgError> cMade = overJammed(script: give s, backlog: 1024);
+    Connection c = match (give cMade) { case Ok(value: x): give x; case Err(error: failure): { return unconnected(e: failure); } };
+    Result<Statement, PgError> prepared = c.prepare(sql: sql);
+    Statement statement = match (give prepared) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "drain: prepare (".concat(other: e.message()).concat(other: ")")); } };
+    Query q = Query.of(statement: statement);
+    q.add(value: 7);
+    Result<Rows, PgError> r = c.query(q: q);
+    isize count = match (r) { case Ok(value: v): v.rowCount(); case Err(error: e): -1; };
+    string got = match (r) { case Ok(value: v): "${count} rows"; case Err(error: e): e.message(); };
+    f = f + check(ok: got.equals(other: "2000 rows"), what: "drain: the request goes out while the server's answer waits to be read (".concat(other: got).concat(other: ")"));
     return f;
 }
 
@@ -359,6 +392,7 @@ unsafe fn int32 extendedTests() {
     f = f + queryTests();
     f = f + hostileTests();
     f = f + streamTests();
+    f = f + drainTests();
     f = f + portalTests();
     f = f + preparedTests();
     f = f + refusalTests();

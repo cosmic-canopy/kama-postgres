@@ -1,0 +1,40 @@
+import { std::collections::DynamicArray, std::memory::Owned,
+         postgres::PgError, postgres::Connection, postgres::Dialer, postgres::wire::Deadline,
+         postgres::session::CancelRoute, postgres::session::Opener };
+export { CancelToken };
+
+// A cancel request for one session's running command, to send from anywhere: another isolate, a timer. It is
+// libpq's PGcancelConn (PQcancelCreate): a copy of the session's configuration, the address the session reached, and
+// the server's process id and secret key. Sending it connects to that address again with the same sslmode, and so the
+// same encryption and fallbacks (libpq 17's encrypted cancel), sends CancelRequest in place of a startup packet, and
+// waits for the server to close the connection, all within connect_timeout.
+//
+// The server cancels whatever the session is running when the request arrives; the session's call then returns
+// the server's error (57014, "canceling statement due to user request"), and the session goes on. A request that
+// arrives once the command is done does nothing: a backend reading its next command drops it.
+type resource CancelToken implements Sendable, Copyable<This>(bare: give) {
+    CancelRoute route;
+    int32 pid = 0;
+    DynamicArray<uint8> key;
+
+    ctor make(CancelRoute route, int32 pid, DynamicArray<uint8> key) { this.route = give route; this.pid = pid; this.key = give key; }
+    friend postgres::Connection::cancelToken[make];
+
+    public ctor copy(ref CancelToken source) { this.route = copy source.route; this.pid = source.pid; this.key = copy source.key; }
+
+    // Send the request over a connection of this client's own: a TCP socket with the session's keepalive settings,
+    // or a Unix socket with its requirepeer check.
+    public unsafe fn Result<Unit, PgError> cancel() {
+        Opener opener = Opener.builtIn();
+        return Connection::sendCancel(route: this.route, opener: opener, pid: this.pid, key: this.key, limit: Deadline.none());
+    }
+
+    // Send it over a connection `dialer` opens, for a session made with `connectWith`.
+    public unsafe fn Result<Unit, PgError> cancelWith(Owned<Dialer> dialer) {
+        Opener opener = Opener.with(dialer: give dialer);
+        return Connection::sendCancel(route: this.route, opener: opener, pid: this.pid, key: this.key, limit: Deadline.none());
+    }
+
+    // The server process whose command this cancels (the session's processId()).
+    public const fn int32 processId() { return this.pid; }
+}

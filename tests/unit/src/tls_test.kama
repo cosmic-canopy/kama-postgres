@@ -11,7 +11,7 @@ import { core::env, std::collections::DynamicArray, std::memory::Owned, std::io:
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Transport,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome };
-export { tlsTests, certPath };
+export { tlsTests, certPath, serverTls, serverEndPoint };
 
 unsafe fn string certPath(const ref string name) {
     Optional<string> dir = env(name: "PGTEST_CERTDIR");

@@ -1,0 +1,282 @@
+// Cancel requests, as libpq's PQcancelCreate and PQcancelBlocking make them (fe-cancel.c): the token a session hands
+// out, and the connection a cancel opens. That connection goes to the address the session used, with the session's
+// encryption, sends CancelRequest in place of the startup packet, and waits for the server's close. Every case runs
+// against scripted servers, one per connection, opened by a dialer.
+import { std::collections::DynamicArray, std::memory::Owned, std::io::IoError, std::io::IoErrorKind, std::encoding::hex::encode as hexEncode,
+         std::time::Duration, postgres::Rows,
+         tls::TlsConfig,
+         postgres::Connection, postgres::CancelToken, postgres::Config, postgres::Environment, postgres::PgError,
+         postgres::Transport, postgres::Dialer, postgres::DialTarget,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire,
+         postgres_unit_tests::over, postgres_unit_tests::welcome, postgres_unit_tests::serverTls,
+         postgres_unit_tests::serverEndPoint };
+export { cancelTests, timeoutTests };
+
+// Opens a fake server for each connection, running the next script; with `secure`, a server with TLS. A dial with no
+// script left is refused, as a closed port refuses.
+type resource ScriptDialer implements Dialer, Sendable {
+    DynamicArray<DynamicArray<Step>> pending;   // the last first: each dial pops one
+    bool secure = false;
+
+    public ctor make(DynamicArray<DynamicArray<Step>> plays, bool secure) {
+        // Popping the given list yields the last first; added in that order, pop() then yields the first first.
+        this.pending = DynamicArray.empty();
+        DynamicArray<DynamicArray<Step>> given = give plays;
+        while (true) {
+            Optional<DynamicArray<Step>> last = given.pop();
+            match (give last) { case Some(value: s): { this.pending.add(item: give s); } case None: { break; } };
+        }
+        this.secure = secure;
+    }
+
+    public unsafe fn Result<Owned<Transport>, IoError> dial(const ref DialTarget target, int32 timeoutMs) {
+        Optional<DynamicArray<Step>> next = this.pending.pop();
+        match (give next) {
+            case Some(value: s): {
+                if (this.secure) {
+                    Owned<Transport> tls = new FakeServer.secure(steps: give s, chunk: 1, writeLimit: 3, config: serverTls(alpn: true, only13: false, askCert: false),
+                                                                 direct: false, endPoint: serverEndPoint(), sni: "");
+                    return Result::Ok(value: give tls);
+                }
+                Owned<Transport> plain = new FakeServer.make(steps: give s, chunk: 1, writeLimit: 3);
+                return Result::Ok(value: give plain);
+            }
+            case None: { return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused)); }
+        };
+        return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused));
+    }
+}
+
+fn DynamicArray<Step> one(Step s) { DynamicArray<Step> v = DynamicArray.empty(); v.add(item: give s); return v; }
+
+fn DynamicArray<DynamicArray<Step>> only(DynamicArray<Step> a) { DynamicArray<DynamicArray<Step>> v = DynamicArray.empty(); v.add(item: give a); return v; }
+
+// The CancelRequest body for the welcome's key: code 80877102, process id 4242, key bytes 1 to `keyLength`.
+unsafe fn string requestBody(isize keyLength) {
+    DynamicArray<uint8> b = DynamicArray.empty();
+    b.add(item: 4ui8); b.add(item: 210ui8); b.add(item: 22ui8); b.add(item: 46ui8);
+    b.add(item: 0ui8); b.add(item: 0ui8); b.add(item: 16ui8); b.add(item: 146ui8);
+    isize i = 1;
+    while (i <= keyLength) { b.add(item: truncate<uint8>(i)); i = i + 1; }
+    return hexEncode(bytes: b.view());
+}
+
+// A session through `dialer`'s first script, for `conninfo` (host and hostaddr, so nothing is looked up).
+unsafe fn Result<Connection, PgError> session(const ref string conninfo, Owned<Dialer> dialer) {
+    Environment env = testEnvironment();
+    Result<Config, PgError> c = resolveWith(text: conninfo, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    return Connection.connectWith(dialer: give dialer, config: config);
+}
+
+// What a token's cancel says: "(sent)" or its error.
+unsafe fn string cancelled(ref CancelToken token, DynamicArray<Step> server, bool secure) {
+    Owned<Dialer> d = new ScriptDialer.make(plays: only(a: give server), secure: secure);
+    Result<Unit, PgError> r = token.cancelWith(dialer: give d);
+    return match (r) { case Ok(value: u): "(sent)"; case Err(error: e): e.message(); };
+}
+
+unsafe fn int32 cancelTests() {
+    int32 f = 0;
+    string plain = "host=localhost hostaddr=127.0.0.1 port=5432 user=u dbname=d sslmode=disable";
+    // libpq's lead for a host given with its hostaddr shows the address it connected to (emitHostIdentityInfo).
+    string lead = "connection to server at \"127.0.0.1\", port 5432 failed: ";
+
+    Owned<Dialer> d1 = new ScriptDialer.make(plays: only(a: one(s: Step::Send(bytes: welcome()))), secure: false);
+    Result<Connection, PgError> made = session(conninfo: plain, dialer: give d1);
+    Connection c = match (give made) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "cancel: session (".concat(other: e.message()).concat(other: ")")); } };
+    Result<CancelToken, PgError> t = c.cancelToken();
+    CancelToken token = match (give t) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "cancel: token (".concat(other: e.message()).concat(other: ")")); } };
+    f = f + check(ok: token.processId() == 4242, what: "cancel: the token names the session's process");
+
+    // The request, byte for byte, and the server's close.
+    string sent = cancelled(token: ref token, server: one(s: Step::Cancel(body: requestBody(keyLength: 4))), secure: false);
+    f = f + check(ok: sent.equals(other: "(sent)"), what: "cancel: CancelRequest with the process id and key, then the server's close (".concat(other: sent).concat(other: ")"));
+    // A copy is the same request, to send from elsewhere.
+    CancelToken twin = copy token;
+    string again = cancelled(token: ref twin, server: one(s: Step::Cancel(body: requestBody(keyLength: 4))), secure: false);
+    f = f + check(ok: again.equals(other: "(sent)"), what: "cancel: a copied token (".concat(other: again).concat(other: ")"));
+    // A server that answers, as none does: libpq's "unexpected response from server", with its lead.
+    string answered = cancelled(token: ref token, server: one(s: Step::Send(bytes: welcome())), secure: false);
+    f = f + check(ok: answered.equals(other: lead.concat(other: "unexpected response from server")), what: "cancel: a server that answers (".concat(other: answered).concat(other: ")"));
+    // A server that never closes: connect_timeout's "timeout expired".
+    string silent = cancelled(token: ref token, server: one(s: Step::Silent), secure: false);
+    f = f + check(ok: silent.equals(other: lead.concat(other: "timeout expired")), what: "cancel: a server that never closes (".concat(other: silent).concat(other: ")"));
+    // No server: the connect's own failure, with libpq's hint.
+    Owned<Dialer> none = new ScriptDialer.make(plays: DynamicArray.empty(), secure: false);
+    Result<Unit, PgError> refused = token.cancelWith(dialer: give none);
+    string why = match (refused) { case Ok(value: u): "(sent)"; case Err(error: e): e.message(); };
+    f = f + check(ok: why.startsWith(prefix: lead) && why.contains(substring: "Is the server running on that host and accepting TCP/IP connections?"),
+                  what: "cancel: nothing listening (".concat(other: why).concat(other: ")"));
+
+    // libpq's refusals to make a token.
+    c.close();
+    Result<CancelToken, PgError> closed = c.cancelToken();
+    string closedWhy = match (closed) { case Ok(value: x): "(made)"; case Err(error: e): e.message(); };
+    f = f + check(ok: closedWhy.equals(other: "connection not open"), what: "cancel: a closed session (".concat(other: closedWhy).concat(other: ")"));
+    Wire keyless = Wire.make();
+    keyless.auth(code: 0); keyless.parameter(name: "client_encoding", value: "UTF8"); keyless.ready(status: 73ui8);
+    Owned<Dialer> d2 = new ScriptDialer.make(plays: only(a: one(s: Step::Send(bytes: keyless.bytes()))), secure: false);
+    Result<Connection, PgError> noKeyMade = session(conninfo: plain, dialer: give d2);
+    match (give noKeyMade) {
+        case Ok(value: k): {
+            Result<CancelToken, PgError> nk = k.cancelToken();
+            string nkWhy = match (nk) { case Ok(value: x): "(made)"; case Err(error: e): e.message(); };
+            f = f + check(ok: nkWhy.equals(other: "no cancellation key received"), what: "cancel: a server that sent no key (".concat(other: nkWhy).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cancel: keyless session (".concat(other: e.message()).concat(other: ")")); }
+    };
+    string none2 = "";
+    Result<Connection, PgError> overMade = over(script: one(s: Step::Send(bytes: welcome())), conninfo: none2);
+    match (give overMade) {
+        case Ok(value: o): {
+            Result<CancelToken, PgError> ot = o.cancelToken();
+            string otWhy = match (ot) { case Ok(value: x): "(made)"; case Err(error: e): e.message(); };
+            f = f + check(ok: otWhy.contains(substring: "connectOver"), what: "cancel: a session over a caller's transport has no address (".concat(other: otWhy).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cancel: session over a transport"); }
+    };
+
+    // Encrypted, as libpq 17 sends it: the session's sslmode again (an SSLRequest, the handshake), the request inside
+    // TLS, and the server's close_notify.
+    string secured = "host=localhost hostaddr=127.0.0.1 port=5432 user=u dbname=d sslmode=require";
+    Owned<Dialer> d3 = new ScriptDialer.make(plays: only(a: one(s: Step::Send(bytes: welcome()))), secure: true);
+    Result<Connection, PgError> tlsMade = session(conninfo: secured, dialer: give d3);
+    match (give tlsMade) {
+        case Ok(value: s): {
+            Connection tlsSession = give s;
+            f = f + check(ok: tlsSession.sslInUse(), what: "cancel: the TLS session is encrypted");
+            Result<CancelToken, PgError> tt = tlsSession.cancelToken();
+            match (give tt) {
+                case Ok(value: tok): {
+                    CancelToken tlsToken = give tok;
+                    string got = cancelled(token: ref tlsToken, server: one(s: Step::Cancel(body: requestBody(keyLength: 4))), secure: true);
+                    f = f + check(ok: got.equals(other: "(sent)"), what: "cancel: over TLS, as the session was (".concat(other: got).concat(other: ")"));
+                    // sslmode=require will not send it in plaintext to a server without TLS.
+                    string refusedPlain = cancelled(token: ref tlsToken, server: one(s: Step::Cancel(body: requestBody(keyLength: 4))), secure: false);
+                    f = f + check(ok: refusedPlain.equals(other: lead.concat(other: "server does not support SSL, but SSL was required")),
+                                  what: "cancel: sslmode=require refuses a server without TLS (".concat(other: refusedPlain).concat(other: ")"));
+                }
+                case Err(error: e): { f = f + check(ok: false, what: "cancel: TLS token (".concat(other: e.message()).concat(other: ")")); }
+            };
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cancel: TLS session (".concat(other: e.message()).concat(other: ")")); }
+    };
+
+    // Protocol 3.2's longer key goes whole.
+    Wire wide = Wire.make();
+    wide.auth(code: 0); wide.parameter(name: "client_encoding", value: "UTF8"); wide.backendKey(pid: 4242, keyLength: 32); wide.ready(status: 73ui8);
+    Owned<Dialer> d4 = new ScriptDialer.make(plays: only(a: one(s: Step::Send(bytes: wide.bytes()))), secure: false);
+    Result<Connection, PgError> longMade = session(conninfo: plain.concat(other: " max_protocol_version=3.2"), dialer: give d4);
+    match (give longMade) {
+        case Ok(value: s): {
+            Result<CancelToken, PgError> lt = s.cancelToken();
+            match (give lt) {
+                case Ok(value: tok): {
+                    CancelToken longToken = give tok;
+                    string got = cancelled(token: ref longToken, server: one(s: Step::Cancel(body: requestBody(keyLength: 32))), secure: false);
+                    f = f + check(ok: got.equals(other: "(sent)"), what: "cancel: a 32-byte key under protocol 3.2 (".concat(other: got).concat(other: ")"));
+                }
+                case Err(error: e): { f = f + check(ok: false, what: "cancel: 3.2 token (".concat(other: e.message()).concat(other: ")")); }
+            };
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "cancel: 3.2 session (".concat(other: e.message()).concat(other: ")")); }
+    };
+    return f;
+}
+
+fn DynamicArray<Step> steps2(Step a, Step b) { DynamicArray<Step> v = DynamicArray.empty(); v.add(item: give a); v.add(item: give b); return v; }
+
+fn DynamicArray<DynamicArray<Step>> both(DynamicArray<Step> a, DynamicArray<Step> b) {
+    DynamicArray<DynamicArray<Step>> v = DynamicArray.empty(); v.add(item: give a); v.add(item: give b); return v;
+}
+
+// The server's answer to a cancelled statement: 57014, then ready.
+fn DynamicArray<uint8> cancelledReply() {
+    Wire m = Wire.make();
+    m.report(tag: 69ui8, severity: "ERROR", code: "57014", message: "canceling statement due to user request");
+    m.ready(status: 73ui8);
+    return m.bytes();
+}
+
+fn DynamicArray<uint8> oneRow() {
+    Wire m = Wire.make();
+    DynamicArray<string> names = DynamicArray.empty(); names.add(item: "n");
+    DynamicArray<string> values = DynamicArray.empty(); values.add(item: "2");
+    m.columns(names: names); m.row(values: values); m.complete(tag: "SELECT 1"); m.ready(status: 73ui8);
+    return m.bytes();
+}
+
+fn string outcome(const ref Result<DynamicArray<Rows>, PgError> r) {
+    return match (r) { case Ok(value: v): "(rows)"; case Err(error: e): e.message(); };
+}
+
+// Query timeouts (Connection.setQueryTimeout): when the limit passes, the command is cancelled through the session's
+// route and the server's answer is waited for; without an answer within the grace, or without a route, the
+// connection is closed and the call is `Timeout`.
+unsafe fn int32 timeoutTests() {
+    int32 f = 0;
+    string plain = "host=localhost hostaddr=127.0.0.1 port=5432 user=u dbname=d sslmode=disable";
+    Duration limit = Duration.fromMillis(ms: 50i64);
+    Duration grace = Duration.fromMillis(ms: 50i64);
+
+    // The server answers the cancel with 57014: that error is the call's, and the session goes on.
+    DynamicArray<Step> serving = DynamicArray.empty();
+    serving.add(item: Step::Send(bytes: welcome()));
+    serving.add(item: Step::Late(then: cancelledReply()));
+    serving.add(item: Step::Send(bytes: oneRow()));
+    Owned<Dialer> d1 = new ScriptDialer.make(plays: both(a: give serving, b: one(s: Step::Cancel(body: requestBody(keyLength: 4)))), secure: false);
+    Result<Connection, PgError> made = session(conninfo: plain, dialer: give d1);
+    Connection c = match (give made) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "timeout: session (".concat(other: e.message()).concat(other: ")")); } };
+    c.setQueryTimeout(timeout: Optional::Some(value: limit), grace: grace);
+    Result<DynamicArray<Rows>, PgError> r1 = c.simpleQuery(sql: "select pg_sleep(60)");
+    string first = outcome(r: r1);
+    f = f + check(ok: first.contains(substring: "canceling statement due to user request") && !c.isClosed(),
+                  what: "timeout: the command is cancelled and its 57014 returned, the session open (".concat(other: first).concat(other: ")"));
+    Result<DynamicArray<Rows>, PgError> r2 = c.simpleQuery(sql: "select 2");
+    f = f + check(ok: outcome(r: r2).equals(other: "(rows)"), what: "timeout: the session goes on after a cancelled command");
+
+    // The cancel is sent, but nothing comes back within the grace: the connection is closed.
+    Owned<Dialer> d2 = new ScriptDialer.make(plays: both(a: steps2(a: Step::Send(bytes: welcome()), b: Step::Silent), b: one(s: Step::Cancel(body: requestBody(keyLength: 4)))), secure: false);
+    Result<Connection, PgError> made2 = session(conninfo: plain, dialer: give d2);
+    match (give made2) {
+        case Ok(value: x): {
+            Connection quiet = give x;
+            quiet.setQueryTimeout(timeout: Optional::Some(value: limit), grace: grace);
+            Result<DynamicArray<Rows>, PgError> r = quiet.simpleQuery(sql: "select pg_sleep(60)");
+            string got = outcome(r: r);
+            f = f + check(ok: got.equals(other: "timeout expired") && quiet.isClosed(), what: "timeout: no answer within the grace closes the connection (".concat(other: got).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "timeout: silent session"); }
+    };
+
+    // The cancel cannot be sent (nothing listens): the connection is closed.
+    Owned<Dialer> d3 = new ScriptDialer.make(plays: only(a: steps2(a: Step::Send(bytes: welcome()), b: Step::Silent)), secure: false);
+    Result<Connection, PgError> made3 = session(conninfo: plain, dialer: give d3);
+    match (give made3) {
+        case Ok(value: x): {
+            Connection stuck = give x;
+            stuck.setQueryTimeout(timeout: Optional::Some(value: limit), grace: grace);
+            Result<DynamicArray<Rows>, PgError> r = stuck.simpleQuery(sql: "select pg_sleep(60)");
+            string got = outcome(r: r);
+            f = f + check(ok: got.equals(other: "timeout expired") && stuck.isClosed(), what: "timeout: a cancel that cannot be sent closes the connection (".concat(other: got).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "timeout: unreachable cancel session"); }
+    };
+
+    // A session over a caller's transport has no route: the connection is closed.
+    string none = "";
+    Result<Connection, PgError> overMade = over(script: steps2(a: Step::Send(bytes: welcome()), b: Step::Silent), conninfo: none);
+    match (give overMade) {
+        case Ok(value: x): {
+            Connection o = give x;
+            o.setQueryTimeout(timeout: Optional::Some(value: limit), grace: grace);
+            Result<DynamicArray<Rows>, PgError> r = o.simpleQuery(sql: "select pg_sleep(60)");
+            string got = outcome(r: r);
+            f = f + check(ok: got.equals(other: "timeout expired") && o.isClosed(), what: "timeout: no route, so the connection is closed (".concat(other: got).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "timeout: session over a transport"); }
+    };
+    return f;
+}

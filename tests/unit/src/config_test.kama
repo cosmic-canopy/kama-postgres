@@ -348,8 +348,42 @@ fn int32 tlsSettingTests() {
     return f;
 }
 
+// A copy is the whole configuration (libpq's pqCopyPGconn, which a cancel request connects with): every keyword's
+// value, the hosts, and the TLS settings, including the environment's SSL_CERT_FILE.
+fn int32 copyTests() {
+    int32 f = 0;
+    Environment env = testEnvironment();
+    env.set(name: "HOME", value: "/home/t");
+    env.set(name: "SSL_CERT_FILE", value: "/etc/bundle.pem");
+    string text = "host=a,b hostaddr=10.0.0.1,10.0.0.2 port=5433,5434 user=u dbname=d password=pw sslmode=verify-full sslrootcert=/r sslcert=/c sslkey=/k sslpassword=kp connect_timeout=7 keepalives_idle=30 require_auth=scram-sha-256 channel_binding=require application_name=app options=-cgeqo=off max_protocol_version=3.2 sslnegotiation=direct";
+    Result<Config, PgError> made = resolveWith(text: text, env: env);
+    Config original = match (give made) { case Ok(value: c): give c; case Err(error: e): { return check(ok: false, what: "copy: resolves (".concat(other: e.message()).concat(other: ")")); } };
+    Config twin = copy original;
+    DynamicArray<string> keys = DynamicArray.empty();
+    foreach (string k in "host hostaddr port user dbname password sslmode sslrootcert sslcert sslkey sslpassword connect_timeout keepalives_idle require_auth channel_binding application_name options max_protocol_version sslnegotiation".split(separator: " ")) { keys.add(item: copy k); }
+    string differing = "";
+    foreach (string k in keys) {
+        Optional<string> a = original.get(keyword: k);
+        Optional<string> b = twin.get(keyword: k);
+        bool same = match (a) {
+            case Some(value: x): match (b) { case Some(value: y): x.equals(other: y); case None: false; };
+            case None: match (b) { case Some(value: y): false; case None: true; };
+        };
+        if (!same) { differing = differing.concat(other: k).concat(other: " "); }
+    }
+    f = f + check(ok: differing.length() == 0, what: "copy: every keyword's value (differs: ".concat(other: differing).concat(other: ")"));
+    bool hosts = twin.hostCount() == 2 && twin.host(index: 1).name().equals(other: "b") && twin.host(index: 1).address().equals(other: "10.0.0.2")
+                 && twin.host(index: 1).port().equals(other: "5434");
+    f = f + check(ok: hosts, what: "copy: the hosts, with their addresses and ports");
+    bool system = match (twin.tls().sslCertFile()) { case Some(value: v): v.equals(other: "/etc/bundle.pem"); case None: false; };
+    bool tls = twin.tls().rootCert().equals(other: "/r") && twin.tls().password().equals(other: "kp") && twin.tls().direct() && system;
+    f = f + check(ok: tls && twin.connectTimeout() == 7, what: "copy: the TLS settings and connect_timeout");
+    return f;
+}
+
 fn int32 configTests() {
     int32 f = 0;
+    f = f + copyTests();
     f = f + tlsSettingTests();
     f = f + requireAuthTests();
     f = f + pgpassTests();

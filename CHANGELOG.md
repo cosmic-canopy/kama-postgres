@@ -6,10 +6,39 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Cancel requests**, as libpq's PQcancelCreate and PQcancelBlocking make them:
+  - `Connection.cancelToken()` gives a `CancelToken`, Sendable and copyable, so another isolate can cancel the
+    session's running command with `cancel()` (or `cancelWith(dialer:)` for a session made with `connectWith`);
+  - the request goes to the address the session used, with the session's sslmode, and so the same encryption and
+    fallbacks (libpq 17's encrypted cancel); CancelRequest takes the place of the startup packet, and the server's close
+    ends it, all within connect_timeout;
+  - protocol 3.2's longer keys go whole;
+  - libpq's messages: "no cancellation key received", "connection not open", "could not send cancel packet: …",
+    "unexpected response from server", each with libpq's lead.
+- **Query timeouts:** `Connection.setQueryTimeout(timeout:, grace:)`, as Npgsql's CommandTimeout and pgjdbc's
+  setQueryTimeout behave (libpq has none):
+  - when the limit passes, the command is cancelled through the session's route;
+  - the server's 57014 is returned, and the session goes on;
+  - if the server does not answer within `grace` (2 s by default), or the session has no route (`connectOver`), the
+    connection is closed and the call returns `Timeout`.
+- `PgError::Cancel`, for a cancel request that could not be made or sent.
+- **Waiting for notifications:** `Connection.waitForNotification(timeout:)` returns the oldest LISTEN/NOTIFY
+  notification already received, else the next to arrive within the time (None when none does), taking in notices
+  and parameter changes on the way. libpq leaves this loop to the application (PQsocket, PQconsumeInput, PQnotifies).
+
 ### Changed
 - **Needs kama ≥ 0.9.523**, the release with the fixes for KPG-31 and KPG-32.
 - A client private key owned by root may be group-readable (0640), as libpq allows. Every other key must still be 0600
   or less. Before, with no way to read a file's owner, every key had to be 0600 or less.
+- **Breaking:** `TransactionStatus` gains `Active`, reported while a command's result is still being read, as libpq's
+  PQtransactionStatus reports PQTRANS_ACTIVE.
+- `Config` is `Copyable`: a copy is the whole configuration, as libpq's pqCopyPGconn copies a connection's options.
+
+### Fixed
+- While a request waits to be written, whatever the server sends is read into the buffer, as libpq's pqSendSome reads
+  it. A server writing results for the commands it already has stops reading once its own output is full; a client
+  that only wrote would then wait forever on a long request. Phase 7's pipelines and COPY rely on this.
 
 ## [0.1.0] — 2026-10-02
 

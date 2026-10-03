@@ -16,7 +16,7 @@ fn string strerror(const ref IoError e) {
 }
 
 // When a wait must end: never, or at an instant of the monotonic clock.
-type value Deadline {
+type value Deadline implements Sendable {
     bool bounded = false;
     Instant at;
 
@@ -24,6 +24,14 @@ type value Deadline {
     public unsafe ctor after(Duration span) { this.bounded = true; this.at = monotonicNow() + span; }
 
     public const fn bool isBounded() { return this.bounded; }
+
+    // Whichever of the two ends first.
+    public const fn Deadline sooner(Deadline other) {
+        if (!other.bounded) { return this; }
+        if (!this.bounded) { return other; }
+        if (other.at < this.at) { return other; }
+        return this;
+    }
 
     // What `Transport.wait` takes: -1 for no limit, else the milliseconds left, rounded up so a wait never ends
     // just short of the deadline and spins; 0 once it has passed.
@@ -93,9 +101,14 @@ type resource Wire implements Sendable {
         return Result::Err(error: PgError::Closed);
     }
 
-    // Write all of `bytes`, waiting for the transport as often as it needs, until `deadline`.
+    // Write all of `bytes`, waiting for the transport as often as it needs, until `deadline`. While a write must wait,
+    // whatever the server sends is read into the buffer, as libpq's pqSendSome reads: a server writing results for
+    // the commands it already has stops reading once its own output fills, so a client that only wrote would wait
+    // forever on a long pipeline or COPY. Once the server has stopped sending (EOF, an error), only writing is waited
+    // for; the reader meets the end when it gets there.
     public unsafe fn Result<Unit, PgError> send(ConstView<uint8> bytes, Deadline deadline) {
         isize sent = 0;
+        bool reading = true;
         while (sent < bytes.length()) {
             Result<isize, IoError> w = this.link.write(bytes: bytes.slice(from: sent, count: bytes.length() - sent));
             bool wait = false;
@@ -106,12 +119,64 @@ type resource Wire implements Sendable {
                 }
             };
             if (wait) {
-                Result<Unit, PgError> ready = this.await(interest: Interest::Write, deadline: deadline);
-                match (give ready) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                Interest want = Interest::Write;
+                if (reading) { want = Interest::ReadWrite; }
+                Result<Ready, IoError> ready = this.link.wait(interest: want, timeoutMs: deadline.remainingMs());
+                Ready r = match (ready) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: this.failure(error: e)); } };
+                if (!r.writable && !(reading && r.readable)) { return Result::Err(error: PgError::Timeout); }
+                if (reading && r.readable) { reading = this.drain(); }
             }
         }
         return Result::Ok(value: Unit::Unit);
     }
+
+    // One read of whatever has arrived, into the buffer, which grows to take it. False once the server has stopped
+    // sending: at EOF, or on an error, which a later read reports.
+    unsafe fn bool drain() {
+        this.makeRoom(needed: this.end - this.start + INITIAL_BYTES);
+        Result<isize, IoError> r = this.link.read(into: this.buf.sliceMut(from: this.end, count: this.buf.length() - this.end));
+        match (r) {
+            case Ok(value: n): {
+                if (n == 0) { return false; }
+                this.end = this.end + n;
+            }
+            case Err(error: e): {
+                match (e.kind()) { case WouldBlock: { } case Interrupted: { } case _: { return false; } };
+            }
+        };
+        return true;
+    }
+
+    // For a cancel request's connection, once the request is sent: wait for the server to close it, as libpq's
+    // PQcancelPoll waits. Ok(false) when it has, having sent nothing; Ok(true) if it sent anything, which a server
+    // answering a cancel request never does. A TLS session must end with close_notify: a truncated one is the
+    // failure libpq reports too.
+    public unsafe fn Result<bool, PgError> awaitEnd(Deadline deadline) {
+        if (this.end > this.start) { return Result::Ok(value: true); }
+        while (true) {
+            this.makeRoom(needed: INITIAL_BYTES);
+            Result<isize, IoError> r = this.link.read(into: this.buf.sliceMut(from: this.end, count: this.buf.length() - this.end));
+            bool wait = false;
+            match (r) {
+                case Ok(value: n): {
+                    if (n == 0) { return Result::Ok(value: false); }
+                    this.end = this.end + n;
+                    return Result::Ok(value: true);
+                }
+                case Err(error: e): {
+                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };
+                }
+            };
+            if (wait) {
+                Result<Unit, PgError> ready = this.await(interest: Interest::Read, deadline: deadline);
+                match (give ready) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+            }
+        }
+        return Result::Ok(value: false);
+    }
+
+    // Bytes received and not yet taken as messages.
+    public const fn isize buffered() { return this.end - this.start; }
 
     // Stop the transport in both directions. Buffered bytes are dropped with it.
     public unsafe fn void shutdown() {

@@ -184,7 +184,7 @@ type enum ChannelBindingMode implements Sendable { Disable, Prefer, Require }
 type enum HostKind implements Sendable { Name, Address, Socket }
 
 // One server to try, as pqConnectOptions2 lays them out: `host` and `hostaddr` paired by position, a port each.
-type resource Host implements Sendable {
+type resource Host implements Sendable, Copyable<This>(bare: give) {
     string hostName;
     string hostAddr;
     string portText;
@@ -195,6 +195,10 @@ type resource Host implements Sendable {
     public ctor make(string name, string address, string port, HostKind kind) {
         this.hostName = give name; this.hostAddr = give address; this.portText = give port; this.hostKind = kind;
         this.fromFile = false; this.filePassword = "";
+    }
+    public ctor copy(ref Host source) {
+        this.hostName = copy source.hostName; this.hostAddr = copy source.hostAddr; this.portText = copy source.portText;
+        this.hostKind = source.hostKind; this.fromFile = source.fromFile; this.filePassword = copy source.filePassword;
     }
     fn void setFilePassword(string password) { this.fromFile = true; this.filePassword = give password; }
     friend Config::readPassfile[setFilePassword];
@@ -240,7 +244,7 @@ fn uint32 bit(int32 code) { return 1ui32 << cast<uint32>(code); }
 
 // `require_auth`: the methods the server may use, and whether it must use one. A port of the require_auth block
 // of pqConnectOptions2 and of check_expected_areq (fe-auth.c), with their messages.
-type resource RequireAuth implements Sendable {
+type resource RequireAuth implements Sendable, Copyable<This>(bare: give) {
     bool given = false;         // the keyword has a value (libpq: require_auth != NULL), even an empty one
     string spec;
     bool required = false;      // auth_required: an exchange must complete
@@ -251,6 +255,10 @@ type resource RequireAuth implements Sendable {
     // No requirement: the keyword was not given.
     public ctor none() {
         this.given = false; this.spec = ""; this.required = false; this.methods = 0ui32; this.scram = false; this.oauth = false;
+    }
+    public ctor copy(ref RequireAuth source) {
+        this.given = source.given; this.spec = copy source.spec; this.required = source.required; this.methods = source.methods;
+        this.scram = source.scram; this.oauth = source.oauth;
     }
 
     // The keyword's value, checked as pqConnectOptions2 checks it. The error is libpq's message.
@@ -382,7 +390,7 @@ fn string describe(int32 code) {
 // The TLS settings of a configuration, resolved as libpq's initialize_SSL reads them: every file path after its
 // default (a setting left empty is the file of that name in the home directory, when there is one), the protocol
 // version bounds as written, and the environment's SSL_CERT_FILE for sslrootcert=system.
-type resource TlsSettings implements Sendable {
+type resource TlsSettings implements Sendable, Copyable<This>(bare: give) {
     SslMode modeSetting = SslMode::Prefer;
     bool directSetting = false;
     SslCertMode certModeSetting = SslCertMode::Allow;
@@ -406,6 +414,16 @@ type resource TlsSettings implements Sendable {
         this.sniSetting = true; this.minText = ""; this.maxText = ""; this.hintText = ""; this.passwordText = ""; this.keylogText = "";
         this.certPath = ""; this.keyPath = ""; this.keyGiven = false; this.rootPath = ""; this.crlPath = ""; this.crlDirPath = "";
         this.homeKnown = false; this.systemCertFile = Optional::None;
+    }
+    public ctor copy(ref TlsSettings source) {
+        this.modeSetting = source.modeSetting; this.directSetting = source.directSetting; this.certModeSetting = source.certModeSetting;
+        this.sniSetting = source.sniSetting; this.minText = copy source.minText; this.maxText = copy source.maxText;
+        this.hintText = copy source.hintText; this.passwordText = copy source.passwordText; this.keylogText = copy source.keylogText;
+        this.certPath = copy source.certPath; this.keyPath = copy source.keyPath; this.keyGiven = source.keyGiven;
+        this.rootPath = copy source.rootPath; this.crlPath = copy source.crlPath; this.crlDirPath = copy source.crlDirPath;
+        this.homeKnown = source.homeKnown;
+        Optional<string> certFile = match (source.systemCertFile) { case Some(value: f): Optional::Some(value: copy f); case None: Optional::None; };
+        this.systemCertFile = give certFile;
     }
 
     friend Config::resolveTls[blank, modeSetting, directSetting, certModeSetting, sniSetting, minText, maxText, hintText, passwordText,
@@ -446,7 +464,9 @@ type resource TlsSettings implements Sendable {
 
 // ---- the configuration --------------------------------------------------------------------------------------
 
-type resource Config implements Sendable {
+// A configuration is copied whole (as libpq's pqCopyPGconn copies a connection's options) for a cancel request,
+// which connects to the same server again.
+type resource Config implements Sendable, Copyable<This>(bare: give) {
     DynamicArray<string> names;    // every libpq keyword, in libpq's order
     DynamicArray<string> values;   // its resolved value ("" when unset)
     DynamicArray<bool> present;    // whether it has a value at all
@@ -515,6 +535,18 @@ type resource Config implements Sendable {
         this.clientKey = DynamicArray.empty();
         this.serverKey = DynamicArray.empty();
         this.tlsSettings = TlsSettings.blank();
+    }
+
+    public ctor copy(ref Config source) {
+        this.names = copy source.names; this.values = copy source.values; this.present = copy source.present;
+        this.hostList = copy source.hostList; this.passfilePath = copy source.passfilePath;
+        this.ssl = source.ssl; this.binding = source.binding; this.auth = copy source.auth;
+        this.minProtocol = source.minProtocol; this.maxProtocol = source.maxProtocol; this.timeoutSeconds = source.timeoutSeconds;
+        this.keepalivesOn = source.keepalivesOn; this.idleSeconds = source.idleSeconds; this.intervalSeconds = source.intervalSeconds;
+        this.probeCount = source.probeCount; this.userTimeoutMs = source.userTimeoutMs;
+        this.params = copy source.params; this.paramValues = copy source.paramValues;
+        this.clientKey = copy source.clientKey; this.serverKey = copy source.serverKey;
+        this.tlsSettings = copy source.tlsSettings;
     }
 
     // ---- reading it ----

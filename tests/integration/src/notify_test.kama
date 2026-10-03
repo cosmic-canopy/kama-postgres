@@ -1,0 +1,67 @@
+// Waiting for LISTEN/NOTIFY notifications on a real server: one sent before the wait, one sent from another isolate
+// while it waits, a payload and none, the sender's process id, and a wait that ends with nothing.
+import { std::collections::DynamicArray, std::concurrent::Isolate, std::time::Duration, std::time::sleep,
+         std::time::monotonicNow, std::time::Instant,
+         postgres::Connection, postgres::PgError, postgres::Notification,
+         postgres_integration_tests::check, postgres_integration_tests::conninfoFor, postgres_integration_tests::open,
+         postgres_integration_tests::scalar };
+export { notifyTests };
+
+// Notifies from another isolate after a pause, over its own session.
+type resource Notifier implements Sendable {
+    Connection conn;
+    public ctor make(Connection conn) { this.conn = give conn; }
+    public unsafe fn void run() {
+        sleep(d: Duration.fromMillis(ms: 300i64));
+        string done = scalar(c: this.conn, sql: "select pg_notify('kp_jobs', 'from afar')::text");
+        this.conn.close();
+    }
+}
+
+fn void notifyLater(Notifier job) { job.run(); }
+
+unsafe fn string described(const ref Result<Optional<Notification>, PgError> r) {
+    return match (r) {
+        case Ok(value: o): match (o) { case Some(value: n): n.channel().concat(other: ":").concat(other: n.payload()); case None: "(none)"; };
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn int32 notifyTests() {
+    int32 f = 0;
+    Result<Connection, PgError> r1 = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection listener = match (give r1) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "notify: connect (".concat(other: e.message()).concat(other: ")")); } };
+    Result<Connection, PgError> r2 = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection sender = match (give r2) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "notify: connect the sender"); } };
+    string listening = scalar(c: listener, sql: "listen kp_jobs");
+    string sent = scalar(c: sender, sql: "notify kp_jobs, 'one'");
+    Result<Optional<Notification>, PgError> got = listener.waitForNotification(timeout: Optional::Some(value: Duration.fromSecs(s: 5i64)));
+    int32 senderPid = sender.processId();
+    bool fromSender = match (got) { case Ok(value: o): match (o) { case Some(value: n): n.processId() == senderPid; case None: false; }; case Err(error: e): false; };
+    string first = described(r: got);
+    f = f + check(ok: first.equals(other: "kp_jobs:one") && fromSender, what: "notify: a notification, with the sender's process id (".concat(other: first).concat(other: ")"));
+    string bare = scalar(c: sender, sql: "notify kp_jobs");
+    Result<Optional<Notification>, PgError> empty = listener.waitForNotification(timeout: Optional::Some(value: Duration.fromSecs(s: 5i64)));
+    string second = described(r: empty);
+    f = f + check(ok: second.equals(other: "kp_jobs:"), what: "notify: one with no payload (".concat(other: second).concat(other: ")"));
+
+    // Sent while the wait is under way, from another isolate.
+    Notifier job = Notifier.make(conn: give sender);
+    Isolate worker = spawn notifyLater(job: give job);
+    Instant start = monotonicNow();
+    Result<Optional<Notification>, PgError> later = listener.waitForNotification(timeout: Optional::Some(value: Duration.fromSecs(s: 10i64)));
+    int64 ms = (monotonicNow() - start).asMillis();
+    worker.join();
+    string third = described(r: later);
+    f = f + check(ok: third.equals(other: "kp_jobs:from afar") && ms >= 200i64 && ms < 9000i64, what: "notify: one sent while waiting, after ${ms} ms (".concat(other: third).concat(other: ")"));
+
+    // Nothing comes: None after the time, and the session goes on.
+    Instant quietStart = monotonicNow();
+    Result<Optional<Notification>, PgError> nothing = listener.waitForNotification(timeout: Optional::Some(value: Duration.fromMillis(ms: 200i64)));
+    int64 quietMs = (monotonicNow() - quietStart).asMillis();
+    string fourth = described(r: nothing);
+    f = f + check(ok: fourth.equals(other: "(none)") && quietMs >= 150i64 && quietMs < 3000i64, what: "notify: nothing within 200 ms, after ${quietMs} ms (".concat(other: fourth).concat(other: ")"));
+    string after = scalar(c: listener, sql: "select 'still here'");
+    f = f + check(ok: after.equals(other: "still here"), what: "notify: the session goes on");
+    return f;
+}

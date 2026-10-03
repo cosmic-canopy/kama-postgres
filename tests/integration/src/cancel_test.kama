@@ -1,0 +1,94 @@
+// Cancel requests against a real server, as libpq_pipeline's cancel test makes them: another isolate cancels a
+// running statement with the session's token, the statement fails with 57014, and the session goes on. Plaintext
+// here; over TLS (libpq 17's encrypted cancel) in the suite's TLS pass, PGTEST_SSLMODE=require; and with protocol
+// 3.2's longer keys where the server has them (18 and later).
+import { std::collections::DynamicArray, std::concurrent::Isolate, std::concurrent::Channel, std::concurrent::Sender,
+         std::concurrent::Receiver, std::concurrent::SendResult, std::time::Duration, std::time::sleep,
+         std::time::monotonicNow, std::time::Instant,
+         postgres::Connection, postgres::CancelToken, postgres::PgError, postgres::Rows, postgres::Query,
+         postgres::protocol::PROTOCOL_3_2, postgres::sqlstate::QUERY_CANCELED,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::conninfoFor,
+         postgres_integration_tests::open, postgres_integration_tests::scalar };
+export { cancelTests };
+
+// Sends the cancel request from another isolate after a pause, and reports how it went.
+type resource Canceller implements Sendable {
+    CancelToken token;
+    Sender<string> report;
+    public ctor make(CancelToken token, Sender<string> report) { this.token = give token; this.report = give report; }
+    public unsafe fn void run() {
+        sleep(d: Duration.fromMillis(ms: 300i64));
+        Result<Unit, PgError> r = this.token.cancel();
+        string outcome = match (r) { case Ok(value: u): "sent"; case Err(error: e): e.message(); };
+        SendResult<string> s = this.report.send(item: give outcome);
+    }
+}
+
+fn void cancelLater(Canceller job) { job.run(); }
+
+unsafe fn int32 cancelOne(const ref string conninfo, const ref string what, bool wants32) {
+    int32 f = 0;
+    Result<Connection, PgError> opened = open(conninfo: conninfo);
+    Connection c = match (give opened) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: what.concat(other: ": connect (").concat(other: e.message()).concat(other: ")")); } };
+    if (wants32) { f = f + check(ok: c.protocolVersion() == PROTOCOL_3_2, what: what.concat(other: ": protocol 3.2, with its 32-byte key")); }
+    Result<CancelToken, PgError> t = c.cancelToken();
+    CancelToken token = match (give t) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: what.concat(other: ": token (").concat(other: e.message()).concat(other: ")")); } };
+    Channel<string> results = Channel.bounded(capacity: 1);
+    Receiver<string> rx = results.receiver();
+    Canceller job = Canceller.make(token: give token, report: results.sender());
+    Isolate worker = spawn cancelLater(job: give job);
+    Instant start = monotonicNow();
+    Result<DynamicArray<Rows>, PgError> r = c.simpleQuery(sql: "select pg_sleep(30)");
+    Duration took = monotonicNow() - start;
+    worker.join();
+    Optional<string> sent = rx.recv();
+    string how = match (give sent) { case Some(value: s): give s; case None: "(no report)"; };
+    f = f + check(ok: how.equals(other: "sent"), what: what.concat(other: ": the request is sent (").concat(other: how).concat(other: ")"));
+    string message = match (r) { case Ok(value: rows): "(finished)"; case Err(error: e): e.message(); };
+    bool cancelled = match (r) { case Ok(value: rows): false; case Err(error: e): e.sqlstate() == QUERY_CANCELED; };
+    int64 ms = took.asMillis();
+    f = f + check(ok: cancelled && message.contains(substring: "canceling statement due to user request") && ms < 10000i64,
+                  what: what.concat(other: ": the statement fails with 57014 after ${ms} ms (").concat(other: message).concat(other: ")"));
+    string after = scalar(c: c, sql: "select 'still here'");
+    f = f + check(ok: after.equals(other: "still here"), what: what.concat(other: ": the session goes on"));
+    return f;
+}
+
+// A query timeout (setQueryTimeout): the statement is cancelled when the limit passes and returns 57014 well before
+// it would have finished, a statement within the limit runs, and the session goes on, through both protocols.
+unsafe fn int32 timeoutTests() {
+    int32 f = 0;
+    Result<Connection, PgError> opened = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection c = match (give opened) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "timeout: connect (".concat(other: e.message()).concat(other: ")")); } };
+    c.setQueryTimeout(timeout: Optional::Some(value: Duration.fromMillis(ms: 200i64)), grace: Duration.fromSecs(s: 5i64));
+    Instant start = monotonicNow();
+    Result<DynamicArray<Rows>, PgError> r = c.simpleQuery(sql: "select pg_sleep(30)");
+    int64 ms = (monotonicNow() - start).asMillis();
+    bool cancelled = match (r) { case Ok(value: rows): false; case Err(error: e): e.sqlstate() == QUERY_CANCELED; };
+    string message = match (r) { case Ok(value: rows): "(finished)"; case Err(error: e): e.message(); };
+    f = f + check(ok: cancelled && ms >= 150i64 && ms < 5000i64 && !c.isClosed(),
+                  what: "timeout: simple query cancelled after ${ms} ms, the session open (".concat(other: message).concat(other: ")"));
+    string quick = scalar(c: c, sql: "select 'in time'");
+    f = f + check(ok: quick.equals(other: "in time"), what: "timeout: a statement within the limit runs");
+    Query slow = Query.make(sql: "select pg_sleep($1)");
+    slow.add(value: 30);
+    Instant start2 = monotonicNow();
+    Result<Rows, PgError> r2 = c.query(q: slow);
+    int64 ms2 = (monotonicNow() - start2).asMillis();
+    bool cancelled2 = match (r2) { case Ok(value: rows): false; case Err(error: e): e.sqlstate() == QUERY_CANCELED; };
+    f = f + check(ok: cancelled2 && ms2 < 5000i64 && !c.isClosed(), what: "timeout: extended query cancelled after ${ms2} ms");
+    string after = scalar(c: c, sql: "select 'still here'");
+    f = f + check(ok: after.equals(other: "still here"), what: "timeout: the session goes on");
+    return f;
+}
+
+unsafe fn int32 cancelTests() {
+    int32 f = 0;
+    f = f + timeoutTests();
+    f = f + cancelOne(conninfo: conninfoFor(user: "kp_trust"), what: "cancel", wants32: false);
+    // Protocol 3.2 (PostgreSQL 18 and later) gives a 32-byte key; an older server settles on 3.0 and its 4 bytes.
+    string major = setting(name: "PGTEST_VERSION");
+    bool newer = major.equals(other: "18") || major.equals(other: "19");
+    f = f + cancelOne(conninfo: conninfoFor(user: "kp_trust").concat(other: " max_protocol_version=latest"), what: "cancel (protocol latest)", wants32: newer);
+    return f;
+}

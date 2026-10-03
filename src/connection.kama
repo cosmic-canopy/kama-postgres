@@ -4,7 +4,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          std::time::Duration,
          postgres::PgError, postgres::ServerError, postgres::ConnectError, postgres::ConnectAttempt,
          postgres::Config, postgres::HostKind, postgres::ChannelBindingMode, postgres::RequireAuth,
-         postgres::Transport, postgres::TcpTransport, postgres::UnixTransport, postgres::socketPathMax,
+         postgres::Transport, postgres::socketPathMax,
          postgres::NoticeHandler, postgres::Notification,
          postgres::logNotice, postgres::Rows,
          postgres::wire::Wire, postgres::wire::Deadline, postgres::wire::strerror,
@@ -19,19 +19,23 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::protocol::bind as sendBind, postgres::protocol::describeStatement as sendDescribeStatement,
          postgres::protocol::execute as sendExecute, postgres::protocol::closeStatement as sendCloseStatement,
          postgres::protocol::closePortal as sendClosePortal, postgres::protocol::sync as sendSync,
+         postgres::protocol::cancelRequest as sendCancelRequest, postgres::CancelToken,
          postgres::protocol::BindValues,
          postgres::Query, postgres::Statement, postgres::Portal, postgres::hasBinaryCodec,
          postgres::Dialer, postgres::DialTarget, postgres::SslCertMode, postgres::sqlstate::sqlstateCode,
          postgres::secure::EncryptionPlan, postgres::secure::Fallback, postgres::secure::Secured, postgres::secure::secure,
-         postgres::secure::TlsSession };
+         postgres::secure::TlsSession,
+         postgres::session::Opener, postgres::session::Opened, postgres::session::CancelRoute };
 export { Connection, TransactionStatus };
 
 // postgres::Connection — one session with a server: connecting as libpq connects (every host and address in
 // turn, each within connect_timeout), authenticating, and running queries. A connection belongs to one isolate at
 // a time and moves between them: it is Sendable, and it holds no Shared.
 
-// Where the session's transaction stands, from the last ReadyForQuery (libpq's PQtransactionStatus).
-type enum TransactionStatus implements Sendable { Idle, InTransaction, Failed, Unknown }
+// Where the session's transaction stands, as libpq's PQtransactionStatus says: Active while a command's result is
+// still being read, otherwise what the last ReadyForQuery said (idle, in a transaction block, or in a failed one);
+// Unknown once the connection is closed.
+type enum TransactionStatus implements Sendable { Idle, Active, InTransaction, Failed, Unknown }
 
 // The authentication request codes (AUTH_REQ_* in PostgreSQL's src/include/libpq/protocol.h).
 comptime int32 AUTH_OK = 0;
@@ -64,6 +68,16 @@ type resource Connection implements Sendable {
     int64 portals = 0i64;     // p0, p1, …
     Optional<TlsSession> tls;          // what TLS settled, when the session is encrypted
     bool refusedBeforeAuth = false;    // startup ended on an ErrorResponse before AuthenticationOk
+    // How a cancel request reaches the server again: the route the connect took (None over a caller's transport),
+    // and how connections are opened (this client's sockets, or the caller's Dialer).
+    Optional<CancelRoute> route;
+    Opener dialing;
+    // The query timeout (setQueryTimeout): the limit, the grace for the server's answer to the cancel, and for the
+    // command in hand, when it must end and whether its cancel has been sent.
+    Optional<Duration> timeoutSetting;
+    Duration graceSetting;
+    Deadline due;
+    bool cancelling = false;
 
     ctor over(Owned<Transport> transport) {
         this.wire = Wire.over(transport: give transport);
@@ -86,6 +100,12 @@ type resource Connection implements Sendable {
         this.portals = 0i64;
         this.tls = Optional::None;
         this.refusedBeforeAuth = false;
+        this.route = Optional::None;
+        this.dialing = Opener.builtIn();
+        this.timeoutSetting = Optional::None;
+        this.graceSetting = Duration.fromSecs(s: 2i64);
+        this.due = Deadline.none();
+        this.cancelling = false;
     }
 
     // Over a transport some of whose bytes were read already: what the server sent after its 'N' to an SSLRequest.
@@ -110,6 +130,12 @@ type resource Connection implements Sendable {
         this.portals = 0i64;
         this.tls = Optional::None;
         this.refusedBeforeAuth = false;
+        this.route = Optional::None;
+        this.dialing = Opener.builtIn();
+        this.timeoutSetting = Optional::None;
+        this.graceSetting = Duration.fromSecs(s: 2i64);
+        this.due = Deadline.none();
+        this.cancelling = false;
     }
 
     // Connect as `config` says, as libpq's PQconnectPoll does: each host in order, each of its addresses in turn,
@@ -127,7 +153,17 @@ type resource Connection implements Sendable {
     // `connect`, with each connection opened by `dialer` (a tunnel, a proxy) rather than a socket of this client's.
     public unsafe ctor Result<Connection, PgError> connectWith(Owned<Dialer> dialer, const ref Config config) {
         Opener opener = Opener.with(dialer: give dialer);
-        return Connection.establish(config: config, opener: opener);
+        Result<Connection, PgError> made = Connection.establish(config: config, opener: opener);
+        match (give made) {
+            case Ok(value: c): {
+                // A cancel request goes through the same dialer.
+                Connection session = give c;
+                session.dialing = give opener;
+                return Result::Ok(value: give session);
+            }
+            case Err(error: e): { return Result::Err(error: give e); }
+        };
+        return Result::Err(error: PgError::Closed);
     }
 
     // Start a session over a transport the caller opened (tokio-postgres's connect_raw). `config` supplies everything
@@ -142,7 +178,8 @@ type resource Connection implements Sendable {
         string host = "";
         if (config.hostCount() > 0 && !socket) { host = copy config.host(index: 0).name(); }
         EncryptionPlan plan = EncryptionPlan.forAddress(mode: config.tls().mode(), socket: socket);
-        Attempt tried = Connection::attempt(link: give transport, config: config, hostIndex: -1, host: host, plan: plan, deadline: deadline);
+        Errand errand = Errand.session();
+        Attempt tried = Connection::attempt(link: give transport, config: config, hostIndex: -1, host: host, plan: plan, deadline: deadline, errand: errand);
         return match (give tried) {
             case Ready(connection: c): Result::Ok(value: give c);
             case Retry(error: e): Result::Err(error: give e);
@@ -154,6 +191,7 @@ type resource Connection implements Sendable {
 
     unsafe ctor Result<Connection, PgError> establish(const ref Config config, ref Opener opener) {
         ConnectError failures = ConnectError.make();
+        Errand errand = Errand.session();
         bool stop = false;
         isize h = 0;
         while (h < config.hostCount() && !stop) {
@@ -162,7 +200,7 @@ type resource Connection implements Sendable {
             bool nextHost = false;
             isize a = 0;
             while (a < targets.length() && !stop && !nextHost) {
-                Visit v = Connection::visit(config: config, hostIndex: h, target: targets[a], opener: opener, failures: failures);
+                Visit v = Connection::visit(config: config, hostIndex: h, target: targets[a], opener: opener, failures: failures, errand: errand);
                 match (give v) {
                     case Connected(connection: c): { return Result::Ok(value: give c); }
                     case NextAddress: { }
@@ -240,7 +278,7 @@ type resource Connection implements Sendable {
     // One address: a connection for each encryption method sslmode allows, until one starts a session or a failure
     // decides otherwise. connect_timeout runs from the first connection and bounds them all, as it bounds libpq's
     // attempts at one address. libpq prints its lead again for every new connection.
-    static unsafe fn Visit visit(const ref Config config, isize hostIndex, const ref DialTarget target, ref Opener opener, ref ConnectError failures) {
+    static unsafe fn Visit visit(const ref Config config, isize hostIndex, const ref DialTarget target, ref Opener opener, ref ConnectError failures, const ref Errand errand) {
         string addressText = "";
         string lead = "";
         if (target.isSocket()) {
@@ -252,6 +290,8 @@ type resource Connection implements Sendable {
         }
         Deadline deadline = Deadline.none();
         if (config.connectTimeout() > 0) { deadline = Deadline.after(span: Duration.fromSecs(s: cast<int64>(config.connectTimeout()))); }
+        // A cancel for a query timeout ends with its grace, if that comes first.
+        deadline = deadline.sooner(other: errand.limit());
         EncryptionPlan plan = EncryptionPlan.forAddress(mode: config.tls().mode(), socket: target.isSocket());
         // libpq's connhost[].host: the name TLS sends as SNI and verify-full checks, "" when only hostaddr was given.
         string host = "";
@@ -271,10 +311,14 @@ type resource Connection implements Sendable {
                     return Visit::Stop;
                 }
             };
-            Attempt tried = Connection::attempt(link: give link, config: config, hostIndex: hostIndex, host: host, plan: plan, deadline: deadline);
+            Attempt tried = Connection::attempt(link: give link, config: config, hostIndex: hostIndex, host: host, plan: plan, deadline: deadline, errand: errand);
             string passfile = passfileFor(config: config, hostIndex: hostIndex);
             match (give tried) {
-                case Ready(connection: c): { return Visit::Connected(connection: give c); }
+                case Ready(connection: c): {
+                    Connection session = give c;
+                    if (!errand.isCancel()) { session.route = Optional::Some(value: CancelRoute.make(config: copy config, hostIndex: hostIndex, target: copy target)); }
+                    return Visit::Connected(connection: give session);
+                }
                 case Retry(error: e): {
                     failures.add(attempt: ConnectAttempt.make(host: copy target.host(), address: copy addressText, port: copy target.port(), lead: copy lead, error: give e, passfile: give passfile, note: ""));
                 }
@@ -298,25 +342,25 @@ type resource Connection implements Sendable {
     // One connection: encryption as `plan` has it now, then startup. What a failure leads to is libpq's: a TLS failure
     // or the server's refusal before authentication tries the next method (Retry) while one is left; 57P03 moves on
     // to the next host; connect_timeout to the next address; anything else ends the connect.
-    static unsafe fn Attempt attempt(Owned<Transport> link, const ref Config config, isize hostIndex, const ref string host, ref EncryptionPlan plan, Deadline deadline) {
+    static unsafe fn Attempt attempt(Owned<Transport> link, const ref Config config, isize hostIndex, const ref string host, ref EncryptionPlan plan, Deadline deadline, const ref Errand errand) {
         bool ssl = match (plan.current()) { case Ssl: true; case Plain: false; };
         if (!ssl) {
             Connection plain = Connection.over(transport: give link);
-            return Connection::finish(c: give plain, config: config, hostIndex: hostIndex, plan: plan, deadline: deadline);
+            return Connection::finish(c: give plain, config: config, hostIndex: hostIndex, plan: plan, deadline: deadline, errand: errand);
         }
         Secured secured = secure(link: give link, settings: config.tls(), host: host, deadline: deadline);
         match (give secured) {
             case Encrypted(link: l, session: s): {
                 Connection c = Connection.over(transport: give l);
                 c.tls = Optional::Some(value: give s);
-                return Connection::finish(c: give c, config: config, hostIndex: hostIndex, plan: plan, deadline: deadline);
+                return Connection::finish(c: give c, config: config, hostIndex: hostIndex, plan: plan, deadline: deadline, errand: errand);
             }
             case Declined(link: l, preread: p): {
                 Fallback next = plan.refused();
                 bool same = match (next) { case SameConnection: true; case _: false; };
                 if (!same) { return Attempt::Final(error: PgError::Tls(detail: "server does not support SSL, but SSL was required", cause: Optional::None)); }
                 Connection c = Connection.resumed(transport: give l, preread: p.view());
-                return Connection::finish(c: give c, config: config, hostIndex: hostIndex, plan: plan, deadline: deadline);
+                return Connection::finish(c: give c, config: config, hostIndex: hostIndex, plan: plan, deadline: deadline, errand: errand);
             }
             case Failed(error: e): {
                 bool timedOut = match (e) { case Timeout: true; case _: false; };
@@ -331,9 +375,21 @@ type resource Connection implements Sendable {
         return Attempt::Final(error: PgError::Closed);
     }
 
-    // Startup over a connection whose encryption is settled.
-    static unsafe fn Attempt finish(Connection c, const ref Config config, isize hostIndex, ref EncryptionPlan plan, Deadline deadline) {
+    // Startup over a connection whose encryption is settled; or, for a cancel request, the request in its place.
+    static unsafe fn Attempt finish(Connection c, const ref Config config, isize hostIndex, ref EncryptionPlan plan, Deadline deadline, const ref Errand errand) {
         Connection session = give c;
+        if (errand.isCancel()) {
+            Result<Unit, PgError> answered = session.cancelExchange(pid: errand.processId(), key: errand.secretKey(), deadline: deadline);
+            session.lose();
+            match (give answered) {
+                case Ok(value: u): { return Attempt::Ready(connection: give session); }
+                case Err(error: e): {
+                    bool late = match (e) { case Timeout: true; case _: false; };
+                    if (late) { return Attempt::TimedOut(error: give e); }
+                    return Attempt::Final(error: give e);
+                }
+            };
+        }
         Result<Unit, PgError> started = session.startup(config: config, hostIndex: hostIndex, deadline: deadline);
         match (give started) {
             case Ok(value: u): { return Attempt::Ready(connection: give session); }
@@ -362,11 +418,12 @@ type resource Connection implements Sendable {
     public unsafe fn Result<DynamicArray<Rows>, PgError> simpleQuery(const ref string sql) {
         Result<Unit, PgError> ok = this.idle();
         match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.arm();
         this.outbox.clear();
         if (!sendQuery(w: this.outbox, sql: sql)) {
             return Result::Err(error: PgError::Usage(detail: "the query text holds a NUL byte, which the protocol cannot carry"));
         }
-        Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
+        Result<Unit, PgError> sent = this.flush(deadline: this.due);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         return this.collect();
     }
@@ -381,7 +438,7 @@ type resource Connection implements Sendable {
         bool copying = false;
         bool done = false;
         while (!done) {
-            Result<BackendMessage, PgError> received = this.wire.receive(deadline: Deadline.none());
+            Result<BackendMessage, PgError> received = this.receive();
             BackendMessage m = match (give received) {
                 case Ok(value: v): give v;
                 case Err(error: e): { this.lose(); return Result::Err(error: give e); }
@@ -428,7 +485,7 @@ type resource Connection implements Sendable {
                     // COPY has its own interface; refusing it here keeps the session usable.
                     this.outbox.clear();
                     bool framed = sendCopyFail(w: this.outbox, reason: "COPY FROM STDIN is not supported by simpleQuery");
-                    Result<Unit, PgError> refusal = this.flush(deadline: Deadline.none());
+                    Result<Unit, PgError> refusal = this.flush(deadline: this.due);
                     match (give refusal) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
                     copyRefused = true;
                 }
@@ -475,6 +532,7 @@ type resource Connection implements Sendable {
     public unsafe fn Result<Statement, PgError> prepare(const ref string sql) {
         Result<Unit, PgError> ok = this.idle();
         match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.arm();
         int64 n = this.statements;
         this.statements = this.statements + 1i64;
         string name = "s${n}";
@@ -487,6 +545,7 @@ type resource Connection implements Sendable {
     public unsafe fn Result<Unit, PgError> closeStatement(Statement statement) {
         Result<Unit, PgError> ok = this.idle();
         match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.arm();
         this.outbox.clear();
         bool framed = sendCloseStatement(w: this.outbox, name: statement.name());
         sendSync(w: this.outbox);
@@ -511,12 +570,14 @@ type resource Connection implements Sendable {
         if (!this.live) { return Result::Err(error: PgError::Closed); }
         if (!this.streaming) { return Result::Err(error: PgError::Usage(detail: "no rows are being read: startRows begins")); }
         if (maxRows < 1) { return Result::Err(error: PgError::Usage(detail: "nextRows needs maxRows of 1 or more")); }
+        this.arm();
         return this.readRows(limit: maxRows, keep: true);
     }
 
     // Read the rest of the rows and drop them, so the connection is free again.
     public unsafe fn Result<Unit, PgError> discardRows() {
         if (!this.streaming) { return Result::Ok(value: Unit::Unit); }
+        this.arm();
         Result<Rows, PgError> r = this.readRows(limit: -1, keep: false);
         return match (give r) { case Ok(value: rows): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
     }
@@ -550,10 +611,11 @@ type resource Connection implements Sendable {
         Result<Unit, PgError> ok = this.idle();
         match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         if (maxRows < 0) { return Result::Err(error: PgError::Usage(detail: "fetch needs maxRows of 0 (every row) or more")); }
+        this.arm();
         this.outbox.clear();
         bool framed = sendExecute(w: this.outbox, portal: portal.name(), maxRows: maxRows);
         sendSync(w: this.outbox);
-        Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
+        Result<Unit, PgError> sent = this.flush(deadline: this.due);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         this.openFields = copy portal.columns();
         this.bindPending = false;
@@ -569,10 +631,113 @@ type resource Connection implements Sendable {
     public unsafe fn Result<Unit, PgError> closePortal(Portal portal) {
         Result<Unit, PgError> ok = this.idle();
         match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.arm();
         this.outbox.clear();
         bool framed = sendClosePortal(w: this.outbox, name: portal.name());
         sendSync(w: this.outbox);
         return this.closeExchange();
+    }
+
+    // ---- query timeouts ----
+
+    // A limit on how long a command may take, from the call that sends it to its result (Npgsql's CommandTimeout,
+    // pgjdbc's setQueryTimeout; libpq has none). When it passes, this client cancels the command as a cancel token
+    // would (a new connection to the same address, with the same encryption), and waits up to `grace` for the server's
+    // answer: the call then returns the server's error (57014, "canceling statement due to user request"), and the
+    // session goes on. If the server does not answer within `grace`, or the cancel cannot be sent (a session over a
+    // caller's transport has no address to send it to), the connection is closed and the call returns `Timeout`.
+    // None, the default, waits as long as the command runs; the server's own statement_timeout still applies
+    // (`options=-cstatement_timeout=…`). A chunk of rows (nextRows) or a portal's fetch is a call of its own.
+    public fn void setQueryTimeout(Optional<Duration> timeout, Duration grace) {
+        this.timeoutSetting = timeout;
+        this.graceSetting = grace;
+    }
+
+    public const fn Optional<Duration> queryTimeout() { return this.timeoutSetting; }
+
+    // A command starts: its deadline is the query timeout from now.
+    unsafe fn void arm() {
+        this.cancelling = false;
+        this.due = match (this.timeoutSetting) { case Some(value: t): Deadline.after(span: t); case None: Deadline.none(); };
+    }
+
+    // The next message of a command's result, within the query timeout. When it passes, the command is cancelled, and
+    // the server's answer is waited for until the grace passes too, which ends the session.
+    unsafe fn Result<BackendMessage, PgError> receive() {
+        while (true) {
+            Result<BackendMessage, PgError> r = this.wire.receive(deadline: this.due);
+            bool late = match (r) { case Err(error: e): isTimeout(e: e); case Ok(value: m): false; };
+            if (!late) { return r; }
+            if (this.cancelling) { return Result::Err(error: PgError::Timeout); }
+            this.cancelling = true;
+            this.due = Deadline.after(span: this.graceSetting);
+            Result<Unit, PgError> sent = this.cancelRunning();
+            match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: PgError::Timeout); } };
+        }
+        return Result::Err(error: PgError::Timeout);
+    }
+
+    // Cancel this session's command, through the route and dialer it connected with, within the grace.
+    unsafe fn Result<Unit, PgError> cancelRunning() {
+        if (this.cancelKey.length() == 0) { return Result::Err(error: PgError::Cancel(detail: "no cancellation key received")); }
+        return match (this.route) {
+            case Some(value: r): Connection::sendCancel(route: r, opener: this.dialing, pid: this.pid, key: this.cancelKey, limit: this.due);
+            case None: Result::Err(error: PgError::Cancel(detail: "a session over a caller's transport (connectOver) has no address to send a cancel request to"));
+        };
+    }
+
+    // ---- cancel ----
+
+    // A token that cancels this session's running command from anywhere: another isolate, a timer (libpq's
+    // PQcancelCreate). It holds a copy of the configuration, the address this session reached, and the server's
+    // process id and secret key; see CancelToken. libpq's errors: "connection not open" for a closed connection, "no
+    // cancellation key received" when the server sent no BackendKeyData. A session over a caller's transport
+    // (`connectOver`) has no address of this client's to send a cancel request to.
+    public fn Result<CancelToken, PgError> cancelToken() {
+        if (!this.live) { return Result::Err(error: PgError::Cancel(detail: "connection not open")); }
+        if (this.cancelKey.length() == 0) { return Result::Err(error: PgError::Cancel(detail: "no cancellation key received")); }
+        return match (this.route) {
+            case Some(value: r): Result::Ok(value: CancelToken.make(route: copy r, pid: this.pid, key: copy this.cancelKey));
+            case None: Result::Err(error: PgError::Cancel(detail: "a session over a caller's transport (connectOver) has no address to send a cancel request to"));
+        };
+    }
+
+    // Send a cancel request as libpq's PQcancelBlocking does: a new connection to the same address, with the same
+    // encryption and its fallbacks (libpq 17's encrypted cancel), CancelRequest in place of the startup packet, then
+    // the server closing it, all within connect_timeout. A failure is reported with libpq's lead.
+    static unsafe fn Result<Unit, PgError> sendCancel(const ref CancelRoute route, ref Opener opener, int32 pid, const ref DynamicArray<uint8> key, Deadline limit) {
+        ConnectError failures = ConnectError.make();
+        Errand errand = Errand.cancelling(pid: pid, key: copy key, limit: limit);
+        Visit v = Connection::visit(config: route.config(), hostIndex: route.hostIndex(), target: route.target(), opener: opener, failures: failures, errand: errand);
+        bool sent = match (v) { case Connected(connection: c): true; case _: false; };
+        if (sent) { return Result::Ok(value: Unit::Unit); }
+        return Result::Err(error: PgError::Connect(error: give failures));
+    }
+    friend postgres::CancelToken::cancel[sendCancel];
+    friend postgres::CancelToken::cancelWith[sendCancel];
+
+    // CancelRequest, then the server's close (libpq's CONNECTION_AWAITING_RESPONSE in PQcancelPoll).
+    unsafe fn Result<Unit, PgError> cancelExchange(int32 pid, const ref DynamicArray<uint8> key, Deadline deadline) {
+        this.outbox.clear();
+        sendCancelRequest(w: this.outbox, processId: pid, secretKey: key.view());
+        Result<Unit, PgError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
+        this.outbox.clear();
+        match (give sent) {
+            case Ok(value: u): { }
+            case Err(error: e): {
+                bool late = match (e) { case Timeout: true; case _: false; };
+                if (late) { return Result::Err(error: give e); }
+                return Result::Err(error: PgError::Cancel(detail: "could not send cancel packet: ".concat(other: e.message())));
+            }
+        };
+        Result<bool, PgError> ended = this.wire.awaitEnd(deadline: deadline);
+        return match (give ended) {
+            case Ok(value: answered): {
+                if (answered) { return Result::Err(error: PgError::Cancel(detail: "unexpected response from server")); }
+                return Result::Ok(value: Unit::Unit);
+            }
+            case Err(error: e): Result::Err(error: give e);
+        };
     }
 
     // ---- the extended protocol's steps ----
@@ -589,6 +754,7 @@ type resource Connection implements Sendable {
     unsafe fn Result<Unit, PgError> start(const ref Query q, const ref string portal, bool run) {
         Result<Unit, PgError> ok = this.idle();
         match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.arm();
         Result<Described, PgError> d = this.describe(q: q);
         Described shape = match (give d) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
         return this.bindAndExecute(q: q, shape: shape, portal: portal, run: run);
@@ -616,7 +782,7 @@ type resource Connection implements Sendable {
         }
         bool framed = sendDescribeStatement(w: this.outbox, name: name);
         sendSync(w: this.outbox);
-        Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
+        Result<Unit, PgError> sent = this.flush(deadline: this.due);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
 
         bool parsed = false;
@@ -627,7 +793,7 @@ type resource Connection implements Sendable {
         DynamicArray<PgError> failed = DynamicArray.empty();
         bool done = false;
         while (!done) {
-            Result<BackendMessage, PgError> received = this.wire.receive(deadline: Deadline.none());
+            Result<BackendMessage, PgError> received = this.receive();
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
             if (background(m: m)) { this.absorb(m: give m); continue; }
             match (give m) {
@@ -683,7 +849,7 @@ type resource Connection implements Sendable {
         }
         if (run) { bool framed = sendExecute(w: this.outbox, portal: portal, maxRows: 0); }
         sendSync(w: this.outbox);
-        Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
+        Result<Unit, PgError> sent = this.flush(deadline: this.due);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         this.openFields = give columns;
         this.bindPending = true;
@@ -711,7 +877,7 @@ type resource Connection implements Sendable {
         bool done = false;
         while (!done) {
             if (!ended && limit > 0 && rows.length() >= limit) { chunk = true; break; }
-            Result<BackendMessage, PgError> received = this.wire.receive(deadline: Deadline.none());
+            Result<BackendMessage, PgError> received = this.receive();
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
             if (background(m: m)) { this.absorb(m: give m); continue; }
             match (give m) {
@@ -752,7 +918,7 @@ type resource Connection implements Sendable {
                     // COPY has its own interface; refusing it here keeps the session usable.
                     this.outbox.clear();
                     bool framed = sendCopyFail(w: this.outbox, reason: "COPY FROM STDIN is not supported by the extended protocol's query");
-                    Result<Unit, PgError> refusal = this.flush(deadline: Deadline.none());
+                    Result<Unit, PgError> refusal = this.flush(deadline: this.due);
                     match (give refusal) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
                     copyRefused = true;
                 }
@@ -783,13 +949,13 @@ type resource Connection implements Sendable {
 
     // Close (statement or portal) and Sync: CloseComplete, then ReadyForQuery.
     unsafe fn Result<Unit, PgError> closeExchange() {
-        Result<Unit, PgError> sent = this.flush(deadline: Deadline.none());
+        Result<Unit, PgError> sent = this.flush(deadline: this.due);
         match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         bool closed = false;
         DynamicArray<PgError> failed = DynamicArray.empty();
         bool done = false;
         while (!done) {
-            Result<BackendMessage, PgError> received = this.wire.receive(deadline: Deadline.none());
+            Result<BackendMessage, PgError> received = this.receive();
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
             if (background(m: m)) { this.absorb(m: give m); continue; }
             match (give m) {
@@ -857,6 +1023,7 @@ type resource Connection implements Sendable {
 
     public const fn TransactionStatus transactionStatus() {
         if (!this.live) { return TransactionStatus::Unknown; }
+        if (this.busy || this.streaming) { return TransactionStatus::Active; }
         if (this.txStatus == 84ui8) { return TransactionStatus::InTransaction; }
         if (this.txStatus == 69ui8) { return TransactionStatus::Failed; }
         return TransactionStatus::Idle;
@@ -882,6 +1049,43 @@ type resource Connection implements Sendable {
             match (give last) { case Some(value: n): { taken.insertAt(index: 0, item: give n); } case None: { more = false; } };
         }
         return taken;
+    }
+
+    // The next LISTEN/NOTIFY notification: the oldest one already received, else the next to arrive within `timeout`
+    // (None waits as long as it takes). Notices and parameter changes are taken in on the way. Returns None when the
+    // time passes first; the session stays open. libpq leaves this wait to the application (poll PQsocket, then
+    // PQconsumeInput and PQnotifies); this is that loop. A server that ends the session while it waits (a FATAL
+    // error, an administrator's termination) returns its error.
+    public unsafe fn Result<Optional<Notification>, PgError> waitForNotification(Optional<Duration> timeout) {
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        if (this.pending.length() > 0) { return Result::Ok(value: Optional::Some(value: this.pending.remove(index: 0))); }
+        Deadline until = match (timeout) { case Some(value: t): Deadline.after(span: t); case None: Deadline.none(); };
+        while (true) {
+            Result<BackendMessage, PgError> received = this.wire.receive(deadline: until);
+            match (give received) {
+                case Ok(value: m): {
+                    if (background(m: m)) { this.absorb(m: give m); }
+                    else {
+                        match (give m) {
+                            case ErrorResponse(fields: f): {
+                                ServerError e = ServerError.make(fields: give f);
+                                this.lose();
+                                return Result::Err(error: PgError::Server(error: give e));
+                            }
+                            case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message other than a notice or a notification while idle")); }
+                        };
+                    }
+                    if (this.pending.length() > 0) { return Result::Ok(value: Optional::Some(value: this.pending.remove(index: 0))); }
+                }
+                case Err(error: e): {
+                    if (isTimeout(e: e)) { return Result::Ok(value: Optional::None); }
+                    this.lose();
+                    return Result::Err(error: give e);
+                }
+            };
+        }
+        return Result::Ok(value: Optional::None);
     }
 
     // ---- startup ----
@@ -1248,6 +1452,23 @@ type resource Described {
     public const fn const ref DynamicArray<FieldDescription> fields() { return this.columns; }
 }
 
+// What a connection is opened for: a session (startup), or a cancel request for another session's command, which
+// libpq sends over a connection made as a session's is (the same encryption and fallbacks), in place of startup.
+type resource Errand {
+    bool cancel = false;
+    int32 pid = 0;
+    DynamicArray<uint8> key;
+    Deadline bound;
+    public ctor session() { this.cancel = false; this.pid = 0; this.key = DynamicArray.empty(); this.bound = Deadline.none(); }
+    public ctor cancelling(int32 pid, DynamicArray<uint8> key, Deadline limit) { this.cancel = true; this.pid = pid; this.key = give key; this.bound = limit; }
+    public const fn Deadline limit() { return this.bound; }
+    public const fn bool isCancel() { return this.cancel; }
+    public const fn int32 processId() { return this.pid; }
+    public const fn const ref DynamicArray<uint8> secretKey() { return this.key; }
+}
+
+fn bool isTimeout(const ref PgError e) { return match (e) { case Timeout: true; case _: false; }; }
+
 // A message that can come at any point of an exchange: a notice, a parameter's new value, a notification.
 fn bool background(const ref BackendMessage m) {
     return match (m) {
@@ -1256,12 +1477,6 @@ fn bool background(const ref BackendMessage m) {
         case NotificationResponse(processId: p, channel: c, payload: x): true;
         case _: false;
     };
-}
-
-// libpq's requirepeer refusal, or "" when the server runs as the account required.
-fn string peerMismatch(const ref string wanted, const ref string actual) {
-    if (actual.equals(other: wanted)) { return ""; }
-    return "requirepeer specifies \"".concat(other: wanted).concat(other: "\", but actual peer user name is \"").concat(other: actual).concat(other: "\"");
 }
 
 // The password file to name when a wrong password came from it: the host's file password is the one used only
@@ -1290,70 +1505,6 @@ type enum Visit { Connected(Connection connection), NextAddress, ToNextHost, Sto
 
 // What one connection came to: a session, or a failure and what libpq does next.
 type enum Attempt { Ready(Connection connection), Retry(PgError error), Final(PgError error), TimedOut(PgError error), NextHost(PgError error) }
-
-// A connection opened, or why not: an address that could not be reached (the next is tried; `note` is libpq's hint
-// after a failed connect), or a server refused before a message was sent (requirepeer: nothing more is tried).
-type enum Opened { Link(Owned<Transport> transport), Unreachable(PgError error, string note), Refused(PgError error) }
-
-// How connections are opened: by this client, as libpq opens them (a TCP socket with its options, a Unix socket with
-// requirepeer), or by a caller's Dialer.
-type resource Opener {
-    DynamicArray<Owned<Dialer>> dialers;   // empty: this client's own sockets; one: the caller's dialer
-
-    public ctor builtIn() { this.dialers = DynamicArray.empty(); }
-    public ctor with(Owned<Dialer> dialer) { this.dialers = DynamicArray.empty(); this.dialers.add(item: give dialer); }
-
-    public unsafe fn Opened open(const ref DialTarget target, const ref Config config, Deadline deadline) {
-        string hint = "\tIs the server running on that host and accepting TCP/IP connections?";
-        if (target.isSocket()) { hint = "\tIs the server running locally and accepting connections on that socket?"; }
-        if (this.dialers.length() > 0) {
-            if (target.isSocket() && config.requirePeer().length() > 0) {
-                return Opened::Refused(error: PgError::Auth(detail: "requirepeer cannot be checked on a transport a Dialer opened"));
-            }
-            Result<Owned<Transport>, IoError> dialed = this.dialers[0].dial(target: target, timeoutMs: deadline.remainingMs());
-            return match (give dialed) {
-                case Ok(value: t): Opened::Link(transport: give t);
-                case Err(error: e): unreachable(e: e, hint: hint);
-            };
-        }
-        if (target.isSocket()) {
-            string path = copy target.socketPath();
-            if (target.linuxAbstract()) { path = path.substring(start: 1, end: path.length()); }
-            Result<Owned<UnixTransport>, IoError> made = new UnixTransport.connect(path: path, linuxAbstract: target.linuxAbstract(), timeoutMs: deadline.remainingMs());
-            Owned<UnixTransport> local = match (give made) { case Ok(value: t): give t; case Err(error: e): { return unreachable(e: e, hint: hint); } };
-            // requirepeer: the server must run as this account, by the socket's peer credentials.
-            string peer = config.requirePeer();
-            if (peer.length() > 0) {
-                Result<string, IoError> who = local.peerUserName();
-                string refusal = match (give who) {
-                    case Ok(value: name): peerMismatch(wanted: peer, actual: name);
-                    case Err(error: e): "could not get peer credentials: ".concat(other: strerror(e: e));
-                };
-                if (refusal.length() > 0) { return Opened::Refused(error: PgError::Auth(detail: give refusal)); }
-            }
-            Owned<Transport> socket = give local;
-            return Opened::Link(transport: give socket);
-        }
-        Optional<SocketAddr> at = target.address();
-        SocketAddr address = match (at) { case Some(value: a): a; case None: { return Opened::Refused(error: PgError::Closed); } };
-        Result<Owned<TcpTransport>, IoError> made = new TcpTransport.connect(address: address, timeoutMs: deadline.remainingMs());
-        Owned<TcpTransport> tcp = match (give made) { case Ok(value: t): give t; case Err(error: e): { return unreachable(e: e, hint: hint); } };
-        Result<Owned<TcpTransport>, PgError> configured = socketOptions(tcp: give tcp, config: config);
-        Owned<TcpTransport> ready = match (give configured) {
-            case Ok(value: t): give t;
-            case Err(error: e): { return Opened::Unreachable(error: give e, note: ""); }
-        };
-        Owned<Transport> transport = give ready;
-        return Opened::Link(transport: give transport);
-    }
-}
-
-// libpq's connectFailureMessage: the reason and its hint; for connect_timeout, just "timeout expired".
-fn Opened unreachable(const ref IoError e, const ref string hint) {
-    bool timedOut = match (e.kind()) { case TimedOut: true; case _: false; };
-    if (timedOut) { return Opened::Unreachable(error: PgError::Timeout, note: ""); }
-    return Opened::Unreachable(error: PgError::Io(error: e), note: copy hint);
-}
 
 fn PgError noPassword() { return PgError::Auth(detail: "fe_sendauth: no password supplied"); }
 
@@ -1384,37 +1535,6 @@ fn string identity(const ref string host, const ref string address, const ref st
     string text = "connection to server at \"".concat(other: host).concat(other: "\"");
     if (address.length() > 0 && !address.equals(other: host)) { text = text.concat(other: " (").concat(other: address).concat(other: ")"); }
     return text.concat(other: ", port ").concat(other: port).concat(other: " failed: ");
-}
-
-// Keepalive and tcp_user_timeout, as libpq applies them to each socket. A failure is reported as libpq reports it,
-// and the next address is tried.
-unsafe fn Result<Owned<TcpTransport>, PgError> socketOptions(Owned<TcpTransport> tcp, const ref Config config) {
-    if (config.keepalives()) {
-        Result<Unit, IoError> on = tcp.keepAlive(on: true);
-        match (on) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "SO_KEEPALIVE", e: e)); } };
-        if (config.keepalivesIdle() >= 0) {
-            Result<Unit, IoError> r = tcp.keepAliveIdle(idle: Duration.fromSecs(s: cast<int64>(config.keepalivesIdle())));
-            match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_KEEPIDLE", e: e)); } };
-        }
-        if (config.keepalivesInterval() >= 0) {
-            Result<Unit, IoError> r = tcp.keepAliveInterval(interval: Duration.fromSecs(s: cast<int64>(config.keepalivesInterval())));
-            match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_KEEPINTVL", e: e)); } };
-        }
-        if (config.keepalivesCount() >= 0) {
-            Result<Unit, IoError> r = tcp.keepAliveCount(count: cast<uint32>(config.keepalivesCount()));
-            match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_KEEPCNT", e: e)); } };
-        }
-    }
-    // libpq passes 0 through, which Linux takes as "the system default"; std refuses 0, so 0 leaves it unset.
-    if (config.tcpUserTimeout() > 0) {
-        Result<Unit, IoError> r = tcp.userTimeout(timeout: Duration.fromMillis(ms: cast<int64>(config.tcpUserTimeout())));
-        match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_USER_TIMEOUT", e: e)); } };
-    }
-    return Result::Ok(value: give tcp);
-}
-
-fn PgError setsockopt(const ref string option, const ref IoError e) {
-    return PgError::Config(detail: "setsockopt(".concat(other: option).concat(other: ") failed: ").concat(other: strerror(e: e)));
 }
 
 // A SASL payload as text: SCRAM's messages are UTF-8.

@@ -38,7 +38,10 @@ type enum PgError implements Error {
     // The connection is still usable.
     Value(string detail),
     // The connection is closed: by `close()`, or by an earlier failure that left it unusable.
-    Closed;
+    Closed,
+    // A cancel request could not be made or sent, or the server answered one, which it never does: libpq's words
+    // ("no cancellation key received", "could not send cancel packet: …", "unexpected response from server").
+    Cancel(string detail);
 
     public const fn string message() {
         return match (this) {
@@ -53,6 +56,7 @@ type enum PgError implements Error {
             case Usage(detail: d): copy d;
             case Value(detail: d): copy d;
             case Closed: "no connection to the server";
+            case Cancel(detail: d): copy d;
         };
     }
 

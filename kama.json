@@ -21,6 +21,7 @@
     "types":    { "visibility": "public" },
     "wire":     { "visibility": "internal" },
     "secure":   { "visibility": "internal" },
+    "session":  { "visibility": "internal" },
     "stringprep": { "visibility": "internal" }
   }
 }

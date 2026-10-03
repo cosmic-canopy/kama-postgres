@@ -1,0 +1,128 @@
+import { std::collections::DynamicArray, std::io::IoError, std::memory::Owned, std::net::SocketAddr, std::time::Duration,
+         postgres::PgError, postgres::Config, postgres::Transport, postgres::TcpTransport, postgres::UnixTransport,
+         postgres::Dialer, postgres::DialTarget, postgres::wire::Deadline, postgres::wire::strerror };
+export { Opener, Opened, CancelRoute };
+
+// postgres::session — how a session reaches its server: the connections a connect opens (this client's own sockets,
+// with libpq's options, or a caller's Dialer), and the route back to the same server that a cancel request takes.
+// Internal.
+
+// How to reach a session's server again, as libpq's PQcancelCreate keeps it: a copy of the configuration the session
+// connected with (every option, as pqCopyPGconn copies them, so sslmode and connect_timeout apply again), the host it
+// reached, and the address it used, with no new lookup.
+type resource CancelRoute implements Sendable, Copyable<This>(bare: give) {
+    Config settings;
+    isize hostAt = 0;
+    DialTarget place;
+
+    public ctor make(Config config, isize hostIndex, DialTarget target) {
+        this.settings = give config; this.hostAt = hostIndex; this.place = give target;
+    }
+    public ctor copy(ref CancelRoute source) {
+        this.settings = copy source.settings; this.hostAt = source.hostAt; this.place = copy source.place;
+    }
+    public const fn const ref Config config() { return this.settings; }
+    public const fn isize hostIndex() { return this.hostAt; }
+    public const fn const ref DialTarget target() { return this.place; }
+}
+
+// A connection opened, or why not: an address that could not be reached (the next is tried; `note` is libpq's hint
+// after a failed connect), or a server refused before a message was sent (requirepeer: nothing more is tried).
+type enum Opened { Link(Owned<Transport> transport), Unreachable(PgError error, string note), Refused(PgError error) }
+
+// How connections are opened: by this client, as libpq opens them (a TCP socket with its options, a Unix socket with
+// requirepeer), or by a caller's Dialer.
+type resource Opener implements Sendable {
+    DynamicArray<Owned<Dialer>> dialers;   // empty: this client's own sockets; one: the caller's dialer
+
+    public ctor builtIn() { this.dialers = DynamicArray.empty(); }
+    public ctor with(Owned<Dialer> dialer) { this.dialers = DynamicArray.empty(); this.dialers.add(item: give dialer); }
+
+    public unsafe fn Opened open(const ref DialTarget target, const ref Config config, Deadline deadline) {
+        string hint = "\tIs the server running on that host and accepting TCP/IP connections?";
+        if (target.isSocket()) { hint = "\tIs the server running locally and accepting connections on that socket?"; }
+        if (this.dialers.length() > 0) {
+            if (target.isSocket() && config.requirePeer().length() > 0) {
+                return Opened::Refused(error: PgError::Auth(detail: "requirepeer cannot be checked on a transport a Dialer opened"));
+            }
+            Result<Owned<Transport>, IoError> dialed = this.dialers[0].dial(target: target, timeoutMs: deadline.remainingMs());
+            return match (give dialed) {
+                case Ok(value: t): Opened::Link(transport: give t);
+                case Err(error: e): unreachable(e: e, hint: hint);
+            };
+        }
+        if (target.isSocket()) {
+            string path = copy target.socketPath();
+            if (target.linuxAbstract()) { path = path.substring(start: 1, end: path.length()); }
+            Result<Owned<UnixTransport>, IoError> made = new UnixTransport.connect(path: path, linuxAbstract: target.linuxAbstract(), timeoutMs: deadline.remainingMs());
+            Owned<UnixTransport> local = match (give made) { case Ok(value: t): give t; case Err(error: e): { return unreachable(e: e, hint: hint); } };
+            // requirepeer: the server must run as this account, by the socket's peer credentials.
+            string peer = config.requirePeer();
+            if (peer.length() > 0) {
+                Result<string, IoError> who = local.peerUserName();
+                string refusal = match (give who) {
+                    case Ok(value: name): peerMismatch(wanted: peer, actual: name);
+                    case Err(error: e): "could not get peer credentials: ".concat(other: strerror(e: e));
+                };
+                if (refusal.length() > 0) { return Opened::Refused(error: PgError::Auth(detail: give refusal)); }
+            }
+            Owned<Transport> socket = give local;
+            return Opened::Link(transport: give socket);
+        }
+        Optional<SocketAddr> at = target.address();
+        SocketAddr address = match (at) { case Some(value: a): a; case None: { return Opened::Refused(error: PgError::Closed); } };
+        Result<Owned<TcpTransport>, IoError> made = new TcpTransport.connect(address: address, timeoutMs: deadline.remainingMs());
+        Owned<TcpTransport> tcp = match (give made) { case Ok(value: t): give t; case Err(error: e): { return unreachable(e: e, hint: hint); } };
+        Result<Owned<TcpTransport>, PgError> configured = socketOptions(tcp: give tcp, config: config);
+        Owned<TcpTransport> ready = match (give configured) {
+            case Ok(value: t): give t;
+            case Err(error: e): { return Opened::Unreachable(error: give e, note: ""); }
+        };
+        Owned<Transport> transport = give ready;
+        return Opened::Link(transport: give transport);
+    }
+}
+
+// libpq's connectFailureMessage: the reason and its hint; for connect_timeout, just "timeout expired".
+fn Opened unreachable(const ref IoError e, const ref string hint) {
+    bool timedOut = match (e.kind()) { case TimedOut: true; case _: false; };
+    if (timedOut) { return Opened::Unreachable(error: PgError::Timeout, note: ""); }
+    return Opened::Unreachable(error: PgError::Io(error: e), note: copy hint);
+}
+
+// libpq's requirepeer refusal, or "" when the server runs as the account required.
+fn string peerMismatch(const ref string wanted, const ref string actual) {
+    if (actual.equals(other: wanted)) { return ""; }
+    return "requirepeer specifies \"".concat(other: wanted).concat(other: "\", but actual peer user name is \"").concat(other: actual).concat(other: "\"");
+}
+
+// Keepalive and tcp_user_timeout, as libpq applies them to each socket. A failure is reported as libpq reports it,
+// and the next address is tried.
+unsafe fn Result<Owned<TcpTransport>, PgError> socketOptions(Owned<TcpTransport> tcp, const ref Config config) {
+    if (config.keepalives()) {
+        Result<Unit, IoError> on = tcp.keepAlive(on: true);
+        match (on) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "SO_KEEPALIVE", e: e)); } };
+        if (config.keepalivesIdle() >= 0) {
+            Result<Unit, IoError> r = tcp.keepAliveIdle(idle: Duration.fromSecs(s: cast<int64>(config.keepalivesIdle())));
+            match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_KEEPIDLE", e: e)); } };
+        }
+        if (config.keepalivesInterval() >= 0) {
+            Result<Unit, IoError> r = tcp.keepAliveInterval(interval: Duration.fromSecs(s: cast<int64>(config.keepalivesInterval())));
+            match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_KEEPINTVL", e: e)); } };
+        }
+        if (config.keepalivesCount() >= 0) {
+            Result<Unit, IoError> r = tcp.keepAliveCount(count: cast<uint32>(config.keepalivesCount()));
+            match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_KEEPCNT", e: e)); } };
+        }
+    }
+    // libpq passes 0 through, which Linux takes as "the system default"; std refuses 0, so 0 leaves it unset.
+    if (config.tcpUserTimeout() > 0) {
+        Result<Unit, IoError> r = tcp.userTimeout(timeout: Duration.fromMillis(ms: cast<int64>(config.tcpUserTimeout())));
+        match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_USER_TIMEOUT", e: e)); } };
+    }
+    return Result::Ok(value: give tcp);
+}
+
+fn PgError setsockopt(const ref string option, const ref IoError e) {
+    return PgError::Config(detail: "setsockopt(".concat(other: option).concat(other: ") failed: ").concat(other: strerror(e: e)));
+}

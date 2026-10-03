@@ -1,7 +1,7 @@
 // postgres::Connection against a scripted server (fake_server.kama): every way a server can answer a startup and a
 // query, including the ways a broken or hostile one can. Replies arrive a byte at a time and writes go out three
 // bytes at a time, so every case also exercises framing and partial writes. No network, no clock.
-import { std::collections::DynamicArray, std::memory::Owned,
+import { std::collections::DynamicArray, std::memory::Owned, std::time::Duration,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::columnOpt,
          postgres::Transport, postgres::TransactionStatus, postgres::Notification,
          postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2, postgres::protocol::md5Password,
@@ -9,7 +9,7 @@ import { std::collections::DynamicArray, std::memory::Owned,
          postgres::sqlstate::TOO_MANY_CONNECTIONS, postgres::sqlstate::QUERY_CANCELED,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire };
-export { connectionTests, over, welcome };
+export { connectionTests, over, overJammed, welcome };
 
 // What every successful startup ends with: AuthenticationOk, the parameters a server reports, a cancel key,
 // ReadyForQuery.
@@ -42,6 +42,16 @@ unsafe fn Result<Connection, PgError> over(DynamicArray<Step> script, const ref 
     Result<Config, PgError> c = resolveWith(text: conninfo, env: env);
     Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
     Owned<Transport> fake = new FakeServer.make(steps: give script, chunk: 1, writeLimit: 3);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+// `over`, through a server that stops taking the client's bytes while more than `backlog` of its replies are unread.
+unsafe fn Result<Connection, PgError> overJammed(DynamicArray<Step> script, isize backlog) {
+    Environment env = testEnvironment();
+    string none = "";
+    Result<Config, PgError> c = resolveWith(text: none, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    Owned<Transport> fake = new FakeServer.jammed(steps: give script, chunk: 4096, writeLimit: 3, backlog: backlog);
     return Connection.connectOver(transport: give fake, config: config);
 }
 
@@ -431,8 +441,86 @@ unsafe fn int32 hostileQueryTests() {
     return f;
 }
 
+// What a notification wait makes of the server's bytes: "ch:payload" for a notification, "(none)" when the time
+// passes, or the error.
+unsafe fn string waited(ref Connection c) {
+    Result<Optional<Notification>, PgError> r = c.waitForNotification(timeout: Optional::Some(value: Duration.fromMillis(ms: 20i64)));
+    return match (give r) {
+        case Ok(value: o): match (give o) { case Some(value: n): n.channel().concat(other: ":").concat(other: n.payload()); case None: "(none)"; };
+        case Err(error: e): e.message();
+    };
+}
+
+// Waiting for a notification: one already queued comes first, then whatever arrives within the time, past notices
+// and parameter changes; nothing within the time is None, and the session goes on. A server that ends the session
+// while it waits says why; one that sends anything else breaks the protocol.
+unsafe fn int32 notificationTests() {
+    int32 f = 0;
+    // The server's messages after ReadyForQuery wait, unread, until the client reads: a notice, a parameter change,
+    // and two notifications.
+    Wire afterwards = Wire.make();
+    afterwards.report(tag: 78ui8, severity: "NOTICE", code: "00000", message: "hello");
+    afterwards.parameter(name: "TimeZone", value: "Europe/Paris");
+    afterwards.notification(pid: 9, channel: "jobs", payload: "first");
+    afterwards.notification(pid: 9, channel: "jobs", payload: "second");
+    DynamicArray<uint8> opening = welcome();
+    DynamicArray<uint8> later = afterwards.bytes();
+    foreach (uint8 b in later) { opening.add(item: b); }
+    DynamicArray<Step> s = steps();
+    s.add(item: Step::Send(bytes: opening));
+    string none = "";
+    Result<Connection, PgError> made = over(script: give s, conninfo: none);
+    Connection c = match (give made) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "notify: connect (".concat(other: e.message()).concat(other: ")")); } };
+    string first = waited(c: ref c);
+    Optional<string> tz = c.parameter(name: "TimeZone");
+    bool paris = match (tz) { case Some(value: z): z.equals(other: "Europe/Paris"); case None: false; };
+    f = f + check(ok: first.equals(other: "jobs:first") && paris, what: "notify: the first notification, past a notice and a parameter change (".concat(other: first).concat(other: ")"));
+    string second = waited(c: ref c);
+    f = f + check(ok: second.equals(other: "jobs:second"), what: "notify: the second, queued with the first (".concat(other: second).concat(other: ")"));
+    string third = waited(c: ref c);
+    f = f + check(ok: third.equals(other: "(none)") && !c.isClosed(), what: "notify: nothing more within the time, and the session open (".concat(other: third).concat(other: ")"));
+
+    // Ended while waiting: the server's FATAL, and a closed connection.
+    Wire ending = Wire.make();
+    ending.report(tag: 69ui8, severity: "FATAL", code: "57P01", message: "terminating connection due to administrator command");
+    DynamicArray<uint8> ended = welcome();
+    DynamicArray<uint8> fatal = ending.bytes();
+    foreach (uint8 b in fatal) { ended.add(item: b); }
+    DynamicArray<Step> s2 = steps();
+    s2.add(item: Step::Send(bytes: ended));
+    Result<Connection, PgError> made2 = over(script: give s2, conninfo: none);
+    match (give made2) {
+        case Ok(value: x): {
+            Connection d = give x;
+            string got = waited(c: ref d);
+            f = f + check(ok: got.contains(substring: "terminating connection due to administrator command") && d.isClosed(), what: "notify: a FATAL while waiting (".concat(other: got).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "notify: connect for FATAL"); }
+    };
+
+    // Anything else while idle breaks the protocol.
+    Wire stray = Wire.make();
+    stray.complete(tag: "SELECT 1");
+    DynamicArray<uint8> strayed = welcome();
+    DynamicArray<uint8> strayBytes = stray.bytes();
+    foreach (uint8 b in strayBytes) { strayed.add(item: b); }
+    DynamicArray<Step> s3 = steps();
+    s3.add(item: Step::Send(bytes: strayed));
+    Result<Connection, PgError> made3 = over(script: give s3, conninfo: none);
+    match (give made3) {
+        case Ok(value: x): {
+            Connection e = give x;
+            string got = waited(c: ref e);
+            f = f + check(ok: got.contains(substring: "while idle") && e.isClosed(), what: "notify: a stray message while idle (".concat(other: got).concat(other: ")"));
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "notify: connect for stray"); }
+    };
+    return f;
+}
+
 unsafe fn int32 connectionTests() {
     int32 f = 0;
+    f = f + notificationTests();
     f = f + authenticationTests();
     f = f + negotiationTests();
     f = f + hostileStartupTests();

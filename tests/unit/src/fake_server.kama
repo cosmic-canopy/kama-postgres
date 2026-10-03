@@ -52,7 +52,13 @@ type enum Step implements Sendable {
     // Reply with `then`, then end the TLS session in order (close_notify) and close the connection.
     TlsClose(DynamicArray<uint8> then),
     // Reply with `then`, damaged in transit: its last record will not authenticate.
-    TlsGarble(DynamicArray<uint8> then)
+    TlsGarble(DynamicArray<uint8> then),
+    // The message must be a CancelRequest whose body (after its length) is `body`, in hex; then the server closes
+    // the connection as PostgreSQL does after one (over TLS, with close_notify). Otherwise FATAL 08P01, as Expect.
+    Cancel(string body),
+    // Reply with `then`, late: the client's next wait for it ends without it (as when a query timeout passes), and
+    // it is there for the wait after.
+    Late(DynamicArray<uint8> then)
 }
 
 // The server's side of the TLS session: what the client sent waits in `inbound` for the engine, and what the engine
@@ -246,6 +252,11 @@ type resource FakeServer implements Transport, Sendable {
     DynamicArray<string> hbaUsers;
     bool overSocket = false;
     DynamicArray<Sender<string>> events;             // zero or one
+    // A server blocked on its own output: with more than `backlog` bytes of its replies unread by the client, it
+    // takes none of the client's bytes (a write would block, and the transport is not writable) until the client
+    // reads. -1: never.
+    isize backlog = -1;
+    DynamicArray<uint8> held;   // a late reply (Step::Late), given to the client after one wait in vain
 
     public ctor make(DynamicArray<Step> steps, isize chunk, isize writeLimit) {
         this.steps = give steps; this.next = 0;
@@ -258,7 +269,22 @@ type resource FakeServer implements Transport, Sendable {
         this.tlsMode = false; this.established = false; this.directAccepted = false;
         this.endPoint = DynamicArray.empty(); this.sniWanted = "";
         this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
-        this.overSocket = false; this.events = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty();
+    }
+
+    // `make`, blocked on its own output past `backlog` bytes of unread replies (see `backlog`).
+    public ctor jammed(DynamicArray<Step> steps, isize chunk, isize writeLimit, isize backlog) {
+        this.steps = give steps; this.next = 0;
+        this.toClient = DynamicArray.empty(); this.readAt = 0;
+        this.fromClient = DynamicArray.empty(); this.parsedAt = 0;
+        this.startupSeen = false; this.hungUp = false;
+        this.chunk = chunk; this.writeLimit = writeLimit;
+        this.clientFirstBare = ""; this.serverFirst = ""; this.scramPassword = ""; this.gs2Header = "n,,";
+        this.tlsConfig = DynamicArray.empty(); this.engine = DynamicArray.empty();
+        this.tlsMode = false; this.established = false; this.directAccepted = false;
+        this.endPoint = DynamicArray.empty(); this.sniWanted = "";
+        this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = backlog; this.held = DynamicArray.empty();
     }
 
     // A server with TLS: it answers an SSLRequest 'S' and serves the script over `config` (and takes a direct
@@ -277,7 +303,7 @@ type resource FakeServer implements Transport, Sendable {
         this.tlsMode = false; this.established = false; this.directAccepted = direct;
         this.endPoint = give endPoint; this.sniWanted = give sni;
         this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
-        this.overSocket = false; this.events = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty();
     }
 
     // A server in policy mode: TLS on (`config`, taking an SSLRequest or a direct ClientHello) or off, an injection
@@ -297,7 +323,7 @@ type resource FakeServer implements Transport, Sendable {
         this.tlsMode = false; this.established = false; this.directAccepted = sslOn;
         this.endPoint = DynamicArray.empty(); this.sniWanted = "";
         this.policy = true; this.injection = give injection; this.hbaTypes = give types; this.hbaUsers = give users;
-        this.overSocket = socket; this.events = DynamicArray.empty(); this.events.add(item: give events);
+        this.overSocket = socket; this.events = DynamicArray.empty(); this.events.add(item: give events); this.backlog = -1; this.held = DynamicArray.empty(); this.held = DynamicArray.empty();
     }
 
     unsafe fn void event(const ref string name) {
@@ -385,9 +411,12 @@ type resource FakeServer implements Transport, Sendable {
         return Result::Ok(value: n);
     }
 
+    fn bool blocked() { return this.backlog >= 0 && this.toClient.length() - this.readAt > this.backlog; }
+
     public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
         if (this.discarding) { return Result::Ok(value: bytes.length()); }
         if (this.hungUp) { return Result::Err(error: IoError.of(kind: IoErrorKind::BrokenPipe)); }
+        if (this.blocked()) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
         isize n = bytes.length();
         if (n > this.writeLimit) { n = this.writeLimit; }
         if (this.tlsMode) {
@@ -463,8 +492,14 @@ type resource FakeServer implements Transport, Sendable {
     }
 
     public fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        if (this.held.length() > 0) {
+            // This wait ends without the late reply; it is there for the next.
+            foreach (uint8 b in this.held) { this.toClient.add(item: b); }
+            this.held = DynamicArray.empty();
+            return Result::Ok(value: Ready.of(readable: false, writable: !this.blocked()));
+        }
         bool readable = this.readAt < this.toClient.length() || this.hungUp;
-        return Result::Ok(value: Ready.of(readable: readable, writable: true));
+        return Result::Ok(value: Ready.of(readable: readable, writable: !this.blocked()));
     }
 
     public fn void shutdown() { }
@@ -635,6 +670,23 @@ type resource FakeServer implements Transport, Sendable {
                 this.queue(b: t.view());
                 isize last = this.toClient.length() - 1;
                 if (last >= 0) { this.toClient[last] = this.toClient[last] ^ 1ui8; }
+            }
+            case Late(then: t): { foreach (uint8 b in t) { this.held.add(item: b); } }
+            case Cancel(body: hex): {
+                string compact = hex.replace(old: " ", with: "");
+                string got = hexEncode(bytes: body.view());
+                if (tag != 0ui8 || !got.equals(other: compact)) {
+                    Wire m = Wire.make();
+                    m.report(tag: 69ui8, severity: "FATAL", code: "08P01", message: "fake server: expected a CancelRequest ".concat(other: compact).concat(other: ", got ").concat(other: got));
+                    this.queue(b: m.bytes().view());
+                    this.hungUp = true;
+                    return;
+                }
+                if (this.tlsMode) {
+                    Result<Unit, TlsError> closed = this.engine[0].close();
+                    this.engine[0].innerRefMut().drain(into: this.toClient);
+                }
+                this.hungUp = true;
             }
         };
         // A Hangup after a reply closes the connection as soon as that reply is sent.

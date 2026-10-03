@@ -41,7 +41,7 @@ type contract Dialer for resource implements Sendable {
 }
 
 // One place a connection attempt goes: a TCP address of a host, or a Unix-domain socket.
-type resource DialTarget implements Sendable {
+type resource DialTarget implements Sendable, Copyable<This>(bare: give) {
     string hostText;
     string portText;
     bool socketKind = false;
@@ -56,6 +56,10 @@ type resource DialTarget implements Sendable {
     ctor overSocket(string host, string port, string path, bool linuxAbstract) {
         this.hostText = give host; this.portText = give port; this.socketKind = true; this.tcp = Optional::None;
         this.pathText = give path; this.abstractName = linuxAbstract;
+    }
+    public ctor copy(ref DialTarget source) {
+        this.hostText = copy source.hostText; this.portText = copy source.portText; this.socketKind = source.socketKind;
+        this.tcp = source.tcp; this.pathText = copy source.pathText; this.abstractName = source.abstractName;
     }
     friend postgres::Connection::targetsOf[overTcp, overSocket];
 

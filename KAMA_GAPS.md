@@ -16,7 +16,7 @@ KPG-14 filed), `0.9.477` (KPG-1 also on Linux aarch64 inside `localhost/kama-dev
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** KPG-31. Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** KPG-32 (HIGH) and KPG-31. Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -26,6 +26,38 @@ changes the right design here, say so and we will follow it.
 ---
 
 ## OPEN
+
+### KPG-32 · HIGH · `break` in a `match` arm does not leave the enclosing loop
+
+**Found** writing phase 6's integration tests, on `kama 0.9.520+gca7e0d21`: a loop that ended with `case None: { break; }`
+never ended, and the test run hung.
+
+```kama
+import { core::println };
+fn int32 main() {
+    int32 turns = 0;
+    while (true) {
+        turns = turns + 1;
+        Optional<int32> next = Optional::None;
+        if (turns < 3) { next = Optional::Some(value: turns); }
+        match (next) {
+            case Some(value: v): { }
+            case None: { break; }
+        };
+        if (turns > 10) { println(s: "break did not leave the loop: ${turns} turns"); return 1; }
+    }
+    println(s: "left the loop after ${turns} turns");
+    return 0;
+}
+```
+
+`kama build` takes it with no diagnostic, and it prints `break did not leave the loop: 11 turns` and exits 1. The
+`break` ends the `match` only, as a `break` in a C `switch` ends the switch: the loop goes on. `continue` in the same
+place does continue the loop (checked the same way: `turns 5, counted 3`). Nothing in kama's SPEC says a `match`
+catches `break`, and a reader of the source takes it to leave the loop. It should, or be a compile error.
+
+**Workaround** (tests/integration/src/tls_test.kama, `fails`): the loop runs on a flag the arm clears. Nothing else in
+this package or @kama/tls has a `break` in a `match` arm.
 
 ### KPG-31 · LOW · `std::fs::Metadata` has no owner, so libpq's private-key rule cannot be ported whole
 

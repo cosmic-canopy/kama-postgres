@@ -5,7 +5,7 @@
   "kind": "library",
   "kama": ">=0.9.519",
   "dependencies": {
-    "@kama/tls": { "path": "../kama-tls" }
+    "@kama/tls": { "version": "^0.1.0" }
   },
   "publish": {
     "exclude": [

@@ -33,9 +33,13 @@ compiler with everything this package relies on:
 
 - **Native protocol, no C.** This package speaks the PostgreSQL v3 wire protocol in kama over `std::net`.
   There is no libpq, no `csrc/` and no `csources`, and it should stay that way. TLS comes from the sibling
-  package `@kama/tls` (`../kama-tls`, a path dependency until it is published), which vendors Mbed TLS. That is the
-  only native code in the dependency tree. What postgres needs from TLS that the package lacks is added THERE, with
-  its own tests, not worked around here.
+  package `@kama/tls` (`../kama-tls`), which vendors Mbed TLS. That is the only native code in the dependency tree.
+  What postgres needs from TLS that the package lacks is added THERE, with its own tests, not worked around here.
+  - All three manifests (root, `tests/unit`, `tests/integration`) take it from the registry (`"version": "^0.1.0"`),
+    pinned by their `kama.lock`, so CI and a consumer build the published bytes.
+  - To develop against an unpublished change in `../kama-tls`, give each manifest a `kama.local.json` (gitignored,
+    never published) with `"overrides": { "@kama/tls": { "path": "<relative path to kama-tls>" } }`, then
+    `kama pkg install`. postgres can only publish once that change is in a published `@kama/tls`.
 
 - **Two test programs, and neither is typed from memory.**
   - `tests/unit` is hermetic. It needs no server and no network, and runs through `tools/test.sh`, debug

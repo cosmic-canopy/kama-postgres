@@ -4,6 +4,6 @@
   "kind": "executable",
   "kama": ">=0.9.519",
   "entry": "src/main.kama",
-  "dependencies": { "@kama/postgres": { "path": "../.." }, "@kama/tls": { "path": "../../../kama-tls" } },
+  "dependencies": { "@kama/postgres": { "path": "../.." }, "@kama/tls": { "version": "^0.1.0" } },
   "modules": { ".": { "visibility": "internal" } }
 }

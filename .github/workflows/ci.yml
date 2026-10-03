@@ -1,14 +1,14 @@
 # CI for @kama/postgres. Copied in shape from @kama/sodium's workflow.
 #
-# ⚠️ NOT YET SEEN GREEN. It pins kama v0.9.486, the first release with everything this package needs (see
-# KAMA_GAPS.md). Until that tag is published, the install step has nothing to resolve.
-#
 # Two jobs:
 #   - unit: tools/test.sh, the hermetic program, debug and release, on linux-x64 and macos-arm64.
 #   - integration: a real PostgreSQL per matrix entry via tools/pg.sh (docker on the Linux runner; macOS
-#     runners have no container runtime). Until the kama integration suite exists, this job proves the
-#     server configuration with `tools/pg.sh smoke`: one login per auth method, using the server's own psql.
+#     runners have no container runtime). `tools/pg.sh smoke` first, one login per auth method with the
+#     server's own psql, so a misconfigured server fails apart from a wrong client; then
+#     tools/test-integration.sh: the integration suite, debug and release, and once more over TLS.
 #     19 is a beta, so it may fail without failing the run.
+# @kama/tls comes from the registry, pinned by kama.lock. The test PKI needs OpenSSL 3, which the Linux image
+# has and macOS has through Homebrew rather than as /usr/bin/openssl.
 # Windows is not in the matrix; the package has never been built there.
 
 name: ci
@@ -40,13 +40,21 @@ jobs:
       # Raise it deliberately, in the same commit that raises the manifests' "kama" floor.
       - name: Install kama
         env:
-          KAMA_VERSION: v0.9.486
+          KAMA_VERSION: v0.9.520
         run: |
           curl -fsSL https://kama-lang.org/install.sh | sh
           echo "$HOME/.kama/bin" >> "$GITHUB_PATH"
 
+      - name: OpenSSL 3 for the test PKI
+        if: runner.os == 'macOS'
+        run: |
+          brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+          echo "OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
+
       - name: Version
-        run: kama --version
+        run: |
+          kama --version
+          "${OPENSSL:-openssl}" version
 
       - name: Unit tests
         run: tools/test.sh
@@ -64,11 +72,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Install kama
+        env:
+          KAMA_VERSION: v0.9.520
+        run: |
+          curl -fsSL https://kama-lang.org/install.sh | sh
+          echo "$HOME/.kama/bin" >> "$GITHUB_PATH"
+
       - name: Start PostgreSQL ${{ matrix.pg }}
         run: tools/pg.sh up --version ${{ matrix.pg }}
 
       - name: Server smoke (one login per auth method)
         run: tools/pg.sh smoke --version ${{ matrix.pg }}
+
+      - name: Integration tests (debug, release, and release over TLS)
+        run: tools/test-integration.sh --version ${{ matrix.pg }}
 
       - name: Server log on failure
         if: failure()

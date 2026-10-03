@@ -1,7 +1,7 @@
 #!/bin/sh
 # pg.sh — the PostgreSQL server the integration tests run against, in a container.
 #
-#   tools/pg.sh up    [--version N]     start (or reuse) postgres:N, wait until it accepts TLS logins
+#   tools/pg.sh up    [--version N]     start (or reuse) postgres:N and a hot standby of it, wait until both accept logins
 #   tools/pg.sh down  [--version N]     remove the container
 #   tools/pg.sh env   [--version N]     print the PGTEST_* settings (also written to out/pgtest-N.env)
 #   tools/pg.sh psql  [--version N] [psql args…]   psql inside the container, as the superuser
@@ -35,6 +35,11 @@ fi
 
 NAME="kama-pg-$VERSION"
 PORT="543$VERSION"
+# A hot standby streams from each server (target_session_attrs, load_balance_hosts): its own container on a network
+# the two share, where the primary is "primary", and its own port.
+STANDBY="$NAME-standby"
+STANDBY_PORT="544$VERSION"
+NET="kama-pg-net-$VERSION"
 TAG=$VERSION
 [ "$VERSION" = 19 ] && TAG=19beta4   # no bare `19` tag until GA; move this when 19.0 ships
 IMAGE=${PGTEST_IMAGE:-docker.io/library/postgres:$TAG}
@@ -44,6 +49,8 @@ SUPERPW=kp_super_pw
 SASLPREP_PW=$(printf '\357\274\253\357\274\260\302\255sasl\302\240prep\357\254\201')
 
 running() { [ "$("$RT" inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = "true" ]; }
+standbyRunning() { [ "$("$RT" inspect -f '{{.State.Running}}' "$STANDBY" 2>/dev/null || true)" = "true" ]; }
+onNetwork() { "$RT" inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$NAME" 2>/dev/null | grep -q "$NET"; }
 
 write_env() {
     mkdir -p "$ROOT/out"
@@ -51,6 +58,7 @@ write_env() {
 PGTEST_VERSION=$VERSION
 PGTEST_HOST=127.0.0.1
 PGTEST_PORT=$PORT
+PGTEST_STANDBY_PORT=$STANDBY_PORT
 PGTEST_DATABASE=kp_test
 PGTEST_CERTDIR=$ROOT/out/test-certs
 PGTEST_SUPERUSER=postgres
@@ -78,6 +86,29 @@ wait_ready() {
     echo "pg.sh: $NAME not ready after 120 s" >&2; "$RT" logs "$NAME" 2>&1 | tail -30 >&2; exit 1
 }
 
+# The standby: a base backup of the primary (pg_basebackup -R, so it starts in recovery and streams from it), then
+# the server. Ready means it answers and is in recovery.
+startStandby() {
+    "$RT" rm -f "$STANDBY" >/dev/null 2>&1 || true
+    "$RT" run -d --name "$STANDBY" --network "$NET" --network-alias standby \
+        -p "127.0.0.1:$STANDBY_PORT:5432" \
+        -e PGPASSWORD=kp_repl_pw \
+        --entrypoint bash \
+        "$IMAGE" -c 'set -e
+            mkdir -p "$PGDATA" && chown postgres:postgres "$PGDATA" && chmod 0700 "$PGDATA"
+            if [ ! -s "$PGDATA/PG_VERSION" ]; then
+                until gosu postgres pg_basebackup -h primary -p 5432 -U kp_repl -D "$PGDATA" -R -X stream -c fast; do sleep 1; done
+            fi
+            exec gosu postgres postgres -D "$PGDATA"' >/dev/null
+    i=0
+    while [ $i -lt 120 ]; do
+        if [ "$("$RT" exec "$STANDBY" psql -X -A -t -q -h 127.0.0.1 -U kp_trust -d kp_test -c 'select pg_is_in_recovery()' 2>/dev/null || true)" = "t" ]; then return 0; fi
+        standbyRunning || { echo "pg.sh: $STANDBY exited during startup:" >&2; "$RT" logs "$STANDBY" 2>&1 | tail -30 >&2; exit 1; }
+        sleep 1; i=$((i + 1))
+    done
+    echo "pg.sh: $STANDBY not ready after 120 s" >&2; "$RT" logs "$STANDBY" 2>&1 | tail -30 >&2; exit 1
+}
+
 case "$cmd" in
     up)
         "$ROOT/tools/gen-test-certs.sh"
@@ -85,13 +116,20 @@ case "$cmd" in
         # it would serve a certificate from a CA the tests no longer have: recreate it.
         if running && ! "$RT" exec "$NAME" sh -c 'cmp -s /certs/ca.crt "$PGDATA/ca.crt"' 2>/dev/null; then
             echo "pg.sh: $NAME has an older test PKI; recreating it"
-            "$RT" rm -f "$NAME" >/dev/null 2>&1 || true
+            "$RT" rm -f "$NAME" "$STANDBY" >/dev/null 2>&1 || true
+        fi
+        "$RT" network inspect "$NET" >/dev/null 2>&1 || "$RT" network create "$NET" >/dev/null
+        # A server from before the standby (no shared network, no replication role) is made again.
+        if running && ! onNetwork; then
+            echo "pg.sh: $NAME predates its standby; recreating it"
+            "$RT" rm -f "$NAME" "$STANDBY" >/dev/null 2>&1 || true
         fi
         if running; then
             echo "pg.sh: $NAME already running on 127.0.0.1:$PORT"
         else
             "$RT" rm -f "$NAME" >/dev/null 2>&1 || true
-            "$RT" run -d --name "$NAME" \
+            "$RT" rm -f "$STANDBY" >/dev/null 2>&1 || true
+            "$RT" run -d --name "$NAME" --network "$NET" --network-alias primary \
                 -e POSTGRES_PASSWORD="$SUPERPW" \
                 -p "127.0.0.1:$PORT:5432" \
                 -v "$ROOT/out/test-certs:/certs:ro" \
@@ -101,10 +139,17 @@ case "$cmd" in
             wait_ready
             echo "pg.sh: $NAME ready on 127.0.0.1:$PORT ($("$RT" exec "$NAME" postgres --version))"
         fi
+        if standbyRunning; then
+            echo "pg.sh: $STANDBY already running on 127.0.0.1:$STANDBY_PORT"
+        else
+            startStandby
+            echo "pg.sh: $STANDBY ready on 127.0.0.1:$STANDBY_PORT, streaming from $NAME"
+        fi
         write_env
         ;;
     down)
-        "$RT" rm -f "$NAME" >/dev/null 2>&1 || true
+        "$RT" rm -f "$STANDBY" "$NAME" >/dev/null 2>&1 || true
+        "$RT" network rm "$NET" >/dev/null 2>&1 || true
         rm -f "$ENVFILE"
         echo "pg.sh: $NAME removed"
         ;;
@@ -146,6 +191,9 @@ try fail "nossl role over TLS"           "$B user=kp_nossl sslmode=require" kp_n
 try fail "wrong password"                "$B user=kp_scram sslmode=disable" wrong
 try ok   "client certificate required"   "$B user=kp_cert sslmode=require sslcertmode=require sslcert=/certs/client.crt sslkey=/tmp/client.key"
 try fail "client certificate not sent"   "$B user=kp_scram sslmode=require sslcertmode=require" kp_scram_pw
+try ok   "the standby, in recovery"      "host=standby dbname=kp_test user=kp_trust sslmode=disable"
+[ "$(psql -X -A -t -q -d "host=standby dbname=kp_test user=kp_trust sslmode=disable" -c "select pg_is_in_recovery()")" = "t" ] \
+    && echo "  ok    the standby is in hot standby" || { echo "  WRONG the standby is not in recovery"; exit 1; }
 if [ "$(psql -X -A -t -q -d "$B user=kp_trust sslmode=disable" -c "show server_version_num")" -ge 170000 ]; then
     try ok "direct TLS negotiation"      "$B user=kp_scram sslmode=require sslnegotiation=direct" kp_scram_pw
 fi

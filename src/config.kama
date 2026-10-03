@@ -9,7 +9,8 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::conninfo::libpqEnvironmentOptions, postgres::conninfo::pgpassLookup,
          postgres::conninfo::defaultSocketDir, postgres::conninfo::parseServiceFile,
          postgres::conninfo::ServiceEntries };
-export { Config, Environment, Host, HostKind, SslMode, SslCertMode, ChannelBindingMode, RequireAuth, TlsSettings, CacheMode };
+export { Config, Environment, Host, HostKind, SslMode, SslCertMode, ChannelBindingMode, RequireAuth, TlsSettings, CacheMode,
+         SessionTarget };
 
 // postgres::Config — everything a connection needs, resolved the way libpq resolves it:
 //   1. the connection string (postgres::conninfo);
@@ -191,6 +192,10 @@ type enum HostKind implements Sendable { Name, Address, Socket }
 //               1.21 in transaction mode).
 //   Off         describe, then run: two round trips each time.
 type enum CacheMode implements Sendable { Statements, Describe, Off }
+
+// target_session_attrs: the kind of server a connect accepts (libpq's target_server_type). Any takes the first it
+// reaches; the others check each server after authentication and move on to the next host when it is not that kind.
+type enum SessionTarget implements Sendable { Any, ReadWrite, ReadOnly, Primary, Standby, PreferStandby }
 
 // One server to try, as pqConnectOptions2 lays them out: `host` and `hostaddr` paired by position, a port each.
 type resource Host implements Sendable, Copyable<This>(bare: give) {
@@ -499,6 +504,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     TlsSettings tlsSettings;
     CacheMode cacheModeSetting = CacheMode::Statements;
     isize cacheCapacitySetting = 512;
+    SessionTarget targetSetting = SessionTarget::Any;
 
     // A connection string, resolved under the process environment.
     public unsafe ctor Result<Config, PgError> parse(const ref string text) {
@@ -548,6 +554,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.tlsSettings = TlsSettings.blank();
         this.cacheModeSetting = CacheMode::Statements;
         this.cacheCapacitySetting = 512;
+        this.targetSetting = SessionTarget::Any;
     }
 
     public ctor copy(ref Config source) {
@@ -562,7 +569,11 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.tlsSettings = copy source.tlsSettings;
         this.cacheModeSetting = source.cacheModeSetting;
         this.cacheCapacitySetting = source.cacheCapacitySetting;
+        this.targetSetting = source.targetSetting;
     }
+
+    // target_session_attrs.
+    public const fn SessionTarget sessionTarget() { return this.targetSetting; }
 
     // How connections made with this configuration keep statements: a CacheMode, and at most `capacity` of them (the
     // least recently used is let go when one more is needed). Not a connection-string keyword: libpq has none.
@@ -802,14 +813,15 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
             return Result::Err(error: fail(detail: "gssencmode value \"".concat(other: gss).concat(other: "\" invalid when GSSAPI support is not compiled in")));
         }
 
+        // pqConnectOptions2: exact names, else libpq's "invalid %s value".
         string target = this.text(keyword: "target_session_attrs");
-        if (!target.equals(other: "any")) {
-            if (target.equals(other: "read-write") || target.equals(other: "read-only") || target.equals(other: "primary")
-                || target.equals(other: "standby") || target.equals(other: "prefer-standby")) {
-                return Result::Err(error: fail(detail: "target_session_attrs value \"".concat(other: target).concat(other: "\" is not supported by this client yet")));
-            }
-            return Result::Err(error: fail(detail: invalidValue(keyword: "target_session_attrs", value: target)));
-        }
+        if (target.equals(other: "any")) { this.targetSetting = SessionTarget::Any; }
+        else if (target.equals(other: "read-write")) { this.targetSetting = SessionTarget::ReadWrite; }
+        else if (target.equals(other: "read-only")) { this.targetSetting = SessionTarget::ReadOnly; }
+        else if (target.equals(other: "primary")) { this.targetSetting = SessionTarget::Primary; }
+        else if (target.equals(other: "standby")) { this.targetSetting = SessionTarget::Standby; }
+        else if (target.equals(other: "prefer-standby")) { this.targetSetting = SessionTarget::PreferStandby; }
+        else { return Result::Err(error: fail(detail: invalidValue(keyword: "target_session_attrs", value: target))); }
 
         Result<Unit, ConnInfoError> keys = this.decodeScramKeys();
         match (give keys) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };

@@ -444,6 +444,37 @@ EOF
 "$RT" exec -i -u postgres "$NAME" sh /tmp/check_tls.sh < "$tmp/tls_inputs" > "$tmp/tls_verdicts.tsv"
 [ "$(wc -l < "$tmp/tls_verdicts.tsv")" -eq "$(wc -l < "$tmp/tls_inputs")" ] || { echo "gen-libpq-test-cases: a TLS case gave no verdict" >&2; exit 1; }
 
+# ---- target_session_attrs: libpq's verdict on each ------------------------------------------------------------------
+# Each mode, with the server (P) and its standby (S, tools/pg.sh) listed in each order, asked of a libpq that reaches
+# them as the kama client does: from the host's network, at 127.0.0.1 on their published ports. The verdict is "ok" and
+# whether the server reached is in recovery, or "fail" and libpq's whole message, the ports written @PORT@ (P's) and
+# @STANDBY_PORT@ (S's).
+PORT="543$VERSION"; STANDBY_PORT="544$VERSION"
+IMAGE=$("$RT" inspect -f '{{.Config.Image}}' "$NAME")
+"$RT" exec "$NAME-standby" true 2>/dev/null || { echo "gen-libpq-test-cases: $NAME-standby is not running (tools/pg.sh up --version $VERSION)" >&2; exit 1; }
+for mode in any read-write read-only primary standby prefer-standby; do
+    for order in PS SP PP SS; do printf '%s|%s\n' "$mode" "$order"; done
+done > "$tmp/tsa_inputs"
+cat > "$tmp/check_tsa.sh" <<'EOF'
+err=$(mktemp)
+while IFS="|" read -r mode order; do
+    first=$PORT; second=$PORT
+    case "$order" in S?) first=$STANDBY_PORT ;; esac
+    case "$order" in ?S) second=$STANDBY_PORT ;; esac
+    if out=$(psql -X -A -t -q -w -d "host=127.0.0.1,127.0.0.1 port=$first,$second user=kp_trust dbname=kp_test sslmode=disable target_session_attrs=$mode" \
+             -c "select pg_is_in_recovery()" 2>"$err"); then
+        printf '%s\t%s\tok\t%s\t\n' "$mode" "$order" "$out"
+    else
+        text=$(sed -e 's/^psql: error: //' -e "s/port $STANDBY_PORT failed/port @STANDBY_PORT@ failed/g" -e "s/port $PORT failed/port @PORT@ failed/g" "$err")
+        printf '%s\t%s\tfail\t\t%s\n' "$mode" "$order" "$(printf '%s' "$text" | od -An -tx1 -v | tr -d ' \n')"
+    fi
+done
+rm -f "$err"
+EOF
+"$RT" run --rm -i --network=host -e PORT="$PORT" -e STANDBY_PORT="$STANDBY_PORT" --entrypoint sh "$IMAGE" -c "$(cat "$tmp/check_tsa.sh")" \
+    < "$tmp/tsa_inputs" > "$tmp/tsa_verdicts.tsv"
+[ "$(wc -l < "$tmp/tsa_verdicts.tsv")" -eq "$(wc -l < "$tmp/tsa_inputs")" ] || { echo "gen-libpq-test-cases: a target_session_attrs case gave no verdict" >&2; exit 1; }
+
 emit "$ROOT/tests/unit/src/libpq_cases.kama" "require_auth: each value of 001_password.pl's cases, and the parse error libpq reports for it (\"\" when it
 parses; the cases that fail later fail on a live server and are in tests/integration).
 .pgpass: 001_password.pl's file and its cases (the role, whether its password \"pass\" is found), then this
@@ -480,7 +511,10 @@ libpq\x27s message as upstream\x27s pattern (\".*\" matches anything). The valid
 Settings: as in tests/unit, and the ones libpq checks host by host are run here.
 TLS: each case's name, environment (\"-\" for none) and connection string (host and port are added), whether libpq
 connected and then whether pg_stat_ssl showed TLS, or else libpq\x27s whole message. @CERTDIR@, @KEYDIR@, @PORT@ and
-@CLIENT@ stand for the test PKI, the client key copies, the server\x27s port and the client\x27s address." <<EOF
+@CLIENT@ stand for the test PKI, the client key copies, the server\x27s port and the client\x27s address.
+target_session_attrs: each mode with the server (P) and its standby (S) listed in each order (PS, SP, PP, SS), whether
+libpq connected and then whether the server it reached is in recovery, or else libpq\x27s whole message. @PORT@ and
+@STANDBY_PORT@ stand for the two ports." <<EOF
 requireAuthMethods|$tmp/require_auth.tsv|0|string
 requireAuthSettings|$tmp/require_auth.tsv|1|string
 requireAuthConnects|$tmp/require_auth.tsv|2|bool
@@ -503,6 +537,11 @@ tlsSettings|$tmp/tls_verdicts.tsv|2|string
 tlsConnects|$tmp/tls_verdicts.tsv|3|bool
 tlsEncrypted|$tmp/tls_verdicts.tsv|4|string
 tlsMessages|$tmp/tls_verdicts.tsv|5|string|hex
+tsaModes|$tmp/tsa_verdicts.tsv|0|string
+tsaOrders|$tmp/tsa_verdicts.tsv|1|string
+tsaConnects|$tmp/tsa_verdicts.tsv|2|bool
+tsaInRecovery|$tmp/tsa_verdicts.tsv|3|string
+tsaMessages|$tmp/tsa_verdicts.tsv|4|string|hex
 EOF
 
 echo "gen-libpq-test-cases: $(wc -l < "$tmp/require_auth.tsv" | tr -d ' ') require_auth cases (libpq agrees), $(wc -l < "$tmp/pgpass_upstream.tsv" | tr -d ' ')+$(wc -l < "$tmp/pgpass_verdicts.tsv" | tr -d ' ') .pgpass cases, $(wc -l < "$tmp/service_verdicts.tsv" | tr -d ' ') service files, $(wc -l < "$tmp/service_scenarios.tsv" | tr -d ' ') service scenarios, $(wc -l < "$tmp/settings_verdicts.tsv" | tr -d ' ') settings (PostgreSQL ${COMMIT%${COMMIT#????????}}, libpq $VERSION)"

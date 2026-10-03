@@ -1,0 +1,50 @@
+// target_session_attrs on a real server and its hot standby (tools/pg.sh), case by case as the container's libpq
+// answered them (tools/gen-libpq-test-cases.sh): each mode with the two listed in each order. Where libpq connected,
+// this client must reach the same kind of server (pg_is_in_recovery()); where it failed, the message must be libpq's,
+// exactly.
+import { std::collections::DynamicArray,
+         postgres::Connection, postgres::PgError,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::open,
+         postgres_integration_tests::scalar,
+         postgres_integration_tests::tsaModes, postgres_integration_tests::tsaOrders, postgres_integration_tests::tsaConnects,
+         postgres_integration_tests::tsaInRecovery, postgres_integration_tests::tsaMessages };
+export { tsaTests };
+
+unsafe fn int32 tsaTests() {
+    int32 f = 0;
+    string port = setting(name: "PGTEST_PORT");
+    string standbyPort = setting(name: "PGTEST_STANDBY_PORT");
+    DynamicArray<string> modes = tsaModes();
+    DynamicArray<string> orders = tsaOrders();
+    DynamicArray<bool> connects = tsaConnects();
+    DynamicArray<string> recovering = tsaInRecovery();
+    DynamicArray<string> messages = tsaMessages();
+    isize i = 0;
+    while (i < modes.length()) {
+        string first = copy port;
+        string second = copy port;
+        if (orders[i].startsWith(prefix: "S")) { first = copy standbyPort; }
+        if (orders[i].endsWith(suffix: "S")) { second = copy standbyPort; }
+        string conninfo = "host=127.0.0.1,127.0.0.1 port=".concat(other: first).concat(other: ",").concat(other: second)
+                          .concat(other: " user=kp_trust dbname=kp_test sslmode=disable target_session_attrs=").concat(other: modes[i]);
+        string what = "tsa (libpq) ".concat(other: modes[i]).concat(other: " ").concat(other: orders[i]).concat(other: ": ");
+        Result<Connection, PgError> opened = open(conninfo: conninfo);
+        match (give opened) {
+            case Ok(value: c): {
+                Connection conn = give c;
+                string inRecovery = scalar(c: conn, sql: "select pg_is_in_recovery()");
+                f = f + check(ok: connects[i] && inRecovery.equals(other: recovering[i]),
+                              what: what.concat(other: "reached a server in recovery ").concat(other: inRecovery).concat(other: ", libpq ").concat(other: recovering[i]));
+            }
+            case Err(error: e): {
+                string want = messages[i].replace(old: "@STANDBY_PORT@", with: standbyPort).replace(old: "@PORT@", with: port);
+                string got = e.message();
+                f = f + check(ok: !connects[i] && got.equals(other: want), what: what.concat(other: "\n    libpq: ").concat(other: want).concat(other: "\n    here:  ").concat(other: got));
+            }
+        };
+        i = i + 1;
+    }
+    isize count = modes.length();
+    f = f + check(ok: count == 24, what: "tsa (libpq): the cases are all there (${count})");
+    return f;
+}

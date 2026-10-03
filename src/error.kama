@@ -43,7 +43,11 @@ type enum PgError implements Error {
     // ("no cancellation key received", "could not send cancel packet: …", "unexpected response from server").
     Cancel(string detail),
     // COMMIT ended the transaction with a rollback, because the transaction had failed (pgx's ErrTxCommitRollback).
-    RolledBack;
+    RolledBack,
+    // The server is not the kind target_session_attrs asked for, or could not be asked: libpq's words ("session is
+    // read-only", "server is in hot standby mode", "\"SHOW transaction_read_only\" failed", …). The connect moves on
+    // to the next host.
+    Target(string detail);
 
     public const fn string message() {
         return match (this) {
@@ -60,6 +64,7 @@ type enum PgError implements Error {
             case Closed: "no connection to the server";
             case Cancel(detail: d): copy d;
             case RolledBack: "commit unexpectedly resulted in rollback";
+            case Target(detail: d): copy d;
         };
     }
 

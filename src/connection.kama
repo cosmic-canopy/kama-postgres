@@ -25,7 +25,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::protocol::copyData as sendCopyData, postgres::protocol::copyDone as sendCopyDone,
          std::io::Reader, std::io::Writer, std::io::writeAll, std::collections::FixedArray,
          postgres::sqlstate::QUERY_CANCELED, postgres::sqlstate::FEATURE_NOT_SUPPORTED,
-         postgres::CacheMode, postgres::session::StatementCache, postgres::session::CachedStatement,
+         postgres::CacheMode, postgres::session::StatementCache, postgres::session::CachedStatement, postgres::SessionTarget,
          postgres::protocol::describePortal as sendDescribePortal, postgres::protocol::flush as sendFlush,
          postgres::PipelineStatus, postgres::PipelineResult, postgres::Batch, postgres::BatchResult,
          postgres::protocol::BindValues,
@@ -224,7 +224,7 @@ type resource Connection implements Sendable {
         string host = "";
         if (config.hostCount() > 0 && !socket) { host = copy config.host(index: 0).name(); }
         EncryptionPlan plan = EncryptionPlan.forAddress(mode: config.tls().mode(), socket: socket);
-        Errand errand = Errand.session();
+        Errand errand = Errand.session(target: config.sessionTarget());
         Attempt tried = Connection::attempt(link: give transport, config: config, hostIndex: -1, host: host, plan: plan, deadline: deadline, errand: errand);
         return match (give tried) {
             case Ready(connection: c): Result::Ok(value: give c);
@@ -237,8 +237,16 @@ type resource Connection implements Sendable {
 
     unsafe ctor Result<Connection, PgError> establish(const ref Config config, ref Opener opener) {
         ConnectError failures = ConnectError.make();
-        Errand errand = Errand.session();
+        // prefer-standby goes round the hosts twice: for a standby, then for any server (libpq's PREFER_STANDBY_PASS2).
+        bool secondPass = match (config.sessionTarget()) { case PreferStandby: true; case _: false; };
+        isize passes = 1;
+        if (secondPass) { passes = 2; }
         bool stop = false;
+        isize pass = 0;
+        while (pass < passes && !stop) {
+        SessionTarget wanted = config.sessionTarget();
+        if (pass == 1) { wanted = SessionTarget::Any; }
+        Errand errand = Errand.session(target: wanted);
         isize h = 0;
         while (h < config.hostCount() && !stop) {
             Result<DynamicArray<DialTarget>, PgError> listed = Connection::targetsOf(config: config, hostIndex: h, failures: failures);
@@ -256,6 +264,8 @@ type resource Connection implements Sendable {
                 a = a + 1;
             }
             h = h + 1;
+        }
+        pass = pass + 1;
         }
         return Result::Err(error: PgError::Connect(error: give failures));
     }
@@ -439,6 +449,18 @@ type resource Connection implements Sendable {
         Result<Unit, PgError> started = session.startup(config: config, hostIndex: hostIndex, deadline: deadline);
         match (give started) {
             case Ok(value: u): {
+                Result<Unit, PgError> fits = session.checkTarget(target: errand.target(), deadline: deadline);
+                match (give fits) {
+                    case Ok(value: k): { }
+                    case Err(error: e): {
+                        // Not the server asked for: libpq sends Terminate and moves on to the next host.
+                        session.close();
+                        if (isTimeout(e: e)) { return Attempt::TimedOut(error: give e); }
+                        bool wrong = match (e) { case Target(detail: d): true; case _: false; };
+                        if (wrong) { return Attempt::NextHost(error: give e); }
+                        return Attempt::Final(error: give e);
+                    }
+                };
                 session.cache = StatementCache.make(mode: config.statementCacheMode(), capacity: config.statementCacheCapacity());
                 return Attempt::Ready(connection: give session);
             }
@@ -1997,6 +2019,79 @@ type resource Connection implements Sendable {
         return Result::Ok(value: Optional::None);
     }
 
+    // ---- target_session_attrs ----
+
+    // libpq's CONNECTION_CHECK_TARGET (fe-connect.c): whether this server is the kind `target` accepts. The server's
+    // reported default_transaction_read_only and in_hot_standby decide when it sent both (14 and later); else it is
+    // asked, within the connect's deadline: SHOW transaction_read_only, or pg_is_in_recovery(). A mismatch is
+    // PgError::Target with libpq's words, and the connect moves on to the next host.
+    unsafe fn Result<Unit, PgError> checkTarget(SessionTarget target, Deadline deadline) {
+        bool any = match (target) { case Any: true; case _: false; };
+        if (any) { return Result::Ok(value: Unit::Unit); }
+        bool access = match (target) { case ReadWrite: true; case ReadOnly: true; case _: false; };
+        if (access) {
+            Optional<string> dtro = this.parameter(name: "default_transaction_read_only");
+            Optional<string> standbyNow = this.parameter(name: "in_hot_standby");
+            bool known = match (dtro) { case Some(value: x): match (standbyNow) { case Some(value: y): true; case None: false; }; case None: false; };
+            bool readOnly = false;
+            if (known) {
+                bool a = match (dtro) { case Some(value: x): x.equals(other: "on"); case None: false; };
+                bool b = match (standbyNow) { case Some(value: y): y.equals(other: "on"); case None: false; };
+                readOnly = a || b;
+            } else {
+                Result<string, PgError> shown = this.probe(sql: "SHOW transaction_read_only", deadline: deadline);
+                match (give shown) {
+                    case Ok(value: v): { readOnly = v.startsWith(prefix: "on"); }
+                    case Err(error: e): {
+                        if (isTimeout(e: e) || !this.live) { return Result::Err(error: give e); }
+                        return Result::Err(error: PgError::Target(detail: "\"SHOW transaction_read_only\" failed"));
+                    }
+                };
+            }
+            bool wantsWrite = match (target) { case ReadWrite: true; case _: false; };
+            if (wantsWrite && readOnly) { return Result::Err(error: PgError::Target(detail: "session is read-only")); }
+            if (!wantsWrite && !readOnly) { return Result::Err(error: PgError::Target(detail: "session is not read-only")); }
+            return Result::Ok(value: Unit::Unit);
+        }
+        bool standby = false;
+        Optional<string> reported = this.parameter(name: "in_hot_standby");
+        bool knows = match (reported) { case Some(value: x): true; case None: false; };
+        if (this.serverVersion() > 0 && this.serverVersion() < 90000) { standby = false; }
+        else if (knows) { standby = match (reported) { case Some(value: x): x.equals(other: "on"); case None: false; }; }
+        else {
+            // The query is sent qualified; libpq's message names it unqualified.
+            Result<string, PgError> recovering = this.probe(sql: "SELECT pg_catalog.pg_is_in_recovery()", deadline: deadline);
+            match (give recovering) {
+                case Ok(value: v): { standby = v.startsWith(prefix: "t"); }
+                case Err(error: e): {
+                    if (isTimeout(e: e) || !this.live) { return Result::Err(error: give e); }
+                    return Result::Err(error: PgError::Target(detail: "\"SELECT pg_is_in_recovery()\" failed"));
+                }
+            };
+        }
+        bool wantsPrimary = match (target) { case Primary: true; case _: false; };
+        if (wantsPrimary && standby) { return Result::Err(error: PgError::Target(detail: "server is in hot standby mode")); }
+        if (!wantsPrimary && !standby) { return Result::Err(error: PgError::Target(detail: "server is not in hot standby mode")); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // The first value of `sql`'s first row, as text, within `deadline` (the connect's).
+    unsafe fn Result<string, PgError> probe(const ref string sql, Deadline deadline) {
+        this.outbox.clear();
+        if (!sendQuery(w: this.outbox, sql: sql)) { return Result::Err(error: nulInQuery()); }
+        Result<Unit, PgError> sent = this.flush(deadline: deadline);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.due = deadline;
+        this.cancelling = false;
+        Result<DynamicArray<Rows>, PgError> r = this.collect();
+        DynamicArray<Rows> results = match (give r) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (results.length() == 0 || results[0].rowCount() == 0 || results[0].isNull(row: 0, column: 0)) {
+            return Result::Err(error: PgError::Target(detail: "no value"));
+        }
+        Result<string, Utf8Error> text = utf8Decode(bytes: results[0].bytes(row: 0, column: 0));
+        return match (give text) { case Ok(value: t): Result::Ok(value: give t); case Err(error: e): Result::Err(error: PgError::Target(detail: "no value")); };
+    }
+
     // ---- startup ----
 
     // From the StartupMessage to ReadyForQuery: authentication, then the session's parameters and cancel key.
@@ -2378,8 +2473,10 @@ type resource Errand {
     int32 pid = 0;
     DynamicArray<uint8> key;
     Deadline bound;
-    public ctor session() { this.cancel = false; this.pid = 0; this.key = DynamicArray.empty(); this.bound = Deadline.none(); }
-    public ctor cancelling(int32 pid, DynamicArray<uint8> key, Deadline limit) { this.cancel = true; this.pid = pid; this.key = give key; this.bound = limit; }
+    SessionTarget kind = SessionTarget::Any;   // for a session: the server target_session_attrs accepts
+    public ctor session(SessionTarget target) { this.cancel = false; this.pid = 0; this.key = DynamicArray.empty(); this.bound = Deadline.none(); this.kind = target; }
+    public ctor cancelling(int32 pid, DynamicArray<uint8> key, Deadline limit) { this.cancel = true; this.pid = pid; this.key = give key; this.bound = limit; this.kind = SessionTarget::Any; }
+    public const fn SessionTarget target() { return this.kind; }
     public const fn Deadline limit() { return this.bound; }
     public const fn bool isCancel() { return this.cancel; }
     public const fn int32 processId() { return this.pid; }

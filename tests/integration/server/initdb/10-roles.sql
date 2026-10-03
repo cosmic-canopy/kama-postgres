@@ -2,6 +2,8 @@
 -- The passwords are test constants, repeated in tools/pg.sh's environment file; nothing here is secret.
 
 SET password_encryption = 'scram-sha-256';
+-- Streams the WAL to the standby tools/pg.sh starts beside each server (target_session_attrs, load_balance_hosts).
+CREATE ROLE kp_repl     LOGIN REPLICATION PASSWORD 'kp_repl_pw';
 CREATE ROLE kp_scram    LOGIN PASSWORD 'kp_scram_pw';
 -- A password SASLprep changes: full-width letters, a soft hyphen (mapped to nothing), a no-break space (mapped to a
 -- space) and the ligature U+FB01 (NFKC: "fi"). The server prepares it before hashing, so a client must prepare it

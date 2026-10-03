@@ -59,7 +59,10 @@ type enum Step implements Sendable {
     Cancel(string body),
     // Reply with `then`, late: the client's next wait for it ends without it (as when a query timeout passes), and
     // it is there for the wait after.
-    Late(DynamicArray<uint8> then)
+    Late(DynamicArray<uint8> then),
+    // A simple query asking a server's role, answered as a primary or a standby would: SHOW transaction_read_only
+    // ("on" on a standby), anything else as pg_is_in_recovery() ("t" on a standby).
+    AnswerRole(bool standby)
 }
 
 // The server's side of the TLS session: what the client sent waits in `inbound` for the engine, and what the engine
@@ -701,6 +704,17 @@ type resource FakeServer implements Transport, Sendable {
                 if (last >= 0) { this.toClient[last] = this.toClient[last] ^ 1ui8; }
             }
             case Late(then: t): { foreach (uint8 b in t) { this.held.add(item: b); } }
+            case AnswerRole(standby: sb): {
+                string asked = cString(body: body, from: 0);
+                string value = "f";
+                if (asked.contains(substring: "transaction_read_only")) { value = "off"; if (sb) { value = "on"; } }
+                else if (sb) { value = "t"; }
+                Wire m = Wire.make();
+                DynamicArray<string> names = DynamicArray.empty(); names.add(item: "v");
+                DynamicArray<string> row = DynamicArray.empty(); row.add(item: give value);
+                m.columns(names: names); m.row(values: row); m.complete(tag: "SELECT 1"); m.ready(status: 73ui8);
+                this.queue(b: m.bytes().view());
+            }
             case Cancel(body: hex): {
                 string compact = hex.replace(old: " ", with: "");
                 string got = hexEncode(bytes: body.view());

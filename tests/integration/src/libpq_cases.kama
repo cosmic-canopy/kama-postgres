@@ -11,8 +11,11 @@
 // TLS: each case's name, environment ("-" for none) and connection string (host and port are added), whether libpq
 // connected and then whether pg_stat_ssl showed TLS, or else libpq\x27s whole message. @CERTDIR@, @KEYDIR@, @PORT@ and
 // @CLIENT@ stand for the test PKI, the client key copies, the server\x27s port and the client\x27s address.
+// target_session_attrs: each mode with the server (P) and its standby (S) listed in each order (PS, SP, PP, SS), whether
+// libpq connected and then whether the server it reached is in recovery, or else libpq\x27s whole message. @PORT@ and
+// @STANDBY_PORT@ stand for the two ports.
 import { std::collections::DynamicArray };
-export { requireAuthMethods, requireAuthSettings, requireAuthConnects, requireAuthMessages, serviceFileKinds, serviceSysconf, serviceEnvSet, serviceEnvValues, serviceConnstrs, serviceOutcomes, servicePatterns, serviceValidFile, settingStages, settingStrings, settingAccepted, settingErrors, tlsNames, tlsEnvironments, tlsSettings, tlsConnects, tlsEncrypted, tlsMessages };
+export { requireAuthMethods, requireAuthSettings, requireAuthConnects, requireAuthMessages, serviceFileKinds, serviceSysconf, serviceEnvSet, serviceEnvValues, serviceConnstrs, serviceOutcomes, servicePatterns, serviceValidFile, settingStages, settingStrings, settingAccepted, settingErrors, tlsNames, tlsEnvironments, tlsSettings, tlsConnects, tlsEncrypted, tlsMessages, tsaModes, tsaOrders, tsaConnects, tsaInRecovery, tsaMessages };
 
 fn DynamicArray<string> requireAuthMethods() {
     DynamicArray<string> v = DynamicArray.empty();
@@ -858,6 +861,151 @@ fn DynamicArray<string> tlsMessages() {
     v.add(item: "");
     v.add(item: "connection to server at \"127.0.0.1\", port @PORT@ failed: channel binding required but not supported by server's authentication request");
     v.add(item: "connection to server at \"127.0.0.1\", port @PORT@ failed: channel binding required, but server authenticated client without channel binding");
+    v.add(item: "");
+    return v;
+}
+
+fn DynamicArray<string> tsaModes() {
+    DynamicArray<string> v = DynamicArray.empty();
+    v.add(item: "any");
+    v.add(item: "any");
+    v.add(item: "any");
+    v.add(item: "any");
+    v.add(item: "read-write");
+    v.add(item: "read-write");
+    v.add(item: "read-write");
+    v.add(item: "read-write");
+    v.add(item: "read-only");
+    v.add(item: "read-only");
+    v.add(item: "read-only");
+    v.add(item: "read-only");
+    v.add(item: "primary");
+    v.add(item: "primary");
+    v.add(item: "primary");
+    v.add(item: "primary");
+    v.add(item: "standby");
+    v.add(item: "standby");
+    v.add(item: "standby");
+    v.add(item: "standby");
+    v.add(item: "prefer-standby");
+    v.add(item: "prefer-standby");
+    v.add(item: "prefer-standby");
+    v.add(item: "prefer-standby");
+    return v;
+}
+
+fn DynamicArray<string> tsaOrders() {
+    DynamicArray<string> v = DynamicArray.empty();
+    v.add(item: "PS");
+    v.add(item: "SP");
+    v.add(item: "PP");
+    v.add(item: "SS");
+    v.add(item: "PS");
+    v.add(item: "SP");
+    v.add(item: "PP");
+    v.add(item: "SS");
+    v.add(item: "PS");
+    v.add(item: "SP");
+    v.add(item: "PP");
+    v.add(item: "SS");
+    v.add(item: "PS");
+    v.add(item: "SP");
+    v.add(item: "PP");
+    v.add(item: "SS");
+    v.add(item: "PS");
+    v.add(item: "SP");
+    v.add(item: "PP");
+    v.add(item: "SS");
+    v.add(item: "PS");
+    v.add(item: "SP");
+    v.add(item: "PP");
+    v.add(item: "SS");
+    return v;
+}
+
+fn DynamicArray<bool> tsaConnects() {
+    DynamicArray<bool> v = DynamicArray.empty();
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: false);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: false);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: false);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: false);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: true);
+    v.add(item: true);
+    return v;
+}
+
+fn DynamicArray<string> tsaInRecovery() {
+    DynamicArray<string> v = DynamicArray.empty();
+    v.add(item: "f");
+    v.add(item: "t");
+    v.add(item: "f");
+    v.add(item: "t");
+    v.add(item: "f");
+    v.add(item: "f");
+    v.add(item: "f");
+    v.add(item: "");
+    v.add(item: "t");
+    v.add(item: "t");
+    v.add(item: "");
+    v.add(item: "t");
+    v.add(item: "f");
+    v.add(item: "f");
+    v.add(item: "f");
+    v.add(item: "");
+    v.add(item: "t");
+    v.add(item: "t");
+    v.add(item: "");
+    v.add(item: "t");
+    v.add(item: "t");
+    v.add(item: "t");
+    v.add(item: "f");
+    v.add(item: "t");
+    return v;
+}
+
+fn DynamicArray<string> tsaMessages() {
+    DynamicArray<string> v = DynamicArray.empty();
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "connection to server at \"127.0.0.1\", port @STANDBY_PORT@ failed: session is read-only\nconnection to server at \"127.0.0.1\", port @STANDBY_PORT@ failed: session is read-only");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "connection to server at \"127.0.0.1\", port @PORT@ failed: session is not read-only\nconnection to server at \"127.0.0.1\", port @PORT@ failed: session is not read-only");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "connection to server at \"127.0.0.1\", port @STANDBY_PORT@ failed: server is in hot standby mode\nconnection to server at \"127.0.0.1\", port @STANDBY_PORT@ failed: server is in hot standby mode");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "connection to server at \"127.0.0.1\", port @PORT@ failed: server is not in hot standby mode\nconnection to server at \"127.0.0.1\", port @PORT@ failed: server is not in hot standby mode");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "");
+    v.add(item: "");
     v.add(item: "");
     return v;
 }

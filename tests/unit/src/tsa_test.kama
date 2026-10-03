@@ -1,0 +1,112 @@
+// target_session_attrs against scripted servers: every case of PostgreSQL's 001_stream_rep.pl (session_vectors.kama,
+// from tools/gen-session-vectors.sh), two hosts that are the primary or a standby, run twice: with servers that report
+// in_hot_standby and default_transaction_read_only (14 and later), and with servers that do not, so the client asks
+// (SHOW transaction_read_only, pg_is_in_recovery()). The connect must reach the node the test expects, or fail with
+// libpq's words for each host it turned down.
+import { std::collections::DynamicArray, std::memory::Owned, std::io::IoError, std::io::IoErrorKind,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Transport,
+         postgres::Dialer, postgres::DialTarget,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire,
+         postgres_unit_tests::tsaFirst, postgres_unit_tests::tsaSecond, postgres_unit_tests::tsaMode, postgres_unit_tests::tsaReached };
+export { tsaTests };
+
+// The welcome of node `name` (primary, standby1, standby2), reporting its role when `reports`, and its name always
+// (as the parameter kp_node), so a test can tell which it reached.
+fn DynamicArray<uint8> welcomeOf(const ref string name, bool reports) {
+    bool standby = name.startsWith(prefix: "standby");
+    Wire m = Wire.make();
+    m.auth(code: 0);
+    m.parameter(name: "server_version", value: "18.4");
+    m.parameter(name: "client_encoding", value: "UTF8");
+    if (reports) {
+        string hot = "off";
+        if (standby) { hot = "on"; }
+        m.parameter(name: "in_hot_standby", value: hot);
+        m.parameter(name: "default_transaction_read_only", value: "off");
+    }
+    m.parameter(name: "kp_node", value: name);
+    m.backendKey(pid: 4242, keyLength: 4);
+    m.ready(status: 73ui8);
+    return m.bytes();
+}
+
+// Opens node `first` at port 5432 and node `second` at 5433, each a fresh fake for every connection.
+type resource RoleDialer implements Dialer, Sendable {
+    string first;
+    string second;
+    bool reports = false;
+    public ctor make(string first, string second, bool reports) { this.first = give first; this.second = give second; this.reports = reports; }
+    public unsafe fn Result<Owned<Transport>, IoError> dial(const ref DialTarget target, int32 timeoutMs) {
+        string node = copy this.first;
+        if (target.port().equals(other: "5433")) { node = copy this.second; }
+        DynamicArray<Step> steps = DynamicArray.empty();
+        steps.add(item: Step::Send(bytes: welcomeOf(name: node, reports: this.reports)));
+        steps.add(item: Step::AnswerRole(standby: node.startsWith(prefix: "standby")));
+        Owned<Transport> server = new FakeServer.make(steps: give steps, chunk: 3, writeLimit: 5);
+        return Result::Ok(value: give server);
+    }
+}
+
+// The phrase libpq gives for a server `mode` turns down.
+fn string refusalFor(const ref string mode) {
+    if (mode.equals(other: "read-write")) { return "session is read-only"; }
+    if (mode.equals(other: "read-only")) { return "session is not read-only"; }
+    if (mode.equals(other: "primary")) { return "server is in hot standby mode"; }
+    return "server is not in hot standby mode";
+}
+
+fn isize occurrences(const ref string text, const ref string part) {
+    isize n = 0;
+    string rest = copy text;
+    while (true) {
+        Optional<usize> at = rest.find(substring: part);
+        match (at) {
+            case Some(value: i): { n = n + 1; rest = rest.substring(start: cast<isize>(i) + part.length(), end: rest.length()); }
+            case None: { break; }
+        };
+    }
+    return n;
+}
+
+unsafe fn int32 tsaTests() {
+    int32 f = 0;
+    DynamicArray<string> firsts = tsaFirst();
+    DynamicArray<string> seconds = tsaSecond();
+    DynamicArray<string> modes = tsaMode();
+    DynamicArray<string> reached = tsaReached();
+    isize i = 0;
+    while (i < modes.length()) {
+        isize variant = 0;
+        while (variant < 2) {
+            bool reports = variant == 0;
+            string how = " (reported)";
+            if (!reports) { how = " (asked)"; }
+            string what = "tsa ".concat(other: modes[i]).concat(other: ", ").concat(other: firsts[i]).concat(other: " then ").concat(other: seconds[i]).concat(other: how);
+            Environment env = testEnvironment();
+            string conninfo = "host=h1,h2 hostaddr=127.0.0.1,127.0.0.2 port=5432,5433 user=u dbname=d sslmode=disable target_session_attrs=".concat(other: modes[i]);
+            Result<Config, PgError> c = resolveWith(text: conninfo, env: env);
+            Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return check(ok: false, what: what.concat(other: ": config (").concat(other: e.message()).concat(other: ")")); } };
+            Owned<Dialer> dialer = new RoleDialer.make(first: copy firsts[i], second: copy seconds[i], reports: reports);
+            Result<Connection, PgError> opened = Connection.connectWith(dialer: give dialer, config: config);
+            if (reached[i].length() > 0) {
+                string node = match (opened) {
+                    case Ok(value: conn): match (conn.parameter(name: "kp_node")) { case Some(value: n): copy n; case None: "(unnamed)"; };
+                    case Err(error: e): e.message();
+                };
+                f = f + check(ok: node.equals(other: reached[i]), what: what.concat(other: ": reaches ").concat(other: reached[i]).concat(other: " (").concat(other: node).concat(other: ")"));
+            } else {
+                string message = match (opened) { case Ok(value: conn): "(connected)"; case Err(error: e): e.message(); };
+                // Each host turned down once, with libpq's lead and words (and twice for prefer-standby's two passes).
+                isize turned = occurrences(text: message, part: refusalFor(mode: modes[i]));
+                f = f + check(ok: turned == 2 && occurrences(text: message, part: "connection to server at") == 2,
+                              what: what.concat(other: ": fails for each host (").concat(other: message).concat(other: ")"));
+            }
+            variant = variant + 1;
+        }
+        i = i + 1;
+    }
+    isize count = modes.length();
+    f = f + check(ok: count == 17, what: "tsa: 001_stream_rep.pl's 17 cases (${count})");
+    return f;
+}

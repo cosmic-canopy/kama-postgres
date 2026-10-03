@@ -78,6 +78,14 @@ All notable changes to this package are recorded here. The format follows
   - The whole batch then goes typed, with one sync, in a second round trip.
   - A failing query aborts the rest, and the batch, one implicit transaction, is rolled back.
   - A query that cannot be described fails the batch before anything runs.
+- **`target_session_attrs`** (any, read-write, read-only, primary, standby, prefer-standby), libpq's
+  CONNECTION_CHECK_TARGET:
+  - after authentication, the server's reported `default_transaction_read_only` and `in_hot_standby` decide;
+  - without them, the client asks, under connect_timeout: `SHOW transaction_read_only` or
+    `SELECT pg_catalog.pg_is_in_recovery()`;
+  - a server of the wrong kind gets Terminate, and the connect moves to the next host, with libpq's words ("session is
+    read-only", "server is not in hot standby mode", …) as `PgError::Target`;
+  - prefer-standby goes round the hosts a second time for any server.
 - **Waiting for notifications:** `Connection.waitForNotification(timeout:)` returns the oldest LISTEN/NOTIFY
   notification already received, else the next to arrive within the time (None when none does), taking in notices
   and parameter changes on the way. libpq leaves this loop to the application (PQsocket, PQconsumeInput, PQnotifies).

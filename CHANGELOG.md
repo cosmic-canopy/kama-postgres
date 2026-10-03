@@ -72,6 +72,12 @@ All notable changes to this package are recorded here. The format follows
   - libpq's refusals, verbatim: "synchronous command execution functions are not allowed in pipeline mode", "cannot
     enter pipeline mode, connection not idle", "cannot exit pipeline mode with uncollected results", "cannot send
     pipeline when not in pipeline mode".
+- **Batches**, pgx's SendBatch: `Batch.add(q:)`, then `Connection.runBatch(batch:)` gives a `BatchResult` per query
+  (`Rows`, `Failed` or `Aborted`).
+  - The SQL the statement cache does not know yet is described in one round trip and kept.
+  - The whole batch then goes typed, with one sync, in a second round trip.
+  - A failing query aborts the rest, and the batch, one implicit transaction, is rolled back.
+  - A query that cannot be described fails the batch before anything runs.
 - **Waiting for notifications:** `Connection.waitForNotification(timeout:)` returns the oldest LISTEN/NOTIFY
   notification already received, else the next to arrive within the time (None when none does), taking in notices
   and parameter changes on the way. libpq leaves this loop to the application (PQsocket, PQconsumeInput, PQnotifies).

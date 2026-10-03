@@ -27,7 +27,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::sqlstate::QUERY_CANCELED, postgres::sqlstate::FEATURE_NOT_SUPPORTED,
          postgres::CacheMode, postgres::session::StatementCache, postgres::session::CachedStatement,
          postgres::protocol::describePortal as sendDescribePortal, postgres::protocol::flush as sendFlush,
-         postgres::PipelineStatus, postgres::PipelineResult,
+         postgres::PipelineStatus, postgres::PipelineResult, postgres::Batch, postgres::BatchResult,
          postgres::protocol::BindValues,
          postgres::Query, postgres::Statement, postgres::Portal, postgres::hasBinaryCodec,
          postgres::Dialer, postgres::DialTarget, postgres::SslCertMode, postgres::sqlstate::sqlstateCode,
@@ -1061,6 +1061,123 @@ type resource Connection implements Sendable {
         Result<Described, PgError> d = this.readDescription(name: name, pipelined: true);
         Described shape = match (give d) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
         return Result::Ok(value: Statement.make(name: copy name, sql: copy sql, types: copy shape.types(), fields: copy shape.fields()));
+    }
+
+    // ---- batches ----
+
+    // Run `batch`'s queries in one round trip (pgx's SendBatch). Queries the statement cache does not know yet are
+    // described first, together, in one round trip (and kept, as the cache's mode says); then every query is sent
+    // typed, with one sync at the end, and the results are read in order. The batch is one implicit transaction: a
+    // query that fails is Failed, the rest are Aborted, and what ran before it is rolled back. A query that cannot be
+    // described (a syntax error) fails the whole batch before anything runs. With no cache (CacheMode::Off), queries
+    // go as a pipeline sends an unknown one: parameters as text, columns as text.
+    public unsafe fn Result<DynamicArray<BatchResult>, PgError> runBatch(const ref Batch batch) {
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.arm();
+        Result<Unit, PgError> described = this.describeBatch(batch: batch);
+        match (give described) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        this.pipeline = 1ui8;
+        isize k = 0;
+        while (k < batch.length()) {
+            Result<Unit, PgError> sent = this.sendQuery(q: batch.at(index: k));
+            k = k + 1;
+            match (give sent) {
+                case Ok(value: u): { }
+                case Err(error: e): {
+                    // Nothing was flushed past this query; what was queued is dropped with the batch.
+                    this.pipeline = 0ui8;
+                    this.queue = DynamicArray.empty();
+                    this.outbox.clear();
+                    return Result::Err(error: give e);
+                }
+            };
+        }
+        Result<Unit, PgError> synced = this.pipelineSync();
+        match (give synced) { case Ok(value: u): { } case Err(error: e): { this.pipeline = 0ui8; return Result::Err(error: give e); } };
+        DynamicArray<BatchResult> results = DynamicArray.withCapacity(capacity: batch.length());
+        bool done = false;
+        while (!done) {
+            Result<Optional<PipelineResult>, PgError> next = this.getResult();
+            Optional<PipelineResult> got = match (give next) { case Ok(value: o): give o; case Err(error: e): { this.pipeline = 0ui8; this.queue = DynamicArray.empty(); return Result::Err(error: give e); } };
+            match (give got) {
+                case Some(value: r): {
+                    match (give r) {
+                        case Rows(rows: rows): { results.add(item: BatchResult::Rows(rows: give rows)); }
+                        case Failed(error: e): {
+                            // An error at the sync (a deferred constraint) belongs to the last query.
+                            if (results.length() == batch.length()) { results.remove(index: results.length() - 1); }
+                            results.add(item: BatchResult::Failed(error: give e));
+                        }
+                        case Aborted: { results.add(item: BatchResult::Aborted); }
+                        case Sync: { done = true; }
+                        case _: { }
+                    };
+                }
+                case None: { done = true; }
+            };
+        }
+        this.pipeline = 0ui8;
+        return Result::Ok(value: give results);
+    }
+
+    // Describe the batch's SQL the cache does not know yet, each text once, in one round trip: Parse and Describe of
+    // each (named under CacheMode::Statements, the unnamed statement otherwise, which each Parse replaces), then Sync.
+    unsafe fn Result<Unit, PgError> describeBatch(const ref Batch batch) {
+        CacheMode mode = this.cache.mode();
+        bool off = match (mode) { case Off: true; case _: false; };
+        if (off) { return Result::Ok(value: Unit::Unit); }
+        bool named = match (mode) { case Statements: true; case _: false; };
+        DynamicArray<string> texts = DynamicArray.empty();
+        DynamicArray<string> names = DynamicArray.empty();
+        isize k = 0;
+        while (k < batch.length()) {
+            bool known = batch.at(index: k).isPrepared() || this.cache.lookup(sql: batch.at(index: k).sql());
+            bool seen = false;
+            foreach (string t in texts) { if (t.equals(other: batch.at(index: k).sql())) { seen = true; } }
+            if (!known && !seen) { texts.add(item: copy batch.at(index: k).sql()); }
+            k = k + 1;
+        }
+        if (texts.length() == 0) { return Result::Ok(value: Unit::Unit); }
+        this.outbox.clear();
+        isize i = 0;
+        while (i < texts.length()) {
+            string name = "";
+            if (named) { name = this.cache.nextName(); this.cache.makeRoom(closing: ref this.closing); }
+            names.add(item: copy name);
+            i = i + 1;
+        }
+        this.queueCloses();
+        BindValues none = BindValues.make();
+        i = 0;
+        while (i < texts.length()) {
+            if (!sendParse(w: this.outbox, name: names[i], sql: texts[i], params: none)) { return Result::Err(error: nulInQuery()); }
+            bool d = sendDescribeStatement(w: this.outbox, name: names[i]);
+            i = i + 1;
+        }
+        sendSync(w: this.outbox);
+        Result<Unit, PgError> sent = this.flush(deadline: this.due);
+        match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        DynamicArray<PgError> failed = DynamicArray.empty();
+        i = 0;
+        while (i < texts.length() && failed.length() == 0) {
+            Result<Described, PgError> d = this.readDescription(name: names[i], pipelined: true);
+            match (give d) {
+                case Ok(value: shape): {
+                    this.cache.add(sql: copy texts[i], statement: CachedStatement.make(name: copy names[i], types: copy shape.types(), fields: copy shape.fields()), closing: ref this.closing);
+                }
+                case Err(error: e): {
+                    bool server = match (e) { case Server(error: x): true; case _: false; };
+                    if (!server) { return Result::Err(error: give e); }
+                    failed.add(item: give e);
+                }
+            };
+            i = i + 1;
+        }
+        Result<Unit, PgError> synced = this.readSync();
+        match (give synced) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
+        return Result::Ok(value: Unit::Unit);
     }
 
     // ---- COPY ----

@@ -1,0 +1,66 @@
+// Batches on a real server (Connection.runBatch, pgx's SendBatch): 10 000 inserts in one batch, a batch whose middle
+// query fails (the rest aborted, the whole batch rolled back), and statements the cache already knows beside new ones.
+import { std::collections::DynamicArray,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::Query, postgres::Batch, postgres::BatchResult,
+         postgres::sqlstate::DIVISION_BY_ZERO,
+         postgres_integration_tests::check, postgres_integration_tests::conninfoFor, postgres_integration_tests::open,
+         postgres_integration_tests::scalar };
+export { batchTests };
+
+fn Query insertOf(int32 n) { Query q = Query.make(sql: "insert into kp_batch values ($1)"); q.add(value: n); return q; }
+
+// The batch's outcomes in a word each: "rows", "failed", "aborted"; or the call's error.
+fn string words(const ref Result<DynamicArray<BatchResult>, PgError> r) {
+    return match (r) {
+        case Ok(value: results): {
+            string all = "";
+            isize i = 0;
+            while (i < results.length()) {
+                string word = match (results[i]) { case Rows(rows: rows): "rows"; case Failed(error: e): "failed"; case Aborted: "aborted"; };
+                if (i > 0) { all = all.concat(other: " "); }
+                all = all.concat(other: word);
+                i = i + 1;
+            }
+            return all;
+        }
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn int32 batchTests() {
+    int32 f = 0;
+    Result<Connection, PgError> opened = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection c = match (give opened) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "batch: connect (".concat(other: e.message()).concat(other: ")")); } };
+    string made = scalar(c: c, sql: "create temp table kp_batch (n int)");
+
+    // 10 000 inserts, one round trip to describe and one to run.
+    Batch many = Batch.make();
+    int32 i = 0;
+    while (i < 10000) { many.add(q: insertOf(n: i)); i = i + 1; }
+    Result<DynamicArray<BatchResult>, PgError> r1 = c.runBatch(batch: many);
+    isize ran = match (r1) { case Ok(value: results): results.length(); case Err(error: e): -1; };
+    string count = scalar(c: c, sql: "select count(*) || ' ' || sum(n) from kp_batch");
+    f = f + check(ok: ran == 10000 && count.equals(other: "10000 49995000"), what: "batch: 10 000 inserts (${ran}; ".concat(other: count).concat(other: ")"));
+
+    // A failure in the middle: the rest aborted, the batch rolled back whole.
+    Batch broken = Batch.make();
+    broken.add(q: insertOf(n: 1));
+    broken.add(q: Query.make(sql: "select 1/0"));
+    broken.add(q: insertOf(n: 2));
+    Result<DynamicArray<BatchResult>, PgError> r2 = c.runBatch(batch: broken);
+    string after = scalar(c: c, sql: "select count(*) from kp_batch");
+    bool divided = match (r2) {
+        case Ok(value: results): results.length() == 3 && match (results[1]) { case Failed(error: e): e.sqlstate() == DIVISION_BY_ZERO; case _: false; };
+        case Err(error: e): false;
+    };
+    f = f + check(ok: words(r: r2).equals(other: "rows failed aborted") && divided && after.equals(other: "10000"), what: "batch: a failure aborts the rest and rolls the batch back (".concat(other: words(r: r2)).concat(other: ", ").concat(other: after).concat(other: ")"));
+
+    // Known and new statements together, and the results in order.
+    Batch mixed = Batch.make();
+    mixed.add(q: Query.make(sql: "select count(*) from kp_batch"));
+    mixed.add(q: insertOf(n: 5));
+    mixed.add(q: Query.make(sql: "select max(n) from kp_batch"));
+    Result<DynamicArray<BatchResult>, PgError> r3 = c.runBatch(batch: mixed);
+    f = f + check(ok: words(r: r3).equals(other: "rows rows rows"), what: "batch: known and new statements together (".concat(other: words(r: r3)).concat(other: ")"));
+    return f;
+}

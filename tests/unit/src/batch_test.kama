@@ -1,0 +1,137 @@
+// Batches (Connection.runBatch, pgx's SendBatch) against a scripted server: the statements not yet known described
+// together in one round trip, then every query bound and executed with one sync; a failing query and the ones it
+// aborts; a statement that cannot be described failing the batch before anything runs.
+import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
+         postgres::Transport, postgres::CacheMode, postgres::Batch, postgres::BatchResult, std::memory::Owned,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome,
+         postgres_unit_tests::sevenQuery };
+export { batchTests };
+
+comptime uint8 PARSE = 80ui8;      // 'P'
+comptime uint8 BIND = 66ui8;       // 'B'
+comptime uint8 DESCRIBE = 68ui8;   // 'D'
+comptime uint8 EXECUTE = 69ui8;    // 'E'
+comptime uint8 SYNC = 83ui8;       // 'S'
+
+unsafe fn string hexOf(const ref string s) { return hexEncode(bytes: s.bytes()); }
+fn Step quiet(uint8 tag, const ref string body) { return Step::Expect(tag: tag, body: copy body, then: DynamicArray.empty()); }
+fn Step answer(uint8 tag, Wire reply) { return Step::Expect(tag: tag, body: "", then: reply.bytes()); }
+fn DynamicArray<uint32> int4() { DynamicArray<uint32> v = DynamicArray.empty(); v.add(item: 23ui32); return v; }
+fn DynamicArray<string> column() { DynamicArray<string> v = DynamicArray.empty(); v.add(item: "n"); return v; }
+fn DynamicArray<int32> one(int32 a) { DynamicArray<int32> v = DynamicArray.empty(); v.add(item: a); return v; }
+
+unsafe fn Result<Connection, PgError> cached(DynamicArray<Step> script) {
+    Environment env = testEnvironment();
+    string none = "";
+    Result<Config, PgError> c = resolveWith(text: none, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    config.setStatementCache(mode: CacheMode::Statements, capacity: 512);
+    Owned<Transport> fake = new FakeServer.make(steps: give script, chunk: 1, writeLimit: 3);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+fn Wire described() { Wire d = Wire.make(); d.parseComplete(); d.parameterTypes(oids: int4()); d.typedColumns(names: column(), oids: int4()); return d; }
+fn Wire ranWith(int32 v) { Wire r = Wire.make(); r.bindComplete(); r.intRow(values: one(a: v)); r.complete(tag: "SELECT 1"); return r; }
+fn Wire ready() { Wire r = Wire.make(); r.ready(status: 73ui8); return r; }
+
+// Parse of `name` with no types, and Describe of it, answered with a description.
+unsafe fn void describes(ref DynamicArray<Step> s, const ref string name, const ref string sql) {
+    s.add(item: quiet(tag: PARSE, body: hexOf(s: name).concat(other: "00").concat(other: hexOf(s: sql)).concat(other: "000000")));
+    s.add(item: answer(tag: DESCRIBE, reply: described()));
+}
+
+// Bind of `name` with the int4 parameter 7, binary result, and Execute.
+unsafe fn void binds(ref DynamicArray<Step> s, const ref string name, Wire reply) {
+    s.add(item: quiet(tag: BIND, body: "00".concat(other: hexOf(s: name)).concat(other: "00 0001 0001 0001 00000004 00000007 0001 0001")));
+    s.add(item: answer(tag: EXECUTE, reply: give reply));
+}
+
+unsafe fn string outcome(const ref Result<DynamicArray<BatchResult>, PgError> r) {
+    return match (r) {
+        case Ok(value: results): {
+            string all = "";
+            isize i = 0;
+            while (i < results.length()) {
+                string word = match (results[i]) { case Rows(rows: rows): "rows"; case Failed(error: e): "failed"; case Aborted: "aborted"; };
+                if (i > 0) { all = all.concat(other: " "); }
+                all = all.concat(other: word);
+                i = i + 1;
+            }
+            return all;
+        }
+        case Err(error: e): e.message();
+    };
+}
+
+unsafe fn int32 batchTests() {
+    int32 f = 0;
+    string a = "select $1 + 1";
+    string b = "select $1 + 2";
+
+    // Two statements in a batch of three: described together, then all bound in one pipeline.
+    DynamicArray<Step> s1 = opening();
+    describes(s: ref s1, name: "sc0", sql: a);
+    describes(s: ref s1, name: "sc1", sql: b);
+    s1.add(item: answer(tag: SYNC, reply: ready()));
+    binds(s: ref s1, name: "sc0", reply: ranWith(v: 8));
+    binds(s: ref s1, name: "sc1", reply: ranWith(v: 9));
+    binds(s: ref s1, name: "sc0", reply: ranWith(v: 8));
+    s1.add(item: answer(tag: SYNC, reply: ready()));
+    Result<Connection, PgError> m1 = cached(script: give s1);
+    Connection c = match (give m1) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "batch: connect (".concat(other: e.message()).concat(other: ")")); } };
+    Batch batch = Batch.make();
+    batch.add(q: sevenQuery(sql: a));
+    batch.add(q: sevenQuery(sql: b));
+    batch.add(q: sevenQuery(sql: a));
+    Result<DynamicArray<BatchResult>, PgError> r1 = c.runBatch(batch: batch);
+    f = f + check(ok: outcome(r: r1).equals(other: "rows rows rows"), what: "batch: described in one round trip, run in another (".concat(other: outcome(r: r1)).concat(other: ")"));
+
+    // A failure aborts the rest; the cache already knows both statements.
+    DynamicArray<Step> s2 = opening();
+    describes(s: ref s2, name: "sc0", sql: a);
+    describes(s: ref s2, name: "sc1", sql: b);
+    s2.add(item: answer(tag: SYNC, reply: ready()));
+    binds(s: ref s2, name: "sc0", reply: ranWith(v: 8));
+    Wire fails = Wire.make(); fails.report(tag: 69ui8, severity: "ERROR", code: "22012", message: "division by zero");
+    binds(s: ref s2, name: "sc1", reply: give fails);
+    s2.add(item: quiet(tag: BIND, body: ""));
+    s2.add(item: quiet(tag: EXECUTE, body: ""));
+    s2.add(item: answer(tag: SYNC, reply: ready()));
+    Result<Connection, PgError> m2 = cached(script: give s2);
+    match (give m2) {
+        case Ok(value: x): {
+            Connection d = give x;
+            Batch bad = Batch.make();
+            bad.add(q: sevenQuery(sql: a));
+            bad.add(q: sevenQuery(sql: b));
+            bad.add(q: sevenQuery(sql: a));
+            Result<DynamicArray<BatchResult>, PgError> r = d.runBatch(batch: bad);
+            f = f + check(ok: outcome(r: r).equals(other: "rows failed aborted"), what: "batch: a failure aborts the rest (".concat(other: outcome(r: r)).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "batch: connect 2"); }
+    };
+
+    // A statement that cannot be described fails the batch before anything runs.
+    DynamicArray<Step> s3 = opening();
+    Wire syntax = Wire.make(); syntax.report(tag: 69ui8, severity: "ERROR", code: "42601", message: "syntax error at or near \"selec\"");
+    s3.add(item: Step::Expect(tag: PARSE, body: "", then: syntax.bytes()));
+    s3.add(item: quiet(tag: DESCRIBE, body: ""));
+    s3.add(item: answer(tag: SYNC, reply: ready()));
+    Result<Connection, PgError> m3 = cached(script: give s3);
+    match (give m3) {
+        case Ok(value: x): {
+            Connection g = give x;
+            Batch broken = Batch.make();
+            broken.add(q: sevenQuery(sql: "selec $1"));
+            Result<DynamicArray<BatchResult>, PgError> r = g.runBatch(batch: broken);
+            string why = outcome(r: r);
+            f = f + check(ok: why.contains(substring: "syntax error"), what: "batch: an undescribable statement fails it before it runs (".concat(other: why).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "batch: connect 3"); }
+    };
+    return f;
+}
+
+fn DynamicArray<Step> opening() { DynamicArray<Step> s = DynamicArray.empty(); s.add(item: Step::Send(bytes: welcome())); return s; }

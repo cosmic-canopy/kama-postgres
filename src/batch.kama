@@ -1,0 +1,20 @@
+import { std::collections::DynamicArray, postgres::Query, postgres::Rows, postgres::ServerError };
+export { Batch, BatchResult };
+
+// A batch of queries sent together and answered in one round trip (pgx's Batch and SendBatch), over pipeline mode.
+
+// The queries, in the order they run.
+type resource Batch implements Sendable {
+    DynamicArray<Query> items;
+    public ctor make() { this.items = DynamicArray.empty(); }
+    // Add `q` to run after those already added.
+    public fn void add(Query q) { this.items.add(item: give q); }
+    public const fn isize length() { return this.items.length(); }
+    const fn const ref Query at(isize index) { return this.items[index]; }
+    friend postgres::Connection::runBatch[at];
+    friend postgres::Connection::describeBatch[at];
+}
+
+// One query's outcome in a batch: its result, the server's error, or Aborted when an earlier query failed. The batch
+// runs as one implicit transaction (one sync at the end), so a failure rolls back the queries before it too.
+type enum BatchResult { Rows(Rows rows), Failed(ServerError error), Aborted }

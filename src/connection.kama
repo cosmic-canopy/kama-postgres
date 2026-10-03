@@ -20,6 +20,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::protocol::execute as sendExecute, postgres::protocol::closeStatement as sendCloseStatement,
          postgres::protocol::closePortal as sendClosePortal, postgres::protocol::sync as sendSync,
          postgres::protocol::cancelRequest as sendCancelRequest, postgres::CancelToken,
+         postgres::TransactionOptions, postgres::Savepoint, postgres::TransactionBody,
          postgres::protocol::BindValues,
          postgres::Query, postgres::Statement, postgres::Portal, postgres::hasBinaryCodec,
          postgres::Dialer, postgres::DialTarget, postgres::SslCertMode, postgres::sqlstate::sqlstateCode,
@@ -78,6 +79,7 @@ type resource Connection implements Sendable {
     Duration graceSetting;
     Deadline due;
     bool cancelling = false;
+    int64 savepoints = 0i64;   // the names given so far: sp_1, sp_2, …
 
     ctor over(Owned<Transport> transport) {
         this.wire = Wire.over(transport: give transport);
@@ -106,6 +108,7 @@ type resource Connection implements Sendable {
         this.graceSetting = Duration.fromSecs(s: 2i64);
         this.due = Deadline.none();
         this.cancelling = false;
+        this.savepoints = 0i64;
     }
 
     // Over a transport some of whose bytes were read already: what the server sent after its 'N' to an SSLRequest.
@@ -136,6 +139,7 @@ type resource Connection implements Sendable {
         this.graceSetting = Duration.fromSecs(s: 2i64);
         this.due = Deadline.none();
         this.cancelling = false;
+        this.savepoints = 0i64;
     }
 
     // Connect as `config` says, as libpq's PQconnectPoll does: each host in order, each of its addresses in turn,
@@ -636,6 +640,88 @@ type resource Connection implements Sendable {
         bool framed = sendClosePortal(w: this.outbox, name: portal.name());
         sendSync(w: this.outbox);
         return this.closeExchange();
+    }
+
+    // ---- transactions ----
+
+    // BEGIN, with `options`. A BEGIN inside a transaction is the server's to answer (a WARNING, and no new
+    // transaction).
+    public unsafe fn Result<Unit, PgError> begin(const ref TransactionOptions options) {
+        string sql = options.sql();
+        return this.command(sql: sql);
+    }
+
+    // COMMIT. A transaction that had failed is rolled back by it, which is `RolledBack`.
+    public unsafe fn Result<Unit, PgError> commit() {
+        Result<DynamicArray<Rows>, PgError> r = this.simpleQuery(sql: "COMMIT");
+        return match (give r) {
+            case Ok(value: results): {
+                bool rolledBack = results.length() > 0 && results[0].commandTag().equals(other: "ROLLBACK");
+                if (rolledBack) { return Result::Err(error: PgError::RolledBack); }
+                return Result::Ok(value: Unit::Unit);
+            }
+            case Err(error: e): Result::Err(error: give e);
+        };
+    }
+
+    public unsafe fn Result<Unit, PgError> rollback() { return this.command(sql: "ROLLBACK"); }
+
+    // SAVEPOINT, with a name this connection gives it.
+    public unsafe fn Result<Savepoint, PgError> savepoint() {
+        int64 n = this.savepoints + 1i64;
+        this.savepoints = n;
+        string name = "sp_${n}";
+        Result<Unit, PgError> made = this.command(sql: "SAVEPOINT ".concat(other: name));
+        match (give made) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return Result::Ok(value: Savepoint.make(name: give name));
+    }
+
+    // RELEASE SAVEPOINT: keep what was done since it, and forget it.
+    public unsafe fn Result<Unit, PgError> releaseSavepoint(Savepoint sp) { return this.command(sql: "RELEASE SAVEPOINT ".concat(other: sp.name())); }
+
+    // ROLLBACK TO SAVEPOINT: undo what was done since it. The savepoint stays, to roll back to again or release.
+    public unsafe fn Result<Unit, PgError> rollbackToSavepoint(const ref Savepoint sp) { return this.command(sql: "ROLLBACK TO SAVEPOINT ".concat(other: sp.name())); }
+
+    // Run `body` in a transaction, as psycopg's `with conn.transaction()` and pgx's BeginFunc do: BEGIN with `options`,
+    // then COMMIT if the body returns Ok, or ROLLBACK if it returns Err, whose error is then this call's. Inside an
+    // open transaction it nests as a savepoint (released, or rolled back to and released), and `options` do not
+    // apply. Rows the body left unread are read first. If ending the transaction fails, that error is returned.
+    public unsafe fn Result<Unit, PgError> transaction(TransactionBody body, const ref TransactionOptions options) {
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        bool nested = this.txStatus != 73ui8;   // 'I'
+        if (nested) {
+            Result<Savepoint, PgError> taken = this.savepoint();
+            Savepoint sp = match (give taken) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
+            Result<Unit, PgError> ran = body.run(conn: ref this);
+            Result<Unit, PgError> settled = this.discardRows();
+            match (give ran) {
+                case Ok(value: u): { return this.releaseSavepoint(sp: give sp); }
+                case Err(error: e): {
+                    Result<Unit, PgError> back = this.rollbackToSavepoint(sp: sp);
+                    Result<Unit, PgError> gone = this.releaseSavepoint(sp: give sp);
+                    return Result::Err(error: give e);
+                }
+            };
+        }
+        Result<Unit, PgError> begun = this.begin(options: options);
+        match (give begun) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Unit, PgError> ran = body.run(conn: ref this);
+        Result<Unit, PgError> settled = this.discardRows();
+        match (give ran) {
+            case Ok(value: u): { return this.commit(); }
+            case Err(error: e): {
+                Result<Unit, PgError> back = this.rollback();
+                return Result::Err(error: give e);
+            }
+        };
+        return Result::Err(error: PgError::Closed);
+    }
+
+    // A statement run for its effect alone.
+    unsafe fn Result<Unit, PgError> command(const ref string sql) {
+        Result<DynamicArray<Rows>, PgError> r = this.simpleQuery(sql: sql);
+        return match (give r) { case Ok(value: rows): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
     }
 
     // ---- query timeouts ----

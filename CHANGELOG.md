@@ -23,6 +23,17 @@ All notable changes to this package are recorded here. The format follows
   - if the server does not answer within `grace` (2 s by default), or the session has no route (`connectOver`), the
     connection is closed and the call returns `Timeout`.
 - `PgError::Cancel`, for a cancel request that could not be made or sent.
+- **Transactions:**
+  - `begin(options:)`, `commit()` and `rollback()`. `TransactionOptions` takes an isolation level, READ ONLY or READ
+    WRITE, and DEFERRABLE.
+  - `savepoint()`, `releaseSavepoint(sp:)` and `rollbackToSavepoint(sp:)`, with names the connection gives (`sp_1`,
+    `sp_2`, …).
+  - `transaction(body:, options:)`, as psycopg's `with conn.transaction()` and pgx's BeginFunc run a body:
+    - a `TransactionBody`'s `run(conn:)` runs between BEGIN and COMMIT, or ROLLBACK when it returns an error, which is
+      then the call's;
+    - inside an open transaction it nests as a savepoint.
+  - `PgError::RolledBack` ("commit unexpectedly resulted in rollback", pgx's words) when COMMIT ends a failed
+    transaction.
 - **Waiting for notifications:** `Connection.waitForNotification(timeout:)` returns the oldest LISTEN/NOTIFY
   notification already received, else the next to arrive within the time (None when none does), taking in notices
   and parameter changes on the way. libpq leaves this loop to the application (PQsocket, PQconsumeInput, PQnotifies).

@@ -1,0 +1,164 @@
+// Transactions against a scripted server: the exact statements each call sends (BEGIN with its options, COMMIT,
+// ROLLBACK, the savepoints), what COMMIT's ROLLBACK tag means, and Connection.transaction's order of statements on
+// success, on failure, and nested inside a transaction as a savepoint.
+import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::TransactionStatus,
+         postgres::TransactionOptions, postgres::IsolationLevel, postgres::AccessMode, postgres::Savepoint,
+         postgres::TransactionBody, postgres::sqlstate::UNIQUE_VIOLATION,
+         postgres_unit_tests::check, postgres_unit_tests::Step, postgres_unit_tests::Wire,
+         postgres_unit_tests::over, postgres_unit_tests::welcome };
+export { transactionTests };
+
+// The simple query `sql` must come next; the server completes it with `tag` and is then ready with `status`.
+unsafe fn Step completes(const ref string sql, const ref string tag, uint8 status) {
+    DynamicArray<uint8> text = DynamicArray.empty();
+    foreach (uint8 b in sql) { text.add(item: b); }
+    text.add(item: 0ui8);
+    Wire reply = Wire.make();
+    reply.complete(tag: tag);
+    reply.ready(status: status);
+    return Step::Expect(tag: 81ui8, body: hexEncode(bytes: text.view()), then: reply.bytes());
+}
+
+// The simple query `sql` must come next, and fails with `code`.
+unsafe fn Step fails(const ref string sql, const ref string code, uint8 status) {
+    DynamicArray<uint8> text = DynamicArray.empty();
+    foreach (uint8 b in sql) { text.add(item: b); }
+    text.add(item: 0ui8);
+    Wire reply = Wire.make();
+    reply.report(tag: 69ui8, severity: "ERROR", code: code, message: "it failed");
+    reply.ready(status: status);
+    return Step::Expect(tag: 81ui8, body: hexEncode(bytes: text.view()), then: reply.bytes());
+}
+
+// A body that runs one statement and counts its runs.
+type resource Runs implements TransactionBody {
+    string statement;
+    int32 calls = 0;
+    public ctor make(string sql) { this.statement = give sql; this.calls = 0; }
+    public unsafe fn Result<Unit, PgError> run(ref Connection conn) {
+        this.calls = this.calls + 1;
+        Result<DynamicArray<Rows>, PgError> r = conn.simpleQuery(sql: this.statement);
+        return match (give r) { case Ok(value: rows): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
+    }
+    public const fn int32 count() { return this.calls; }
+}
+
+// A script that starts with the server's welcome.
+fn DynamicArray<Step> opening() { DynamicArray<Step> s = DynamicArray.empty(); s.add(item: Step::Send(bytes: welcome())); return s; }
+
+unsafe fn Result<Connection, PgError> scripted(DynamicArray<Step> steps) {
+    string none = "";
+    return over(script: give steps, conninfo: none);
+}
+
+fn string said(const ref Result<Unit, PgError> r) { return match (r) { case Ok(value: u): "ok"; case Err(error: e): e.message(); }; }
+
+unsafe fn int32 transactionTests() {
+    int32 f = 0;
+    TransactionOptions plain = TransactionOptions.defaults();
+
+    // BEGIN with every option, then COMMIT.
+    DynamicArray<Step> s1 = opening();
+    s1.add(item: completes(sql: "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE", tag: "BEGIN", status: 84ui8));
+    s1.add(item: completes(sql: "COMMIT", tag: "COMMIT", status: 73ui8));
+    s1.add(item: completes(sql: "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE", tag: "BEGIN", status: 84ui8));
+    s1.add(item: completes(sql: "ROLLBACK", tag: "ROLLBACK", status: 73ui8));
+    Result<Connection, PgError> m1 = scripted(steps: give s1);
+    Connection c = match (give m1) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "transaction: connect (".concat(other: e.message()).concat(other: ")")); } };
+    TransactionOptions strict = TransactionOptions.of(isolation: IsolationLevel::Serializable, access: AccessMode::ReadOnly, deferrable: true);
+    Result<Unit, PgError> b1 = c.begin(options: strict);
+    f = f + check(ok: said(r: b1).equals(other: "ok") && c.transactionStatus() == TransactionStatus::InTransaction, what: "transaction: BEGIN with its options (".concat(other: said(r: b1)).concat(other: ")"));
+    Result<Unit, PgError> k1 = c.commit();
+    f = f + check(ok: said(r: k1).equals(other: "ok") && c.transactionStatus() == TransactionStatus::Idle, what: "transaction: COMMIT");
+    TransactionOptions written = TransactionOptions.of(isolation: IsolationLevel::ReadCommitted, access: AccessMode::ReadWrite, deferrable: false);
+    Result<Unit, PgError> b2 = c.begin(options: written);
+    Result<Unit, PgError> r2 = c.rollback();
+    f = f + check(ok: said(r: b2).equals(other: "ok") && said(r: r2).equals(other: "ok"), what: "transaction: BEGIN READ COMMITTED READ WRITE, then ROLLBACK");
+
+    // A COMMIT the server ends with a rollback: the transaction had failed.
+    DynamicArray<Step> s2 = opening();
+    s2.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: 84ui8));
+    s2.add(item: completes(sql: "COMMIT", tag: "ROLLBACK", status: 73ui8));
+    Result<Connection, PgError> m2 = scripted(steps: give s2);
+    match (give m2) {
+        case Ok(value: x): {
+            Connection d = give x;
+            Result<Unit, PgError> b = d.begin(options: plain);
+            Result<Unit, PgError> k = d.commit();
+            f = f + check(ok: said(r: k).equals(other: "commit unexpectedly resulted in rollback"), what: "transaction: COMMIT that rolled back (".concat(other: said(r: k)).concat(other: ")"));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "transaction: connect 2"); }
+    };
+
+    // Savepoints by name.
+    DynamicArray<Step> s3 = opening();
+    s3.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: 84ui8));
+    s3.add(item: completes(sql: "SAVEPOINT sp_1", tag: "SAVEPOINT", status: 84ui8));
+    s3.add(item: completes(sql: "ROLLBACK TO SAVEPOINT sp_1", tag: "ROLLBACK", status: 84ui8));
+    s3.add(item: completes(sql: "RELEASE SAVEPOINT sp_1", tag: "RELEASE", status: 84ui8));
+    s3.add(item: completes(sql: "COMMIT", tag: "COMMIT", status: 73ui8));
+    Result<Connection, PgError> m3 = scripted(steps: give s3);
+    match (give m3) {
+        case Ok(value: x): {
+            Connection e = give x;
+            Result<Unit, PgError> b = e.begin(options: plain);
+            Result<Savepoint, PgError> sp = e.savepoint();
+            match (give sp) {
+                case Ok(value: p): {
+                    Savepoint point = give p;
+                    f = f + check(ok: point.name().equals(other: "sp_1"), what: "transaction: the savepoint is sp_1");
+                    Result<Unit, PgError> back = e.rollbackToSavepoint(sp: point);
+                    Result<Unit, PgError> gone = e.releaseSavepoint(sp: give point);
+                    Result<Unit, PgError> k = e.commit();
+                    f = f + check(ok: said(r: back).equals(other: "ok") && said(r: gone).equals(other: "ok") && said(r: k).equals(other: "ok"),
+                                  what: "transaction: ROLLBACK TO and RELEASE the savepoint by name");
+                }
+                case Err(error: x): { f = f + check(ok: false, what: "transaction: SAVEPOINT (".concat(other: x.message()).concat(other: ")")); }
+            };
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "transaction: connect 3"); }
+    };
+
+    // The body helper: BEGIN, the body, COMMIT; and BEGIN, the failing body, ROLLBACK, with the body's error.
+    DynamicArray<Step> s4 = opening();
+    s4.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: 84ui8));
+    s4.add(item: completes(sql: "INSERT INTO t VALUES (1)", tag: "INSERT 0 1", status: 84ui8));
+    s4.add(item: completes(sql: "COMMIT", tag: "COMMIT", status: 73ui8));
+    s4.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: 84ui8));
+    s4.add(item: fails(sql: "INSERT INTO t VALUES (1)", code: "23505", status: 69ui8));
+    s4.add(item: completes(sql: "ROLLBACK", tag: "ROLLBACK", status: 73ui8));
+    // Nested inside a transaction: a savepoint, released on success, rolled back to and released on failure.
+    s4.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: 84ui8));
+    s4.add(item: completes(sql: "SAVEPOINT sp_1", tag: "SAVEPOINT", status: 84ui8));
+    s4.add(item: completes(sql: "INSERT INTO t VALUES (1)", tag: "INSERT 0 1", status: 84ui8));
+    s4.add(item: completes(sql: "RELEASE SAVEPOINT sp_1", tag: "RELEASE", status: 84ui8));
+    s4.add(item: completes(sql: "SAVEPOINT sp_2", tag: "SAVEPOINT", status: 84ui8));
+    s4.add(item: fails(sql: "INSERT INTO t VALUES (1)", code: "23505", status: 69ui8));
+    s4.add(item: completes(sql: "ROLLBACK TO SAVEPOINT sp_2", tag: "ROLLBACK", status: 84ui8));
+    s4.add(item: completes(sql: "RELEASE SAVEPOINT sp_2", tag: "RELEASE", status: 84ui8));
+    s4.add(item: completes(sql: "COMMIT", tag: "COMMIT", status: 73ui8));
+    Result<Connection, PgError> m4 = scripted(steps: give s4);
+    match (give m4) {
+        case Ok(value: x): {
+            Connection g = give x;
+            Runs insert = Runs.make(sql: "INSERT INTO t VALUES (1)");
+            Result<Unit, PgError> ok = g.transaction(body: insert, options: plain);
+            f = f + check(ok: said(r: ok).equals(other: "ok") && insert.count() == 1 && g.transactionStatus() == TransactionStatus::Idle,
+                          what: "transaction: BEGIN, the body, COMMIT (".concat(other: said(r: ok)).concat(other: ")"));
+            Result<Unit, PgError> bad = g.transaction(body: insert, options: plain);
+            bool unique = match (bad) { case Ok(value: u): false; case Err(error: e): e.sqlstate() == UNIQUE_VIOLATION; };
+            f = f + check(ok: unique && g.transactionStatus() == TransactionStatus::Idle, what: "transaction: a failing body is rolled back, and its error returned (".concat(other: said(r: bad)).concat(other: ")"));
+            Result<Unit, PgError> outer = g.begin(options: plain);
+            Result<Unit, PgError> inner = g.transaction(body: insert, options: plain);
+            f = f + check(ok: said(r: inner).equals(other: "ok") && g.transactionStatus() == TransactionStatus::InTransaction, what: "transaction: nested, a released savepoint (".concat(other: said(r: inner)).concat(other: ")"));
+            Result<Unit, PgError> innerBad = g.transaction(body: insert, options: plain);
+            bool unique2 = match (innerBad) { case Ok(value: u): false; case Err(error: e): e.sqlstate() == UNIQUE_VIOLATION; };
+            f = f + check(ok: unique2 && g.transactionStatus() == TransactionStatus::InTransaction, what: "transaction: nested and failing, rolled back to its savepoint, the outer still open");
+            Result<Unit, PgError> k = g.commit();
+            f = f + check(ok: said(r: k).equals(other: "ok"), what: "transaction: the outer commits (".concat(other: said(r: k)).concat(other: ")"));
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "transaction: connect 4"); }
+    };
+    return f;
+}

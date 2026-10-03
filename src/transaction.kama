@@ -1,0 +1,57 @@
+import { postgres::PgError, postgres::Connection };
+export { IsolationLevel, AccessMode, TransactionOptions, Savepoint, TransactionBody };
+
+// Transactions: what BEGIN asks for, a savepoint inside a transaction, and the body Connection.transaction runs.
+// libpq leaves transactions to SQL; these are the drivers' shape (psycopg's `with conn.transaction()`, pgx's
+// BeginFunc), over the same statements.
+
+// SET TRANSACTION's isolation levels. Default leaves the session's (default_transaction_isolation).
+type enum IsolationLevel implements Sendable { Default, ReadCommitted, RepeatableRead, Serializable, ReadUncommitted }
+
+// READ WRITE or READ ONLY. Default leaves the session's (default_transaction_read_only).
+type enum AccessMode implements Sendable { Default, ReadWrite, ReadOnly }
+
+// What BEGIN asks for: an isolation level, an access mode, and DEFERRABLE (which only a SERIALIZABLE READ ONLY
+// transaction uses: it waits for a snapshot that cannot fail).
+type value TransactionOptions implements Sendable {
+    public IsolationLevel isolation = IsolationLevel::Default;
+    public AccessMode access = AccessMode::Default;
+    public bool deferrable = false;
+
+    // The session's defaults: a plain BEGIN.
+    public ctor defaults() { this.isolation = IsolationLevel::Default; this.access = AccessMode::Default; this.deferrable = false; }
+    public ctor of(IsolationLevel isolation, AccessMode access, bool deferrable) {
+        this.isolation = isolation; this.access = access; this.deferrable = deferrable;
+    }
+
+    // The BEGIN statement these options make.
+    public const fn string sql() {
+        string text = "BEGIN";
+        string level = match (this.isolation) {
+            case Default: "";
+            case ReadCommitted: " ISOLATION LEVEL READ COMMITTED";
+            case RepeatableRead: " ISOLATION LEVEL REPEATABLE READ";
+            case Serializable: " ISOLATION LEVEL SERIALIZABLE";
+            case ReadUncommitted: " ISOLATION LEVEL READ UNCOMMITTED";
+        };
+        string mode = match (this.access) { case Default: ""; case ReadWrite: " READ WRITE"; case ReadOnly: " READ ONLY"; };
+        text = text.concat(other: level).concat(other: mode);
+        if (this.deferrable) { text = text.concat(other: " DEFERRABLE"); }
+        return text;
+    }
+}
+
+// A savepoint in the current transaction, named by the connection that made it ("sp_1", "sp_2", …).
+type resource Savepoint implements Sendable {
+    string label;
+    ctor make(string name) { this.label = give name; }
+    friend postgres::Connection::savepoint[make];
+    public const fn const ref string name() { return this.label; }
+}
+
+// What Connection.transaction runs inside the transaction. The body keeps whatever it produces in its own fields,
+// which the caller reads afterwards: the call borrows it. Ok commits (or releases the savepoint); Err rolls back,
+// and the body's error is the call's.
+type contract TransactionBody for value, resource {
+    fn Result<Unit, PgError> run(ref Connection conn);
+}

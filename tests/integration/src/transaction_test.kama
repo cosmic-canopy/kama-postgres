@@ -1,0 +1,101 @@
+// Transactions on a real server: BEGIN's options as the server applies them, a READ ONLY transaction refusing a
+// write, Connection.transaction committing, rolling back, and nesting as savepoints, and a deferred constraint that
+// fails at COMMIT.
+import { std::collections::DynamicArray,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::TransactionStatus, postgres::column,
+         postgres::TransactionOptions, postgres::IsolationLevel, postgres::AccessMode, postgres::TransactionBody,
+         postgres::sqlstate::READ_ONLY_SQL_TRANSACTION, postgres::sqlstate::UNIQUE_VIOLATION, postgres::sqlstate::DIVISION_BY_ZERO,
+         postgres_integration_tests::check, postgres_integration_tests::conninfoFor, postgres_integration_tests::open,
+         postgres_integration_tests::scalar };
+export { transactionTests };
+
+// Runs statements in order, stopping at the first error, and keeps the first column of the last row read.
+type resource Script implements TransactionBody {
+    DynamicArray<string> statements;
+    string seen;
+    public ctor make(DynamicArray<string> statements) { this.statements = give statements; this.seen = ""; }
+    public unsafe fn Result<Unit, PgError> run(ref Connection conn) {
+        foreach (string sql in this.statements) {
+            Result<DynamicArray<Rows>, PgError> r = conn.simpleQuery(sql: sql);
+            match (give r) {
+                case Ok(value: results): {
+                    if (results.length() > 0 && results[0].rowCount() > 0) {
+                        Result<string, PgError> v = column::<string>(rows: results[0], row: 0, index: 0);
+                        match (give v) { case Ok(value: text): { this.seen = give text; } case Err(error: e): { } };
+                    }
+                }
+                case Err(error: e): { return Result::Err(error: give e); }
+            };
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+    public const fn const ref string last() { return this.seen; }
+}
+
+// Runs an inner body as a nested transaction (a savepoint), and goes on whether it failed or not.
+type resource Nesting implements TransactionBody {
+    string before;
+    Script inner;
+    string after;
+    public ctor make(string before, Script inner, string after) { this.before = give before; this.inner = give inner; this.after = give after; }
+    public unsafe fn Result<Unit, PgError> run(ref Connection conn) {
+        Result<DynamicArray<Rows>, PgError> a = conn.simpleQuery(sql: this.before);
+        TransactionOptions none = TransactionOptions.defaults();
+        Result<Unit, PgError> nested = conn.transaction(body: this.inner, options: none);
+        Result<DynamicArray<Rows>, PgError> b = conn.simpleQuery(sql: this.after);
+        return match (give b) { case Ok(value: r): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
+    }
+}
+
+fn DynamicArray<string> list(const ref string a) { DynamicArray<string> v = DynamicArray.empty(); v.add(item: copy a); return v; }
+fn DynamicArray<string> pair(const ref string a, const ref string b) { DynamicArray<string> v = list(a: a); v.add(item: copy b); return v; }
+
+unsafe fn int32 transactionTests() {
+    int32 f = 0;
+    Result<Connection, PgError> opened = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection c = match (give opened) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "transaction: connect (".concat(other: e.message()).concat(other: ")")); } };
+    string made = scalar(c: c, sql: "create temp table kp_tx (id int primary key)");
+
+    // The options, as the server reports them inside the transaction.
+    Script show = Script.make(statements: pair(a: "show transaction_isolation", b: "select current_setting('transaction_read_only') || ' ' || current_setting('transaction_deferrable')"));
+    TransactionOptions strict = TransactionOptions.of(isolation: IsolationLevel::Serializable, access: AccessMode::ReadOnly, deferrable: true);
+    Script iso = Script.make(statements: list(a: "show transaction_isolation"));
+    Result<Unit, PgError> r0 = c.transaction(body: iso, options: strict);
+    Result<Unit, PgError> r1 = c.transaction(body: show, options: strict);
+    f = f + check(ok: iso.last().equals(other: "serializable") && show.last().equals(other: "on on"),
+                  what: "transaction: SERIALIZABLE READ ONLY DEFERRABLE, as the server sees it (".concat(other: iso.last()).concat(other: ", ").concat(other: show.last()).concat(other: ")"));
+
+    // READ ONLY refuses a write; the error is the call's, and the session is idle again. (A temporary table may be
+    // written in a read-only transaction, so the write is a CREATE TABLE.)
+    TransactionOptions readOnly = TransactionOptions.of(isolation: IsolationLevel::Default, access: AccessMode::ReadOnly, deferrable: false);
+    Script write = Script.make(statements: list(a: "create table kp_tx_never (id int)"));
+    Result<Unit, PgError> r2 = c.transaction(body: write, options: readOnly);
+    bool refused = match (r2) { case Ok(value: u): false; case Err(error: e): e.sqlstate() == READ_ONLY_SQL_TRANSACTION; };
+    f = f + check(ok: refused && c.transactionStatus() == TransactionStatus::Idle, what: "transaction: READ ONLY refuses a write (25006), and the session is idle");
+
+    // A nested transaction that fails is rolled back to its savepoint; the outer one goes on and commits.
+    Script innerBody = Script.make(statements: pair(a: "insert into kp_tx values (2)", b: "select 1/0"));
+    Nesting outer = Nesting.make(before: "insert into kp_tx values (1)", inner: give innerBody, after: "insert into kp_tx values (3)");
+    TransactionOptions plain = TransactionOptions.defaults();
+    Result<Unit, PgError> r3 = c.transaction(body: outer, options: plain);
+    string ids = scalar(c: c, sql: "select string_agg(id::text, ',' order by id) from kp_tx");
+    f = f + check(ok: ids.equals(other: "1,3"), what: "transaction: the failed nested part is undone, the rest committed (".concat(other: ids).concat(other: ")"));
+
+    // A deferred constraint fails at COMMIT: that is the error, and the transaction is gone.
+    string deferred = scalar(c: c, sql: "create temp table kp_tx_deferred (id int unique deferrable initially deferred)");
+    Script twice = Script.make(statements: pair(a: "insert into kp_tx_deferred values (1)", b: "insert into kp_tx_deferred values (1)"));
+    Result<Unit, PgError> r4 = c.transaction(body: twice, options: plain);
+    bool atCommit = match (r4) { case Ok(value: u): false; case Err(error: e): e.sqlstate() == UNIQUE_VIOLATION; };
+    string count = scalar(c: c, sql: "select count(*) from kp_tx_deferred");
+    f = f + check(ok: atCommit && count.equals(other: "0") && c.transactionStatus() == TransactionStatus::Idle,
+                  what: "transaction: a deferred unique constraint fails at COMMIT, nothing kept (".concat(other: count).concat(other: ")"));
+
+    // A COMMIT after an error inside the transaction rolls back: RolledBack.
+    Result<Unit, PgError> b = c.begin(options: plain);
+    Result<DynamicArray<Rows>, PgError> bad = c.simpleQuery(sql: "select 1/0");
+    Result<Unit, PgError> k = c.commit();
+    string said = match (k) { case Ok(value: u): "ok"; case Err(error: e): e.message(); };
+    f = f + check(ok: said.equals(other: "commit unexpectedly resulted in rollback") && c.transactionStatus() == TransactionStatus::Idle,
+                  what: "transaction: COMMIT of a failed transaction (".concat(other: said).concat(other: ")"));
+    return f;
+}

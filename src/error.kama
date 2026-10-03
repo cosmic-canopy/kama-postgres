@@ -41,7 +41,9 @@ type enum PgError implements Error {
     Closed,
     // A cancel request could not be made or sent, or the server answered one, which it never does: libpq's words
     // ("no cancellation key received", "could not send cancel packet: …", "unexpected response from server").
-    Cancel(string detail);
+    Cancel(string detail),
+    // COMMIT ended the transaction with a rollback, because the transaction had failed (pgx's ErrTxCommitRollback).
+    RolledBack;
 
     public const fn string message() {
         return match (this) {
@@ -57,6 +59,7 @@ type enum PgError implements Error {
             case Value(detail: d): copy d;
             case Closed: "no connection to the server";
             case Cancel(detail: d): copy d;
+            case RolledBack: "commit unexpectedly resulted in rollback";
         };
     }
 

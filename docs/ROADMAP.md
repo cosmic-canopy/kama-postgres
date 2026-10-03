@@ -1,12 +1,16 @@
 # Roadmap
 
-Where this is, 2026-10-01: phases 0–5 are done. The client connects and queries on every supported server
-(14–18, 19 beta), debug and release:
+Where this is, 2026-10-03: phases 0–6 are done. The client connects and queries on every supported server
+(14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
   TCP or a Unix-domain socket (with `requirepeer`).
 - **Authenticating.** Trust, password, md5 and SCRAM (with SASLprep, as PostgreSQL prepares a password) all
   work, and it refuses a server that has not proved it knows the password.
+- **TLS.** Every sslmode with libpq's fallbacks, direct negotiation, verify-ca and verify-full (libpq's host-name
+  rules), client certificates and encrypted keys, CRLs, `sslrootcert=system`, sslcertmode, protocol bounds,
+  SCRAM-SHA-256-PLUS and `sslkeylogfile`, through `@kama/tls` (Mbed TLS). A `Dialer` opens each connection when a
+  caller wants its own (a tunnel, a proxy).
 - **Querying.**
   - The simple protocol, with libpq's error and notice formatting.
   - The extended protocol, with typed parameters and the `pg"…"` tag.
@@ -15,10 +19,11 @@ Where this is, 2026-10-01: phases 0–5 are done. The client connects and querie
     dimension included. Every built-in type this client reads round-trips on every server version.
 
 Expected values come from PostgreSQL itself: its TAP tests and test modules, a live libpq asked case by case, and a
-live server's send and output functions. Phase 5 began with the port to kama 0.9.506, which fixed every gap phases 3
-and 4 filed (KPG-11 to KPG-22). Its own gaps, KPG-23 to KPG-30, were fixed in 0.9.519, and the package now needs that
-compiler: the `pg` tag's holes are typed, and every workaround is gone ([KAMA_GAPS.md](../KAMA_GAPS.md)). Phase 6,
-TLS, is next. It needs `@kama/tls` ported to the new `IoError` first.
+live server's send and output functions. For TLS that is `005_negotiate_encryption.pl`'s 53 negotiation cases (replayed
+event by event against a scripted server), `001_ssltests.pl`'s 36 host-name cases with upstream's certificates, and 43
+cases the container's libpq answered against the same server and files. Phase 5's gaps (KPG-23 to KPG-30) were fixed in
+0.9.519, which the package needs. Phase 6 filed KPG-31 (a file's owner, for libpq's root-owned key rule; the stricter
+rule applies meanwhile) and KPG-32 (`break` in a `match` arm) ([KAMA_GAPS.md](../KAMA_GAPS.md)). Phase 7 is next.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -31,10 +36,10 @@ matrix.
 | 3 | Pure layers: `protocol/` buffers + every message (golden bytes, malformed input); SCRAM/md5 over `std::digest` (RFC vectors); connection strings (libpq's URI regression cases); type codecs; generated SQLSTATE and OID tables | **done** |
 | 4 | Plain connection: Config as libpq resolves it (service file, environment, `.pgpass`, `require_auth`, every setting checked); hosts and addresses in order with `connect_timeout` and keepalive; Unix-domain sockets and `requirepeer`; startup, trust / password / md5 / SCRAM, protocol 3.2 negotiation; simple query, errors, notices, notifications queued; `Transport` for a caller's own stream — integration suite on 14–19 | **done** |
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
-| 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates | next |
-| 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | |
+| 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
+| 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | next |
 | 8 | Pool (cross-isolate), examples, hardening (server restart, bounded memory), CI green, docs | |
-| — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0 — only on the maintainer's word | |
+| — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version — only on the maintainer's word | |
 
 ## Decided, and why
 
@@ -52,6 +57,17 @@ matrix.
 - **Stricter than libpq where libpq is lenient by default.** Once SCRAM starts, AuthenticationOk before a
   verified server signature is refused, whatever `require_auth` says. Out-of-order SASL messages are a protocol
   error.
+- **TLS runs over any `Transport`,** as pgx runs it over whatever its DialFunc returns and tokio-postgres over any
+  stream. So `connectOver` and `connectWith` (a `Dialer` per connection) get TLS too, and the unit tests run real TLS
+  against a scripted server with no network.
+- **libpq's words, Mbed TLS's reasons.** Where libpq quotes OpenSSL ("SSL error: %s"), this client prints libpq's
+  frame with @kama/tls's words, which say what failed (the alert's name, the verify reasons). No other driver
+  reproduces another library's wording, and OpenSSL's changes between its versions.
+- **The host name is checked by libpq's rules, not the TLS library's:** Mbed TLS verifies the chain only, and
+  `postgres::verifyServerName` ports libpq's check (subjectAltNames of the host's kind before the CN, one-label
+  wildcards, its messages). SNI is libpq's too: a host name, never an address, and not with `sslsni=0`.
+- **A `TlsConfig` per attempt,** as libpq builds an SSL_CTX per connection: every file is read again, and a bad key
+  fails that attempt (so `prefer` falls back), not the configuration.
 - **Typed access is `column::<T>(rows:, row:, index:)`, bounded on `Deserializable`.** Methods cannot be generic
   (a cstar decision), and a package cannot add a contract to `Uuid` or `Timestamp`. The serde contract is the one
   they already implement. It is addressed as `PQgetvalue(res, row, col)` is: a row does not carry the column

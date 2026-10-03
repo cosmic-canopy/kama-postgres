@@ -33,8 +33,9 @@ compiler with everything this package relies on:
 
 - **Native protocol, no C.** This package speaks the PostgreSQL v3 wire protocol in kama over `std::net`.
   There is no libpq, no `csrc/` and no `csources`, and it should stay that way. TLS comes from the sibling
-  package `@kama/tls` (`../kama-tls`), which vendors Mbed TLS. That is the only native code in the
-  dependency tree.
+  package `@kama/tls` (`../kama-tls`, a path dependency until it is published), which vendors Mbed TLS. That is the
+  only native code in the dependency tree. What postgres needs from TLS that the package lacks is added THERE, with
+  its own tests, not worked around here.
 
 - **Two test programs, and neither is typed from memory.**
   - `tests/unit` is hermetic. It needs no server and no network, and runs through `tools/test.sh`, debug
@@ -54,8 +55,18 @@ compiler with everything this package relies on:
       `.pgpass` files, service files and settings.
     - for SASLprep, PostgreSQL's `test_saslprep` module and the SCRAM verifiers a live server stores
       (`tools/gen-saslprep.sh`).
+    - for TLS (`tools/gen-ssl-vectors.sh`, no server needed): `001_ssltests.pl`'s host-name cases with upstream's
+      certificates embedded, and every case of `005_negotiate_encryption.pl`, run as written against stubs; and a TLS
+      table in `tools/gen-libpq-test-cases.sh`, each case asked of the container's libpq with the same files.
 
-    A message this client prints is libpq's message, compared exactly.
+    A message this client prints is libpq's message, compared exactly. The one exception is where libpq quotes
+    OpenSSL ("SSL error: %s", "could not load private key file \"%s\": %s"): there the frame is libpq's and the words are
+    @kama/tls's, and the tests compare the frame (`sameAsLibpq` in tests/integration/src/tls_libpq_test.kama).
+  - The unit tests' FakeServer runs Mbed TLS as the server when made with `secure`, and plays the server
+    `005_negotiate_encryption.pl` configures (TLS on or off, injection points, its pg_hba lines) in policy mode,
+    behind a `Dialer` that opens one per connection and reports each server's events.
+  - `tools/test-integration.sh` runs the whole integration suite a third time per version, over TLS
+    (`PGTEST_SSLMODE=require`). A test whose point is plaintext uses `plainConninfoFor`.
 
 - **`tools/pg.sh` is the server.**
   - It runs the official `postgres:N` image (14–18, plus 19 beta) under podman or docker, and
@@ -103,18 +114,32 @@ compiler with everything this package relies on:
 - **A connection is libpq's, step for step.**
   - `Config` resolves settings in libpq's order, and every setting is either honoured or refused with a clear
     error. Nothing is silently ignored.
-  - Until phase 6 this client is "libpq built without SSL", and says so in libpq's words.
+  - This client is libpq built with SSL (Mbed TLS) and without GSSAPI, and says so in libpq's words.
+  - `Connection.connect` walks PQconnectPoll: each host, each address, and at each address the encryption sslmode
+    allows in its order (`postgres::secure::EncryptionPlan`). What a failure leads to is libpq's: 'N' goes on in
+    plaintext on the same socket; a TLS failure or a refusal before authentication tries the next method on a new
+    connection, printing libpq's lead again; 57P03 moves to the next host; connect_timeout to the next address;
+    anything else ends the connect. A Unix socket is always plaintext.
+  - `postgres::secure` (internal) holds TLS: `negotiate.kama` (the plan, the SSLRequest, direct negotiation, the
+    post-handshake checks), `setup.kama` (initialize_SSL, step for step, a `TlsConfig` per attempt) and
+    `transport.kama` (`TlsTransport`, TLS over ANY `Transport`). `postgres::verifyServerName` is libpq's host-name
+    check, with glibc's inet_aton and inet_pton ported for "is this host an address".
+  - `Connection.connectWith(dialer:, config:)` takes a `Dialer` and runs the whole procedure over connections it
+    opens; `connectOver` treats its one transport as host 0 and makes one attempt.
   - Ports come from the pinned PostgreSQL source, not from memory. The source files are fetched by the
     generators, pinned by SHA256.
 - **Notices go to std::log** under the tag `postgres` (WARNING as warn, NOTICE/INFO as info, DEBUG/LOG as
   debug), unless the connection has a `NoticeHandler`. Notices raised during startup always go to the log.
-- **I/O is a `Transport`:** non-blocking `read`/`write` and `wait(interest:, timeoutMs:)`.
+- **I/O is a `Transport`:** non-blocking `read`/`write` and `wait(interest:, timeoutMs:)`, plus `explain(error:)`,
+  which words a failure as libpq does for that layer (a plain socket answers None).
   - `TcpTransport` is a non-blocking `TcpStream` plus a `std::net::Poller`. The internal module
     `postgres::wire` frames messages over any transport, with deadlines.
   - `UnixTransport` is the same for a socket host (a directory, or `@name` on Linux). Its connect is
     non-blocking too, bounded by connect_timeout.
-  - Phase 6 adds a TLS transport, after the SSLRequest exchange on the concrete `TcpStream`. `Connection` does
-    not change.
+  - `TlsTransport` wraps any `Owned<Transport>` (through `TransportStream`, a `ReliableStream` adapter). It never
+    leaves ciphertext queued while the connection waits to read: `write` flushes first, `wait` flushes while it
+    waits, and a buffered record is readable at once. The SSLRequest's answer is read on the transport before
+    `Wire` exists; bytes after an 'N' reach `Wire.resume`.
   - The integration tests reach the server's socket through a relay of their own (`socket_test.kama`).
     `PGTEST_SOCKDIR` is a short directory under /tmp, made by the runner, since a socket path is at most 103
     bytes on macOS.
@@ -151,6 +176,10 @@ compiler with everything this package relies on:
   - `float` is reserved, as every C keyword is; so is `out`.
   - A resource that implements `Copyable<This>` must say its bare hand-off: `Copyable<This>(bare: give)`.
   - `DynamicArray.remove` returns `T` and `pop` returns `Optional<T>`.
+  - A `break` in a `match` arm leaves the match, not the loop (KPG-32): end such a loop on a flag.
+  - A static function is called with `::` (`Connection::visit(…)`); `.` on a type calls a constructor.
+  - A function that must build a resource through a private constructor gets a `friend` grant, or is a `static` of
+    the type: a free function in the same file cannot call it.
   - An `IoError` is a value: branch on `e.kind()`, and make one with `IoError.of(kind: IoErrorKind::…)`.
 
 - **Nothing from the server is trusted.**

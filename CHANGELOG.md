@@ -6,7 +6,28 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
-Needs **kama ≥ 0.9.519**.
+Needs **kama ≥ 0.9.519**, and `@kama/tls` (Mbed TLS 4.1.1).
+
+### Added
+- **TLS**, as libpq built with SSL does it, through `@kama/tls`:
+  - every `sslmode`, with libpq's order and fallbacks: `prefer` tries TLS and then plaintext, `allow` the other way
+    round, on a new connection after a refusal, with libpq's lead printed for each; an SSLRequest answered 'N' goes
+    on in plaintext on the same socket; a Unix socket is plaintext whatever sslmode says;
+  - `sslnegotiation=direct` (PostgreSQL 17 and later), with ALPN "postgresql" required;
+  - verification: a root file that exists verifies the chain under any mode, `verify-full` checks the server's name
+    by libpq's rules (`postgres::verifyServerName`), `sslrootcert=system` with the environment's `SSL_CERT_FILE`,
+    `sslcrl`/`sslcrldir` with OpenSSL's every-certificate rule;
+  - client certificates: `sslcert`, `sslkey` (libpq's checks of the file, PEM or DER), `sslpassword` for encrypted keys,
+    `sslcertmode` disable/allow/require;
+  - `sslsni`, `ssl_min_protocol_version`/`ssl_max_protocol_version`, `sslkeylogfile` (NSS key-log lines);
+  - SCRAM-SHA-256-PLUS, bound to the server certificate's tls-server-end-point hash whenever the server offers it and
+    `channel_binding` is not `disable`;
+  - `Connection.sslInUse()`, `sslAttribute(name:)` and `sslAttributeNames()`, as PQsslAttribute;
+  - libpq's messages throughout; where libpq quotes OpenSSL, libpq's frame with Mbed TLS's reason. README lists
+    what differs from a libpq built with OpenSSL.
+- `Connection.connectWith(dialer:, config:)` and the `Dialer` contract: libpq's whole connection procedure (hosts,
+  addresses, TLS fallbacks) over connections a caller opens. `connectOver` now honours sslmode for its transport.
+- `PgError::Tls(detail, cause)`, and `Transport.explain(error:)`, through which a transport words its own failures.
 
 ### Changed
 - **Needs kama ≥ 0.9.519**, which fixed every compiler gap this package filed (KPG-11 to KPG-30). Ported to its

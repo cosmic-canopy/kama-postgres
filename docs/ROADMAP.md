@@ -34,8 +34,8 @@ cases the container's libpq answered against the same server and files. Phase 5'
 package needs the 0.9.523 release that carries them ([KAMA_GAPS.md](../KAMA_GAPS.md)). Phase 7's tests replay the traces
 of libpq's `libpq_pipeline` message for message and the cases of `001_stream_rep.pl` and `003_load_balance_host_list.pl`,
 and ask the container's libpq about each `target_session_attrs` case against a primary and its standby. On kama 0.9.667,
-KPG-33 to KPG-38 are fixed, and KPG-39 and KPG-40 (a question about nested windows) are open. Phase 8 is under way: its
-plan is below.
+KPG-33 to KPG-38 are fixed. KPG-39 (fixed in 0.9.669) and KPG-40 (nesting through `tx.conn()` is intended; the freeze
+it relies on was fixed in 0.9.672) wait for the v0.9.672 release. Phase 8 is under way: its plan is below.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -140,11 +140,16 @@ it fail.
   - Run with `KAMA=<dir>/bin/kama tools/test.sh`, or `curl -fsSL https://kama-lang.org/install.sh | KAMA_VERSION=v0.9.667 sh`.
 - **kama-tls.** `../kama-tls` is readable again. The package needs `@kama/tls` ≥ 0.1.3 (its `TlsError` is `Sendable`),
   and the locks pin 0.1.4.
-- **KPG-40 asks cstar to confirm** that `borrow tx.conn().transaction() as inner` (a second window over the connection,
-  through the view) is intended. 0.3.0's nesting relies on it. If cstar says no, nesting moves to a mint on the view
-  (`borrow tx.transaction() as inner`) before 0.3.0.
-- **KPG-39 is open.** Std's JSON cannot be imported in the unit tests until it is fixed. When it is, add a `JsonValue`
-  test beside `typed_test.kama`'s `Untyped`, and drop the README's known issue.
+- **Before S1: port to kama v0.9.672, once it is tagged.** It is not yet: the latest release on 2026-10-18 is v0.9.667.
+  It carries both answers, so the package should need it for 0.3.0.
+  - **KPG-40, answered:** `borrow tx.conn().transaction() as inner` is intended. Keep it, and add no mint on the view.
+    Before 0.9.672 the inner window did not freeze `tx`, so the outer transaction could be committed from inside a
+    savepoint. The windows' check of the server's status made that harmless, but 0.9.672 refuses it.
+  - **KPG-39, fixed in 0.9.669:** std's JSON can be imported beside this package.
+  - Steps: download the release and check its checksum. Run both repros, plus the refusal of `tx` inside `inner`, and
+    move the two entries to FIXED. Raise `"kama"` to `>=0.9.672` in the three manifests and the CI pin. Add a
+    `JsonValue` test beside `typed_test.kama`'s `Untyped`. Drop the README's known issue, and note it all in the
+    CHANGELOG. Then run the full gate.
 
 ## Decided, and why
 

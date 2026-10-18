@@ -16,8 +16,9 @@ Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.47
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** KPG-39 (HIGH) and KPG-40 (LOW, a question). Every earlier gap is fixed, except KPG-8, which is closed as a
-non-goal (see below).
+**Open now:** KPG-39 (HIGH) and KPG-40 (LOW, a question), both answered by cstar and waiting to be verified on the v0.9.672
+release: KPG-39 is fixed in 0.9.669, and KPG-40 is intended, with the defect it turned up fixed in 0.9.672. Every
+earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -28,7 +29,33 @@ non-goal (see below).
 
 ## OPEN
 
-### KPG-40 · LOW · Is a window inside a window, through a view's `ref` accessor, intended?
+### KPG-40 · LOW · Is a window inside a window, through a view's `ref` accessor, intended? — ANSWERED: yes
+
+**cstar's answer:** intended. Keep `borrow tx.conn().transaction() as inner`, and add no mint on the view
+(`@viewable … for view`): that would be a second spelling of the same nesting.
+- Opening a window through the enclosing window's alias is a reborrow, not a second name for the storage. The inner
+  window freezes `tx` for its block, so only one of `tx` and `inner` is usable at a time, and the windows close inside
+  out.
+- What SPEC refuses (`xfail/borrow_nested_same_place`) is a second window from the same root, where both names stay
+  live: `borrow c.transaction() as t2` inside `tx` is refused ("two mutable views of one buffer").
+
+**A defect it turned up, fixed in 0.9.672.** Our soundness argument below was wrong for 0.9.667 to 0.9.671. There, the
+inner window did **not** freeze `tx`: `tx.conn().leave()` inside the savepoint was accepted, so the outer transaction
+could be committed from inside it.
+- The defect was wider than this case: a window minted on a call that returns a place froze nothing at all, so
+  `borrow h.items().viewMut() as v { h.items().add(…); }` was a use-after-free in safe code.
+- In 0.9.672, using `tx` inside `inner` is refused ("tx is frozen by the enclosing borrow"), and the repro below still
+  builds and prints `2 0`. SPEC's borrow rule 1 now says both things: a mint on a place-returning call freezes that
+  call's roots, and a window reached through an alias freezes the alias.
+- kama's tests now pin both: `tests/borrow_nested_through_alias` pins this shape as legal, and
+  `xfail/borrow_nested_alias_frozen` pins the refusal.
+- Here, the hole could not corrupt a session. A COMMIT or ROLLBACK through `tx` inside `inner` ends the block, which
+  the server reports, so both windows find their transaction over and send nothing. But 0.3.0 should need 0.9.672, so
+  that the compiler refuses it.
+
+**To do on v0.9.672:** run the repro below (`2 0`) and the refusal of `tx` inside `inner`, then move this entry to FIXED.
+
+The question as filed:
 
 **A question, not a bug.** @kama/postgres 0.3.0's API relies on the answer being yes, so we ask before it ships. The
 scoped transaction nests as a savepoint by opening a second window over the same connection, reached through the first
@@ -69,10 +96,16 @@ fn int32 main() {
 
 - **Why we think it is sound here:** the view owns no storage that could move. The inner window freezes the alias
   `tx` (a place-returning call's receiver), so the outer transaction cannot be committed from inside the savepoint.
+  (Wrong before 0.9.672: see the answer above.)
 - **If it should be refused,** the alternative we would follow is a mint on the view itself (a `@viewable` contract
   `for view`), so nesting reads `borrow tx.transaction() as inner`. Say which, and we will change before 0.3.0.
+  (cstar: do not.)
 
 ### KPG-39 · HIGH · Importing std's JSON makes `Optional<int64>` (and `uint64`, `float64`) not `Sendable`
+
+**cstar: fixed in 0.9.669.** The JSON import no longer strips `Sendable` or `==` from `Optional<int64>`, `uint64` or
+`float64`, so `CopyChunk` builds unchanged. The fix ships in v0.9.672. **To do on v0.9.672:** run the repros below,
+move this entry to FIXED, add the `JsonValue` test the workaround names, and drop the README's known issue.
 
 **Found** porting to `kama 0.9.667` (the release), and the same on the dev build `0.9.668+g425eecff`: a unit test that
 reads a column into a `std::serialization::text::json::JsonValue` made the whole test program fail, in a file the test

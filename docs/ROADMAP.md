@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-03: phases 0–7 are done, and 0.2.0, which carries phase 7, is published (0.1.0 was phases 0–6, with `@kama/tls` 0.1.0). The client connects and queries on every supported server
+Where this is, 2026-10-18: phases 0–7 are done. 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (tagged `v0.2.1`, for the registry to publish). 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -33,7 +33,8 @@ cases the container's libpq answered against the same server and files. Phase 5'
 0.9.519, and phase 6's (KPG-31, a file's owner, and KPG-32, `break` in a `match` arm) in 0.9.521 and 0.9.522; the
 package needs the 0.9.523 release that carries them ([KAMA_GAPS.md](../KAMA_GAPS.md)). Phase 7's tests replay the traces
 of libpq's `libpq_pipeline` message for message and the cases of `001_stream_rep.pl` and `003_load_balance_host_list.pl`,
-and ask the container's libpq about each `target_session_attrs` case against a primary and its standby. Phase 8 is next.
+and ask the container's libpq about each `target_session_attrs` case against a primary and its standby. On kama 0.9.667,
+KPG-33 to KPG-38 are fixed and KPG-39 is open. Phase 8 is next: its plan is below.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -48,8 +49,88 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Pool (cross-isolate), examples, hardening (server restart, bounded memory), CI green, docs | next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | next: S0 (kama 0.9.667) done, as 0.2.1 |
+| 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
+
+## Phase 8, planned
+
+Decided with the maintainer on 2026-10-18. Each step commits on main once it is green: `tools/test.sh`, debug and
+release, and the integration matrix (14–19, debug, release and TLS). Before a test is called good, a mutation must make
+it fail.
+
+- **S0, done (0.2.1).** The port to kama 0.9.667.
+- **S0b, scoped transactions** (KPG-35 is fixed in 0.9.658: a view's `~dtor` closes its borrow window).
+  - The shape is `borrow conn.transaction() as tx { … }`. It was prototyped on 0.9.667, nesting and an early return
+    included.
+  - `Connection` implements a `@viewable` contract whose nullary mint `transaction()` sends BEGIN, or SAVEPOINT inside
+    an open transaction.
+  - The `Transaction` view offers:
+    - `conn()`, a `ref Connection`, since the host is frozen inside the window;
+    - `commit()`;
+    - `rollback()`;
+    - `began()`, BEGIN's outcome, since a mint cannot return a Result;
+    - `setOptions(options:)`, which runs SET TRANSACTION before any query.
+  - `~Transaction` rolls back, or does ROLLBACK TO and RELEASE for a savepoint, unless the server says the transaction
+    is already over. So a commit made through `tx.conn()` counts.
+  - It **replaces** `transaction(body:, options:)` and `TransactionBody` in 0.3.0. That is a breaking change, made
+    because there is one way to do a thing, and kama has no overloading, so both cannot be called `transaction`.
+    `begin`, `commit`, `rollback` and the savepoint methods stay.
+- **S1, connection groundwork.**
+  - `Connection.ping()`: an empty query, with ReadyForQuery back.
+  - `Connection.resetSession()`: Npgsql's reset that keeps prepared statements (CLOSE ALL, SET SESSION AUTHORIZATION
+    DEFAULT, RESET ALL, UNLISTEN *, `pg_advisory_unlock_all()`, DISCARD SEQUENCES, DISCARD TEMP). The list is read
+    from Npgsql's pinned source, not typed from memory.
+  - Whatever state the pool needs in order to decide what to do on release.
+- **S2, hardening.**
+  - libpq's rule that a message of a short type over 30000 bytes is "lost synchronization with server" (fe-protocol3.c).
+  - Bounds, each configurable: the read buffer that grows while a write waits, the notification queue, the
+    ParameterStatus count, and an optional limit on a buffered result (off by default).
+  - `tools/pg.sh restart|stop|start`, and restart tests, with libpq's words, over TLS too.
+  - Seeded mutations of every scripted reply. Each must end in a `PgError`, never a panic.
+- **S3, the pool** (`src/pool/`).
+  - **Shape.** One `Channel<Slot>` (`Idle(conn, since, born)` or `Empty`) plus a permit channel. That bounds the total
+    with no atomic and no mutex, and lets a sequential user keep one connection.
+  - **API.**
+    - `Pool.make(config:, options:)`.
+    - `pool.share()` gives a Sendable `PoolShare`, which `Pool.join(share:)` turns into a pool in another isolate.
+    - `acquire(timeout:)` gives a `Lease`, which returns its connection on drop.
+    - `run(body:)`.
+  - **Defaults** are pgxpool's: max size max(4, cpus), min idle 0, a lifetime of 1 h with jitter, an idle timeout of
+    30 min, and a health check every minute. The acquire timeout is 30 s, as sqlx and HikariCP use.
+  - **Release.** A closed, busy, COPY or pipeline connection is closed. One inside a transaction is rolled back, then
+    reset (decision below).
+- **S4, maintenance.** One isolate per pool, stopped when the pool drops. It closes idle and expired connections, pings
+    the rest, and keeps min idle. Acquire also pings a connection that has been idle for more than 1 s.
+- **S5, pool tests.**
+  - Unit, through a counting Dialer: the bound, timeouts, replacement, the reset's exact messages, reaping.
+  - Integration: N isolates (`pg_stat_activity` never over the maximum), a server restart, TLS.
+- **S6, examples.** `examples/<name>/`, each its own executable project, as in @kama/sodium: quickstart, typed rows,
+  transactions, COPY from a CSV file, a LISTEN/NOTIFY worker, a pool shared by isolates, a batch. `tools/test.sh`
+  builds them; `tools/test-integration.sh` runs them live.
+- **S7, docs and 0.3.0.**
+  - Make the README's links absolute, because the registry renders a relative link as plain text.
+  - Update the CHANGELOG, this file and AGENTS.postgres.md.
+  - Tag `v0.3.0` for the registry to publish.
+
+**Decisions:**
+- **On release, roll back and reset the session.** Npgsql and asyncpg do; pgx and deadpool do not. It is the safer
+  default and costs one round trip. A pool can turn it off.
+- **A maintenance isolate.** pgxpool, HikariCP, Npgsql, sqlx and bb8 all have one.
+- **Windows is phase 9.**
+- **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
+  for changes.
+
+**What the next session needs to know:**
+- **The compiler.** Build with the released 0.9.667, as CI does. The dev tree (`../cstar/out`) is past the release,
+  and `~/.kama/bin/kama` is an old 0.9.440.
+  - To get it: `kama-macos-universal-v0.9.667.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its
+    `.sha256` and unpacked anywhere.
+  - Run with `KAMA=<dir>/bin/kama tools/test.sh`, or `curl -fsSL https://kama-lang.org/install.sh | KAMA_VERSION=v0.9.667 sh`.
+- **kama-tls.** `../kama-tls` could not be read from this session (macOS denied access). `@kama/tls` 0.1.1 builds
+  unchanged on 0.9.667.
+- **KPG-39 is open.** Std's JSON cannot be imported in the unit tests until it is fixed. When it is, add a `JsonValue`
+  test beside `typed_test.kama`'s `Untyped`, and drop the README's known issue.
 
 ## Decided, and why
 

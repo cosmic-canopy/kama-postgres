@@ -6,6 +6,13 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A TLS handshake no longer spins on a server that falls silent in it.** Waiting to read, the handshake took a
+  transport that was only writable as ready, so a server that answered the SSLRequest with `S` and then said nothing
+  kept the connection busy for ever, past `connect_timeout`. Only the side waited for counts now, and the deadline
+  ends it as `timeout expired`. Found by @kama/redis, which runs the same loop over a scripted server that is always
+  writable; a unit case here plays that server.
+
 ## [0.2.1] — 2026-10-18
 
 0.2.0 on the kama of today: 0.2.0 does not build on kama 0.9.667, whose serde contracts changed, and this does. Needs

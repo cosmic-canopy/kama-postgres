@@ -4,7 +4,8 @@
 // three bytes at a time, so the TLS records are taken apart and put back together on every case. The expected
 // messages are libpq's, from its source at REL_18_STABLE (fe-connect.c, fe-secure-openssl.c, fe-auth.c).
 // Certificates come from tools/gen-test-certs.sh (PGTEST_CERTDIR, set by tools/test.sh).
-import { core::env, std::collections::DynamicArray, std::memory::Owned, std::io::IoError, std::fs::readFile, std::fs::writeFile,
+import { core::env, std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::memory::Owned,
+         std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::fs::readFile, std::fs::writeFile,
          std::fs::setPermissions, std::fs::Permissions, std::fs::readText, std::fs::stat, std::fs::Metadata, std::fs::remove,
          std::process::currentUser, std::process::UserId,
          tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion, tls::Certificate,
@@ -79,6 +80,23 @@ unsafe fn string verifyAt(const ref string host) {
     return "host=".concat(other: host).concat(other: " user=u dbname=d sslmode=verify-full sslrootcert=").concat(other: certPath(name: "ca.crt"));
 }
 
+// A server that answers the SSLRequest with 'S' and then says nothing, ever, and never closes: its transport stays
+// writable, as a socket's does. The handshake must time out on it, and not take writable for ready.
+type resource Hushed implements Transport, Sendable {
+    bool answered = false;
+    public ctor make() { this.answered = false; }
+    public fn Result<isize, IoError> read(View<uint8> into) {
+        if (this.answered) { return Result::Err(error: IoError.of(kind: IoErrorKind::WouldBlock)); }
+        into[0] = 83ui8;   // 'S'
+        this.answered = true;
+        return Result::Ok(value: 1);
+    }
+    public fn Result<isize, IoError> write(ConstView<uint8> bytes) { return Result::Ok(value: bytes.length()); }
+    public fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) { return Result::Ok(value: Ready.of(readable: !this.answered, writable: true)); }
+    public fn void shutdown() { }
+    public fn Optional<PgError> explain(IoError error) { return Optional::None; }
+}
+
 // Each answer to an SSLRequest, by a server that does not run TLS.
 unsafe fn int32 answerTests() {
     int32 f = 0;
@@ -118,6 +136,15 @@ unsafe fn int32 answerTests() {
     sx.add(item: Step::Send(bytes: welcome()));
     string gs = messageOf(r: overTlsChunked(script: give sx, conninfo: require, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: "", chunk: 64));
     f = f + check(ok: gs.equals(other: "received unencrypted data after SSL response"), what: "tls answer: plaintext after S (".concat(other: gs).concat(other: ")"));
+
+    // 'S', then silence through the handshake: the deadline passes ("timeout expired"), however writable the
+    // transport stays.
+    Environment vars = testEnvironment();
+    Result<Config, PgError> hc = resolveWith(text: require.concat(other: " connect_timeout=2"), env: vars);
+    Config hushedConfig = match (give hc) { case Ok(value: v): give v; case Err(error: bad): { return f + check(ok: false, what: "tls answer: silence: config"); } };
+    Owned<Transport> hushed = new Hushed.make();
+    string gh = messageOf(r: Connection.connectOver(transport: give hushed, config: hushedConfig));
+    f = f + check(ok: gh.equals(other: "timeout expired"), what: "tls answer: S, then silence in the handshake, times out (".concat(other: gh).concat(other: ")"));
     return f;
 }
 

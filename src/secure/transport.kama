@@ -122,7 +122,9 @@ type resource TlsTransport implements Transport, Sendable {
                 case Ok(value: x): x;
                 case Err(error: e): { return Result::Err(error: tlsMessage(detail: "SSL SYSCALL error: ".concat(other: strerror(e: e)))); }
             };
-            bool ready = r.readable || r.writable;
+            // Only the side asked for counts: a transport that is writable while the server says nothing has timed out.
+            bool ready = r.readable;
+            if (want == Interest::Write) { ready = r.writable; }
             if (!ready) { return Result::Err(error: PgError::Timeout); }
         }
         return Result::Ok(value: Unit::Unit);

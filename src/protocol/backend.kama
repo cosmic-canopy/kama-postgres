@@ -86,7 +86,7 @@ type resource RowValues implements Sendable {
 
 // The fields of an ErrorResponse or NoticeResponse: one-letter codes ('S' severity, 'C' SQLSTATE, 'M'
 // message, 'D' detail, …) each with a text value, in the order sent.
-type resource ErrorFields {
+type resource ErrorFields implements Sendable {
     DynamicArray<uint8> codes;
     DynamicArray<string> texts;
 

@@ -7,7 +7,7 @@ export { PgError, ServerError, ConnectError, ConnectAttempt };
 //
 // Every message is libpq's wording wherever libpq has one, so a message from this client reads the same as psql's.
 
-type enum PgError implements Error {
+type enum PgError implements Error, Sendable {
     // A connection setting that cannot be used: a connection string that does not parse, an invalid value, a
     // service that is not defined.
     Config(string detail),
@@ -89,7 +89,7 @@ fn string ioMessage(const ref IoError e) {
 
 // An ErrorResponse or a NoticeResponse: every field the server sent, by the one-letter codes of the protocol's
 // "Error and Notice Message Fields". The accessors are named after libpq's PG_DIAG_* fields.
-type resource ServerError {
+type resource ServerError implements Sendable {
     ErrorFields all;
 
     public ctor make(ErrorFields fields) { this.all = give fields; }
@@ -184,7 +184,7 @@ fn Optional<int32> decimal(Optional<string> v) {
 }
 
 // One host and address tried during a connect, and why it failed.
-type resource ConnectAttempt {
+type resource ConnectAttempt implements Sendable {
     string hostText;
     string addressText;
     string portText;
@@ -226,7 +226,7 @@ type resource ConnectAttempt {
 }
 
 // Every attempt of a failed connect, in the order made. There is at least one.
-type resource ConnectError {
+type resource ConnectError implements Sendable {
     DynamicArray<ConnectAttempt> tried;
 
     public ctor make() { this.tried = DynamicArray.empty(); }

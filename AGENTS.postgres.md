@@ -41,8 +41,9 @@ release it is built and tested with, and the first with everything this package 
   There is no libpq, no `csrc/` and no `csources`, and it should stay that way. TLS comes from the sibling
   package `@kama/tls` (`../kama-tls`), which vendors Mbed TLS. That is the only native code in the dependency tree.
   What postgres needs from TLS that the package lacks is added THERE, with its own tests, not worked around here.
-  - All three manifests (root, `tests/unit`, `tests/integration`) take it from the registry (`"version": "^0.1.0"`),
-    pinned by their `kama.lock`, so CI and a consumer build the published bytes.
+  - All three manifests (root, `tests/unit`, `tests/integration`) take it from the registry (`"version": "^0.1.3"`),
+    pinned by their `kama.lock`, so CI and a consumer build the published bytes. 0.1.3 is the floor because its
+    `TlsError` is `Sendable`, and `PgError`, which carries one, must be.
   - To develop against an unpublished change in `../kama-tls`, give each manifest a `kama.local.json` (gitignored,
     never published) with `"overrides": { "@kama/tls": { "path": "<relative path to kama-tls>" } }`, then
     `kama pkg install`. postgres can only publish once that change is in a published `@kama/tls`.

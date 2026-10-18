@@ -6,6 +6,11 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **Needs `@kama/tls` ≥ 0.1.3**, the first whose `TlsError` is `Sendable`.
+- `PgError` is `Sendable`, and so are `ServerError`, `ConnectError`, `ConnectAttempt`, `ProtocolError` and
+  `ErrorFields`, so an error can cross isolates (a `Channel<PgError>`, or a `Sendable` type that holds one).
+
 ### Fixed
 - **A TLS handshake no longer spins on a server that falls silent in it.** Waiting to read, the handshake took a
   transport that was only writable as ready, so a server that answered the SSLRequest with `S` and then said nothing

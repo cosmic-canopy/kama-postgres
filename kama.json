@@ -8,7 +8,7 @@
   "kind": "library",
   "kama": ">=0.9.667",
   "dependencies": {
-    "@kama/tls": { "version": "^0.1.0" }
+    "@kama/tls": { "version": "^0.1.3" }
   },
   "publish": {
     "exclude": [

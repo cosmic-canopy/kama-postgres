@@ -2,6 +2,6 @@
   "lockVersion": 1,
   "packages": {
     "@kama/postgres": { "source": "path", "path": "../..", "dependencies": ["@kama/tls"] },
-    "@kama/tls": { "source": "registry", "url": "https://registry.kama-lang.org/@kama/tls/0.1.1.tar.gz", "registry": "https://registry.kama-lang.org", "version": "0.1.1", "integrity": "sha256-77d90e149c1c575b9150eedd885837db27ba436308305e50532b1f7795fd4a28", "treeHash": "sha256-6ae82062a1590bc5898196d900d045a92d904dcb45d5fa5031b2d4046b00732c", "dependencies": [] }
+    "@kama/tls": { "source": "registry", "url": "https://registry.kama-lang.org/@kama/tls/0.1.4.tar.gz", "registry": "https://registry.kama-lang.org", "version": "0.1.4", "integrity": "sha256-a267cc9607e088d817b594790caa9b00a780ceb35d120a1c5aa87aa648139d94", "treeHash": "sha256-cc968d4dcc0720e74674be97e1fd8e9050648d158432e54c5ddab0f6b2ece84b", "dependencies": [] }
   }
 }

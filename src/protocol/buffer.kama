@@ -19,7 +19,7 @@ export { MessageWriter, Cursor, ProtocolError, MAX_MESSAGE };
 comptime int64 MAX_MESSAGE = 1073741823i64;
 
 // What can be wrong with bytes that claim to be a backend message.
-type enum ProtocolError implements Error {
+type enum ProtocolError implements Error, Sendable {
     // The message ended before a field it must contain.
     Truncated(uint8 tag),
     // A declared length below the minimum (4 bytes for the length itself), or past the message end.

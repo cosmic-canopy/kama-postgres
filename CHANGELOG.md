@@ -6,6 +6,13 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-10-18
+
+0.2.0 on the kama of today: 0.2.0 does not build on kama 0.9.667, whose serde contracts changed, and this does. Needs
+**kama ≥ 0.9.667** and `@kama/tls` ^0.1.0 (0.1.1 builds unchanged on it). Verified on kama 0.9.667, debug and release,
+on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta, in plaintext and over TLS, each server with a hot
+standby. The API is 0.2.0's.
+
 ### Changed
 - **Needs kama ≥ 0.9.667.** kama's serde contracts changed (a deserialization error is now a `DeErrorKind` and a
   place), and the column reader and the parameter writer follow them:
@@ -14,6 +21,11 @@ All notable changes to this package are recorded here. The format follows
   - `rowAs` still passes over a column that no field claims, as before, now through serde's `unknownField`.
 - The 0.2.0 README's known issue (KPG-38, a release build failing when two files pass the same kind of parameter) is
   fixed in kama 0.9.543, so the note is gone.
+
+### Known issue
+- On kama 0.9.667, a program that imports std's JSON (`std::serialization::text::json`) and uses this package does not
+  compile: the import makes `Optional<int64>` not `Sendable`, and `CopyChunk` holds one. A kama bug, filed as KPG-39;
+  the README says what to do until a kama release fixes it.
 
 ## [0.2.0] — 2026-10-03
 

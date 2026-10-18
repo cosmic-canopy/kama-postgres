@@ -244,6 +244,15 @@ A connection string can list several hosts, as libpq's can:
   so its columns come back as text, and `column::<T>` reads them from text. A query the cache knows goes typed.
 - **Pipelines take no statement or portal names.** The two libpq_pipeline traces that name them are not replayed.
 
+## Known issue: std's JSON on kama 0.9.667
+
+A program that imports std's JSON (`std::serialization::text::json`, for `JsonValue` or `JsonNumber`) and uses this
+package fails `kama check`: "`postgres::CopyChunk` declares `implements Sendable`, but its variant `Done` payload `rows`
+(of type `Optional<int64>`) is not Sendable". Nothing in the program is wrong. Importing std's JSON makes
+`Optional<int64>`, `Optional<uint64>` and `Optional<float64>` lose `Sendable` everywhere. This is a kama compiler bug,
+filed as KPG-39 in this repository's KAMA_GAPS.md, and it is fixed in kama, not here. Until a kama release fixes it, a
+program that uses this package cannot also import std's JSON.
+
 ## What it covers
 
 - **Connecting:**

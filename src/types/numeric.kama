@@ -126,11 +126,11 @@ type resource Numeric implements Formattable, Serializable, Deserializable<This>
     }
     public ctor Result<Numeric, Owned<Error>> deserialize(Deserializer r) {
         string text = r.readString();
-        if (r.failed()) { DeError e = r.errorCode(); return Result::Err(error: e); }
+        if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
         Result<Numeric, DecodeError> v = Numeric.parse(text: text);
         return match (give v) {
             case Ok(value: x): Result::Ok(value: give x);
-            case Err(error: pe): { r.failWith(e: DeError::Malformed); return Result::Err(error: DeError::Malformed); }
+            case Err(error: pe): { r.failWith(kind: DeErrorKind::Malformed); return Result::Err(error: DeError.of(kind: DeErrorKind::Malformed)); }
         };
     }
 

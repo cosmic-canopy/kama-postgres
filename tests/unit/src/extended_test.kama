@@ -61,20 +61,18 @@ fn int32 unconnected(const ref PgError e) { string m = e.message(); return check
 
 fn string errorText(const ref Result<Rows, PgError> r) { return match (r) { case Ok(value: v): "ok"; case Err(error: e): e.message(); }; }
 
-// `sql` with the int4 parameter 7. Other test files build their queries here, so one file holds the int32 adapter's
-// use: a release build fails when two do (KPG-38).
+// `sql` with the int4 parameter 7, as several suites ask.
 fn Query sevenQuery(const ref string sql) {
     Query q = Query.make(sql: copy sql);
     q.add(value: 7);
     return q;
 }
 
-// `sql` with one parameter: an int32 (declared int4 in a pipeline), or a string (left for the server to infer). Here
-// for the same reason as sevenQuery (KPG-38).
+// `sql` with one parameter: an int32 (declared int4 in a pipeline), or a string (left for the server to infer).
 fn Query withInt(const ref string sql, int32 n) { Query q = Query.make(sql: copy sql); q.add(value: n); return q; }
 fn Query withText(const ref string sql, const ref string text) { Query q = Query.make(sql: copy sql); q.add(value: text); return q; }
 
-// `statement`'s query with the int4 parameter 7 (see sevenQuery: KPG-38).
+// `statement`'s query with the int4 parameter 7.
 fn Query sevenOf(const ref Statement statement) {
     Query q = Query.of(statement: statement);
     q.add(value: 7);

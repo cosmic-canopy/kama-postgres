@@ -12,8 +12,8 @@ edit.
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.523**, declared as `"kama"` in every manifest here, and pinned in CI. That is the first
-compiler with everything this package relies on:
+**The package needs kama ≥ 0.9.667**, declared as `"kama"` in every manifest here, and pinned in CI. That is the
+release it is built and tested with, and the first with everything this package relies on:
 - a non-fatal write to a closed socket;
 - a `Sendable` `TcpStream`;
 - `recvTimeout`;
@@ -29,7 +29,11 @@ compiler with everything this package relies on:
 - `IoError.osMessage()`, for libpq's strerror text;
 - floats printed in their shortest form, as PostgreSQL prints them;
 - a `break` in a `match` arm that leaves the loop (KPG-32);
-- `Metadata.owner`, for libpq's rule that a root-owned key may be 0640 (KPG-31).
+- `Metadata.owner`, for libpq's rule that a root-owned key may be 0640 (KPG-31);
+- serde's `DeErrorKind` contract (`failWith(kind:)`, `errorKind()`, `peekKind`, `readNumberText`, `unknownField`),
+  which `decode.kama`'s reader and `query.kama`'s writer implement;
+- one copy of an adapter's vtable in a release build (KPG-38, 0.9.543);
+- a view's `~dtor`, run when its borrow window closes (KPG-35, 0.9.658).
 
 ## What is true here and nowhere else
 
@@ -217,9 +221,9 @@ compiler with everything this package relies on:
   - std's `shuffle` and other mutating helpers take a `View`, from `viewMut()`, not `view()`, which is const.
   - `Result<Unit, E>` is made with `Result::Ok(value: Unit::Unit)`.
   - A path dependency is relative to its manifest; an absolute path is not found.
-- **KPG-38's workaround.** Two files that use the same `type adapter` conversion (an int32 or a string into
-  `PgParam`) fail every release build. In `tests/unit`, those uses live in `extended_test.kama`, behind its helpers
-  `sevenQuery`, `sevenOf`, `withInt` and `withText`. Delete them when KPG-38 is fixed.
+  - A `match` on a std enum marked `@nonExhaustive` (`std::net::Interest`, `DeErrorKind`) needs `case _:`.
+  - A deserialization error is a kind and a place: `r.failWith(kind: DeErrorKind::Malformed)`, then
+    `Result::Err(error: DeError.of(kind: r.errorKind()))`.
 
 - **Nothing from the server is trusted.**
   - Every length is bounded before it is used.

@@ -6,18 +6,17 @@ it. Every entry with a repro was **run** on the version named. Nothing is inferr
 spec. An entry that is an absence cites the cstar files that show it instead. This file is excluded from
 the published package, as it is in `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.523`, the release (`v0.9.523`), and the dev build at `../cstar/out/Darwin-arm64/kama`
-(`0.9.523+gf8212db3`). KPG-31 and KPG-32 were re-run on it, with the repros as filed, before they moved to FIXED;
-KPG-33 to KPG-38 were filed on it. Earlier rounds: `0.9.519` (KPG-23 to KPG-30 verified), `0.9.506` (KPG-11 to KPG-22
-verified, KPG-23 to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to KPG-14 filed), `0.9.477`
-(KPG-1 also on Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.470` and the public
-`0.9.440`.
+**Current compiler:** `kama 0.9.667`, the release (`v0.9.667`, from GitHub, checksum verified). KPG-33 to KPG-38 were
+re-run on it, with the repros as filed, before they moved to FIXED. Earlier rounds: `0.9.523` (KPG-31 and KPG-32
+verified, KPG-33 to KPG-38 filed), `0.9.519` (KPG-23 to KPG-30 verified), `0.9.506` (KPG-11 to KPG-22 verified, KPG-23
+to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to KPG-14 filed), `0.9.477` (KPG-1 also on
+Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.470` and the public `0.9.440`.
 
 **Reporter:** the `@kama/postgres` repo. Each open entry names the workaround this package uses, so the
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** KPG-38 (HIGH), KPG-37 (HIGH), KPG-33 (HIGH), KPG-34 (HIGH), KPG-35 (MED, a request) and KPG-36 (LOW). Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** KPG-39 (HIGH). Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -28,224 +27,83 @@ changes the right design here, say so and we will follow it.
 
 ## OPEN
 
-### KPG-38 · HIGH · Two files that use the same `type adapter` fail every release build: its vtable is emitted twice
+### KPG-39 · HIGH · Importing std's JSON makes `Optional<int64>` (and `uint64`, `float64`) not `Sendable`
 
-**Found** adding the statement cache's tests (phase 7), on `kama 0.9.523+gf8212db3`. The unit-test program built
-debug, and its release build stopped in clang:
+**Found** porting to `kama 0.9.667` (the release), and the same on the dev build `0.9.668+g425eecff`: a unit test that
+reads a column into a `std::serialization::text::json::JsonValue` made the whole test program fail, in a file the test
+does not touch:
 
 ```
-unit--release.c:92382:20: error: redefinition of 'int32__as_postgres__PgParam__writeParam__thunk'
-unit--release.c:92385:37: error: redefinition of 'int32__as_postgres__PgParam'
+src/copy.kama:29:0: error: `postgres::CopyChunk` declares `implements Sendable`, but its variant `Done` payload `rows`
+(of type `Optional<int64>`) is not Sendable — `Optional<int64>` does not declare `implements Sendable`
 ```
 
-A release build is one C unit, the files' C one after another, and each file that passes an `int32` as a `PgParam`
-(through `type adapter <…, int32, …> implements PgParam`) emits its own `static` thunk and vtable for it. Reduced, with
-no package:
+Reduced, with no package. This checks:
 
 ```kama
-// src/shown.kama
-import { core::println };
-export { Shown, show };
-type contract Shown for value, resource, enum, intrinsic { const fn int64 twice(); }
-type adapter <int32> implements Shown { public const fn int64 twice() { return cast<int64>(this) * 2i64; } }
-fn int64 show(Shown v) { return v.twice(); }
-
-// src/a.kama
-import { show };
-export { fromA };
-fn int64 fromA() { return show(v: 7); }
-
-// src/b.kama
-import { show };
-export { fromB };
-fn int64 fromB() { return show(v: 8); }
-
-// src/main.kama
-import { core::println, fromA, fromB };
-fn int32 main() { int64 a = fromA(); int64 b = fromB(); println(s: "${a} ${b}"); return 0; }
+type enum Chunk implements Sendable { Data(int32 n), Done(Optional<int64> rows) }
+fn int32 main() { Chunk c = Chunk::Done(rows: Optional::Some(value: 3i64)); return 0; }
 ```
 
-With a manifest whose entry is `src/main.kama`, `kama build kama.json --debug` prints `14 16`, and `--release` fails
-with `redefinition of 'int32__as_adapters__Shown__twice__thunk'` and `… 'int32__as_adapters__Shown'`.
-
-**Why HIGH:** any program that passes an integer to `Query.add` (or a `pg"…"` hole) from two of its files cannot be
-built for release, and that is how an application uses this package.
-
-**Workaround** (tests/unit/src/cache_test.kama): its queries' parameter is added by `extended_test.kama`'s
-`sevenQuery`, so one file holds the int32 adapter's use. Nothing in the package itself can avoid it, since the
-conversion happens in the caller's file.
-
-### KPG-37 · HIGH · A lock stops installing when a newer version is published, if the package is also reached through a path dependency
-
-**Found** on `kama 0.9.523` (the release, `f8212db3`), the day `@kama/tls` 0.1.1 was published: `kama pkg install
-tests/unit/kama.json` in this repo, unchanged and green the day before, failed with `version resolution did not
-converge (too many range conflicts)`. That manifest depends on `@kama/postgres` by path (`../..`), whose manifest asks
-for `@kama/tls ^0.1.0`, and on `@kama/tls ^0.1.0` directly, and its `kama.lock` pins 0.1.0. Reduced, against a
-`file://` registry:
-
-```sh
-K=kama; T=$(mktemp -d); mkdir -p $T/reg $T/leaf/src $T/mid/src $T/app/src
-cat > $T/leaf/kama.json <<EOF
-{ "name": "@x/leaf", "version": "0.1.0", "license": "MIT", "kind": "library", "kama": ">=0.9.523",
-  "modules": { ".": { "visibility": "public" } } }
-EOF
-printf 'export { one };\nfn int32 one() { return 1; }\n' > $T/leaf/src/leaf.kama; printf 'MIT\n' > $T/leaf/LICENSE
-cat > $T/mid/kama.json <<EOF
-{ "name": "@x/mid", "version": "0.1.0", "kind": "library", "kama": ">=0.9.523", "modules": { ".": { "visibility": "public" } },
-  "registries": { "default": ["file://$T/reg"] }, "dependencies": { "@x/leaf": { "version": "^0.1.0" } } }
-EOF
-printf 'export { two };\nfn int32 two() { return 2; }\n' > $T/mid/src/mid.kama
-cat > $T/app/kama.json <<EOF
-{ "name": "app", "version": "0.0.1", "kind": "executable", "entry": "src/main.kama", "kama": ">=0.9.523",
-  "modules": { ".": { "visibility": "internal" } }, "registries": { "default": ["file://$T/reg"] },
-  "dependencies": { "@x/mid": { "path": "../mid" }, "@x/leaf": { "version": "^0.1.0" } } }
-EOF
-echo 'fn int32 main() { return 0; }' > $T/app/src/main.kama
-cd $T/leaf && git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm v1 && $K publish kama.json --registry file://$T/reg
-cd $T/app && $K pkg install kama.json          # installs, and the lock pins @x/leaf 0.1.0
-cd $T/leaf && sed -i.bak 's/"0.1.0"/"0.1.1"/' kama.json && git -c user.email=t@t -c user.name=t commit -qam v2 && $K publish kama.json --registry file://$T/reg
-cd $T/app && $K pkg install kama.json          # did not converge
-```
-
-The second install says `kama pkg install: version resolution did not converge (too many range conflicts)`. 0.1.0
-still satisfies every `^0.1.0` in the graph, and the lock names it. Each piece alone installs:
-- without the app's direct `@x/leaf` dependency, it installs;
-- with no lock, it resolves to 0.1.1;
-- a lock pinning 0.1.0 in a project with no path dependency installs 0.1.0.
-
-**Why HIGH:** a committed lock stops installing the moment a dependency publishes a compatible patch, with no commit
-in the project. CI goes red, and so does any checkout of a published package's own tests.
-
-**Workaround** (all three locks here): re-resolve, so each lock pins the newest version (`@kama/tls` 0.1.1). That
-lasts until the next release of `@kama/tls`.
-
-### KPG-33 · HIGH · A parent may use a place its `scope`'s spawned child borrows by `ref`: a data race, accepted
-
-**Found** surveying kama for phase 7 (a cancel token that another isolate uses), on `kama 0.9.523+gf8212db3`.
+The same file with one import above it fails `kama check` (and `kama build`) with the error above:
 
 ```kama
-import { core::println, std::concurrent::Isolate };
-
-type resource Counter implements Sendable {
-    int64 n = 0;
-    public ctor make() { }
-    public fn void bump() { this.n = this.n + 1; }
-    public const fn int64 value() { return this.n; }
-}
-
-fn void worker(ref Counter c) {
-    int64 i = 0;
-    while (i < 20000000i64) { c.bump(); i = i + 1; }
-}
-
-fn int32 main() {
-    Counter c = Counter.make();
-    scope {
-        spawn worker(c: ref c);
-        int64 i = 0;
-        while (i < 20000000i64) { c.bump(); i = i + 1; }
-    }
-    int64 total = c.value();
-    println(s: "total ${total} (40000000 if nothing raced)");
-    return 0;
-}
+import { std::serialization::text::json::JsonNumber };
 ```
 
-`kama check` says OK. Built `--debug` on macOS arm64, it prints `total 22373426 (40000000 if nothing raced)`, and
-`22670326` on a second run: the child and the parent's own scope body write `c` at once. While a child holds a `ref`
-borrow, the scope body should not be able to touch the place (or the borrow should be refused).
+- A field fails the same way: `type resource Holder implements Sendable { Optional<int64> rows; … }`.
+- `Optional<uint64>` and `Optional<float64>` fail too.
+- `Optional<int32>`, `Optional<bool>` and `Optional<string>` still check.
 
-**Workaround:** none needed. This package never shares a place with a spawned child; a `Connection` moves whole
-between isolates. Filed because phase 7's cancel token and phase 8's pool are designed around isolates.
+Those three are the types `JsonNumber`'s `asInt64`, `asUint64` and `asFloat64` return. So it looks as if their first
+instance, made in json.kama, is kept without `Optional`'s conditional `Sendable`. KPG-30, fixed in 0.9.514, was a
+conditional conformance that depended on imports.
 
-### KPG-34 · HIGH · A `return` in a destructor body skips the fields' destructors, silently
+**Why HIGH:** an application that uses std's JSON and `@kama/postgres` does not compile, because `CopyChunk` holds an
+`Optional<int64>`. No code in the application is wrong.
 
-**Found** surveying kama for phase 7 (a transaction that rolls back in a destructor), on `kama 0.9.523+gf8212db3`.
-
-```kama
-import { core::println };
-
-type resource Inner {
-    public ctor make() { }
-    ~Inner() { println(s: "Inner dropped"); }
-}
-
-type resource Outer {
-    Inner inner;
-    bool done = false;
-    public ctor make(bool done) { this.inner = Inner.make(); this.done = done; }
-    ~Outer() {
-        if (this.done) { return; }
-        println(s: "Outer: not done");
-    }
-}
-
-fn int32 main() {
-    { Outer a = Outer.make(done: false); }
-    println(s: "--");
-    { Outer b = Outer.make(done: true); }
-    println(s: "end");
-    return 0;
-}
-```
-
-`kama check` says OK. It prints `Outer: not done`, `Inner dropped`, `--`, `end`: for `b`, `Inner` is never dropped, so
-whatever it owns (a socket, a buffer) leaks. The emitter knows (`src/kama.cemit.cpp:30180`: "Early return inside a dtor
-body is unsupported."), but nothing tells the author. It should be an error, or the drops should run on every path.
-
-**Workaround:** none needed yet. This package's destructors (`~Connection`) call one method and never return early.
-
-### KPG-35 · MED · A borrow window cannot run code when it ends (asked for: a scoped transaction)
-
-**Asked for** in phase 7's transaction design, on `kama 0.9.523+gf8212db3`. A database transaction wants a scope that
-ends it on every path, rolling back unless the code committed. tokio-postgres and Npgsql use a guard that borrows the
-connection and rolls back on drop; psycopg's `with conn.transaction():` and pgx's `BeginFunc` use a block or a closure.
-kama has no stored borrows (GOALS 3e) and no closures (a non-goal), and its borrow window is the nearest thing. But the
-view a window mints cannot run anything when the window ends:
-
-```kama
-type resource Conn { public ctor make() { } }
-type view Tx {
-    UnsafePtr<Conn> c;
-    unsafe ctor over(UnsafePtr<Conn> c) { this.c = c; }
-    ~Tx() { }
-}
-fn int32 main() { return 0; }
-```
-
-`kama check` refuses it: `a view borrows and owns nothing — it may not declare a ~dtor (it would free memory it doesn't
-own)`. Without the `~Tx()` it checks.
-
-**What would close it:** an exit hook on a view minted by a borrow window. That could be a `~dtor` that a view may
-declare, or a hook the minting contract declares, run when the window ends on any path, with the view's fields in
-scope. Then `borrow conn.transaction() as tx { … }` rolls back unless `tx.commit()` ran, and nothing escapes the window.
-
-**Workaround** (phase 7, `src/transaction.kama`):
-- `begin`, `commit`, `rollback` and savepoint methods on `Connection`;
-- `transaction(body:)`, which takes a contract-typed body and ends the transaction on every path.
-
-The cost is a small type per body, and, with the bare methods, a transaction an early return leaves open
-(`transactionStatus()` reports it).
-
-### KPG-36 · LOW · `docs/TYPE_MODEL.md` shows a `ref` field, which does not parse
-
-`docs/TYPE_MODEL.md:124` gives `type view EcsQuery { ref World w; … }` as an example of a view. On `kama 0.9.523`:
-
-```kama
-type resource World { public ctor make() { } }
-type view EcsQuery { ref World w; }
-fn int32 main() { return 0; }
-```
-
-`kama check` gives `reffield.kama:2:31: Parse error: syntax error, unexpected IDENTIFIER, expecting OPERATOR or # or ::
-or <`. SPEC (no stored borrows) agrees with the parser, so the example should hold an `UnsafePtr<World>`.
-
----
+**Workaround:** none in the package. Changing `CopyChunk`'s public shape would be a workaround we would want to delete.
+`tests/unit/src/typed_test.kama` tests the reader's untyped reads (`peekKind`, `readNumberText`) through a small
+hand-written `Deserializable` instead of `JsonValue`. The `JsonValue` test is added when this is fixed.
 
 ## FIXED — kept for the record
 
-KPG-31 and KPG-32 were verified on 0.9.523, the first release with their fixes. KPG-23 to KPG-30 were verified on 0.9.519, KPG-11 to KPG-22 on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
+KPG-33 to KPG-38 were verified on 0.9.667. KPG-31 and KPG-32 were verified on 0.9.523, the first release with their fixes. KPG-23 to KPG-30 were verified on 0.9.519, KPG-11 to KPG-22 on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
 same repro as the original report.
+
+### KPG-38 · HIGH · Two files that use the same `type adapter` failed every release build — FIXED in 0.9.543
+
+Fixed by `7872c6b6` (KR-114): a helper two modules need (an intrinsic target's contract vtable and its thunks, an
+isolate trampoline) is defined once in the one-unit release build. The repro (`Shown` passed an `int32` from `a.kama`
+and `b.kama`) prints `14 16` built `--release` on 0.9.667, as it does `--debug`. The workaround's comments are gone,
+and `tests/unit/src/cache_test.kama` passes an `int32` itself, so the suite's own release build would catch a return.
+
+### KPG-37 · HIGH · A lock stopped installing when a newer version was published, with a path dependency — FIXED in 0.9.525
+
+Fixed by `df6a7bc3` (KB-39): a locked version that a second range still admits is kept, not re-resolved forever. The
+repro, run as filed against a `file://` registry on 0.9.667, installs after `@x/leaf` 0.1.1 is published, and the
+lock still pins 0.1.0.
+
+### KPG-33 · HIGH · A parent could use a place its `scope`'s spawned child borrows by `ref` — FIXED in 0.9.551
+
+Fixed by `ce7fc913` (KR-112). The repro is refused on 0.9.667: "`c` is held by `ref` by the child `spawn`ed at line 18
+until this `scope` joins it — using it here, read or write, races with the child."
+
+### KPG-34 · HIGH · A `return` in a destructor body skipped the fields' destructors — FIXED in 0.9.544
+
+Fixed by `09649780` (KR-113): a `return` in a destructor ends its body, and the fields are still dropped. The repro
+prints `Inner dropped` for both `a` and `b` on 0.9.667.
+
+### KPG-35 · MED · A borrow window could not run code when it ended (a scoped transaction) — FIXED in 0.9.658
+
+Fixed by `941d40cb` (KR-124): a `type view` may declare `~dtor`, and the `borrow` that minted it runs it when the
+window closes, on every path out of the block (its end, `return`, `break`, `continue`), after the block's locals. The
+repro checks on 0.9.667, and kama's `tests/borrow_view_closes.kama` (a transaction that rolls back unless it committed)
+exits 42 on it. Phase 8 adopts it: `borrow conn.transaction() as tx { … }`.
+
+### KPG-36 · LOW · `docs/TYPE_MODEL.md` showed a `ref` field, which does not parse — FIXED in 0.9.557
+
+Fixed by `a103caf9` (KR-119): the example's view holds `UnsafePtr<World> world`.
 
 ### KPG-32 · HIGH · `break` in a `match` arm did not leave the enclosing loop — FIXED in 0.9.521
 

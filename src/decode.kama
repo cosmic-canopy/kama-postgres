@@ -240,7 +240,7 @@ type resource CellReader implements Deserializer {
     isize bytesElement = 0;        // the cell, for 2
     isize byteAt = 0;              // the byte read next
     bool err = false;
-    DeError code;
+    DeErrorKind code = DeErrorKind::Malformed;
     Problem problem;
     isize failedCell = 0;
     isize failedElement = -1;
@@ -260,7 +260,7 @@ type resource CellReader implements Deserializer {
         this.labels = give labels; this.whole = whole;
         this.opened = false; this.current = 0; this.next = 0;
         this.element = -1; this.firstElement = 0; this.endElement = 0; this.bytesFrom = 0; this.bytesElement = 0; this.byteAt = 0;
-        this.err = false; this.code = DeError::Malformed; this.problem = Problem::Fine;
+        this.err = false; this.code = DeErrorKind::Malformed; this.problem = Problem::Fine;
         this.failedCell = 0; this.failedElement = -1; this.asked = ""; this.why = "";
     }
     friend valueReader[make];
@@ -282,9 +282,9 @@ type resource CellReader implements Deserializer {
     fn void advance() { if (this.element >= 0) { this.element = this.element + 1; } }
 
     // The first failure is the one reported.
-    fn void refuse(Problem p, const ref string what, string detail, DeError e) {
+    fn void refuse(Problem p, const ref string what, string detail, DeErrorKind kind) {
         if (this.err) { return; }
-        this.err = true; this.code = e; this.problem = p; this.failedCell = this.current;
+        this.err = true; this.code = kind; this.problem = p; this.failedCell = this.current;
         this.failedElement = -1;
         if (this.element >= 0) { this.failedElement = this.element - this.firstElement; }
         this.asked = copy what; this.why = give detail;
@@ -294,13 +294,13 @@ type resource CellReader implements Deserializer {
     fn bool usable(const ref string what) {
         if (this.err) { return false; }
         bool isNull = match (this.cells[this.at()]) { case Null: true; case _: false; };
-        if (isNull) { this.refuse(p: Problem::IsNull, what: what, detail: "", e: DeError::TypeMismatch); return false; }
+        if (isNull) { this.refuse(p: Problem::IsNull, what: what, detail: "", kind: DeErrorKind::TypeMismatch); return false; }
         string bad = match (this.cells[this.at()]) { case Bad(why: w): copy w; case Opaque(text: t, why: w): copy w; case _: ""; };
-        if (bad.length() > 0) { this.refuse(p: Problem::Undecodable, what: what, detail: give bad, e: DeError::Malformed); return false; }
+        if (bad.length() > 0) { this.refuse(p: Problem::Undecodable, what: what, detail: give bad, kind: DeErrorKind::Malformed); return false; }
         return true;
     }
 
-    fn void mismatch(const ref string what) { this.refuse(p: Problem::Mismatch, what: what, detail: "", e: DeError::TypeMismatch); }
+    fn void mismatch(const ref string what) { this.refuse(p: Problem::Mismatch, what: what, detail: "", kind: DeErrorKind::TypeMismatch); }
 
     fn int64 integer(int32 maxBits, const ref string what) {
         if (!this.usable(what: what)) { return 0i64; }
@@ -333,8 +333,8 @@ type resource CellReader implements Deserializer {
 
     public fn void beginObject(usize count) {
         string w = "a struct";
-        if (!this.whole) { this.refuse(p: Problem::Shape, what: w, detail: "a column holds one value; read a row into a struct with rowAs", e: DeError::TypeMismatch); return; }
-        if (this.opened) { this.refuse(p: Problem::Shape, what: w, detail: "a field of a row is one column, not a nested struct", e: DeError::TypeMismatch); return; }
+        if (!this.whole) { this.refuse(p: Problem::Shape, what: w, detail: "a column holds one value; read a row into a struct with rowAs", kind: DeErrorKind::TypeMismatch); return; }
+        if (this.opened) { this.refuse(p: Problem::Shape, what: w, detail: "a field of a row is one column, not a nested struct", kind: DeErrorKind::TypeMismatch); return; }
         this.opened = true;
         this.next = 0;
     }
@@ -373,7 +373,7 @@ type resource CellReader implements Deserializer {
         isize count = match (this.cells[this.at()]) { case Elements(first: f, count: n, text: t): n; case _: 0; };
         if (first < 0) { this.mismatch(what: what); return; }
         if (this.element >= 0) {
-            this.refuse(p: Problem::Shape, what: what, detail: "an array inside an array: this client reads arrays of one dimension", e: DeError::TypeMismatch);
+            this.refuse(p: Problem::Shape, what: what, detail: "an array inside an array: this client reads arrays of one dimension", kind: DeErrorKind::TypeMismatch);
             return;
         }
         this.element = this.elementBase + first;
@@ -459,18 +459,51 @@ type resource CellReader implements Deserializer {
     public const fn bool failed() { return this.err; }
     public fn void fail() {
         string w = "this type";
-        this.refuse(p: Problem::Mismatch, what: w, detail: "", e: DeError::Malformed);
+        this.refuse(p: Problem::Mismatch, what: w, detail: "", kind: DeErrorKind::Malformed);
     }
-    public fn void failWith(DeError e) {
+    public fn void failWith(DeErrorKind kind) {
         if (this.err) { return; }
         string w = "this type";
         // A type's own deserialize refused the text it was given (Uuid, Timestamp, Numeric, …). That value was
         // read, so it is the one before the next.
         if (this.element > this.firstElement) { this.element = this.element - 1; }
         string text = match (this.cells[this.at()]) { case Text(text: t): copy t; case _: ""; };
-        this.refuse(p: Problem::Undecodable, what: w, detail: "\"".concat(other: text).concat(other: "\" is not a value of the type read"), e: e);
+        this.refuse(p: Problem::Undecodable, what: w, detail: "\"".concat(other: text).concat(other: "\" is not a value of the type read"), kind: kind);
     }
-    public const fn DeError errorCode() { return this.code; }
+    public const fn DeErrorKind errorKind() { return this.code; }
+    // What the next value is, unread, for a type that reads whatever it finds (an untyped JSON value): a whole row is
+    // an object of its columns; a column is a number (an integer, an oid, a float), a bool, an array (of one
+    // dimension), NULL, or a string, every other value as PostgreSQL prints it (a bytea's \x… among them).
+    public fn ValueKind peekKind() {
+        if (this.err) { return ValueKind::Null; }
+        if (this.whole && !this.opened) { return ValueKind::Object; }
+        return match (this.cells[this.at()]) {
+            case Null: ValueKind::Null;
+            case Integer(value: v, bits: b): ValueKind::Number;
+            case Oid(value: v): ValueKind::Number;
+            case Float(value: v, bits: b, text: t): ValueKind::Number;
+            case Boolean(value: v): ValueKind::Bool;
+            case Elements(first: f, count: n, text: t): ValueKind::Array;
+            case _: ValueKind::String;
+        };
+    }
+    // A number's exact text: an integer, an oid or a float column's, as PostgreSQL prints it.
+    public fn string readNumberText() {
+        string w = "a number";
+        if (!this.usable(what: w)) { return ""; }
+        bool isNumber = match (this.cells[this.at()]) {
+            case Integer(value: v, bits: b): true; case Oid(value: v): true; case Float(value: v, bits: b, text: t): true; case _: false;
+        };
+        if (!isNumber) { this.mismatch(what: w); return ""; }
+        string text = cellText(c: this.cells[this.at()]);
+        this.advance();
+        return text;
+    }
+    // A column no field of the struct claims is passed over, as sqlx's FromRow and Dapper pass it: a row may carry
+    // more columns than the type reads. Each field() moves to the next column, so nothing is left to skip.
+    public fn void unknownField() { }
+    // A row has no maps.
+    public fn bool atKeyedMap() { return false; }
 }
 
 // "column 2 ("score", int8)"
@@ -487,7 +520,7 @@ fn string describeColumn(const ref Rows rows, isize index) {
 fn PgError readFailure(const ref CellReader r, const ref Rows rows, isize index, Owned<Error> e) {
     // The derive's own verdict on a row: a field that had to have a column did not. The reader saw nothing wrong.
     Optional<DeError> code = e.as<DeError>();
-    bool missing = match (code) { case Some(value: c): match (c) { case MissingField: true; case _: false; }; case None: false; };
+    bool missing = match (code) { case Some(value: c): match (c.kind()) { case MissingField: true; case _: false; }; case None: false; };
     if (missing && index < 0) {
         return PgError::Value(detail: "the row has no column for a field of the type that is neither Optional nor @field(default)");
     }

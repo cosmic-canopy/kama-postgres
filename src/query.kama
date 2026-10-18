@@ -146,6 +146,10 @@ type resource ParamSerializer implements Serializer {
     public fn void fail() { string w = "the value refused to serialize"; this.refuse(what: w); }
     public fn void failWith(SerError e) { string w = e.message(); this.refuse(what: w); }
     public const fn SerError errorCode() { return SerError::NotRepresentable; }
+    // A number's exact decimal text (an untyped JSON number) goes as text, for the server's input function.
+    public fn void writeNumberText(const ref string text) { this.put(p: Param::Text(text: copy text)); }
+    // A parameter is one value: a map has no keyed form here.
+    public const fn bool keyedMaps() { return false; }
     friend Query::add[err, why, values, elements];
 }
 

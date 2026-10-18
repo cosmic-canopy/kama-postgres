@@ -20,6 +20,7 @@ import { std::collections::DynamicArray, std::collections::ConstView,
          postgres::types::TEXT_ARRAY, postgres::types::BOOL_ARRAY, postgres::types::FLOAT8_ARRAY,
          postgres::types::UUID_ARRAY, postgres::types::DATE_ARRAY, postgres::types::TIMESTAMPTZ_ARRAY,
          postgres::types::NUMERIC_ARRAY, postgres::types::BYTEA_ARRAY, postgres::types::JSONB_ARRAY,
+         std::memory::Owned,
          postgres_unit_tests::check, postgres_unit_tests::unhex,
          postgres_unit_tests::codecTypes, postgres_unit_tests::codecTexts, postgres_unit_tests::codecBinaries };
 export { typedTests };
@@ -411,10 +412,122 @@ unsafe fn int32 ruleTests() {
     return f;
 }
 
+// A value read whatever it is, as std's JsonValue reads one (its deserialize asks peekKind first): what the reader's
+// untyped reads give. Std's JsonValue itself cannot be imported here until KPG-39 is fixed.
+type enum Untyped implements Deserializable<This> {
+    Null, Bool(bool value), Number(string text), Text(string text), List(isize count), Record(isize count);
+
+    public ctor Result<Untyped, Owned<Error>> deserialize(Deserializer r) {
+        ValueKind k = r.peekKind();
+        if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
+        match (k) {
+            case Null: {
+                if (!r.readNull()) { r.failWith(kind: DeErrorKind::Malformed); }
+                if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
+                return Result::Ok(value: Untyped::Null);
+            }
+            case Bool: {
+                bool b = r.readBool();
+                if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
+                return Result::Ok(value: Untyped::Bool(value: b));
+            }
+            case Number: {
+                string t = r.readNumberText();
+                if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
+                return Result::Ok(value: Untyped::Number(text: give t));
+            }
+            case Array: {
+                r.beginArray();
+                isize n = 0;
+                while (r.moreElems()) {
+                    Result<Untyped, Owned<Error>> e = Untyped.deserialize(r: r);
+                    match (give e) { case Ok(value: v): { } case Err(error: x): { return Result::Err(error: give x); } };
+                    n = n + 1;
+                }
+                if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
+                return Result::Ok(value: Untyped::List(count: n));
+            }
+            case Object: {
+                r.beginObject(count: 0);
+                isize n = 0;
+                while (r.moreFields()) {
+                    FieldKey fk = r.field();
+                    Result<Untyped, Owned<Error>> e = Untyped.deserialize(r: r);
+                    match (give e) { case Ok(value: v): { } case Err(error: x): { return Result::Err(error: give x); } };
+                    n = n + 1;
+                }
+                r.endObject();
+                if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
+                return Result::Ok(value: Untyped::Record(count: n));
+            }
+            case _: {
+                string t = r.readString();
+                if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
+                return Result::Ok(value: Untyped::Text(text: give t));
+            }
+        };
+    }
+}
+
+// An untyped value's kind and text, for the checks: "number 7", "string ann", "null", "array 3", "object 8".
+fn string untypedShown(const ref Untyped v) {
+    return match (v) {
+        case Null: "null";
+        case Bool(value: b): { if (b) { return "bool true"; } := "bool false"; }
+        case Number(text: t): "number ".concat(other: t);
+        case Text(text: t): "string ".concat(other: t);
+        case List(count: n): "array ${n}";
+        case Record(count: n): "object ${n}";
+    };
+}
+
+fn string untypedResult(const ref Result<Untyped, PgError> r) {
+    return match (r) { case Ok(value: v): untypedShown(v: v); case Err(error: e): "error ".concat(other: e.message()); };
+}
+
+// An untyped value reads whatever a column holds, through the reader's peekKind and readNumberText: a number as the
+// server's exact text, a bool, an array of one dimension, NULL as its own null, and every other value as its
+// PostgreSQL text (a bytea's \x… among them). A whole row reads as an object of its columns.
+unsafe fn int32 untypedTests() {
+    int32 f = 0;
+    Shape s = accountRow(withNick: false, withAvatar: true);
+    s.addText(name: "ratio", oid: FLOAT8, text: "0.1");
+    s.addText(name: "big", oid: INT8, text: "9007199254740993");
+    s.addText(name: "ok", oid: BOOL, text: "t");
+    Rows rows = s.rows();
+    string want = "number 7";
+    Result<Untyped, PgError> id = column::<Untyped>(rows: rows, row: 0, index: 0);
+    string got = untypedResult(r: id);
+    f = f + check(ok: got.equals(other: want), what: "typed: an int4, read untyped, is a number (".concat(other: got).concat(other: ")"));
+    Result<Untyped, PgError> nick = column::<Untyped>(rows: rows, row: 0, index: 3);
+    got = untypedResult(r: nick);
+    f = f + check(ok: got.equals(other: "null"), what: "typed: NULL, read untyped, is its null (".concat(other: got).concat(other: ")"));
+    Result<Untyped, PgError> avatar = column::<Untyped>(rows: rows, row: 0, index: 5);
+    got = untypedResult(r: avatar);
+    f = f + check(ok: got.equals(other: "string \\x0102ff"), what: "typed: a bytea, read untyped, is its text (".concat(other: got).concat(other: ")"));
+    Result<Untyped, PgError> scores = column::<Untyped>(rows: rows, row: 0, index: 7);
+    got = untypedResult(r: scores);
+    f = f + check(ok: got.equals(other: "array 3"), what: "typed: an int4[], read untyped, is an array (".concat(other: got).concat(other: ")"));
+    Result<Untyped, PgError> ratio = column::<Untyped>(rows: rows, row: 0, index: 8);
+    got = untypedResult(r: ratio);
+    f = f + check(ok: got.equals(other: "number 0.1"), what: "typed: a float8 keeps the server's text (".concat(other: got).concat(other: ")"));
+    Result<Untyped, PgError> big = column::<Untyped>(rows: rows, row: 0, index: 9);
+    got = untypedResult(r: big);
+    f = f + check(ok: got.equals(other: "number 9007199254740993"), what: "typed: an int8 past 2^53 stays exact (".concat(other: got).concat(other: ")"));
+    Result<Untyped, PgError> ok = column::<Untyped>(rows: rows, row: 0, index: 10);
+    got = untypedResult(r: ok);
+    f = f + check(ok: got.equals(other: "bool true"), what: "typed: a bool, read untyped (".concat(other: got).concat(other: ")"));
+    Result<Untyped, PgError> whole = rowAs::<Untyped>(rows: rows, row: 0);
+    got = untypedResult(r: whole);
+    f = f + check(ok: got.equals(other: "object 11"), what: "typed: a row, read untyped, is an object of its columns (".concat(other: got).concat(other: ")"));
+    return f;
+}
+
 unsafe fn int32 typedTests() {
     int32 f = 0;
     f = f + textTests();
     f = f + nativeTests();
     f = f + ruleTests();
+    f = f + untypedTests();
     return f;
 }

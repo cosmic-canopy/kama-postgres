@@ -8,7 +8,7 @@ install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls)
 kama pkg add kama.json @kama/postgres --version ^0.2.0     # from the official registry, registry.kama-lang.org
 ```
 
-Needs **kama ≥ 0.9.523**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
+Needs **kama ≥ 0.9.667**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
 release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta.
 
 > **Status: early.** It connects, authenticates and runs queries, with typed parameters and typed rows, over TCP, a
@@ -243,14 +243,6 @@ A connection string can list several hosts, as libpq's can:
 - **Text columns from pipelined SQL the cache has not seen.** Such a query goes as libpq's PQsendQueryParams sends it,
   so its columns come back as text, and `column::<T>` reads them from text. A query the cache knows goes typed.
 - **Pipelines take no statement or portal names.** The two libpq_pipeline traces that name them are not replayed.
-
-## Known issue: release builds on kama 0.9.523
-
-A program that passes the same kind of value to `Query.add` or a `pg"…"` hole from two of its files fails its release
-build. An integer from two files is enough. clang reports `redefinition of 'int32__as_postgres__PgParam…'`. This is a
-kama compiler bug, filed as KPG-38 in this repository's KAMA_GAPS.md, and debug builds are not affected. Until a
-kama release fixes it, keep each conversion in one file: for example, a helper that adds an `int32` to a `Query`,
-called from the other files.
 
 ## What it covers
 

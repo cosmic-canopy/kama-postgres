@@ -68,7 +68,8 @@ unsafe fn void runs(ref DynamicArray<Step> s, const ref string name, Wire reply)
 }
 
 unsafe fn string ran(ref Connection c, const ref string sql) {
-    Query q = sevenQuery(sql: sql);   // KPG-38: the int32 adapter's use stays in one file
+    Query q = Query.make(sql: copy sql);
+    q.add(value: 7);
     Result<Rows, PgError> r = c.query(q: q);
     return match (give r) {
         case Ok(value: rows): {

@@ -205,11 +205,11 @@ type value LocalDateTime implements Formattable, Serializable, Deserializable<Th
     }
     public ctor Result<LocalDateTime, Owned<Error>> deserialize(Deserializer r) {
         string text = r.readString();
-        if (r.failed()) { DeError e = r.errorCode(); return Result::Err(error: e); }
+        if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
         Result<LocalDateTime, DecodeError> v = LocalDateTime.parse(text: text);
         return match (v) {
             case Ok(value: x): Result::Ok(value: x);
-            case Err(error: pe): { r.failWith(e: DeError::Malformed); return Result::Err(error: DeError::Malformed); }
+            case Err(error: pe): { r.failWith(kind: DeErrorKind::Malformed); return Result::Err(error: DeError.of(kind: DeErrorKind::Malformed)); }
         };
     }
 }
@@ -333,11 +333,11 @@ type value TimeOfDay implements Formattable, Serializable, Deserializable<This> 
     }
     public ctor Result<TimeOfDay, Owned<Error>> deserialize(Deserializer r) {
         string text = r.readString();
-        if (r.failed()) { DeError e = r.errorCode(); return Result::Err(error: e); }
+        if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
         Result<TimeOfDay, DecodeError> v = TimeOfDay.parse(text: text);
         return match (v) {
             case Ok(value: x): Result::Ok(value: x);
-            case Err(error: pe): { r.failWith(e: DeError::Malformed); return Result::Err(error: DeError::Malformed); }
+            case Err(error: pe): { r.failWith(kind: DeErrorKind::Malformed); return Result::Err(error: DeError.of(kind: DeErrorKind::Malformed)); }
         };
     }
 }
@@ -393,11 +393,11 @@ type value TimeTz implements Formattable, Serializable, Deserializable<This> {
     }
     public ctor Result<TimeTz, Owned<Error>> deserialize(Deserializer r) {
         string text = r.readString();
-        if (r.failed()) { DeError e = r.errorCode(); return Result::Err(error: e); }
+        if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
         Result<TimeTz, DecodeError> v = TimeTz.parse(text: text);
         return match (v) {
             case Ok(value: x): Result::Ok(value: x);
-            case Err(error: pe): { r.failWith(e: DeError::Malformed); return Result::Err(error: DeError::Malformed); }
+            case Err(error: pe): { r.failWith(kind: DeErrorKind::Malformed); return Result::Err(error: DeError.of(kind: DeErrorKind::Malformed)); }
         };
     }
 }
@@ -484,11 +484,11 @@ type value Interval implements Formattable, Serializable, Deserializable<This> {
     }
     public ctor Result<Interval, Owned<Error>> deserialize(Deserializer r) {
         string text = r.readString();
-        if (r.failed()) { DeError e = r.errorCode(); return Result::Err(error: e); }
+        if (r.failed()) { return Result::Err(error: DeError.of(kind: r.errorKind())); }
         Result<Interval, DecodeError> v = Interval.parse(text: text);
         return match (v) {
             case Ok(value: x): Result::Ok(value: x);
-            case Err(error: pe): { r.failWith(e: DeError::Malformed); return Result::Err(error: DeError::Malformed); }
+            case Err(error: pe): { r.failWith(kind: DeErrorKind::Malformed); return Result::Err(error: DeError.of(kind: DeErrorKind::Malformed)); }
         };
     }
 }

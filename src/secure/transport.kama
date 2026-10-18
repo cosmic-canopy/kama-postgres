@@ -205,8 +205,8 @@ type resource TlsTransport implements Transport, Sendable {
     }
 
     public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
-        bool wantRead = match (interest) { case Read: true; case ReadWrite: true; case Write: false; };
-        bool wantWrite = match (interest) { case Write: true; case ReadWrite: true; case Read: false; };
+        bool wantRead = match (interest) { case Read: true; case ReadWrite: true; case Write: false; case _: true; };
+        bool wantWrite = match (interest) { case Write: true; case ReadWrite: true; case Read: false; case _: true; };
         if (wantRead && this.engine.hasBufferedInput()) { return Result::Ok(value: Ready.of(readable: true, writable: false)); }
         Deadline deadline = Deadline.none();
         if (timeoutMs >= 0) { deadline = Deadline.after(span: Duration.fromMillis(ms: cast<int64>(timeoutMs))); }

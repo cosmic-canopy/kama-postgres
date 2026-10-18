@@ -6,6 +6,15 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **Needs kama ≥ 0.9.667.** kama's serde contracts changed (a deserialization error is now a `DeErrorKind` and a
+  place), and the column reader and the parameter writer follow them:
+  - a column can be asked what it holds (`peekKind`) and an integer, oid or float column for its exact text
+    (`readNumberText`), so a type that reads whatever it finds (an untyped JSON value) can read a column;
+  - `rowAs` still passes over a column that no field claims, as before, now through serde's `unknownField`.
+- The 0.2.0 README's known issue (KPG-38, a release build failing when two files pass the same kind of parameter) is
+  fixed in kama 0.9.543, so the note is gone.
+
 ## [0.2.0] — 2026-10-03
 
 Phase 7, the full session. Needs **kama ≥ 0.9.523** and `@kama/tls` ^0.1.0. Verified on kama 0.9.523, debug and

@@ -1,93 +1,153 @@
-// Transactions on a real server: BEGIN's options as the server applies them, a READ ONLY transaction refusing a
-// write, Connection.transaction committing, rolling back, and nesting as savepoints, and a deferred constraint that
-// fails at COMMIT.
-import { std::collections::DynamicArray,
-         postgres::Connection, postgres::PgError, postgres::Rows, postgres::TransactionStatus, postgres::column,
-         postgres::TransactionOptions, postgres::IsolationLevel, postgres::AccessMode, postgres::TransactionBody,
-         postgres::sqlstate::READ_ONLY_SQL_TRANSACTION, postgres::sqlstate::UNIQUE_VIOLATION, postgres::sqlstate::DIVISION_BY_ZERO,
+// Transactions on a real server: the borrow window's Transaction committing, rolling back as it closes (falling
+// through and returning early), nesting as savepoints, ending nothing a COMMIT through the connection ended, and SET
+// TRANSACTION as the server applies it, for a transaction and for a savepoint; a deferred constraint that fails at
+// COMMIT; COMMIT of a failed transaction; and a window whose session the server ends, or that leaves a COPY open.
+import { std::collections::DynamicArray, std::time::Duration, std::time::sleep,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::TransactionStatus, postgres::columnOpt,
+         postgres::TransactionOptions, postgres::IsolationLevel, postgres::AccessMode, postgres::Transaction, postgres::CopyInfo,
+         postgres::sqlstate::READ_ONLY_SQL_TRANSACTION, postgres::sqlstate::UNIQUE_VIOLATION,
+         postgres::sqlstate::ACTIVE_SQL_TRANSACTION, postgres::sqlstate::DIVISION_BY_ZERO,
          postgres_integration_tests::check, postgres_integration_tests::conninfoFor, postgres_integration_tests::open,
-         postgres_integration_tests::scalar };
+         postgres_integration_tests::scalar, postgres_integration_tests::warningsLogged };
 export { transactionTests };
 
-// Runs statements in order, stopping at the first error, and keeps the first column of the last row read.
-type resource Script implements TransactionBody {
-    DynamicArray<string> statements;
-    string seen;
-    public ctor make(DynamicArray<string> statements) { this.statements = give statements; this.seen = ""; }
-    public unsafe fn Result<Unit, PgError> run(ref Connection conn) {
-        foreach (string sql in this.statements) {
-            Result<DynamicArray<Rows>, PgError> r = conn.simpleQuery(sql: sql);
-            match (give r) {
-                case Ok(value: results): {
-                    if (results.length() > 0 && results[0].rowCount() > 0) {
-                        Result<string, PgError> v = column::<string>(rows: results[0], row: 0, index: 0);
-                        match (give v) { case Ok(value: text): { this.seen = give text; } case Err(error: e): { } };
-                    }
-                }
-                case Err(error: e): { return Result::Err(error: give e); }
-            };
-        }
-        return Result::Ok(value: Unit::Unit);
-    }
-    public const fn const ref string last() { return this.seen; }
+// The first value of `sql`'s first result as text, or the error's message: `scalar`, inside a window.
+unsafe fn string valueIn(ref Transaction tx, const ref string sql) {
+    Result<DynamicArray<Rows>, PgError> r = tx.conn().simpleQuery(sql: sql);
+    DynamicArray<Rows> rs = match (give r) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+    if (rs.length() == 0 || rs[0].rowCount() == 0) { return "(no rows)"; }
+    Result<Optional<string>, PgError> v = columnOpt::<string>(rows: rs[0], row: 0, index: 0);
+    Optional<string> o = match (give v) { case Ok(value: x): give x; case Err(error: e): { return e.message(); } };
+    return match (give o) { case Some(value: t): give t; case None: "NULL"; };
 }
 
-// Runs an inner body as a nested transaction (a savepoint), and goes on whether it failed or not.
-type resource Nesting implements TransactionBody {
-    string before;
-    Script inner;
-    string after;
-    public ctor make(string before, Script inner, string after) { this.before = give before; this.inner = give inner; this.after = give after; }
-    public unsafe fn Result<Unit, PgError> run(ref Connection conn) {
-        Result<DynamicArray<Rows>, PgError> a = conn.simpleQuery(sql: this.before);
-        TransactionOptions none = TransactionOptions.defaults();
-        Result<Unit, PgError> nested = conn.transaction(body: this.inner, options: none);
-        Result<DynamicArray<Rows>, PgError> b = conn.simpleQuery(sql: this.after);
-        return match (give b) { case Ok(value: r): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
-    }
+// Run `sql` inside a window: its SQLSTATE if it failed, 0 if it ran.
+unsafe fn int32 runIn(ref Transaction tx, const ref string sql) {
+    Result<DynamicArray<Rows>, PgError> r = tx.conn().simpleQuery(sql: sql);
+    return match (r) { case Ok(value: rows): 0; case Err(error: e): e.sqlstate(); };
 }
 
-fn DynamicArray<string> list(const ref string a) { DynamicArray<string> v = DynamicArray.empty(); v.add(item: copy a); return v; }
-fn DynamicArray<string> pair(const ref string a, const ref string b) { DynamicArray<string> v = list(a: a); v.add(item: copy b); return v; }
+fn int32 stateOf(const ref Result<Unit, PgError> r) { return match (r) { case Ok(value: u): 0; case Err(error: e): e.sqlstate(); }; }
+
+unsafe fn string idsOf(ref Connection c) { return scalar(c: c, sql: "select coalesce(string_agg(id::text, ',' order by id), '-') from kp_tx"); }
+
+// A window left by a `return` with the body's error: rolled back.
+unsafe fn Result<Unit, PgError> failsHalfway(ref Connection c) {
+    borrow c.transaction() as tx {
+        int32 a = runIn(tx: ref tx, sql: "insert into kp_tx values (2)");
+        Result<DynamicArray<Rows>, PgError> r = tx.conn().simpleQuery(sql: "select 1/0");
+        match (give r) { case Ok(value: rows): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return tx.commit();
+    }
+}
 
 unsafe fn int32 transactionTests() {
     int32 f = 0;
     Result<Connection, PgError> opened = open(conninfo: conninfoFor(user: "kp_trust"));
     Connection c = match (give opened) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "transaction: connect (".concat(other: e.message()).concat(other: ")")); } };
     string made = scalar(c: c, sql: "create temp table kp_tx (id int primary key)");
-
-    // The options, as the server reports them inside the transaction.
-    Script show = Script.make(statements: pair(a: "show transaction_isolation", b: "select current_setting('transaction_read_only') || ' ' || current_setting('transaction_deferrable')"));
-    TransactionOptions strict = TransactionOptions.of(isolation: IsolationLevel::Serializable, access: AccessMode::ReadOnly, deferrable: true);
-    Script iso = Script.make(statements: list(a: "show transaction_isolation"));
-    Result<Unit, PgError> r0 = c.transaction(body: iso, options: strict);
-    Result<Unit, PgError> r1 = c.transaction(body: show, options: strict);
-    f = f + check(ok: iso.last().equals(other: "serializable") && show.last().equals(other: "on on"),
-                  what: "transaction: SERIALIZABLE READ ONLY DEFERRABLE, as the server sees it (".concat(other: iso.last()).concat(other: ", ").concat(other: show.last()).concat(other: ")"));
-
-    // READ ONLY refuses a write; the error is the call's, and the session is idle again. (A temporary table may be
-    // written in a read-only transaction, so the write is a CREATE TABLE.)
-    TransactionOptions readOnly = TransactionOptions.of(isolation: IsolationLevel::Default, access: AccessMode::ReadOnly, deferrable: false);
-    Script write = Script.make(statements: list(a: "create table kp_tx_never (id int)"));
-    Result<Unit, PgError> r2 = c.transaction(body: write, options: readOnly);
-    bool refused = match (r2) { case Ok(value: u): false; case Err(error: e): e.sqlstate() == READ_ONLY_SQL_TRANSACTION; };
-    f = f + check(ok: refused && c.transactionStatus() == TransactionStatus::Idle, what: "transaction: READ ONLY refuses a write (25006), and the session is idle");
-
-    // A nested transaction that fails is rolled back to its savepoint; the outer one goes on and commits.
-    Script innerBody = Script.make(statements: pair(a: "insert into kp_tx values (2)", b: "select 1/0"));
-    Nesting outer = Nesting.make(before: "insert into kp_tx values (1)", inner: give innerBody, after: "insert into kp_tx values (3)");
     TransactionOptions plain = TransactionOptions.defaults();
-    Result<Unit, PgError> r3 = c.transaction(body: outer, options: plain);
-    string ids = scalar(c: c, sql: "select string_agg(id::text, ',' order by id) from kp_tx");
-    f = f + check(ok: ids.equals(other: "1,3"), what: "transaction: the failed nested part is undone, the rest committed (".concat(other: ids).concat(other: ")"));
 
-    // A deferred constraint fails at COMMIT: that is the error, and the transaction is gone.
+    // Falling through rolls back; so does a `return` with the body's error.
+    borrow c.transaction() as tx { int32 a = runIn(tx: ref tx, sql: "insert into kp_tx values (1)"); }
+    Result<Unit, PgError> half = failsHalfway(c: ref c);
+    string none = idsOf(c: ref c);
+    f = f + check(ok: none.equals(other: "-") && stateOf(r: half) == DIVISION_BY_ZERO && c.transactionStatus() == TransactionStatus::Idle,
+                  what: "transaction: a window that falls through, or returns its error, keeps nothing (".concat(other: none).concat(other: ")"));
+
+    // tx.commit() keeps what was done.
+    string committed = "";
+    borrow c.transaction() as tx {
+        int32 a = runIn(tx: ref tx, sql: "insert into kp_tx values (3)");
+        Result<Unit, PgError> k = tx.commit();
+        committed = match (k) { case Ok(value: u): "ok"; case Err(error: e): e.message(); };
+    }
+    string kept = idsOf(c: ref c);
+    f = f + check(ok: committed.equals(other: "ok") && kept.equals(other: "3"), what: "transaction: tx.commit() keeps the row (".concat(other: kept).concat(other: ")"));
+
+    // A window inside a window is a savepoint: an inner window that falls through, and one whose statement fails, are
+    // undone; the outer goes on and commits.
+    borrow c.transaction() as tx {
+        int32 a = runIn(tx: ref tx, sql: "insert into kp_tx values (4)");
+        borrow tx.conn().transaction() as inner { int32 b = runIn(tx: ref inner, sql: "insert into kp_tx values (5)"); }
+        int32 d = runIn(tx: ref tx, sql: "insert into kp_tx values (6)");
+        borrow tx.conn().transaction() as inner {
+            int32 e = runIn(tx: ref inner, sql: "insert into kp_tx values (7)");
+            int32 g = runIn(tx: ref inner, sql: "select 1/0");
+        }
+        int32 h = runIn(tx: ref tx, sql: "insert into kp_tx values (8)");
+        Result<Unit, PgError> k = tx.commit();
+    }
+    string nested = idsOf(c: ref c);
+    f = f + check(ok: nested.equals(other: "3,4,6,8"), what: "transaction: inner windows are undone, the outer commits (".concat(other: nested).concat(other: ")"));
+
+    // A COMMIT through the connection ends the window's transaction: a block begun after it is the caller's.
+    borrow c.transaction() as tx {
+        Result<Unit, PgError> k = tx.conn().commit();
+        Result<Unit, PgError> b = tx.conn().begin(options: plain);
+        int32 a = runIn(tx: ref tx, sql: "insert into kp_tx values (9)");
+    }
+    bool stillOpen = c.transactionStatus() == TransactionStatus::InTransaction;
+    Result<Unit, PgError> closing = c.commit();
+    string after = idsOf(c: ref c);
+    f = f + check(ok: stillOpen && after.equals(other: "3,4,6,8,9"), what: "transaction: a block begun after the window's COMMIT is left open (".concat(other: after).concat(other: ")"));
+
+    // setOptions, as the server sees it.
+    TransactionOptions strict = TransactionOptions.of(isolation: IsolationLevel::Serializable, access: AccessMode::ReadOnly, deferrable: true);
+    string level = "";
+    string modes = "";
+    borrow c.transaction() as tx {
+        Result<Unit, PgError> o = tx.setOptions(options: strict);
+        level = valueIn(tx: ref tx, sql: "show transaction_isolation");
+        modes = valueIn(tx: ref tx, sql: "select current_setting('transaction_read_only') || ' ' || current_setting('transaction_deferrable')");
+    }
+    f = f + check(ok: level.equals(other: "serializable") && modes.equals(other: "on on"),
+                  what: "transaction: SERIALIZABLE READ ONLY DEFERRABLE, as the server sees it (".concat(other: level).concat(other: ", ").concat(other: modes).concat(other: ")"));
+
+    // READ ONLY refuses a write (a temporary table may be written in a read-only transaction, so the write is a CREATE
+    // TABLE); the window rolls back, and the session is idle.
+    TransactionOptions readOnly = TransactionOptions.of(isolation: IsolationLevel::Default, access: AccessMode::ReadOnly, deferrable: false);
+    int32 refused = 0;
+    borrow c.transaction() as tx {
+        Result<Unit, PgError> o = tx.setOptions(options: readOnly);
+        refused = runIn(tx: ref tx, sql: "create table kp_tx_never (id int)");
+    }
+    f = f + check(ok: refused == READ_ONLY_SQL_TRANSACTION && c.transactionStatus() == TransactionStatus::Idle, what: "transaction: READ ONLY refuses a write (25006), and the session is idle");
+
+    // For a savepoint the server takes READ ONLY, and refuses an isolation level (25001); either way the inner window
+    // is undone and the outer goes on.
+    TransactionOptions serializable = TransactionOptions.of(isolation: IsolationLevel::Serializable, access: AccessMode::Default, deferrable: false);
+    int32 isolationRefused = 0;
+    string readOnlySet = "";
+    int32 writeRefused = 0;
+    borrow c.transaction() as tx {
+        borrow tx.conn().transaction() as inner {
+            Result<Unit, PgError> o = inner.setOptions(options: serializable);
+            isolationRefused = stateOf(r: o);
+        }
+        borrow tx.conn().transaction() as inner {
+            Result<Unit, PgError> o = inner.setOptions(options: readOnly);
+            readOnlySet = match (o) { case Ok(value: u): "ok"; case Err(error: e): e.message(); };
+            writeRefused = runIn(tx: ref inner, sql: "create table kp_tx_never (id int)");
+        }
+        int32 a = runIn(tx: ref tx, sql: "insert into kp_tx values (10)");
+        Result<Unit, PgError> k = tx.commit();
+    }
+    string withSavepoints = idsOf(c: ref c);
+    f = f + check(ok: isolationRefused == ACTIVE_SQL_TRANSACTION && readOnlySet.equals(other: "ok") && writeRefused == READ_ONLY_SQL_TRANSACTION && withSavepoints.equals(other: "3,4,6,8,9,10"),
+                  what: "transaction: a savepoint's options are the server's to take or refuse, and the outer commits (".concat(other: readOnlySet).concat(other: ", ").concat(other: withSavepoints).concat(other: ")"));
+
+    // A deferred constraint fails at COMMIT: that is the commit's error, nothing is kept, and the session goes on.
     string deferred = scalar(c: c, sql: "create temp table kp_tx_deferred (id int unique deferrable initially deferred)");
-    Script twice = Script.make(statements: pair(a: "insert into kp_tx_deferred values (1)", b: "insert into kp_tx_deferred values (1)"));
-    Result<Unit, PgError> r4 = c.transaction(body: twice, options: plain);
-    bool atCommit = match (r4) { case Ok(value: u): false; case Err(error: e): e.sqlstate() == UNIQUE_VIOLATION; };
+    int32 atCommit = 0;
+    borrow c.transaction() as tx {
+        int32 a = runIn(tx: ref tx, sql: "insert into kp_tx_deferred values (1)");
+        int32 b = runIn(tx: ref tx, sql: "insert into kp_tx_deferred values (1)");
+        Result<Unit, PgError> k = tx.commit();
+        atCommit = stateOf(r: k);
+    }
     string count = scalar(c: c, sql: "select count(*) from kp_tx_deferred");
-    f = f + check(ok: atCommit && count.equals(other: "0") && c.transactionStatus() == TransactionStatus::Idle,
+    f = f + check(ok: atCommit == UNIQUE_VIOLATION && count.equals(other: "0") && c.transactionStatus() == TransactionStatus::Idle,
                   what: "transaction: a deferred unique constraint fails at COMMIT, nothing kept (".concat(other: count).concat(other: ")"));
 
     // A COMMIT after an error inside the transaction rolls back: RolledBack.
@@ -97,5 +157,35 @@ unsafe fn int32 transactionTests() {
     string said = match (k) { case Ok(value: u): "ok"; case Err(error: e): e.message(); };
     f = f + check(ok: said.equals(other: "commit unexpectedly resulted in rollback") && c.transactionStatus() == TransactionStatus::Idle,
                   what: "transaction: COMMIT of a failed transaction (".concat(other: said).concat(other: ")"));
+
+    // The server ends the session inside a window (idle_in_transaction_session_timeout): the window's ROLLBACK finds
+    // it gone, and the connection is closed, with no wait.
+    Result<Connection, PgError> idleOpened = open(conninfo: conninfoFor(user: "kp_trust"));
+    match (give idleOpened) {
+        case Ok(value: x): {
+            Connection idle = give x;
+            string timeout = scalar(c: idle, sql: "set idle_in_transaction_session_timeout = 100");
+            borrow idle.transaction() as tx { sleep(d: Duration.fromMillis(ms: 400i64)); }
+            f = f + check(ok: idle.isClosed(), what: "transaction: a session the server ended inside the window is closed");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "transaction: connect for the idle timeout"); }
+    };
+
+    // A COPY left open: the window cannot roll back, so it closes the connection, and says so in the log.
+    Result<Connection, PgError> copyOpened = open(conninfo: conninfoFor(user: "kp_trust"));
+    match (give copyOpened) {
+        case Ok(value: x): {
+            Connection copying = give x;
+            string table = scalar(c: copying, sql: "create temp table kp_tx_copy (id int)");
+            int32 before = warningsLogged();
+            bool started = false;
+            borrow copying.transaction() as tx {
+                Result<CopyInfo, PgError> st = tx.conn().startCopyIn(sql: "copy kp_tx_copy from stdin");
+                started = match (st) { case Ok(value: info): true; case Err(error: e): false; };
+            }
+            f = f + check(ok: started && copying.isClosed() && warningsLogged() == before + 1, what: "transaction: a COPY left open in a window closes the connection, with a warning");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "transaction: connect for the COPY"); }
+    };
     return f;
 }

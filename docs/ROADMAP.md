@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-18: phases 0–7 are done. 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (tagged `v0.2.1`, for the registry to publish). 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-18: phases 0–7 are done, and phase 8 is under way (S0 and S0b are done). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -19,7 +19,7 @@ Where this is, 2026-10-18: phases 0–7 are done. 0.2.0 carried phase 7, and 0.2
     dimension included. Every built-in type this client reads round-trips on every server version.
 - **The full session (phase 7).**
   - A statement cache, which is pgx's design.
-  - Transactions and savepoints, with a body helper that nests.
+  - Transactions and savepoints, scoped by a borrow window that nests (since phase 8's S0b).
   - COPY in and out.
   - Waiting for notifications.
   - libpq's pipeline mode, with pgx's Batch on top.
@@ -34,7 +34,8 @@ cases the container's libpq answered against the same server and files. Phase 5'
 package needs the 0.9.523 release that carries them ([KAMA_GAPS.md](../KAMA_GAPS.md)). Phase 7's tests replay the traces
 of libpq's `libpq_pipeline` message for message and the cases of `001_stream_rep.pl` and `003_load_balance_host_list.pl`,
 and ask the container's libpq about each `target_session_attrs` case against a primary and its standby. On kama 0.9.667,
-KPG-33 to KPG-38 are fixed and KPG-39 is open. Phase 8 is next: its plan is below.
+KPG-33 to KPG-38 are fixed, and KPG-39 and KPG-40 (a question about nested windows) are open. Phase 8 is under way: its
+plan is below.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -49,7 +50,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | next: S0 (kama 0.9.667) done, as 0.2.1 |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1) and S0b done; S1 next |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -60,7 +61,7 @@ release, and the integration matrix (14–19, debug, release and TLS). Before a 
 it fail.
 
 - **S0, done (0.2.1).** The port to kama 0.9.667.
-- **S0b, scoped transactions** (KPG-35 is fixed in 0.9.658: a view's `~dtor` closes its borrow window).
+- **S0b, done: scoped transactions** (KPG-35 is fixed in 0.9.658: a view's `~dtor` closes its borrow window).
   - The shape is `borrow conn.transaction() as tx { … }`. It was prototyped on 0.9.667, nesting and an early return
     included.
   - `Connection` implements a `@viewable` contract whose nullary mint `transaction()` sends BEGIN, or SAVEPOINT inside
@@ -76,6 +77,11 @@ it fail.
   - It **replaces** `transaction(body:, options:)` and `TransactionBody` in 0.3.0. That is a breaking change, made
     because there is one way to do a thing, and kama has no overloading, so both cannot be called `transaction`.
     `begin`, `commit`, `rollback` and the savepoint methods stay.
+  - As built: a view holds no resource, so `began()`'s error waits on the `Connection` (which is why `PgError` became
+    `Sendable`, on `@kama/tls` 0.1.3). "The server says it is over" is a count of ReadyForQuery's returns to idle,
+    taken as the window opens. A window that cannot roll back closes the connection, as pgx's Rollback does.
+    `setOptions` on a savepoint is the server's to take (READ ONLY) or refuse (an isolation level, 25001), which fails
+    the savepoint only.
 - **S1, connection groundwork.**
   - `Connection.ping()`: an empty query, with ReadyForQuery back.
   - `Connection.resetSession()`: Npgsql's reset that keeps prepared statements (CLOSE ALL, SET SESSION AUTHORIZATION
@@ -100,6 +106,11 @@ it fail.
     30 min, and a health check every minute. The acquire timeout is 30 s, as sqlx and HikariCP use.
   - **Release.** A closed, busy, COPY or pipeline connection is closed. One inside a transaction is rolled back, then
     reset (decision below).
+    - `Connection.settle()` (S0b) is the rollback half: it reads off an open result, sends ROLLBACK, and closes a
+      connection still in a block. Release must check `pipelineStatus()` itself, because `transactionStatus()` says
+      Idle in pipeline mode once the queue drains.
+    - `borrow lease.conn().transaction() as tx` compiles over a lease whose `fn ref Connection conn()` returns
+      `this.slot[0]` (probed on 0.9.667).
 - **S4, maintenance.** One isolate per pool, stopped when the pool drops. It closes idle and expired connections, pings
     the rest, and keeps min idle. Acquire also pings a connection that has been idle for more than 1 s.
 - **S5, pool tests.**
@@ -127,8 +138,11 @@ it fail.
   - To get it: `kama-macos-universal-v0.9.667.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its
     `.sha256` and unpacked anywhere.
   - Run with `KAMA=<dir>/bin/kama tools/test.sh`, or `curl -fsSL https://kama-lang.org/install.sh | KAMA_VERSION=v0.9.667 sh`.
-- **kama-tls.** `../kama-tls` could not be read from this session (macOS denied access). `@kama/tls` 0.1.1 builds
-  unchanged on 0.9.667.
+- **kama-tls.** `../kama-tls` is readable again. The package needs `@kama/tls` ≥ 0.1.3 (its `TlsError` is `Sendable`),
+  and the locks pin 0.1.4.
+- **KPG-40 asks cstar to confirm** that `borrow tx.conn().transaction() as inner` (a second window over the connection,
+  through the view) is intended. 0.3.0's nesting relies on it. If cstar says no, nesting moves to a mint on the view
+  (`borrow tx.transaction() as inner`) before 0.3.0.
 - **KPG-39 is open.** Std's JSON cannot be imported in the unit tests until it is fixed. When it is, add a `JsonValue`
   test beside `typed_test.kama`'s `Untyped`, and drop the README's known issue.
 
@@ -179,9 +193,10 @@ it fail.
 - **The statement cache is pgx's.** It keeps an LRU of named statements, on by default, with a describe-only mode for
   poolers and an off mode. A plan the server refuses after a schema change is retried once outside a transaction, as
   pgjdbc does. libpq has no cache, so this follows the drivers that have one.
-- **Transactions are methods plus a body.** `transaction(body:)` runs a `TransactionBody`, which nests as a savepoint,
-  because kama has no closures. The request for an exit hook on a borrow window is KPG-35. Once it lands, this
-  becomes `borrow conn.transaction() as tx { … }`.
+- **A transaction is a borrow window,** `borrow conn.transaction() as tx { … }`, psycopg's `with conn.transaction()`
+  with no closure. The window rolls back unless the transaction is over, on every path out of the block, and a window
+  inside a window is a savepoint. It replaced 0.2's `transaction(body:)` once KPG-35 gave a view a destructor that
+  runs as its window closes.
 - **Pipelining is libpq's pipeline mode, ported step by step,** with a pgx-style `Batch` on top. Its tests are libpq's
   own traces.
 - **A query timeout cancels and keeps the connection,** as Npgsql, pgjdbc and asyncpg do:

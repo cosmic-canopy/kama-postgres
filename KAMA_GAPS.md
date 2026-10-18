@@ -16,7 +16,8 @@ Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.47
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** KPG-39 (HIGH). Every earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** KPG-39 (HIGH) and KPG-40 (LOW, a question). Every earlier gap is fixed, except KPG-8, which is closed as a
+non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -26,6 +27,50 @@ changes the right design here, say so and we will follow it.
 ---
 
 ## OPEN
+
+### KPG-40 · LOW · Is a window inside a window, through a view's `ref` accessor, intended?
+
+**A question, not a bug.** @kama/postgres 0.3.0's API relies on the answer being yes, so we ask before it ships. The
+scoped transaction nests as a savepoint by opening a second window over the same connection, reached through the first
+view: `borrow tx.conn().transaction() as inner { … }`. kama 0.9.667 accepts it and runs it, both destructors in order.
+SPEC.md's borrow rules (around line 412) say "a window inside a window over the same storage" is refused
+(`xfail/borrow_nested_same_place`). The checker cannot see through `conn()`'s `UnsafePtr`, so this may be accepted by
+accident.
+
+Reduced, with no package. On 0.9.667 this checks and prints `2 0`:
+
+```kama
+import { core::println };
+@viewable type contract Transacts for resource { fn Tx transaction(); }
+type view Tx {
+    UnsafePtr<Conn> c;
+    unsafe ctor over(UnsafePtr<Conn> c) { this.c = c; }
+    public unsafe fn ref Conn conn() { return this.c[0]; }
+    unsafe ~Tx() { this.c[0].leave(); }
+}
+type resource Conn implements Transacts {
+    int32 open = 0;
+    public ctor make() { this.open = 0; }
+    public unsafe fn Tx transaction() { this.open = this.open + 1; return Tx.over(c: addr(of: this)); }
+    public fn void leave() { this.open = this.open - 1; }
+    public const fn int32 depth() { return this.open; }
+}
+fn int32 main() {
+    Conn c = Conn.make();
+    int32 inside = 0;
+    borrow c.transaction() as tx {
+        borrow tx.conn().transaction() as inner { inside = inner.conn().depth(); }   // a second window over `c`
+    }
+    int32 after = c.depth();
+    println(s: "${inside} ${after}");
+    return 0;
+}
+```
+
+- **Why we think it is sound here:** the view owns no storage that could move. The inner window freezes the alias
+  `tx` (a place-returning call's receiver), so the outer transaction cannot be committed from inside the savepoint.
+- **If it should be refused,** the alternative we would follow is a mint on the view itself (a `@viewable` contract
+  `for view`), so nesting reads `borrow tx.transaction() as inner`. Say which, and we will change before 0.3.0.
 
 ### KPG-39 · HIGH · Importing std's JSON makes `Optional<int64>` (and `uint64`, `float64`) not `Sendable`
 

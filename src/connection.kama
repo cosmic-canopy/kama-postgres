@@ -1,7 +1,7 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::validate,
          std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error, std::io::IoError, std::io::IoErrorKind,
          std::memory::Owned, std::net::SocketAddr, std::net::IpAddr, std::net::resolve, std::net::parseIp,
-         std::time::Duration, std::random::Rng, std::random::shuffle,
+         std::time::Duration, std::random::Rng, std::random::shuffle, std::log::logWarn,
          postgres::PgError, postgres::ServerError, postgres::ConnectError, postgres::ConnectAttempt,
          postgres::Config, postgres::HostKind, postgres::ChannelBindingMode, postgres::RequireAuth,
          postgres::Transport, postgres::socketPathMax,
@@ -20,7 +20,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::protocol::execute as sendExecute, postgres::protocol::closeStatement as sendCloseStatement,
          postgres::protocol::closePortal as sendClosePortal, postgres::protocol::sync as sendSync,
          postgres::protocol::cancelRequest as sendCancelRequest, postgres::CancelToken,
-         postgres::TransactionOptions, postgres::Savepoint, postgres::TransactionBody,
+         postgres::TransactionOptions, postgres::Savepoint, postgres::Transaction,
          postgres::CopyInfo, postgres::CopyChunk, postgres::protocol::CopyFormats,
          postgres::protocol::copyData as sendCopyData, postgres::protocol::copyDone as sendCopyDone,
          std::io::Reader, std::io::Writer, std::io::writeAll, std::collections::FixedArray,
@@ -45,6 +45,9 @@ export { Connection, TransactionStatus };
 // Unknown once the connection is closed.
 type enum TransactionStatus implements Sendable { Idle, Active, InTransaction, Failed, Unknown }
 
+// What lets `borrow conn.transaction() as tx { … }` mint a Transaction: the window that scopes it.
+@viewable type contract Transactional for resource { fn Transaction transaction(); }
+
 // The authentication request codes (AUTH_REQ_* in PostgreSQL's src/include/libpq/protocol.h).
 comptime int32 AUTH_OK = 0;
 comptime int32 AUTH_PASSWORD = 3;
@@ -53,7 +56,7 @@ comptime int32 AUTH_SASL = 10;
 comptime int32 AUTH_SASL_CONT = 11;
 comptime int32 AUTH_SASL_FIN = 12;
 
-type resource Connection implements Sendable {
+type resource Connection implements Sendable, Transactional {
     Wire wire;
     MessageWriter outbox;
     bool live = false;
@@ -87,6 +90,11 @@ type resource Connection implements Sendable {
     Deadline due;
     bool cancelling = false;
     int64 savepoints = 0i64;   // the names given so far: sp_1, sp_2, …
+    // Scoped transactions (Transaction): how many transaction blocks the server has reported ended, how many windows
+    // have been minted, and the last mint's error when its BEGIN (or SAVEPOINT) failed, until began() claims it.
+    int64 txEnded = 0i64;
+    int64 mints = 0i64;
+    DynamicArray<PgError> unbegun;
     uint8 copyMode = 0ui8;     // a COPY in progress: 1 FROM STDIN (copy-in), 2 TO STDOUT (copy-out); 0 none
     // The statement cache (Config.setStatementCache), the statements it let go that the server is still to close,
     // the CloseCompletes owed for those sent, and for the command in hand whether its statement came from the cache.
@@ -131,6 +139,9 @@ type resource Connection implements Sendable {
         this.due = Deadline.none();
         this.cancelling = false;
         this.savepoints = 0i64;
+        this.txEnded = 0i64;
+        this.mints = 0i64;
+        this.unbegun = DynamicArray.empty();
         this.copyMode = 0ui8;
         this.cache = StatementCache.make(mode: CacheMode::Off, capacity: 0);
         this.closing = DynamicArray.empty();
@@ -172,6 +183,9 @@ type resource Connection implements Sendable {
         this.due = Deadline.none();
         this.cancelling = false;
         this.savepoints = 0i64;
+        this.txEnded = 0i64;
+        this.mints = 0i64;
+        this.unbegun = DynamicArray.empty();
         this.copyMode = 0ui8;
         this.cache = StatementCache.make(mode: CacheMode::Off, capacity: 0);
         this.closing = DynamicArray.empty();
@@ -579,7 +593,7 @@ type resource Connection implements Sendable {
                     if (!copying) { return this.violation(detail: unexpected(tag: 99ui8)); }
                     copying = false;
                 }
-                case ReadyForQuery(status: s): { this.txStatus = s; done = true; }
+                case ReadyForQuery(status: s): { this.ready(status: s); done = true; }
                 case _: { return this.violation(detail: "unexpected response from server: a message the simple query protocol does not send"); }
             };
         }
@@ -783,41 +797,84 @@ type resource Connection implements Sendable {
     // ROLLBACK TO SAVEPOINT: undo what was done since it. The savepoint stays, to roll back to again or release.
     public unsafe fn Result<Unit, PgError> rollbackToSavepoint(const ref Savepoint sp) { return this.command(sql: "ROLLBACK TO SAVEPOINT ".concat(other: sp.name())); }
 
-    // Run `body` in a transaction, as psycopg's `with conn.transaction()` and pgx's BeginFunc do: BEGIN with `options`,
-    // then COMMIT if the body returns Ok, or ROLLBACK if it returns Err, whose error is then this call's. Inside an
-    // open transaction it nests as a savepoint (released, or rolled back to and released), and `options` do not
-    // apply. Rows the body left unread are read first. If ending the transaction fails, that error is returned.
-    public unsafe fn Result<Unit, PgError> transaction(TransactionBody body, const ref TransactionOptions options) {
-        Result<Unit, PgError> ok = this.idle();
-        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        bool nested = this.txStatus != 73ui8;   // 'I'
-        if (nested) {
-            Result<Savepoint, PgError> taken = this.savepoint();
-            Savepoint sp = match (give taken) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
-            Result<Unit, PgError> ran = body.run(conn: ref this);
-            Result<Unit, PgError> settled = this.discardRows();
-            match (give ran) {
-                case Ok(value: u): { return this.releaseSavepoint(sp: give sp); }
-                case Err(error: e): {
-                    Result<Unit, PgError> back = this.rollbackToSavepoint(sp: sp);
-                    Result<Unit, PgError> gone = this.releaseSavepoint(sp: give sp);
-                    return Result::Err(error: give e);
-                }
-            };
+    // ---- scoped transactions ----
+
+    // A transaction for a borrow window to scope: `borrow conn.transaction() as tx { … }`. BEGIN, or inside a
+    // transaction block a savepoint (sp_1, sp_2, … as `savepoint()` names them), so a window inside a window nests.
+    // A mint cannot return a Result: `tx.began()` says whether the statement succeeded. Options are `tx.setOptions`.
+    public unsafe fn Transaction transaction() {
+        this.mints = this.mints + 1i64;
+        int64 mint = this.mints;
+        this.unbegun = DynamicArray.empty();
+        int64 point = 0i64;
+        string sql = "BEGIN";
+        if (this.txStatus != 73ui8) {   // 'I'
+            point = this.savepoints + 1i64;
+            this.savepoints = point;
+            sql = "SAVEPOINT sp_${point}";
         }
-        Result<Unit, PgError> begun = this.begin(options: options);
-        match (give begun) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        Result<Unit, PgError> ran = body.run(conn: ref this);
-        Result<Unit, PgError> settled = this.discardRows();
-        match (give ran) {
-            case Ok(value: u): { return this.commit(); }
-            case Err(error: e): {
-                Result<Unit, PgError> back = this.rollback();
-                return Result::Err(error: give e);
-            }
-        };
-        return Result::Err(error: PgError::Closed);
+        Result<Unit, PgError> r = this.command(sql: sql);
+        bool open = true;
+        match (give r) { case Ok(value: u): { } case Err(error: e): { this.unbegun.add(item: give e); open = false; } };
+        return Transaction.over(host: addr(of: this), point: point, epoch: this.txEnded, mint: mint, open: open);
     }
+
+    // The error of the window `mint` made, whose transaction did not begin: once, and only while no later window has
+    // been minted.
+    fn Result<Unit, PgError> unbegunError(int64 mint) {
+        if (mint == this.mints) {
+            Optional<PgError> e = this.unbegun.pop();
+            match (give e) { case Some(value: x): { return Result::Err(error: give x); } case None: { } };
+            return Result::Err(error: PgError::Usage(detail: "the transaction did not begin, and began() has returned why"));
+        }
+        return Result::Err(error: PgError::Usage(detail: "the transaction did not begin, and why was dropped when a later transaction() began"));
+    }
+
+    // How many transaction blocks the server has reported ended (ReadyForQuery back to idle).
+    const fn int64 blocksEnded() { return this.txEnded; }
+
+    // End a window's transaction: COMMIT or ROLLBACK, or for the savepoint sp_`point` RELEASE, or ROLLBACK TO and
+    // RELEASE in one message, as psycopg sends them.
+    unsafe fn Result<Unit, PgError> endWindow(int64 point, bool commit) {
+        if (point == 0i64) {
+            if (commit) { return this.commit(); }
+            return this.rollback();
+        }
+        if (commit) { return this.command(sql: "RELEASE SAVEPOINT sp_${point}"); }
+        return this.command(sql: "ROLLBACK TO SAVEPOINT sp_${point}; RELEASE SAVEPOINT sp_${point}");
+    }
+
+    // A window closes: end its transaction unless it is over (it did not begin, the view ended it, or the server has
+    // reported a block ended since it began). A savepoint that cannot be rolled back to closes the connection, unless
+    // the server refused it, which leaves the transaction failed for its owner's COMMIT to report.
+    unsafe fn void settleWindow(int64 point, int64 epoch, bool open, bool done) {
+        if (!this.live || !open || done || this.txEnded != epoch) { return; }
+        if (point == 0i64) { this.settle(); return; }
+        Result<Unit, PgError> drained = this.discardRows();
+        Result<Unit, PgError> back = this.endWindow(point: point, commit: false);
+        bool kept = match (back) { case Ok(value: u): true; case Err(error: e): this.live && isServerError(e: e); };
+        if (!kept) { this.abandon(r: back); }
+    }
+
+    // Leave no transaction block open: read off an open result, then ROLLBACK. A connection still in a block after
+    // that (the ROLLBACK failed, or could not be sent while a COPY or pipeline mode is in progress) is closed, as pgx
+    // closes one whose rollback failed: the state it is in is not known.
+    unsafe fn void settle() {
+        if (!this.live) { return; }
+        Result<Unit, PgError> drained = this.discardRows();
+        Result<Unit, PgError> back = this.rollback();
+        if (this.txStatus != 73ui8) { this.abandon(r: back); }
+    }
+
+    // Close a connection whose transaction could not be ended, and log why.
+    unsafe fn void abandon(const ref Result<Unit, PgError> r) {
+        if (!this.live) { return; }
+        string why = match (r) { case Ok(value: u): "the session is still in a transaction block"; case Err(error: e): e.message(); };
+        logWarn(tag: "postgres", msg: "could not end the transaction its window opened (".concat(other: why).concat(other: "): closing the connection"));
+        this.close();
+    }
+
+    friend postgres::Transaction[unbegunError, blocksEnded, endWindow, command, settleWindow];
 
     // A statement run for its effect alone.
     unsafe fn Result<Unit, PgError> command(const ref string sql) {
@@ -1056,7 +1113,7 @@ type resource Connection implements Sendable {
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
             if (background(m: m)) { this.absorb(m: give m); continue; }
             match (give m) {
-                case ReadyForQuery(status: s): { this.txStatus = s; return Result::Ok(value: Unit::Unit); }
+                case ReadyForQuery(status: s): { this.ready(status: s); return Result::Ok(value: Unit::Unit); }
                 case CloseComplete: { if (!this.owedClose()) { return Result::Err(error: this.broken(detail: unexpected(tag: 51ui8))); } }
                 case ErrorResponse(fields: f): {
                     // An error at the sync itself (a deferred constraint at the implicit commit): a result of its own,
@@ -1414,7 +1471,7 @@ type resource Connection implements Sendable {
                     if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
                     failed.add(item: PgError::Server(error: give e));
                 }
-                case ReadyForQuery(status: s): { this.txStatus = s; done = true; }
+                case ReadyForQuery(status: s): { this.ready(status: s); done = true; }
                 case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place in a COPY's start")); }
             };
         }
@@ -1471,7 +1528,7 @@ type resource Connection implements Sendable {
                     if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
                     failed.add(item: PgError::Server(error: give e));
                 }
-                case ReadyForQuery(status: s): { this.txStatus = s; done = true; }
+                case ReadyForQuery(status: s): { this.ready(status: s); done = true; }
                 case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place at the end of a COPY")); }
             };
         }
@@ -1722,7 +1779,7 @@ type resource Connection implements Sendable {
                 }
                 case ReadyForQuery(status: s): {
                     if (pipelined) { return Result::Err(error: this.broken(detail: unexpected(tag: 90ui8))); }
-                    this.txStatus = s;
+                    this.ready(status: s);
                     done = true;
                 }
                 case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place while describing a statement")); }
@@ -1868,7 +1925,7 @@ type resource Connection implements Sendable {
                 }
                 case ReadyForQuery(status: s): {
                     if (pipelined || (this.bindPending && failed.length() == 0)) { return Result::Err(error: this.broken(detail: unexpected(tag: 90ui8))); }
-                    this.txStatus = s;
+                    this.ready(status: s);
                     done = true;
                 }
                 case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place in a query's result")); }
@@ -1911,7 +1968,7 @@ type resource Connection implements Sendable {
                     if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }
                     failed.add(item: PgError::Server(error: give e));
                 }
-                case ReadyForQuery(status: s): { this.txStatus = s; done = true; }
+                case ReadyForQuery(status: s): { this.ready(status: s); done = true; }
                 case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place after a Close")); }
             };
         }
@@ -2231,7 +2288,7 @@ type resource Connection implements Sendable {
                     case NoticeResponse(fields: f): { this.deliver(fields: give f); }
                     case ErrorResponse(fields: f): { return Result::Err(error: PgError::Server(error: ServerError.make(fields: give f))); }
                     case ReadyForQuery(status: s): {
-                        this.txStatus = s;
+                        this.ready(status: s);
                         Optional<string> encoding = this.parameter(name: "client_encoding");
                         match (give encoding) {
                             case Some(value: e): {
@@ -2443,6 +2500,13 @@ type resource Connection implements Sendable {
     }
 
     // The session is over: the transport is shut and every later call is `Closed`.
+    // ReadyForQuery's transaction status. A block that ends (the status goes back to idle) is counted, which is how a
+    // Transaction knows the server has ended the block its window opened.
+    fn void ready(uint8 status) {
+        if (status == 73ui8 && this.txStatus != 73ui8) { this.txEnded = this.txEnded + 1i64; }
+        this.txStatus = status;
+    }
+
     unsafe fn void lose() {
         this.busy = false;
         this.streaming = false;
@@ -2496,6 +2560,7 @@ type resource Errand {
 }
 
 fn bool isTimeout(const ref PgError e) { return match (e) { case Timeout: true; case _: false; }; }
+fn bool isServerError(const ref PgError e) { return match (e) { case Server(error: s): true; case _: false; }; }
 
 // The server's refusal to run a cached plan whose result has changed shape (RevalidateCachedQuery).
 fn bool isStalePlan(const ref PgError e) {

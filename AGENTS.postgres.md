@@ -137,6 +137,16 @@ release it is built and tested with, and the first with everything this package 
   host index and the `DialTarget`, and `Opener` dials it again. A cancel runs the session's encryption plan, sends
   CancelRequest, and waits for the server to close. A query timeout cancels through the same route, then waits the
   grace period.
+- **A transaction is a borrow window:** `borrow conn.transaction() as tx { … }` (`src/transaction.kama`, and the mint
+  and its helpers under "scoped transactions" in `src/connection.kama`).
+  - The mint sends BEGIN, or SAVEPOINT inside a block. The view's `~Transaction` calls `Connection.settleWindow`,
+    which rolls back unless the transaction is over.
+  - "Over" means the view ended it (`done`), or the server reported a block ended since the mint: `txEnded` counts
+    ReadyForQuery's returns to idle, through `ready(status:)`. Every ReadyForQuery handler goes through `ready`.
+  - A view holds no resource, so `began()`'s error waits on the `Connection` (`unbegun`), claimed once.
+  - A rollback the window cannot do closes the connection (`settle`, `abandon`), as pgx's Rollback does. `settle()` is
+    also the pool's rollback on release.
+  - The `@viewable` contract `Transactional` is not exported: a consumer opens the window without importing it.
 - **Parameters are `PgParam`s** (`src/query.kama`), a contract this package declares, with `type adapter`s for
   the primitives, `DynamicArray`, `Optional` (None is NULL), std's `Uuid`, `Timestamp` and `Date`, and its own
   types. Each writes itself through a `Serializer`. `Query.add(value:)` and the `pg` tag's holes
@@ -225,6 +235,14 @@ release it is built and tested with, and the first with everything this package 
   - A `match` on a std enum marked `@nonExhaustive` (`std::net::Interest`, `DeErrorKind`) needs `case _:`.
   - A deserialization error is a kind and a place: `r.failWith(kind: DeErrorKind::Malformed)`, then
     `Result::Err(error: DeError.of(kind: r.errorKind()))`.
+  - A `type view` holds only values and raw pointers: no `string`, no resource. What it must report (an error) lives on
+    the type it views.
+  - A mint is nullary and returns the bare view, so it can neither take options nor fail: a method on the view does
+    the rest (`setOptions`, `began`).
+  - Inside a `borrow` window the host is frozen: reach it through the view (`tx.conn()`). Since a `ref`-returning call
+    cannot feed a `ref` parameter, a helper takes the view (`ref Transaction`), not the connection.
+  - A type that holds a `PgError` must be `Sendable` if it is held by a `Sendable` one, and so must every payload:
+    that is why the error types (and `@kama/tls`'s `TlsError`) declare it.
 
 - **Nothing from the server is trusted.**
   - Every length is bounded before it is used.

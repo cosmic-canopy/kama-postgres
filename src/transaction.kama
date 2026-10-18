@@ -1,9 +1,9 @@
 import { postgres::PgError, postgres::Connection };
-export { IsolationLevel, AccessMode, TransactionOptions, Savepoint, TransactionBody };
+export { IsolationLevel, AccessMode, TransactionOptions, Savepoint, Transaction };
 
-// Transactions: what BEGIN asks for, a savepoint inside a transaction, and the body Connection.transaction runs.
-// libpq leaves transactions to SQL; these are the drivers' shape (psycopg's `with conn.transaction()`, pgx's
-// BeginFunc), over the same statements.
+// Transactions: what BEGIN asks for, a savepoint inside a transaction, and the transaction a borrow window scopes.
+// libpq leaves transactions to SQL; these are the drivers' shape (psycopg's `with conn.transaction()`, pgx's Tx),
+// over the same statements.
 
 // SET TRANSACTION's isolation levels. Default leaves the session's (default_transaction_isolation).
 type enum IsolationLevel implements Sendable { Default, ReadCommitted, RepeatableRead, Serializable, ReadUncommitted }
@@ -25,8 +25,10 @@ type value TransactionOptions implements Sendable {
     }
 
     // The BEGIN statement these options make.
-    public const fn string sql() {
-        string text = "BEGIN";
+    public const fn string sql() { return "BEGIN".concat(other: this.modes()); }
+
+    // The transaction modes, each after a space, as BEGIN and SET TRANSACTION take them: "" for the defaults.
+    public const fn string modes() {
         string level = match (this.isolation) {
             case Default: "";
             case ReadCommitted: " ISOLATION LEVEL READ COMMITTED";
@@ -35,7 +37,7 @@ type value TransactionOptions implements Sendable {
             case ReadUncommitted: " ISOLATION LEVEL READ UNCOMMITTED";
         };
         string mode = match (this.access) { case Default: ""; case ReadWrite: " READ WRITE"; case ReadOnly: " READ ONLY"; };
-        text = text.concat(other: level).concat(other: mode);
+        string text = level.concat(other: mode);
         if (this.deferrable) { text = text.concat(other: " DEFERRABLE"); }
         return text;
     }
@@ -49,9 +51,78 @@ type resource Savepoint implements Sendable {
     public const fn const ref string name() { return this.label; }
 }
 
-// What Connection.transaction runs inside the transaction. The body keeps whatever it produces in its own fields,
-// which the caller reads afterwards: the call borrows it. Ok commits (or releases the savepoint); Err rolls back,
-// and the body's error is the call's.
-type contract TransactionBody for value, resource {
-    fn Result<Unit, PgError> run(ref Connection conn);
+// A transaction scoped to a borrow window, as psycopg's `with conn.transaction()` scopes one, with no closure:
+//
+//     borrow conn.transaction() as tx { … tx.conn().execute(q: …) … return tx.commit(); }
+//
+// `transaction()` sends BEGIN, or SAVEPOINT inside a transaction block, so a window inside a window is a savepoint.
+// When the block is left by any path (its end, `return`, `break`, `continue`), the window ends the transaction it
+// opened: ROLLBACK, or ROLLBACK TO and RELEASE for a savepoint, unless it is over already. It is over once this view
+// committed or rolled it back, or once the server reported the block ended, so a COMMIT run through `conn()` counts.
+// The window owns its block until the server says it ended: a block chained in the same message ("COMMIT; BEGIN",
+// COMMIT AND CHAIN) is rolled back when the window closes.
+//
+// The connection is frozen inside the window; `conn()` reaches it. A rollback the window cannot do (a COPY or pipeline
+// mode left open, a session that failed) closes the connection, as pgx closes one whose rollback failed, and is logged
+// as a warning under the tag "postgres". A trap skips the window's end; the server rolls back the transaction of a
+// session that ends.
+type view Transaction {
+    UnsafePtr<Connection> host;
+    int64 point;   // 0 for a transaction; n for the savepoint sp_n
+    int64 epoch;   // the connection's count of transaction blocks ended, as the window opened
+    int64 mint;    // which of the connection's transaction() calls made this, to claim its error
+    bool open;     // BEGIN (or SAVEPOINT) succeeded
+    bool done;     // this view committed or rolled back
+
+    unsafe ctor over(UnsafePtr<Connection> host, int64 point, int64 epoch, int64 mint, bool open) {
+        this.host = host; this.point = point; this.epoch = epoch; this.mint = mint; this.open = open; this.done = false;
+    }
+    friend postgres::Connection::transaction[over];
+
+    // The connection, which the window freezes.
+    public unsafe fn ref Connection conn() { return this.host[0]; }
+
+    // Whether BEGIN (or SAVEPOINT) succeeded, since `transaction()` cannot return a Result: its error, once. A window
+    // whose transaction did not begin ends nothing. Every call through `conn()` still runs, outside a transaction.
+    public unsafe fn Result<Unit, PgError> began() {
+        if (this.open) { return Result::Ok(value: Unit::Unit); }
+        return this.host[0].unbegunError(mint: this.mint);
+    }
+
+    // COMMIT, or RELEASE SAVEPOINT. A COMMIT the server turns into a ROLLBACK is `RolledBack`, and a COMMIT that fails
+    // (a deferred constraint) has still ended the transaction.
+    public unsafe fn Result<Unit, PgError> commit() { return this.end(commit: true); }
+
+    // ROLLBACK, or ROLLBACK TO and RELEASE the savepoint.
+    public unsafe fn Result<Unit, PgError> rollback() { return this.end(commit: false); }
+
+    // SET TRANSACTION with `options`, which must come before the transaction's first query. Defaults send nothing. The
+    // server refuses an isolation level or DEFERRABLE for a savepoint, which fails the savepoint only.
+    public unsafe fn Result<Unit, PgError> setOptions(const ref TransactionOptions options) {
+        Result<Unit, PgError> ok = this.current();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        string modes = options.modes();
+        if (modes.length() == 0) { return Result::Ok(value: Unit::Unit); }
+        return this.host[0].command(sql: "SET TRANSACTION".concat(other: modes));
+    }
+
+    unsafe fn Result<Unit, PgError> end(bool commit) {
+        Result<Unit, PgError> ok = this.current();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Unit, PgError> r = this.host[0].endWindow(point: this.point, commit: commit);
+        bool ended = match (r) { case Ok(value: u): true; case Err(error: e): false; };
+        if (ended) { this.done = true; }
+        return r;
+    }
+
+    // The transaction is this window's to end: it began, and it is not over.
+    unsafe fn Result<Unit, PgError> current() {
+        if (!this.open) { return this.host[0].unbegunError(mint: this.mint); }
+        if (this.done || this.host[0].blocksEnded() != this.epoch) {
+            return Result::Err(error: PgError::Usage(detail: "the transaction is over: it was committed or rolled back"));
+        }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    unsafe ~Transaction() { this.host[0].settleWindow(point: this.point, epoch: this.epoch, open: this.open, done: this.done); }
 }

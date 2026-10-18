@@ -106,8 +106,43 @@ that changes:
 
 ## Transactions
 
-`begin(options:)`, `commit()` and `rollback()` run the statements, with what BEGIN asks for. A COMMIT that the server
-turns into a ROLLBACK, because the transaction had failed, is `PgError::RolledBack`. `savepoint()` gives a
+A transaction is a borrow window. `transaction()` sends BEGIN, and the window ends the transaction when the block is
+left by any path (its end, `return`, `break`, `continue`): ROLLBACK, unless it was committed. It is psycopg's
+`with conn.transaction()` with no closure, because the window is the scope. The connection is frozen inside the
+window, and `tx.conn()` reaches it:
+
+```kama
+fn Result<Unit, PgError> transfer(ref Connection conn, int64 cents) {
+    borrow conn.transaction() as tx {
+        Result<Unit, PgError> begun = tx.began();
+        match (give begun) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Optional<int64>, PgError> debit = tx.conn().execute(q: pg"update accounts set balance = balance - ${cents} where id = 1");
+        match (give debit) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: give e); } };   // rolls back
+        Result<Optional<int64>, PgError> credit = tx.conn().execute(q: pg"update accounts set balance = balance + ${cents} where id = 2");
+        match (give credit) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return tx.commit();
+    }
+}
+```
+
+- **`tx.began()`** says whether BEGIN succeeded, since `transaction()` cannot return a Result. Check it first: a window
+  whose transaction did not begin ends nothing, and statements sent through `tx.conn()` still run, outside a
+  transaction.
+- **`tx.commit()`** sends COMMIT; a COMMIT the server turns into a ROLLBACK, because the transaction had failed, is
+  `PgError::RolledBack`. **`tx.rollback()`** sends ROLLBACK. **`tx.setOptions(options:)`** runs SET TRANSACTION with
+  an isolation level, an access mode and DEFERRABLE, before the transaction's first query; the defaults send nothing.
+- **A window inside a window is a savepoint**: `borrow tx.conn().transaction() as inner { … }` sends `SAVEPOINT sp_1`.
+  `inner.commit()` releases it; a window that falls through rolls back to it and releases it, and the outer
+  transaction goes on.
+- **The transaction is over** once the view has committed or rolled it back, or once the server says the block
+  ended, so a COMMIT sent through `tx.conn()` counts. A block chained in the same message (`COMMIT AND CHAIN`,
+  `"COMMIT; BEGIN"`) belongs to the window, which rolls it back.
+- **A window that cannot roll back closes the connection**, as pgx does, and logs a warning under the tag `postgres`.
+  That happens when a COPY or pipeline mode is left open, or when the server refuses the ROLLBACK. The server rolls back
+  the transaction of a session that ends, so a program that traps loses nothing it kept either.
+- A helper takes the transaction as `ref Transaction`.
+
+`begin(options:)`, `commit()` and `rollback()` run the same statements without a window. `savepoint()` gives a
 `Savepoint` the connection names (`sp_1`, `sp_2`, …), for `releaseSavepoint(sp:)` and `rollbackToSavepoint(sp:)`.
 
 ```kama
@@ -115,28 +150,6 @@ TransactionOptions options = TransactionOptions.of(isolation: IsolationLevel::Se
 Result<Unit, PgError> begun = conn.begin(options: options);
 // … queries …
 Result<Unit, PgError> done = conn.commit();
-```
-
-`transaction(body:, options:)` runs a body between BEGIN and COMMIT, as psycopg's `with conn.transaction()` and pgx's
-BeginFunc do. An error from the body rolls back and is returned. Inside an open transaction the call nests as a
-savepoint. The body keeps what it produces in its own fields, which the caller reads afterwards:
-
-```kama
-type resource Transfer implements TransactionBody {
-    int64 cents = 0;
-    public ctor make(int64 cents) { this.cents = cents; }
-    public unsafe fn Result<Unit, PgError> run(ref Connection conn) {
-        int64 amount = this.cents;
-        Result<Optional<int64>, PgError> debit = conn.execute(q: pg"update accounts set balance = balance - ${amount} where id = 1");
-        match (give debit) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: give e); } };
-        Result<Optional<int64>, PgError> credit = conn.execute(q: pg"update accounts set balance = balance + ${amount} where id = 2");
-        match (give credit) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: give e); } };
-        return Result::Ok(value: Unit::Unit);
-    }
-}
-
-Transfer transfer = Transfer.make(cents: 500i64);
-Result<Unit, PgError> moved = conn.transaction(body: transfer, options: TransactionOptions.defaults());
 ```
 
 ## COPY

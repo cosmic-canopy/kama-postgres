@@ -6,10 +6,30 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `Transaction`, the transaction a borrow window scopes, which `transaction()` now mints. Its methods are `conn()`,
+  `began()`, `commit()`, `rollback()` and `setOptions(options:)`, which runs SET TRANSACTION.
+- `TransactionOptions.modes()`: the transaction modes, as BEGIN and SET TRANSACTION take them.
+
 ### Changed
+- **Breaking: `transaction()` is a borrow window**, `borrow conn.transaction() as tx { … }`, which kama 0.9.658 made
+  possible: a view's destructor runs when its window closes (KPG-35).
+  - The window sends BEGIN, or SAVEPOINT inside a transaction block, so a window inside a window nests.
+  - When the block is left by any path (its end, `return`, `break`, `continue`), the window rolls the transaction back
+    (ROLLBACK, or ROLLBACK TO and RELEASE for a savepoint) unless it is over. It is over once the view committed or
+    rolled it back, or once the server reported the block ended, so a COMMIT run through `tx.conn()` counts.
+  - A window that cannot roll back (a COPY or pipeline mode left open, a ROLLBACK the server refuses) closes the
+    connection, as pgx closes one whose rollback failed, and logs a warning under `postgres`.
+  - BEGIN's options are `tx.setOptions(options:)`, since a mint takes no arguments, and BEGIN's outcome is
+    `tx.began()`, since a mint cannot return a Result.
 - **Needs `@kama/tls` ≥ 0.1.3**, the first whose `TlsError` is `Sendable`.
 - `PgError` is `Sendable`, and so are `ServerError`, `ConnectError`, `ConnectAttempt`, `ProtocolError` and
   `ErrorFields`, so an error can cross isolates (a `Channel<PgError>`, or a `Sendable` type that holds one).
+
+### Removed
+- **Breaking:** `transaction(body:, options:)` and `TransactionBody`. The window replaces them, and kama has no
+  overloading, so both cannot be called `transaction`. A body's statements move into the window's block, and what it
+  kept in its fields becomes locals. `begin`, `commit`, `rollback` and the savepoint methods stay.
 
 ### Fixed
 - **A TLS handshake no longer spins on a server that falls silent in it.** Waiting to read, the handshake took a

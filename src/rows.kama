@@ -38,6 +38,13 @@ type resource Rows implements Sendable {
     }
 
     public const fn isize rowCount() { return this.rows.length(); }
+    // The bytes of its rows as the server sent them (Limits.resultBytes counts these).
+    public const fn isize byteSize() {
+        isize total = 0;
+        isize i = 0;
+        while (i < this.rows.length()) { total = total + this.rows[i].byteSize(); i = i + 1; }
+        return total;
+    }
     public const fn bool isNull(isize row, isize column) { return this.rows[row].isNull(column: column); }
 
     // A value's bytes as the server sent them, in the column's format; empty for NULL (ask `isNull` to tell NULL

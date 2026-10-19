@@ -58,12 +58,14 @@ type resource Wire implements Sendable {
     FixedArray<uint8> buf;
     isize start = 0;   // the first byte not yet consumed
     isize end = 0;     // one past the last byte read
+    isize readCap = -1;   // Limits.readBuffer: the most bytes held while a write waits; -1 for no bound
 
     public ctor over(Owned<Transport> transport) {
         this.link = give transport;
         this.buf = FixedArray.make(size: INITIAL_BYTES);
         this.start = 0;
         this.end = 0;
+        this.readCap = -1;
     }
 
     // Over a transport some of whose bytes were read before this Wire existed (the answer to an SSLRequest was
@@ -77,6 +79,13 @@ type resource Wire implements Sendable {
         while (i < preread.length()) { this.buf[i] = preread[i]; i = i + 1; }
         this.start = 0;
         this.end = preread.length();
+        this.readCap = -1;
+    }
+
+    // Limits.readBuffer: the most bytes this wire holds while a write waits (None for no bound).
+    public fn void setReadLimit(Optional<isize> bytes) {
+        isize cap = match (bytes) { case Some(value: n): n; case None: -1; };
+        this.readCap = cap;
     }
 
     // The next message from the server, read where `framing` says (before authentication, in a session, during COPY
@@ -159,6 +168,9 @@ type resource Wire implements Sendable {
     // the commands it already has stops reading once its own output fills, so a client that only wrote would wait
     // forever on a long pipeline or COPY. Once the server has stopped sending (EOF, an error), only writing is waited
     // for; the reader meets the end when it gets there.
+    //
+    // What arrives meanwhile is held, up to Limits.readBuffer: past it the server is sending without end while it will
+    // not take what is written, and the write fails with PgError::Limit.
     public unsafe fn Result<Unit, PgError> send(ConstView<uint8> bytes, Deadline deadline) {
         isize sent = 0;
         bool reading = true;
@@ -177,7 +189,13 @@ type resource Wire implements Sendable {
                 Result<Ready, IoError> ready = this.link.wait(interest: want, timeoutMs: deadline.remainingMs());
                 Ready r = match (ready) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: this.failure(error: e)); } };
                 if (!r.writable && !(reading && r.readable)) { return Result::Err(error: PgError::Timeout); }
-                if (reading && r.readable) { reading = this.drain(); }
+                if (reading && r.readable) {
+                    reading = this.drain();
+                    if (this.readCap >= 0 && this.end - this.start > this.readCap) {
+                        isize cap = this.readCap;
+                        return Result::Err(error: PgError::Limit(detail: "the server sent more than ${cap} bytes while a write waited (Limits.readBuffer); the connection is closed"));
+                    }
+                }
             }
         }
         return Result::Ok(value: Unit::Unit);

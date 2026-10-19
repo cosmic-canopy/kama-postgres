@@ -35,6 +35,17 @@ All notable changes to this package are recorded here. The format follows
 
   The long types, the limits and the messages are read from libpq's source by `tools/gen-libpq-tables.sh`
   (`src/protocol/framing.kama`), and the unit tests check every type and length in each place against libpq's outcome.
+- **Bounds on what a server can make a connection hold** (`Limits`, set with `Config.setLimits`), each an `Optional`
+  that `None` turns off:
+  - `readBuffer`, the bytes taken in while a write waits (default 1 GiB): past it the connection closes;
+  - `parameters`, the distinct ParameterStatus names (default 1,000): past it the connection closes;
+  - `notifications`, the queue (default 10,000): past it the oldest is dropped, counted by
+    `Connection.droppedNotifications()`, and logged as a warning at the first drop since the queue was last read;
+  - `resultBytes`, the row bytes one call keeps (off by default; pgjdbc's `maxResultBuffer`): `query`, `simpleQuery`
+    (its statements together), `getResult`, and `runBatch` (its results together). Past it the result is read to its
+    end and dropped, the call fails, and the session and its transaction go on.
+
+  Reaching a bound is the new `PgError::Limit`. `takeNotifications` no longer takes quadratic time.
 - **Seeded mutations of every scripted reply** (`tests/unit/src/garble_test.kama`). Eighteen conversations carry every
   backend message this client reads, in each state it can arrive in: startup with each authentication method and a
   protocol downgrade, the simple and extended protocols, the statement cache, a portal, COPY both ways, a pipeline, a

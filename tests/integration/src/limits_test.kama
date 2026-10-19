@@ -1,0 +1,57 @@
+// Config.setLimits against a real server: a result over resultBytes is read to its end and the session goes on, in a
+// transaction too; a burst of notifications past the bound keeps the newest, in order, and counts the rest.
+import { std::collections::DynamicArray,
+         postgres::Connection, postgres::Config, postgres::conninfo::ConnInfo, postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
+         postgres::PgError, postgres::Rows, postgres::Notification, postgres::Limits, postgres::TransactionStatus,
+         postgres_integration_tests::check, postgres_integration_tests::conninfoFor, postgres_integration_tests::quietEnvironment,
+         postgres_integration_tests::scalar };
+export { limitsTests };
+
+unsafe fn Result<Connection, PgError> openLimited(const ref string conninfo, Limits limits) {
+    Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: conninfo);
+    ConnInfo info = match (give parsed) { case Ok(value: i): give i; case Err(error: e): { return Result::Err(error: PgError::Config(detail: e.message())); } };
+    Result<Config, PgError> c = Config.resolve(info: give info, environment: quietEnvironment());
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    config.setLimits(limits: limits);
+    return Connection.connect(config: config);
+}
+
+fn string messageOf(const ref Result<DynamicArray<Rows>, PgError> r) { return match (r) { case Ok(value: v): "(ok)"; case Err(error: e): e.message(); }; }
+
+unsafe fn int32 limitsTests() {
+    int32 f = 0;
+    Limits bounded = Limits.defaults();
+    bounded.resultBytes = Optional::Some(value: 10000);
+    bounded.notifications = Optional::Some(value: 5);
+    Result<Connection, PgError> made = openLimited(conninfo: conninfoFor(user: "kp_trust"), limits: bounded);
+    match (give made) {
+        case Ok(value: x): {
+            Connection c = give x;
+            // A hundred rows of a thousand bytes: over 10000.
+            string big = "select repeat('x', 1000) from generate_series(1, 100)";
+            Result<DynamicArray<Rows>, PgError> over = c.simpleQuery(sql: big);
+            string m = messageOf(r: over);
+            string one = scalar(c: c, sql: "select 1");
+            f = f + check(ok: m.equals(other: "the result was over 10000 bytes (Limits.resultBytes): the command ran, and its rows were read and dropped") && one.equals(other: "1"),
+                          what: "limits: a result over resultBytes on a live server, and the session after it: ".concat(other: m));
+            string begun = scalar(c: c, sql: "begin");
+            Result<DynamicArray<Rows>, PgError> inBlock = c.simpleQuery(sql: big);
+            bool kept = c.transactionStatus() == TransactionStatus::InTransaction;
+            string still = scalar(c: c, sql: "select 2");
+            string rolled = scalar(c: c, sql: "rollback");
+            f = f + check(ok: kept && still.equals(other: "2"), what: "limits: inside a block, the transaction is still usable after the bound: ".concat(other: messageOf(r: inBlock)));
+            // Twenty notifications, sent as the statement commits: the newest five are kept.
+            string listening = scalar(c: c, sql: "listen kp_limits");
+            string sent = scalar(c: c, sql: "select count(pg_notify('kp_limits', g::text)) from generate_series(1, 20) g");
+            DynamicArray<Notification> taken = c.takeNotifications();
+            string payloads = "";
+            isize i = 0;
+            while (i < taken.length()) { if (i > 0) { payloads = payloads.concat(other: " "); } payloads = payloads.concat(other: taken[i].payload()); i = i + 1; }
+            f = f + check(ok: payloads.equals(other: "16 17 18 19 20") && c.droppedNotifications() == 15i64,
+                          what: "limits: past five notifications the newest are kept, in order: ".concat(other: payloads));
+            c.close();
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "limits: connect: ".concat(other: e.message())); }
+    };
+    return f;
+}

@@ -179,7 +179,7 @@
   "id": "M23",
   "suite": "unit",
   "file": "src/connection.kama",
-  "old": "        this.pending = DynamicArray.empty();\n        return Result::Ok(value: Unit::Unit);\n    }\n\n    // ---- pipeline mode ----",
+  "old": "        this.pending = Deque.empty();\n        return Result::Ok(value: Unit::Unit);\n    }\n\n    // ---- pipeline mode ----",
   "new": "        return Result::Ok(value: Unit::Unit);\n    }\n\n    // ---- pipeline mode ----",
   "expect": "reset: notifications received before it and during it are dropped"
  },

@@ -269,6 +269,39 @@ It is refused, as any command is, while a result, a COPY or pipeline mode is in 
 and it takes in any notices on the way. libpq leaves this loop to the application, through PQsocket, PQconsumeInput
 and PQnotifies.
 
+## Limits
+
+What a server can make one connection hold is bounded, where libpq bounds nothing. Each bound is set on the `Config`,
+since libpq has no keyword for it, and each is an `Optional`: `None` turns it off.
+
+```kama
+Limits limits = Limits.defaults();
+limits.resultBytes = Optional::Some(value: 64 * 1024 * 1024);   // fail a result over 64 MiB, and keep the session
+config.setLimits(limits: limits);
+```
+
+| bound | default | past it |
+|---|---|---|
+| `readBuffer`: bytes taken in while a write waits | 1 GiB | the connection closes |
+| `parameters`: distinct parameters the server reports | 1,000 | the connection closes |
+| `notifications`: notifications waiting to be read | 10,000 | the oldest is dropped |
+| `resultBytes`: row bytes one call keeps | off | the call fails, and the session goes on |
+
+- **`readBuffer`.** This client reads while it writes, as libpq does, or a server answering a long pipeline would wait
+  on the client while the client waits on it. A server that keeps sending while it takes nothing is a runaway.
+- **`parameters`.** A server reports about twenty.
+- **`notifications`.** A dropped notification is counted by `droppedNotifications()`, and the first since the queue
+  was last read is logged as a warning under `postgres`. No other driver bounds this queue: libpq, pgjdbc and pgx let
+  it grow, and Npgsql and asyncpg have none. PostgreSQL delivers a notification at most once, so a listener that must
+  not miss an event already re-reads its state after a gap; this is one more kind of gap.
+- **`resultBytes`** (pgjdbc's `maxResultBuffer`) counts the rows `query`, `simpleQuery` and `getResult` keep, a
+  simple query's statements together and a batch's results together. Past it, the rest of the result is read and
+  dropped, and the call returns `PgError::Limit` once the server is ready. The command ran, and the session and its
+  transaction go on. Rows read a chunk at a time (`startRows`, a portal's `fetch`) are not counted: that is how to
+  read a big result.
+
+Reaching a bound is `PgError::Limit`, which names the bound, its value and what was given up.
+
 ## Several hosts
 
 A connection string can list several hosts, as libpq's can:
@@ -281,6 +314,8 @@ A connection string can list several hosts, as libpq's can:
 
 - **Query timeouts.** libpq has none; `statement_timeout` is the server's. This client's is the drivers' design,
   described above.
+- **Bounds.** libpq bounds none of what a server can make it hold. This client does (see Limits), and refuses a
+  pre-3.0 error with an empty text, which libpq reports as an empty error.
 - **The cancel race.** A cancel can reach the server just after its command finished and the next one started. libpq
   documents the same race. This client narrows it as libpq does, by waiting for the server to close the cancel
   connection, but no client can close it entirely.
@@ -326,7 +361,9 @@ tools/pg.sh down --version 18
 ```
 
 The unit tests need no server. They include a scripted fake server that drives every startup and query path,
-hostile ones included, and runs Mbed TLS as the server for the TLS paths. The integration tests start each server in
+hostile ones included, and runs Mbed TLS as the server for the TLS paths. Every reply of eighteen conversations is
+then changed in turn, ten ways, from a seed (`garble_test.kama`; `PGTEST_GARBLE_SEEDS=N` runs more): the client must
+never panic, and a protocol error must end the session. The integration tests start each server in
 podman or docker, and run the whole suite a second time over TLS. Their expected results come from libpq itself:
 PostgreSQL's own authentication, service-file and TLS tests (its negotiation matrix and its host-name cases, replayed
 by `tools/gen-ssl-vectors.sh`), and the server container's libpq asked case by case (`tools/gen-libpq-test-cases.sh`).

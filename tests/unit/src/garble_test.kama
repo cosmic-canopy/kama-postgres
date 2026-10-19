@@ -1,7 +1,8 @@
 // Seeded mutations of every reply a scripted server sends (fake_server.kama's Garble). Each exercise is one conversation
 // a client has with a server, and together they carry every backend message this client reads, in each state it can
 // arrive in. A clean run of an exercise counts its replies; then each reply in turn is changed in each way GarbleKind
-// names, with every choice drawn from a seed.
+// names, with every choice drawn from a seed. Every other case runs under tiny bounds (Config.setLimits), so a garbled
+// reply also meets each bound being reached.
 //
 // Whatever comes back, the client must answer with a result or a PgError, and never panic: a panic ends this program,
 // which fails the run. An error must say something, and after a protocol error the session must be over. Nothing can
@@ -15,7 +16,7 @@ import { core::env, core::println, std::collections::DynamicArray, std::memory::
          tls::TlsConfig,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
          postgres::Portal, postgres::Transport, postgres::CacheMode, postgres::CopyInfo, postgres::CopyChunk,
-         postgres::Notification, postgres::PipelineResult, postgres::column, postgres::protocol::md5Password,
+         postgres::Notification, postgres::PipelineResult, postgres::Limits, postgres::column, postgres::protocol::md5Password,
          postgres::protocol::PROTOCOL_3_0,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire,
@@ -265,11 +266,23 @@ fn string conninfoFor(isize e) {
     return "user=u dbname=d connect_timeout=2";
 }
 
-// Connect for exercise `e` over a fake garbling as `g` says, its replies numbered to `counts` (zero or one sender).
-unsafe fn Result<Connection, PgError> connectFor(isize e, Garble g, DynamicArray<Sender<isize>> counts) {
+// Bounds small enough that the exercises reach them: four parameters, one notification, eight bytes of rows.
+fn Limits tiny() {
+    Limits l = Limits.defaults();
+    l.readBuffer = Optional::Some(value: 64);
+    l.parameters = Optional::Some(value: 4);
+    l.notifications = Optional::Some(value: 1);
+    l.resultBytes = Optional::Some(value: 8);
+    return l;
+}
+
+// Connect for exercise `e` over a fake garbling as `g` says, its replies numbered to `counts` (zero or one sender),
+// under tiny bounds when `small`.
+unsafe fn Result<Connection, PgError> connectFor(isize e, Garble g, DynamicArray<Sender<isize>> counts, bool small) {
     Environment vars = testEnvironment();
     Result<Config, PgError> c = resolveWith(text: conninfoFor(e: e), env: vars);
     Config config = match (give c) { case Ok(value: v): give v; case Err(error: x): { return Result::Err(error: give x); } };
+    if (small) { config.setLimits(limits: tiny()); }
     if (e == 7 || e == 9 || e == 12) { config.setStatementCache(mode: CacheMode::Off, capacity: 0); }
     if (e == 17) {
         TlsConfig server = serverTls(alpn: true, only13: false, askCert: false);
@@ -423,10 +436,11 @@ unsafe fn string act(isize e, ref Connection c, ref bool errors) {
     return broken;
 }
 
-// One case: exercise `e` with garble `g`. "" when the rules held; else what broke. `errors` says whether anything failed.
-unsafe fn string runCase(isize e, Garble g, ref bool errors) {
+// One case: exercise `e` with garble `g`, under tiny bounds when `small`. "" when the rules held; else what broke.
+// `errors` says whether anything failed.
+unsafe fn string runCase(isize e, Garble g, bool small, ref bool errors) {
     DynamicArray<Sender<isize>> none = DynamicArray.empty();
-    Result<Connection, PgError> made = connectFor(e: e, g: g, counts: give none);
+    Result<Connection, PgError> made = connectFor(e: e, g: g, counts: give none, small: small);
     return match (give made) {
         case Ok(value: x): {
             Connection c = give x;
@@ -453,7 +467,7 @@ unsafe fn isize repliesOf(isize e, ref string broken) {
     Receiver<isize> rx = channel.receiver();
     DynamicArray<Sender<isize>> counts = DynamicArray.empty();
     counts.add(item: channel.sender());
-    Result<Connection, PgError> made = connectFor(e: e, g: Garble.none(), counts: give counts);
+    Result<Connection, PgError> made = connectFor(e: e, g: Garble.none(), counts: give counts, small: false);
     bool errors = false;
     match (give made) {
         case Ok(value: x): { Connection c = give x; broken = act(e: e, c: ref c, errors: ref errors); c.close(); }
@@ -504,10 +518,12 @@ unsafe fn int32 garbleTests() {
                 while (k < KINDS) {
                     uint64 mixed = cast<uint64>(seed) * 1000003ui64 + cast<uint64>(e * 1009 + t * 31 + k);
                     Garble g = Garble.of(seed: mixed, target: t, kind: kindOf(k: k));
+                    bool small = (t + k) % 2 == 1;
                     string label = name.concat(other: ", reply ${t}, ").concat(other: kindName(k: k)).concat(other: ", seed ${seed}");
+                    if (small) { label = label.concat(other: ", tiny bounds"); }
                     if (trace) { println(s: "garble: ".concat(other: label)); }
                     bool errors = false;
-                    string broken = runCase(e: e, g: g, errors: ref errors);
+                    string broken = runCase(e: e, g: g, small: small, errors: ref errors);
                     cases = cases + 1;
                     if (errors) { withErrors = withErrors + 1; }
                     if (broken.length() > 0) {

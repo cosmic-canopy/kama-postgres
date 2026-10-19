@@ -1,0 +1,493 @@
+// Config.setLimits against a scripted server: each bound reached, what is given up there, and the session after it.
+// readBuffer and parameters end the session; notifications drop the oldest, counted and logged once per overflow;
+// resultBytes reads a result to its end, drops its rows and keeps the session. Each bound set to None is no bound.
+import { std::collections::DynamicArray, std::memory::Owned,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
+         postgres::Statement, postgres::Transport, postgres::Limits, postgres::Notification, postgres::TransactionStatus,
+         postgres::PipelineResult, postgres::Batch, postgres::BatchResult, postgres::CacheMode,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome };
+export { limitsTests, captureLog, warningsLogged };
+
+comptime uint8 IDLE = 73ui8;     // 'I'
+comptime uint8 INTX = 84ui8;     // 'T'
+comptime uint8 PARSE = 80ui8;    // 'P'
+comptime uint8 BIND = 66ui8;     // 'B'
+comptime uint8 DESCRIBE = 68ui8; // 'D'
+comptime uint8 EXECUTE = 69ui8;  // 'E'
+comptime uint8 SYNC = 83ui8;     // 'S'
+comptime uint8 QUERY = 81ui8;    // 'Q'
+
+// The log sink main installs: warnings under `postgres` are counted, and nothing is printed.
+static int32 warnings = 0;
+
+fn void captureLog(int32 level, string tag, string msg) {
+    if (tag.equals(other: "postgres") && level == 1) { warnings = warnings + 1; }
+}
+
+fn int32 warningsLogged() { return warnings; }
+
+fn Step quiet(uint8 tag) { return Step::Expect(tag: tag, body: "", then: DynamicArray.empty()); }
+fn Step answer(uint8 tag, Wire reply) { return Step::Expect(tag: tag, body: "", then: reply.bytes()); }
+fn DynamicArray<string> one(const ref string a) { DynamicArray<string> v = DynamicArray.empty(); v.add(item: copy a); return v; }
+fn DynamicArray<uint32> oneOid(uint32 a) { DynamicArray<uint32> v = DynamicArray.empty(); v.add(item: a); return v; }
+fn DynamicArray<int32> oneInt(int32 a) { DynamicArray<int32> v = DynamicArray.empty(); v.add(item: a); return v; }
+fn DynamicArray<Step> opening() { DynamicArray<Step> s = DynamicArray.empty(); s.add(item: Step::Send(bytes: welcome())); return s; }
+
+// A simple query's answer: `count` rows of one 10-byte text value, its tag, ready with `status`.
+fn Wire tenByteRows(isize count, uint8 status) {
+    Wire w = Wire.make();
+    w.columns(names: one(a: "v"));
+    isize i = 0;
+    while (i < count) { w.row(values: one(a: "0123456789")); i = i + 1; }
+    w.complete(tag: "SELECT ${count}");
+    w.ready(status: status);
+    return w;
+}
+
+fn Wire completed(const ref string tag, uint8 status) { Wire w = Wire.make(); w.complete(tag: tag); w.ready(status: status); return w; }
+
+// Connect over the script with `limits`, the statement cache off.
+unsafe fn Result<Connection, PgError> limited(DynamicArray<Step> steps, Limits limits) {
+    Environment vars = testEnvironment();
+    string none = "";
+    Result<Config, PgError> c = resolveWith(text: none, env: vars);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    config.setStatementCache(mode: CacheMode::Off, capacity: 0);
+    config.setLimits(limits: limits);
+    Owned<Transport> fake = new FakeServer.make(steps: give steps, chunk: 4096, writeLimit: 4096);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+// `limited`, with the statement cache on (a batch goes through it).
+unsafe fn Result<Connection, PgError> limitedCached(DynamicArray<Step> steps, Limits limits) {
+    Environment vars = testEnvironment();
+    string none = "";
+    Result<Config, PgError> c = resolveWith(text: none, env: vars);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    config.setLimits(limits: limits);
+    Owned<Transport> fake = new FakeServer.make(steps: give steps, chunk: 4096, writeLimit: 4096);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+// The same through a server that takes nothing more while over `backlog` bytes of its replies are unread.
+unsafe fn Result<Connection, PgError> jammed(DynamicArray<Step> steps, Limits limits, isize backlog) {
+    Environment vars = testEnvironment();
+    string none = "";
+    Result<Config, PgError> c = resolveWith(text: none, env: vars);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    config.setStatementCache(mode: CacheMode::Off, capacity: 0);
+    config.setLimits(limits: limits);
+    Owned<Transport> fake = new FakeServer.jammed(steps: give steps, chunk: 4096, writeLimit: 3, backlog: backlog);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+fn string messageOf<T>(const ref Result<T, PgError> r) { return match (r) { case Ok(value: v): "(ok)"; case Err(error: e): e.message(); }; }
+
+fn bool isLimit<T>(const ref Result<T, PgError> r) {
+    return match (r) { case Ok(value: v): false; case Err(error: e): match (e) { case Limit(detail: d): true; case _: false; }; };
+}
+
+fn bool ran<T>(const ref Result<T, PgError> r) { return match (r) { case Ok(value: v): true; case Err(error: e): false; }; }
+
+// ---- readBuffer ----
+
+// The drain case of extended_test.kama: the server answers a Bind with 2000 rows before it takes the rest of the
+// request, so the client reads them while its write waits.
+unsafe fn DynamicArray<Step> drainScript() {
+    DynamicArray<Step> s = opening();
+    s.add(item: quiet(tag: PARSE));
+    s.add(item: quiet(tag: DESCRIBE));
+    Wire d = Wire.make(); d.parseComplete(); d.parameterTypes(oids: oneOid(a: 23ui32)); d.typedColumns(names: one(a: "n"), oids: oneOid(a: 23ui32)); d.ready(status: IDLE);
+    s.add(item: answer(tag: SYNC, reply: give d));
+    Wire rows = Wire.make();
+    rows.bindComplete();
+    isize i = 0;
+    while (i < 2000) { rows.intRow(values: oneInt(a: 7)); i = i + 1; }
+    s.add(item: answer(tag: BIND, reply: give rows));
+    s.add(item: quiet(tag: EXECUTE));
+    s.add(item: answer(tag: SYNC, reply: completed(tag: "SELECT 2000", status: IDLE)));
+    return s;
+}
+
+unsafe fn string drained(Limits limits) {
+    Result<Connection, PgError> made = jammed(steps: drainScript(), limits: limits, backlog: 1024);
+    Connection c = match (give made) { case Ok(value: x): give x; case Err(error: e): { return "connect: ".concat(other: e.message()); } };
+    Result<Statement, PgError> prepared = c.prepare(sql: "select $1");
+    Statement statement = match (give prepared) { case Ok(value: x): give x; case Err(error: e): { return "prepare: ".concat(other: e.message()); } };
+    Query q = Query.of(statement: statement);
+    q.add(value: 7);
+    Result<Rows, PgError> r = c.query(q: q);
+    isize count = match (r) { case Ok(value: v): v.rowCount(); case Err(error: e): -1; };
+    string got = match (r) { case Ok(value: v): "${count} rows"; case Err(error: e): e.message(); };
+    if (c.isClosed()) { got = got.concat(other: " (closed)"); }
+    return got;
+}
+
+unsafe fn int32 readBufferTests() {
+    int32 f = 0;
+    Limits small = Limits.defaults();
+    small.readBuffer = Optional::Some(value: 4096);
+    string m = drained(limits: small);
+    f = f + check(ok: m.equals(other: "the server sent more than 4096 bytes while a write waited (Limits.readBuffer); the connection is closed (closed)"),
+                  what: "limits: readBuffer ends the session when a write waits on a server that sends past it: ".concat(other: m));
+    Limits none = Limits.defaults();
+    none.readBuffer = Optional::None;
+    string all = drained(limits: none);
+    f = f + check(ok: all.equals(other: "2000 rows"), what: "limits: readBuffer None holds whatever comes: ".concat(other: all));
+    string byDefault = drained(limits: Limits.defaults());
+    f = f + check(ok: byDefault.equals(other: "2000 rows"), what: "limits: the default readBuffer is far past this: ".concat(other: byDefault));
+    return f;
+}
+
+// ---- parameters ----
+
+// A startup reporting client_encoding, server_version and `count` more parameters, each named apart, then the first
+// of those again `repeats` times.
+fn DynamicArray<uint8> reporting(isize count, isize repeats) {
+    Wire m = Wire.make();
+    m.auth(code: 0);
+    m.parameter(name: "client_encoding", value: "UTF8");
+    m.parameter(name: "server_version", value: "18.4");
+    isize i = 0;
+    while (i < count) { m.parameter(name: "p${i}", value: "v"); i = i + 1; }
+    i = 0;
+    while (i < repeats) { m.parameter(name: "p0", value: "again"); i = i + 1; }
+    m.backendKey(pid: 1, keyLength: 4);
+    m.ready(status: IDLE);
+    return m.bytes();
+}
+
+unsafe fn int32 parameterTests() {
+    int32 f = 0;
+    Limits ten = Limits.defaults();
+    ten.parameters = Optional::Some(value: 10);
+    // client_encoding, server_version and nine more: eleven.
+    DynamicArray<Step> s1 = DynamicArray.empty();
+    s1.add(item: Step::Send(bytes: reporting(count: 9, repeats: 0)));
+    Result<Connection, PgError> r1 = limited(steps: give s1, limits: ten);
+    string m1 = messageOf(r: r1);
+    f = f + check(ok: m1.equals(other: "the server reported more than 10 parameters (Limits.parameters); the connection is closed"),
+                  what: "limits: an eleventh parameter at startup ends the connect: ".concat(other: m1));
+    DynamicArray<Step> s2 = DynamicArray.empty();
+    s2.add(item: Step::Send(bytes: reporting(count: 8, repeats: 0)));
+    Result<Connection, PgError> r2 = limited(steps: give s2, limits: ten);
+    f = f + check(ok: ran(r: r2), what: "limits: ten parameters are kept: ".concat(other: messageOf(r: r2)));
+    // At the bound, a name already kept is reported again and again: its value changes, and nothing is added.
+    DynamicArray<Step> s3 = DynamicArray.empty();
+    s3.add(item: Step::Send(bytes: reporting(count: 8, repeats: 500)));
+    Result<Connection, PgError> r3 = limited(steps: give s3, limits: ten);
+    f = f + check(ok: ran(r: r3), what: "limits: a parameter reported again is not another: ".concat(other: messageOf(r: r3)));
+    // After startup: a query's answer carries the eleventh, and the session ends.
+    DynamicArray<Step> s4 = DynamicArray.empty();
+    s4.add(item: Step::Send(bytes: reporting(count: 8, repeats: 0)));
+    Wire more = Wire.make(); more.parameter(name: "late", value: "v"); more.complete(tag: "SET"); more.ready(status: IDLE);
+    s4.add(item: answer(tag: QUERY, reply: give more));
+    Result<Connection, PgError> r4 = limited(steps: give s4, limits: ten);
+    match (give r4) {
+        case Ok(value: c): {
+            Result<DynamicArray<Rows>, PgError> q = c.simpleQuery(sql: "set late = v");
+            string m4 = messageOf(r: q);
+            f = f + check(ok: m4.equals(other: "the server reported more than 10 parameters (Limits.parameters); the connection is closed") && c.isClosed(),
+                          what: "limits: an eleventh parameter in a session ends it: ".concat(other: m4));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "limits: connect for a late parameter: ".concat(other: e.message())); }
+    };
+    Limits none = Limits.defaults();
+    none.parameters = Optional::None;
+    DynamicArray<Step> s5 = DynamicArray.empty();
+    s5.add(item: Step::Send(bytes: reporting(count: 2000, repeats: 0)));
+    Result<Connection, PgError> r5 = limited(steps: give s5, limits: none);
+    f = f + check(ok: ran(r: r5), what: "limits: parameters None keeps 2002: ".concat(other: messageOf(r: r5)));
+    return f;
+}
+
+// ---- notifications ----
+
+fn Wire notifying(isize count, isize from) {
+    Wire w = Wire.make();
+    isize i = 0;
+    while (i < count) { isize n = from + i; w.notification(pid: 7, channel: "ch", payload: "n${n}"); i = i + 1; }
+    w.complete(tag: "SELECT 0");
+    w.ready(status: IDLE);
+    return w;
+}
+
+unsafe fn string payloads(ref Connection c) {
+    DynamicArray<Notification> taken = c.takeNotifications();
+    string text = "";
+    isize i = 0;
+    while (i < taken.length()) {
+        if (i > 0) { text = text.concat(other: " "); }
+        text = text.concat(other: taken[i].payload());
+        i = i + 1;
+    }
+    return text;
+}
+
+unsafe fn int32 notificationTests() {
+    int32 f = 0;
+    Limits three = Limits.defaults();
+    three.notifications = Optional::Some(value: 3);
+    DynamicArray<Step> s = opening();
+    s.add(item: answer(tag: QUERY, reply: notifying(count: 5, from: 1)));
+    s.add(item: answer(tag: QUERY, reply: notifying(count: 2, from: 6)));
+    s.add(item: answer(tag: QUERY, reply: notifying(count: 4, from: 8)));
+    Result<Connection, PgError> made = limited(steps: give s, limits: three);
+    match (give made) {
+        case Ok(value: x): {
+            Connection c = give x;
+            int32 before = warningsLogged();
+            Result<DynamicArray<Rows>, PgError> q1 = c.simpleQuery(sql: "select 1");
+            string kept = payloads(c: ref c);
+            int32 once = warningsLogged() - before;
+            f = f + check(ok: kept.equals(other: "n3 n4 n5") && c.droppedNotifications() == 2i64 && once == 1,
+                          what: "limits: past three notifications the oldest go, counted and logged once: ".concat(other: kept).concat(other: " (${once} warnings)"));
+            // Within the bound nothing is dropped or logged.
+            Result<DynamicArray<Rows>, PgError> q2 = c.simpleQuery(sql: "select 2");
+            string two = payloads(c: ref c);
+            f = f + check(ok: two.equals(other: "n6 n7") && c.droppedNotifications() == 2i64 && warningsLogged() - before == 1,
+                          what: "limits: within the bound nothing is dropped: ".concat(other: two));
+            // The queue was read since the last drop, so the next overflow is logged again; the oldest one waits first.
+            Result<DynamicArray<Rows>, PgError> q3 = c.simpleQuery(sql: "select 3");
+            Result<Optional<Notification>, PgError> first = c.waitForNotification(timeout: Optional::None);
+            string head = match (first) { case Ok(value: o): match (o) { case Some(value: n): copy n.payload(); case None: "none"; }; case Err(error: e): e.message(); };
+            string rest = payloads(c: ref c);
+            f = f + check(ok: head.equals(other: "n9") && rest.equals(other: "n10 n11") && c.droppedNotifications() == 3i64 && warningsLogged() - before == 2,
+                          what: "limits: a later overflow is logged again, and waitForNotification gives the oldest kept: ".concat(other: head).concat(other: " ").concat(other: rest));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "limits: connect for notifications: ".concat(other: e.message())); }
+    };
+    // None keeps every one.
+    Limits none = Limits.defaults();
+    none.notifications = Optional::None;
+    DynamicArray<Step> s2 = opening();
+    s2.add(item: answer(tag: QUERY, reply: notifying(count: 20, from: 1)));
+    Result<Connection, PgError> m2 = limited(steps: give s2, limits: none);
+    match (give m2) {
+        case Ok(value: x): {
+            Connection c = give x;
+            Result<DynamicArray<Rows>, PgError> q = c.simpleQuery(sql: "select 1");
+            DynamicArray<Notification> all = c.takeNotifications();
+            f = f + check(ok: all.length() == 20 && c.droppedNotifications() == 0i64, what: "limits: notifications None keeps twenty");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "limits: connect for unbounded notifications"); }
+    };
+    return f;
+}
+
+// ---- resultBytes ----
+
+unsafe fn int32 resultTests() {
+    int32 f = 0;
+    // Five rows of 16 bytes each (a column count, a length, ten bytes): 80 bytes, over a bound of 50.
+    Limits fifty = Limits.defaults();
+    fifty.resultBytes = Optional::Some(value: 50);
+    string over = "the result was over 50 bytes (Limits.resultBytes): the command ran, and its rows were read and dropped";
+    DynamicArray<Step> s = opening();
+    s.add(item: answer(tag: QUERY, reply: tenByteRows(count: 5, status: IDLE)));
+    s.add(item: answer(tag: QUERY, reply: tenByteRows(count: 3, status: IDLE)));
+    s.add(item: answer(tag: QUERY, reply: completed(tag: "BEGIN", status: INTX)));
+    s.add(item: answer(tag: QUERY, reply: tenByteRows(count: 5, status: INTX)));
+    s.add(item: answer(tag: QUERY, reply: tenByteRows(count: 1, status: INTX)));
+    // Two statements in one simple query, 48 and 32 bytes: over together.
+    Wire both = Wire.make();
+    both.columns(names: one(a: "v")); both.row(values: one(a: "0123456789")); both.row(values: one(a: "0123456789")); both.row(values: one(a: "0123456789")); both.complete(tag: "SELECT 3");
+    both.columns(names: one(a: "v")); both.row(values: one(a: "0123456789")); both.row(values: one(a: "0123456789")); both.complete(tag: "SELECT 2");
+    both.ready(status: INTX);
+    s.add(item: answer(tag: QUERY, reply: give both));
+    Result<Connection, PgError> made = limited(steps: give s, limits: fifty);
+    match (give made) {
+        case Ok(value: x): {
+            Connection c = give x;
+            Result<DynamicArray<Rows>, PgError> big = c.simpleQuery(sql: "select five");
+            string m = messageOf(r: big);
+            f = f + check(ok: m.equals(other: over) && !c.isClosed() && c.transactionStatus() == TransactionStatus::Idle,
+                          what: "limits: a result over resultBytes fails, and the session goes on: ".concat(other: m));
+            Result<DynamicArray<Rows>, PgError> small = c.simpleQuery(sql: "select three");
+            isize rows = match (small) { case Ok(value: v): v[0].rowCount(); case Err(error: e): -1; };
+            f = f + check(ok: rows == 3, what: "limits: the next result within the bound comes whole: ".concat(other: messageOf(r: small)));
+            Result<DynamicArray<Rows>, PgError> b = c.simpleQuery(sql: "begin");
+            Result<DynamicArray<Rows>, PgError> inBlock = c.simpleQuery(sql: "select five");
+            f = f + check(ok: isLimit(r: inBlock) && c.transactionStatus() == TransactionStatus::InTransaction,
+                          what: "limits: inside a block the transaction is kept: ".concat(other: messageOf(r: inBlock)));
+            Result<DynamicArray<Rows>, PgError> after = c.simpleQuery(sql: "select one");
+            f = f + check(ok: ran(r: after), what: "limits: the block goes on after it: ".concat(other: messageOf(r: after)));
+            Result<DynamicArray<Rows>, PgError> together = c.simpleQuery(sql: "select three; select two");
+            f = f + check(ok: isLimit(r: together) && !c.isClosed(), what: "limits: a simple query's statements count together: ".concat(other: messageOf(r: together)));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "limits: connect for results: ".concat(other: e.message())); }
+    };
+
+    // The extended protocol: query is counted; a result read a chunk at a time is not.
+    DynamicArray<Step> s2 = opening();
+    isize k = 0;
+    while (k < 2) {
+        s2.add(item: quiet(tag: PARSE));
+        s2.add(item: quiet(tag: DESCRIBE));
+        Wire d = Wire.make(); d.parseComplete(); d.parameterTypes(oids: DynamicArray.empty()); d.typedColumns(names: one(a: "n"), oids: oneOid(a: 23ui32)); d.ready(status: IDLE);
+        s2.add(item: answer(tag: SYNC, reply: give d));
+        s2.add(item: quiet(tag: BIND));
+        s2.add(item: quiet(tag: EXECUTE));
+        Wire e = Wire.make(); e.bindComplete();
+        isize i = 0;
+        while (i < 10) { e.intRow(values: oneInt(a: 7)); i = i + 1; }
+        e.complete(tag: "SELECT 10"); e.ready(status: IDLE);
+        s2.add(item: answer(tag: SYNC, reply: give e));
+        k = k + 1;
+    }
+    Result<Connection, PgError> m2 = limited(steps: give s2, limits: fifty);
+    match (give m2) {
+        case Ok(value: x): {
+            Connection c = give x;
+            Result<Rows, PgError> q = c.query(q: Query.make(sql: "select n"));
+            f = f + check(ok: isLimit(r: q) && !c.isClosed(), what: "limits: query is counted (ten rows of 10 bytes): ".concat(other: messageOf(r: q)));
+            Result<Unit, PgError> started = c.startRows(q: Query.make(sql: "select n"));
+            isize seen = 0;
+            isize guard = 0;
+            while (c.isStreaming() && guard < 20) {
+                Result<Rows, PgError> chunk = c.nextRows(maxRows: 6);   // 60 bytes a chunk: over the bound, were it counted
+                match (chunk) { case Ok(value: rows): { seen = seen + rows.rowCount(); } case Err(error: e): { guard = 100; } };
+                guard = guard + 1;
+            }
+            f = f + check(ok: seen == 10, what: "limits: rows read a chunk at a time are not counted: ${seen} rows");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "limits: connect for the extended protocol: ".concat(other: e.message())); }
+    };
+
+    // A pipeline: a result over the bound fails its getResult, and the pipeline reads on to its sync.
+    DynamicArray<Step> s3 = opening();
+    isize p = 0;
+    while (p < 2) {
+        s3.add(item: quiet(tag: PARSE));
+        s3.add(item: quiet(tag: BIND));
+        s3.add(item: quiet(tag: DESCRIBE));
+        Wire w = Wire.make(); w.parseComplete(); w.bindComplete(); w.columns(names: one(a: "v"));
+        isize n = 1;
+        if (p == 0) { n = 5; }
+        isize i = 0;
+        while (i < n) { w.row(values: one(a: "0123456789")); i = i + 1; }
+        w.complete(tag: "SELECT ${n}");
+        s3.add(item: answer(tag: EXECUTE, reply: give w));
+        p = p + 1;
+    }
+    Wire z = Wire.make(); z.ready(status: IDLE);
+    s3.add(item: answer(tag: SYNC, reply: give z));
+    s3.add(item: answer(tag: QUERY, reply: tenByteRows(count: 1, status: IDLE)));
+    Result<Connection, PgError> m3 = limited(steps: give s3, limits: fifty);
+    match (give m3) {
+        case Ok(value: x): {
+            Connection c = give x;
+            Result<Unit, PgError> entered = c.enterPipelineMode();
+            Result<Unit, PgError> a = c.sendQuery(q: Query.make(sql: "select five"));
+            Result<Unit, PgError> b = c.sendQuery(q: Query.make(sql: "select one"));
+            Result<Unit, PgError> synced = c.pipelineSync();
+            Result<Optional<PipelineResult>, PgError> r1 = c.getResult();
+            Result<Optional<PipelineResult>, PgError> r2 = c.getResult();
+            Result<Optional<PipelineResult>, PgError> r3 = c.getResult();
+            bool second = match (r2) { case Ok(value: o): match (o) { case Some(value: res): match (res) { case Rows(rows: rows): rows.rowCount() == 1; case _: false; }; case None: false; }; case Err(error: e): false; };
+            bool sync = match (r3) { case Ok(value: o): match (o) { case Some(value: res): match (res) { case Sync: true; case _: false; }; case None: false; }; case Err(error: e): false; };
+            Result<Unit, PgError> exited = c.exitPipelineMode();
+            Result<DynamicArray<Rows>, PgError> after = c.simpleQuery(sql: "select one");
+            f = f + check(ok: isLimit(r: r1) && second && sync && ran(r: after),
+                          what: "limits: in a pipeline the result over the bound fails, and the rest come: ".concat(other: messageOf(r: r1)));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "limits: connect for a pipeline: ".concat(other: e.message())); }
+    };
+
+    // A batch counts its results together: 48 and 32 bytes are over 50 between them. A batch goes through the cache:
+    // its statements are described together, then bound and run in one pipeline.
+    DynamicArray<Step> s4 = opening();
+    isize q = 0;
+    while (q < 2) {
+        s4.add(item: quiet(tag: PARSE));
+        Wire d = Wire.make(); d.parseComplete(); d.parameterTypes(oids: DynamicArray.empty()); d.typedColumns(names: one(a: "v"), oids: oneOid(a: 25ui32));
+        s4.add(item: answer(tag: DESCRIBE, reply: give d));
+        q = q + 1;
+    }
+    Wire described = Wire.make(); described.ready(status: IDLE);
+    s4.add(item: answer(tag: SYNC, reply: give described));
+    Wire three = Wire.make(); three.bindComplete(); three.row(values: one(a: "0123456789")); three.row(values: one(a: "0123456789")); three.row(values: one(a: "0123456789")); three.complete(tag: "SELECT 3");
+    s4.add(item: quiet(tag: BIND));
+    s4.add(item: answer(tag: EXECUTE, reply: give three));
+    Wire two = Wire.make(); two.bindComplete(); two.row(values: one(a: "0123456789")); two.row(values: one(a: "0123456789")); two.complete(tag: "SELECT 2");
+    s4.add(item: quiet(tag: BIND));
+    s4.add(item: answer(tag: EXECUTE, reply: give two));
+    Wire synced = Wire.make(); synced.ready(status: IDLE);
+    s4.add(item: answer(tag: SYNC, reply: give synced));
+    s4.add(item: answer(tag: QUERY, reply: tenByteRows(count: 1, status: IDLE)));
+    Result<Connection, PgError> m4 = limitedCached(steps: give s4, limits: fifty);
+    match (give m4) {
+        case Ok(value: x): {
+            Connection c = give x;
+            Batch batch = Batch.make();
+            batch.add(q: Query.make(sql: "select three"));
+            batch.add(q: Query.make(sql: "select two"));
+            Result<DynamicArray<BatchResult>, PgError> r = c.runBatch(batch: batch);
+            Result<DynamicArray<Rows>, PgError> after = c.simpleQuery(sql: "select one");
+            f = f + check(ok: isLimit(r: r) && ran(r: after), what: "limits: a batch's results count together, and the session goes on: ".concat(other: messageOf(r: r)).concat(other: " / ").concat(other: messageOf(r: after)));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "limits: connect for a batch: ".concat(other: e.message())); }
+    };
+
+    // One result of a batch over the bound alone: the batch reads on to its sync, and the session goes on.
+    DynamicArray<Step> s6 = opening();
+    isize b = 0;
+    while (b < 2) {
+        s6.add(item: quiet(tag: PARSE));
+        Wire d = Wire.make(); d.parseComplete(); d.parameterTypes(oids: DynamicArray.empty()); d.typedColumns(names: one(a: "v"), oids: oneOid(a: 25ui32));
+        s6.add(item: answer(tag: DESCRIBE, reply: give d));
+        b = b + 1;
+    }
+    Wire ready6 = Wire.make(); ready6.ready(status: IDLE);
+    s6.add(item: answer(tag: SYNC, reply: give ready6));
+    Wire five = Wire.make(); five.bindComplete();
+    isize r6 = 0;
+    while (r6 < 5) { five.row(values: one(a: "0123456789")); r6 = r6 + 1; }
+    five.complete(tag: "SELECT 5");
+    s6.add(item: quiet(tag: BIND));
+    s6.add(item: answer(tag: EXECUTE, reply: give five));
+    Wire single = Wire.make(); single.bindComplete(); single.row(values: one(a: "0123456789")); single.complete(tag: "SELECT 1");
+    s6.add(item: quiet(tag: BIND));
+    s6.add(item: answer(tag: EXECUTE, reply: give single));
+    Wire done6 = Wire.make(); done6.ready(status: IDLE);
+    s6.add(item: answer(tag: SYNC, reply: give done6));
+    s6.add(item: answer(tag: QUERY, reply: tenByteRows(count: 1, status: IDLE)));
+    Result<Connection, PgError> m6 = limitedCached(steps: give s6, limits: fifty);
+    match (give m6) {
+        case Ok(value: x): {
+            Connection c = give x;
+            Batch batch = Batch.make();
+            batch.add(q: Query.make(sql: "select five"));
+            batch.add(q: Query.make(sql: "select one"));
+            Result<DynamicArray<BatchResult>, PgError> r = c.runBatch(batch: batch);
+            Result<DynamicArray<Rows>, PgError> after = c.simpleQuery(sql: "select one");
+            f = f + check(ok: isLimit(r: r) && ran(r: after), what: "limits: a batch result over the bound alone, and the batch reads on to its sync: ".concat(other: messageOf(r: r)).concat(other: " / ").concat(other: messageOf(r: after)));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "limits: connect for a batch over alone: ".concat(other: e.message())); }
+    };
+
+    // Off by default.
+    DynamicArray<Step> s5 = opening();
+    s5.add(item: answer(tag: QUERY, reply: tenByteRows(count: 500, status: IDLE)));
+    Result<Connection, PgError> m5 = limited(steps: give s5, limits: Limits.defaults());
+    match (give m5) {
+        case Ok(value: x): {
+            Connection c = give x;
+            Result<DynamicArray<Rows>, PgError> all = c.simpleQuery(sql: "select many");
+            isize rows = match (all) { case Ok(value: v): v[0].rowCount(); case Err(error: e): -1; };
+            f = f + check(ok: rows == 500, what: "limits: resultBytes is off by default");
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "limits: connect with the defaults"); }
+    };
+    return f;
+}
+
+unsafe fn int32 limitsTests() {
+    int32 f = 0;
+    f = f + readBufferTests();
+    f = f + parameterTests();
+    f = f + notificationTests();
+    f = f + resultTests();
+    return f;
+}

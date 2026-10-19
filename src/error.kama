@@ -47,7 +47,11 @@ type enum PgError implements Error, Sendable {
     // The server is not the kind target_session_attrs asked for, or could not be asked: libpq's words ("session is
     // read-only", "server is in hot standby mode", "\"SHOW transaction_read_only\" failed", …). The connect moves on
     // to the next host.
-    Target(string detail);
+    Target(string detail),
+    // A bound of Config.setLimits was reached. The detail names the bound, its value and what was given up. Past
+    // `readBuffer` or `parameters` the session is over (isClosed()); past `resultBytes` the command ran, its rows were
+    // read and dropped, and the session goes on.
+    Limit(string detail);
 
     public const fn string message() {
         return match (this) {
@@ -65,6 +69,7 @@ type enum PgError implements Error, Sendable {
             case Cancel(detail: d): copy d;
             case RolledBack: "commit unexpectedly resulted in rollback";
             case Target(detail: d): copy d;
+            case Limit(detail: d): copy d;
         };
     }
 

@@ -2,7 +2,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          std::encoding::utf8::Utf8Error, std::encoding::base64::decode as b64decode,
          std::encoding::base64::DecodeError, std::fs::readFile, std::fs::File, std::fs::OpenMode, std::fs::Metadata,
          std::fs::Permissions, std::io::IoError, std::process::currentUser, std::process::UserId,
-         std::log::logWarn, core::env, postgres::wire::strerror,
+         std::log::logWarn, core::env, postgres::wire::strerror, postgres::Limits,
          postgres::PgError, postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
          postgres::conninfo::ConnInfo, postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
          postgres::conninfo::Keyword, postgres::conninfo::libpqKeywords, postgres::conninfo::EnvironmentOption,
@@ -504,6 +504,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     TlsSettings tlsSettings;
     CacheMode cacheModeSetting = CacheMode::Statements;
     isize cacheCapacitySetting = 512;
+    Limits limitsSetting;
     SessionTarget targetSetting = SessionTarget::Any;
     bool balanceRandom = false;    // load_balance_hosts=random
 
@@ -555,6 +556,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.tlsSettings = TlsSettings.blank();
         this.cacheModeSetting = CacheMode::Statements;
         this.cacheCapacitySetting = 512;
+        this.limitsSetting = Limits.defaults();
         this.targetSetting = SessionTarget::Any;
         this.balanceRandom = false;
     }
@@ -571,6 +573,7 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         this.tlsSettings = copy source.tlsSettings;
         this.cacheModeSetting = source.cacheModeSetting;
         this.cacheCapacitySetting = source.cacheCapacitySetting;
+        this.limitsSetting = source.limitsSetting;
         this.targetSetting = source.targetSetting;
         this.balanceRandom = source.balanceRandom;
     }
@@ -591,6 +594,11 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
 
     public const fn CacheMode statementCacheMode() { return this.cacheModeSetting; }
     public const fn isize statementCacheCapacity() { return this.cacheCapacitySetting; }
+
+    // What a connection made with this configuration may be made to hold (Limits). Not a connection-string keyword:
+    // libpq has no such bounds.
+    public fn void setLimits(Limits limits) { this.limitsSetting = limits; }
+    public const fn Limits limits() { return this.limitsSetting; }
 
     // ---- reading it ----
 

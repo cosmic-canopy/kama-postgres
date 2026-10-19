@@ -51,7 +51,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1 and the port to kama 0.9.673 done; S2 under way (S2a, S2d done) |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1 and the port to kama 0.9.673 done; S2 under way (S2a, S2d, S2b done) |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -142,9 +142,17 @@ it fail.
     `FakeServer.garbled`. A run must end in a result or a `PgError` with a message, never a panic, and a protocol error
     must end the session. It found one thing to fix: a pre-3.0 error with an empty text, now "received invalid error
     message". 500 seeds (a million cases, 80 seconds in release) find nothing more.
-  - **S2b: bounds, each configurable** (an `Optional`, None turning it off): the read buffer that grows while a write
-    waits, the notification queue (the oldest dropped, with a warning and a count), the ParameterStatus count, and an
-    optional limit on a buffered result (off by default; the rest is read and dropped, and the session kept).
+  - **S2b, done: bounds, each configurable** (`Limits`, `Config.setLimits`; each an `Optional`, None turning it off):
+    - `readBuffer`, the bytes held while a write waits (1 GiB): past it the connection closes;
+    - `parameters` (1,000): past it the connection closes;
+    - `notifications` (10,000): the oldest dropped, counted and logged, decided with the maintainer although no other
+      driver bounds this queue;
+    - `resultBytes` (off): the rest read and dropped, the call failing with `PgError::Limit`, and the session and its
+      transaction kept, where pgjdbc master closes the connection. A simple query's statements and a batch's results
+      count together.
+
+    Live: a result over the bound and a burst of notifications against each server. The garbling runs half its cases
+    under tiny bounds.
   - **S2c: `tools/pg.sh restart|stop|start`, and restart tests**, with libpq's words, over TLS too, driven from the
     test program through `std::process::Command`.
 - **S3, the pool** (`src/pool/`).

@@ -158,5 +158,149 @@
   "old": "                    if (r.columnCount() != columns) { return this.violation(detail: \"unexpected field count in \\\"D\\\" message\"); }\n",
   "new": "",
   "expect": "PANICKED"
+ },
+ {
+  "id": "B1",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "if (this.readCap >= 0 && this.end - this.start > this.readCap) {",
+  "new": "if (this.readCap >= 0 && this.end - this.start > this.readCap * 100000) {",
+  "expect": "limits: readBuffer ends the session"
+ },
+ {
+  "id": "B2",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        session.wire.setReadLimit(bytes: config.limits().readBuffer);\n",
+  "new": "",
+  "expect": "limits: readBuffer ends the session"
+ },
+ {
+  "id": "B3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "if (cap < 0 || this.paramNames.length() < cap) { return false; }",
+  "new": "if (cap < 0 || this.paramNames.length() <= cap) { return false; }",
+  "expect": "limits: an eleventh parameter at startup ends the connect"
+ },
+ {
+  "id": "B4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        while (i < this.paramNames.length()) { if (this.paramNames[i].equals(other: name)) { return false; } i = i + 1; }\n        return true;",
+  "new": "        return true;",
+  "expect": "limits: a parameter reported again is not another"
+ },
+ {
+  "id": "B5",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "while (room > 0 && this.pending.length() >= room) {",
+  "new": "while (room > 0 && this.pending.length() > room) {",
+  "expect": "limits: past three notifications the oldest go"
+ },
+ {
+  "id": "B6",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.dropLogged) { return; }\n",
+  "new": "",
+  "expect": "limits: past three notifications the oldest go, counted and logged once"
+ },
+ {
+  "id": "B7",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.dropLogged = false;\n        return taken;",
+  "new": "        return taken;",
+  "expect": "limits: a later overflow is logged again"
+ },
+ {
+  "id": "B8",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "this.droppedCount = this.droppedCount + 1i64;",
+  "new": "",
+  "expect": "limits: past three notifications the oldest go"
+ },
+ {
+  "id": "B9",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "if (allowance < 0) { over = true; rows = DynamicArray.empty(); }",
+  "new": "if (allowance < -1000000) { over = true; rows = DynamicArray.empty(); }",
+  "expect": "limits: query is counted"
+ },
+ {
+  "id": "B10",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                        over = allowance < 0;\n                    }\n                    if (over) { RowValues dropped = give r; }",
+  "new": "                        over = allowance < -1000000;\n                    }\n                    if (over) { RowValues dropped = give r; }",
+  "expect": "limits: a result over resultBytes fails"
+ },
+ {
+  "id": "B11",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                                over = allowance < 0;\n                            }\n                            if (over) { Rows dropped = give rows; }",
+  "new": "                                over = allowance < -1000000;\n                            }\n                            if (over) { Rows dropped = give rows; }",
+  "expect": "limits: a batch's results count together"
+ },
+ {
+  "id": "B12",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "if (!limited) { this.pipeline = 0ui8;",
+  "new": "if (true) { this.pipeline = 0ui8;",
+  "expect": "limits: a batch result over the bound alone"
+ },
+ {
+  "id": "B13",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "this.readRows(limit: -1, keep: true, pipelined: true, counted: true);",
+  "new": "this.readRows(limit: -1, keep: true, pipelined: true, counted: false);",
+  "expect": "limits: in a pipeline the result over the bound fails"
+ },
+ {
+  "id": "B14",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "this.readRows(limit: maxRows, keep: true, pipelined: false, counted: false);",
+  "new": "this.readRows(limit: maxRows, keep: true, pipelined: false, counted: true);",
+  "expect": "limits: rows read a chunk at a time are not counted"
+ },
+ {
+  "id": "B15",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        session.limits = config.limits();\n",
+  "new": "",
+  "expect": "limits: a result over resultBytes fails"
+ },
+ {
+  "id": "B16",
+  "suite": "unit",
+  "file": "src/limits.kama",
+  "old": "        this.resultBytes = Optional::None;\n    }\n\n    // No bound at all",
+  "new": "        this.resultBytes = Optional::Some(value: 100);\n    }\n\n    // No bound at all",
+  "expect": "limits: resultBytes is off by default"
+ },
+ {
+  "id": "IB1",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "                        over = allowance < 0;\n                    }\n                    if (over) { RowValues dropped = give r; }",
+  "new": "                        over = false;\n                    }\n                    if (over) { RowValues dropped = give r; }",
+  "expect": "limits: a result over resultBytes on a live server"
+ },
+ {
+  "id": "IB2",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "while (room > 0 && this.pending.length() >= room) {",
+  "new": "while (room > 0 && this.pending.length() > room + 100) {",
+  "expect": "limits: past five notifications the newest are kept"
  }
 ]

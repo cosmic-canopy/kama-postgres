@@ -267,6 +267,10 @@ release it is built and tested with, and the first with everything this package 
     from libpq's source into `src/protocol/framing.kama`): a short type over 30000 bytes is lost synchronization, and
     startup accepts only R, E and v, each within libpq's bounds.
   - The buffer grows only as bytes arrive, never to a length a header merely declares.
+  - What a server can make a connection hold is bounded (`Limits`, `Config.setLimits`): the bytes held while a write
+    waits (`Wire.send`), the parameters (`Connection.nextMessage`, which every read goes through), the notification
+    queue (`enqueue`), and a buffered result (`readRows`' `counted`, `collect`, `runBatch`). A reader that buffers a
+    new kind of result must count it.
   - Every length is bounded before it is used.
   - Every text field is validated as UTF-8.
   - A malformed message is `PgError::Protocol`, never a panic. The unit tests feed truncated and oversized

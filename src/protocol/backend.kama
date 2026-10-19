@@ -107,6 +107,8 @@ type resource RowValues implements Sendable {
         this.body = give body; this.starts = give starts; this.lengths = give lengths;
     }
     public const fn isize columnCount() { return this.lengths.length(); }
+    // The DataRow's body, in bytes: what keeping the row costs, as Limits.resultBytes counts it.
+    public const fn isize byteSize() { return this.body.length(); }
     public const fn bool isNull(isize column) { return this.lengths[column] < 0; }
     // A column's bytes; empty for NULL (ask `isNull` to tell NULL from an empty value).
     public unsafe const fn ConstView<uint8> value(isize column) {

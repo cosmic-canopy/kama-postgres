@@ -1,7 +1,8 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::validate,
          std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error, std::io::IoError, std::io::IoErrorKind,
          std::memory::Owned, std::net::SocketAddr, std::net::IpAddr, std::net::resolve, std::net::parseIp,
-         std::time::Duration, std::random::Rng, std::random::shuffle, std::log::logWarn,
+         std::time::Duration, std::random::Rng, std::random::shuffle, std::log::logWarn, std::collections::Deque,
+         postgres::Limits,
          postgres::PgError, postgres::ServerError, postgres::ConnectError, postgres::ConnectAttempt,
          postgres::Config, postgres::HostKind, postgres::ChannelBindingMode, postgres::RequireAuth,
          postgres::Transport, postgres::socketPathMax,
@@ -69,7 +70,12 @@ type resource Connection implements Sendable, Transactional {
     DynamicArray<string> paramNames;
     DynamicArray<string> paramValues;
     Optional<Owned<NoticeHandler>> handler;
-    DynamicArray<Notification> pending;
+    // The notifications received and not yet taken, oldest first, at most Limits.notifications of them; how many were
+    // dropped for room; and whether that was logged since the queue was last read.
+    Deque<Notification> pending;
+    int64 droppedCount = 0i64;
+    bool dropLogged = false;
+    Limits limits;   // Config.setLimits, applied before startup
     // A result being read: its columns as they arrive, and whether its BindComplete is still to come. While
     // `busy`, every other call is refused, as libpq refuses one while a query is in progress.
     bool busy = false;
@@ -129,7 +135,10 @@ type resource Connection implements Sendable, Transactional {
         this.paramNames = DynamicArray.empty();
         this.paramValues = DynamicArray.empty();
         this.handler = Optional::None;
-        this.pending = DynamicArray.empty();
+        this.pending = Deque.empty();
+        this.droppedCount = 0i64;
+        this.dropLogged = false;
+        this.limits = Limits.defaults();
         this.busy = false;
         this.streaming = false;
         this.bindPending = false;
@@ -175,7 +184,10 @@ type resource Connection implements Sendable, Transactional {
         this.paramNames = DynamicArray.empty();
         this.paramValues = DynamicArray.empty();
         this.handler = Optional::None;
-        this.pending = DynamicArray.empty();
+        this.pending = Deque.empty();
+        this.droppedCount = 0i64;
+        this.dropLogged = false;
+        this.limits = Limits.defaults();
         this.busy = false;
         this.streaming = false;
         this.bindPending = false;
@@ -483,6 +495,8 @@ type resource Connection implements Sendable, Transactional {
                 }
             };
         }
+        session.limits = config.limits();
+        session.wire.setReadLimit(bytes: config.limits().readBuffer);
         Result<Unit, PgError> started = session.startup(config: config, hostIndex: hostIndex, deadline: deadline);
         match (give started) {
             case Ok(value: u): {
@@ -539,6 +553,9 @@ type resource Connection implements Sendable, Transactional {
     // Read the server's answer through ReadyForQuery: one result per statement, or the first error.
     unsafe fn Result<DynamicArray<Rows>, PgError> collect() {
         DynamicArray<Rows> results = DynamicArray.empty();
+        // Limits.resultBytes, for all the statements' rows together: past it they are dropped as they come.
+        isize allowance = match (this.limits.resultBytes) { case Some(value: n): n; case None: -1; };
+        bool over = false;
         isize columns = -1;                                     // the open result's column count; -1 when none is open
         DynamicArray<int16> formats = DynamicArray.empty();     // its columns' formats, for checking each row
         DynamicArray<PgError> failed = DynamicArray.empty();    // errors, in order: the first is the one returned
@@ -567,7 +584,11 @@ type resource Connection implements Sendable, Transactional {
                         this.lose();
                         return Result::Err(error: PgError::Protocol(error: ProtocolError::NotUtf8(tag: 68ui8)));
                     }
-                    results[results.length() - 1].addRow(row: give r);
+                    if (!over && allowance >= 0) {
+                        allowance = allowance - r.byteSize();
+                        over = allowance < 0;
+                    }
+                    if (over) { RowValues dropped = give r; } else { results[results.length() - 1].addRow(row: give r); }
                 }
                 case CommandComplete(commandTag: t): {
                     this.noteTag(tag: t);
@@ -588,7 +609,7 @@ type resource Connection implements Sendable, Transactional {
                 case NoticeResponse(fields: f): { this.deliver(fields: give f); }
                 case ParameterStatus(name: n, value: v): { this.setParameter(name: give n, value: give v); }
                 case NotificationResponse(processId: p, channel: c, payload: x): {
-                    this.pending.add(item: Notification.make(processId: p, channel: give c, payload: give x));
+                    this.enqueue(n: Notification.make(processId: p, channel: give c, payload: give x));
                 }
                 case CopyInResponse(formats: cf): {
                     // COPY has its own interface; refusing it here keeps the session usable.
@@ -612,6 +633,7 @@ type resource Connection implements Sendable, Transactional {
             return Result::Err(error: PgError::Usage(detail: "COPY runs through startCopyIn/startCopyOut (or copyFrom/copyTo), not simpleQuery; the statement was not run, or its output was discarded"));
         }
         if (failed.length() > 0) { return Result::Err(error: failed.remove(index: 0)); }
+        if (over) { return Result::Err(error: overResult(limits: this.limits)); }
         return Result::Ok(value: give results);
     }
 
@@ -625,11 +647,11 @@ type resource Connection implements Sendable, Transactional {
         bool retryable = this.txStatus == 73ui8;   // 'I': nothing has run yet that a retry could repeat
         Result<Unit, PgError> started = this.start(q: q, portal: "", run: true);
         match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true, pipelined: false);
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true, pipelined: false, counted: true);
         if (retryable && this.stalePlan(r: r)) {
             Result<Unit, PgError> again = this.start(q: q, portal: "", run: true);
             match (give again) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-            return this.readRows(limit: -1, keep: true, pipelined: false);
+            return this.readRows(limit: -1, keep: true, pipelined: false, counted: true);
         }
         return r;
     }
@@ -640,11 +662,11 @@ type resource Connection implements Sendable, Transactional {
         bool retryable = this.txStatus == 73ui8;
         Result<Unit, PgError> started = this.start(q: q, portal: "", run: true);
         match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        Result<Rows, PgError> r = this.readRows(limit: -1, keep: false, pipelined: false);
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: false, pipelined: false, counted: false);
         if (retryable && this.stalePlan(r: r)) {
             Result<Unit, PgError> again = this.start(q: q, portal: "", run: true);
             match (give again) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-            r = this.readRows(limit: -1, keep: false, pipelined: false);
+            r = this.readRows(limit: -1, keep: false, pipelined: false, counted: false);
         }
         return match (give r) { case Ok(value: rows): Result::Ok(value: rows.rowsAffected()); case Err(error: e): Result::Err(error: give e); };
     }
@@ -709,14 +731,14 @@ type resource Connection implements Sendable, Transactional {
         if (!this.streaming) { return Result::Err(error: PgError::Usage(detail: "no rows are being read: startRows begins")); }
         if (maxRows < 1) { return Result::Err(error: PgError::Usage(detail: "nextRows needs maxRows of 1 or more")); }
         this.arm();
-        return this.readRows(limit: maxRows, keep: true, pipelined: false);
+        return this.readRows(limit: maxRows, keep: true, pipelined: false, counted: false);
     }
 
     // Read the rest of the rows and drop them, so the connection is free again.
     public unsafe fn Result<Unit, PgError> discardRows() {
         if (!this.streaming) { return Result::Ok(value: Unit::Unit); }
         this.arm();
-        Result<Rows, PgError> r = this.readRows(limit: -1, keep: false, pipelined: false);
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: false, pipelined: false, counted: false);
         return match (give r) { case Ok(value: rows): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
     }
 
@@ -738,7 +760,7 @@ type resource Connection implements Sendable, Transactional {
         match (give started) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
         this.portals = this.portals + 1i64;
         DynamicArray<FieldDescription> fields = copy this.openFields;
-        Result<Rows, PgError> bound = this.readRows(limit: -1, keep: false, pipelined: false);
+        Result<Rows, PgError> bound = this.readRows(limit: -1, keep: false, pipelined: false, counted: false);
         match (give bound) { case Ok(value: r): { } case Err(error: e): { return Result::Err(error: give e); } };
         return Result::Ok(value: Portal.make(name: give name, fields: give fields));
     }
@@ -759,7 +781,7 @@ type resource Connection implements Sendable, Transactional {
         this.bindPending = false;
         this.rowLimited = maxRows > 0;
         this.busy = true;
-        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true, pipelined: false);
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true, pipelined: false, counted: false);
         bool finished = match (r) { case Ok(value: rows): !rows.suspended(); case Err(error: e): false; };
         if (finished) { portal.finish(); }
         return r;
@@ -963,7 +985,7 @@ type resource Connection implements Sendable, Transactional {
                 return Result::Err(error: PgError::Protocol(error: ProtocolError::Violation(detail: "the session was still in a transaction block after its reset")));
             }
         }
-        this.pending = DynamicArray.empty();
+        this.pending = Deque.empty();
         return Result::Ok(value: Unit::Unit);
     }
 
@@ -1143,7 +1165,7 @@ type resource Connection implements Sendable, Transactional {
         this.rowLimited = false;
         this.fromCache = head.cached();
         this.cachedSql = copy head.sql();
-        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true, pipelined: true);
+        Result<Rows, PgError> r = this.readRows(limit: -1, keep: true, pipelined: true, counted: true);
         return match (give r) {
             case Ok(value: rows): Result::Ok(value: Optional::Some(value: PipelineResult::Rows(rows: give rows)));
             case Err(error: e): this.failedInPipeline(e: give e);
@@ -1273,14 +1295,33 @@ type resource Connection implements Sendable, Transactional {
         Result<Unit, PgError> synced = this.pipelineSync();
         match (give synced) { case Ok(value: u): { } case Err(error: e): { this.pipeline = 0ui8; return Result::Err(error: give e); } };
         DynamicArray<BatchResult> results = DynamicArray.withCapacity(capacity: batch.length());
+        // Limits.resultBytes holds for the batch as a whole: past it, each result is still read, to the sync, and dropped.
+        isize allowance = match (this.limits.resultBytes) { case Some(value: n): n; case None: -1; };
+        bool over = false;
         bool done = false;
         while (!done) {
             Result<Optional<PipelineResult>, PgError> next = this.getResult();
-            Optional<PipelineResult> got = match (give next) { case Ok(value: o): give o; case Err(error: e): { this.pipeline = 0ui8; this.queue = DynamicArray.empty(); return Result::Err(error: give e); } };
+            Optional<PipelineResult> got = Optional::None;
+            match (give next) {
+                case Ok(value: o): { got = give o; }
+                case Err(error: e): {
+                    // One result over the bound was read to its end: the batch reads on to its sync.
+                    bool limited = match (e) { case Limit(detail: d): this.live; case _: false; };
+                    if (!limited) { this.pipeline = 0ui8; this.queue = DynamicArray.empty(); return Result::Err(error: give e); }
+                    over = true;
+                    got = Optional::Some(value: PipelineResult::Aborted);
+                }
+            };
             match (give got) {
                 case Some(value: r): {
                     match (give r) {
-                        case Rows(rows: rows): { results.add(item: BatchResult::Rows(rows: give rows)); }
+                        case Rows(rows: rows): {
+                            if (!over && allowance >= 0) {
+                                allowance = allowance - rows.byteSize();
+                                over = allowance < 0;
+                            }
+                            if (over) { Rows dropped = give rows; } else { results.add(item: BatchResult::Rows(rows: give rows)); }
+                        }
                         case Failed(error: e): {
                             // An error at the sync (a deferred constraint) belongs to the last query.
                             if (results.length() == batch.length()) { results.remove(index: results.length() - 1); }
@@ -1295,6 +1336,7 @@ type resource Connection implements Sendable, Transactional {
             };
         }
         this.pipeline = 0ui8;
+        if (over) { return Result::Err(error: overResult(limits: this.limits)); }
         return Result::Ok(value: give results);
     }
 
@@ -1574,7 +1616,7 @@ type resource Connection implements Sendable, Transactional {
     // what follows: read what has arrived, without waiting. Its error ends the COPY.
     unsafe fn Result<Unit, PgError> copyStillWanted() {
         while (true) {
-            Result<BackendMessage, PgError> r = this.wire.receive(deadline: Deadline.after(span: Duration.zero()), framing: this.phase);
+            Result<BackendMessage, PgError> r = this.nextMessage(deadline: Deadline.after(span: Duration.zero()), framing: this.phase);
             match (give r) {
                 case Ok(value: m): {
                     if (background(m: m)) { this.absorb(m: give m); continue; }
@@ -1655,7 +1697,7 @@ type resource Connection implements Sendable, Transactional {
     // The same, read as `framing` says: getCopyData reads as COPY OUT.
     unsafe fn Result<BackendMessage, PgError> receiveAs(Framing framing) {
         while (true) {
-            Result<BackendMessage, PgError> r = this.wire.receive(deadline: this.due, framing: framing);
+            Result<BackendMessage, PgError> r = this.nextMessage(deadline: this.due, framing: framing);
             bool late = match (r) { case Err(error: e): isTimeout(e: e); case Ok(value: m): false; };
             if (!late) { return r; }
             if (this.cancelling) { return Result::Err(error: PgError::Timeout); }
@@ -1920,9 +1962,17 @@ type resource Connection implements Sendable, Transactional {
     // Read the open result: BindComplete (when a Bind was sent), DataRows, the command's end (CommandComplete,
     // EmptyQueryResponse or PortalSuspended), then ReadyForQuery. With `limit` > 0, return once that many rows have
     // come and leave the rest open for the next call. A server error ends the result and is returned once the
-    // server is ready; `keep` false drops the rows as they arrive.
-    unsafe fn Result<Rows, PgError> readRows(isize limit, bool keep, bool pipelined) {
+    // server is ready; `keep` false drops the rows as they arrive. A `counted` result keeps at most
+    // Limits.resultBytes of rows: past that it is read to its end and its rows dropped, and the call fails with
+    // PgError::Limit, the session in step.
+    unsafe fn Result<Rows, PgError> readRows(isize limit, bool keep, bool pipelined, bool counted) {
         DynamicArray<RowValues> rows = DynamicArray.empty();
+        isize allowance = -1;   // the bytes of rows still to keep; -1 for no bound
+        if (counted && keep) {
+            isize bound = match (this.limits.resultBytes) { case Some(value: n): n; case None: -1; };
+            allowance = bound;
+        }
+        bool over = false;
         DynamicArray<int16> formats = DynamicArray.withCapacity(capacity: this.openFields.length());
         isize k = 0;
         while (k < this.openFields.length()) { formats.add(item: this.openFields[k].format()); k = k + 1; }
@@ -1975,7 +2025,11 @@ type resource Connection implements Sendable, Transactional {
                         this.lose();
                         return Result::Err(error: PgError::Protocol(error: ProtocolError::NotUtf8(tag: 68ui8)));
                     }
-                    if (keep) { rows.add(item: give r); } else { RowValues dropped = give r; }
+                    if (keep && !over && allowance >= 0) {
+                        allowance = allowance - r.byteSize();
+                        if (allowance < 0) { over = true; rows = DynamicArray.empty(); }
+                    }
+                    if (keep && !over) { rows.add(item: give r); } else { RowValues dropped = give r; }
                 }
                 case CommandComplete(commandTag: t): {
                     if (this.bindPending || this.portalDescribing || ended) { return Result::Err(error: this.broken(detail: unexpected(tag: 67ui8))); }
@@ -2031,6 +2085,7 @@ type resource Connection implements Sendable, Transactional {
             return Result::Err(error: failed.remove(index: 0));
         }
         if (copyRefused) { return Result::Err(error: PgError::Usage(detail: "COPY runs through startCopyIn/startCopyOut (or copyFrom/copyTo), not query; the statement was not run, or its output was discarded")); }
+        if (over) { return Result::Err(error: overResult(limits: this.limits)); }
         Rows result = Rows.make(fields: copy this.openFields, rows: give rows, tag: give tag);
         if (suspended) { result.suspend(); }
         return Result::Ok(value: give result);
@@ -2066,12 +2121,35 @@ type resource Connection implements Sendable, Transactional {
         return Result::Ok(value: Unit::Unit);
     }
 
+    // A notification, queued for waitForNotification and takeNotifications. At Limits.notifications the oldest goes to
+    // make room: counted (droppedNotifications), and logged at the first drop since the queue was last read.
+    unsafe fn void enqueue(Notification n) {
+        isize room = match (this.limits.notifications) { case Some(value: k): k; case None: -1; };
+        if (room == 0) { Notification unkept = give n; this.noteDrop(); return; }
+        while (room > 0 && this.pending.length() >= room) {
+            Optional<Notification> oldest = this.pending.popFront();
+            this.noteDrop();
+        }
+        this.pending.pushBack(item: give n);
+    }
+
+    fn void noteDrop() {
+        this.droppedCount = this.droppedCount + 1i64;
+        if (this.dropLogged) { return; }
+        this.dropLogged = true;
+        isize room = match (this.limits.notifications) { case Some(value: k): k; case None: -1; };
+        logWarn(tag: "postgres", msg: "a notification was dropped: at most ${room} are kept (Limits.notifications); read them with waitForNotification or takeNotifications");
+    }
+
+    // The notifications dropped for room since the connection was made (Limits.notifications).
+    public const fn int64 droppedNotifications() { return this.droppedCount; }
+
     // What the server sends outside any result: a notice, a parameter's new value, a notification.
-    fn void absorb(BackendMessage m) {
+    unsafe fn void absorb(BackendMessage m) {
         match (give m) {
             case NoticeResponse(fields: f): { this.deliver(fields: give f); }
             case ParameterStatus(name: n, value: v): { this.setParameter(name: give n, value: give v); }
-            case NotificationResponse(processId: p, channel: c, payload: x): { this.pending.add(item: Notification.make(processId: p, channel: give c, payload: give x)); }
+            case NotificationResponse(processId: p, channel: c, payload: x): { this.enqueue(n: Notification.make(processId: p, channel: give c, payload: give x)); }
             case _: { }
         };
     }
@@ -2131,13 +2209,20 @@ type resource Connection implements Sendable, Transactional {
     // The LISTEN/NOTIFY notifications received so far, oldest first, as libpq's PQnotifies queues them. They
     // arrive with query results; taking them empties the queue.
     public fn DynamicArray<Notification> takeNotifications() {
-        DynamicArray<Notification> taken = DynamicArray.empty();
+        DynamicArray<Notification> taken = DynamicArray.withCapacity(capacity: this.pending.length());
         bool more = true;
         while (more) {
-            Optional<Notification> last = this.pending.pop();
-            match (give last) { case Some(value: n): { taken.insertAt(index: 0, item: give n); } case None: { more = false; } };
+            Optional<Notification> first = this.pending.popFront();
+            match (give first) { case Some(value: n): { taken.add(item: give n); } case None: { more = false; } };
         }
+        this.dropLogged = false;
         return taken;
+    }
+
+    // The oldest notification queued, if any; the queue has been read, so a later drop is logged again.
+    fn Optional<Notification> nextQueued() {
+        this.dropLogged = false;
+        return this.pending.popFront();
     }
 
     // The next LISTEN/NOTIFY notification: the oldest one already received, else the next to arrive within `timeout`
@@ -2148,10 +2233,10 @@ type resource Connection implements Sendable, Transactional {
     public unsafe fn Result<Optional<Notification>, PgError> waitForNotification(Optional<Duration> timeout) {
         Result<Unit, PgError> ok = this.idle();
         match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
-        if (this.pending.length() > 0) { return Result::Ok(value: Optional::Some(value: this.pending.remove(index: 0))); }
+        if (this.pending.length() > 0) { return Result::Ok(value: this.nextQueued()); }
         Deadline until = match (timeout) { case Some(value: t): Deadline.after(span: t); case None: Deadline.none(); };
         while (true) {
-            Result<BackendMessage, PgError> received = this.wire.receive(deadline: until, framing: this.phase);
+            Result<BackendMessage, PgError> received = this.nextMessage(deadline: until, framing: this.phase);
             match (give received) {
                 case Ok(value: m): {
                     if (background(m: m)) { this.absorb(m: give m); }
@@ -2165,7 +2250,7 @@ type resource Connection implements Sendable, Transactional {
                             case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message other than a notice or a notification while idle")); }
                         };
                     }
-                    if (this.pending.length() > 0) { return Result::Ok(value: Optional::Some(value: this.pending.remove(index: 0))); }
+                    if (this.pending.length() > 0) { return Result::Ok(value: this.nextQueued()); }
                 }
                 case Err(error: e): {
                     if (isTimeout(e: e)) { return Result::Ok(value: Optional::None); }
@@ -2274,7 +2359,7 @@ type resource Connection implements Sendable, Transactional {
         int32 saslStage = 0;            // 0 none, 1 client-first sent, 2 client-final sent, 3 server verified
         DynamicArray<ScramClient> scram = DynamicArray.empty();   // zero or one
         while (true) {
-            Result<BackendMessage, PgError> received = this.wire.receive(deadline: deadline, framing: this.phase);
+            Result<BackendMessage, PgError> received = this.nextMessage(deadline: deadline, framing: this.phase);
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
             if (!authenticated) {
                 match (give m) {
@@ -2546,7 +2631,7 @@ type resource Connection implements Sendable, Transactional {
             case Err(error: e): {
                 bool io = match (e) { case Io(error: x): true; case Tls(detail: d, cause: c): true; case _: false; };
                 if (io) {
-                    Result<BackendMessage, PgError> waiting = this.wire.receive(deadline: Deadline.after(span: Duration.fromMillis(ms: 0i64)), framing: this.phase);
+                    Result<BackendMessage, PgError> waiting = this.nextMessage(deadline: Deadline.after(span: Duration.fromMillis(ms: 0i64)), framing: this.phase);
                     match (give waiting) {
                         case Ok(value: m): {
                             match (give m) {
@@ -2587,6 +2672,30 @@ type resource Connection implements Sendable, Transactional {
         if (found >= 0) { this.paramValues[found] = give value; return; }
         this.paramNames.add(item: give name);
         this.paramValues.add(item: give value);
+    }
+
+    // The next message from the wire, as `framing` reads it: every message comes through here. A ParameterStatus that
+    // would make more than Limits.parameters distinct parameters ends the session, since a server reports about
+    // twenty, and one that reports without end is not one to keep reading.
+    unsafe fn Result<BackendMessage, PgError> nextMessage(Deadline deadline, Framing framing) {
+        Result<BackendMessage, PgError> r = this.wire.receive(deadline: deadline, framing: framing);
+        bool overflow = match (r) {
+            case Ok(value: m): match (m) { case ParameterStatus(name: n, value: v): this.parameterOverflows(name: n); case _: false; };
+            case Err(error: e): false;
+        };
+        if (!overflow) { return r; }
+        isize cap = match (this.limits.parameters) { case Some(value: k): k; case None: -1; };
+        this.lose();
+        return Result::Err(error: PgError::Limit(detail: "the server reported more than ${cap} parameters (Limits.parameters); the connection is closed"));
+    }
+
+    // Whether `name` would be a parameter past Limits.parameters: a new one, with the bound reached.
+    fn bool parameterOverflows(const ref string name) {
+        isize cap = match (this.limits.parameters) { case Some(value: k): k; case None: -1; };
+        if (cap < 0 || this.paramNames.length() < cap) { return false; }
+        isize i = 0;
+        while (i < this.paramNames.length()) { if (this.paramNames[i].equals(other: name)) { return false; } i = i + 1; }
+        return true;
     }
 
     // The session is over: the transport is shut and every later call is `Closed`.
@@ -2751,6 +2860,12 @@ type enum Attempt { Ready(Connection connection), Retry(PgError error), Final(Pg
 fn PgError noPassword() { return PgError::Auth(detail: "fe_sendauth: no password supplied"); }
 
 fn PgError negotiation(const ref string what) { return violation(detail: what); }
+
+// Limits.resultBytes reached: what the call returns once the result has been read to its end.
+fn PgError overResult(const ref Limits limits) {
+    isize bound = match (limits.resultBytes) { case Some(value: n): n; case None: -1; };
+    return PgError::Limit(detail: "the result was over ${bound} bytes (Limits.resultBytes): the command ran, and its rows were read and dropped");
+}
 
 fn PgError violation(const ref string detail) { return PgError::Protocol(error: ProtocolError::Violation(detail: copy detail)); }
 

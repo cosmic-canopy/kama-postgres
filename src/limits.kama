@@ -1,0 +1,45 @@
+export { Limits };
+
+// What a server can make one connection hold, bounded (Config.setLimits). libpq bounds none of these; a server that
+// sends without end, or an application that never reads its notifications, would otherwise grow a connection's memory
+// until the process runs out. Each bound is an Optional, and None turns it off.
+//
+// The defaults are far past what a real server sends: they stop a runaway, not a workload.
+type value Limits implements Sendable {
+    // The bytes a connection takes in while one of its writes waits. It reads while it writes, as libpq does, or a
+    // server writing results for a long pipeline or COPY would wait on the client while the client waits on it. Past
+    // this the session ends. The default is the largest message accepted, 1 GiB.
+    public Optional<isize> readBuffer;
+    // The distinct parameters (ParameterStatus) a session keeps. A server reports about twenty. Past this the session
+    // ends.
+    public Optional<isize> parameters;
+    // The notifications (LISTEN/NOTIFY) kept for waitForNotification and takeNotifications. Past this the oldest is
+    // dropped: a warning goes to the log under `postgres` at the first drop since the queue was last read, and
+    // droppedNotifications() counts them. PostgreSQL delivers a notification at most once, so a listener that must not
+    // miss an event re-reads its state after any gap; this is one more kind of gap.
+    public Optional<isize> notifications;
+    // The DataRow bytes one call keeps as its result (pgjdbc's maxResultBuffer): query, simpleQuery for all its
+    // statements together, and getResult. Past this the rest of the result is read and dropped, and the call fails
+    // with PgError::Limit once the server is ready; the command ran, and the session goes on. Off by default. A
+    // result read a chunk at a time (startRows, a portal's fetch) is not counted: that is the way to read a big one.
+    public Optional<isize> resultBytes;
+
+    public ctor defaults() {
+        this.readBuffer = Optional::Some(value: DEFAULT_READ_BUFFER);
+        this.parameters = Optional::Some(value: DEFAULT_PARAMETERS);
+        this.notifications = Optional::Some(value: DEFAULT_NOTIFICATIONS);
+        this.resultBytes = Optional::None;
+    }
+
+    // No bound at all, as libpq has none.
+    public ctor unbounded() {
+        this.readBuffer = Optional::None;
+        this.parameters = Optional::None;
+        this.notifications = Optional::None;
+        this.resultBytes = Optional::None;
+    }
+}
+
+comptime isize DEFAULT_READ_BUFFER = 1073741824;
+comptime isize DEFAULT_PARAMETERS = 1000;
+comptime isize DEFAULT_NOTIFICATIONS = 10000;

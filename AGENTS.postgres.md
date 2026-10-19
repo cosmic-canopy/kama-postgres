@@ -12,7 +12,7 @@ edit.
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.667**, declared as `"kama"` in every manifest here, and pinned in CI. That is the
+**The package needs kama ≥ 0.9.673**, declared as `"kama"` in every manifest here, and pinned in CI. That is the
 release it is built and tested with, and the first with everything this package relies on:
 - a non-fatal write to a closed socket;
 - a `Sendable` `TcpStream`;
@@ -33,7 +33,9 @@ release it is built and tested with, and the first with everything this package 
 - serde's `DeErrorKind` contract (`failWith(kind:)`, `errorKind()`, `peekKind`, `readNumberText`, `unknownField`),
   which `decode.kama`'s reader and `query.kama`'s writer implement;
 - one copy of an adapter's vtable in a release build (KPG-38, 0.9.543);
-- a view's `~dtor`, run when its borrow window closes (KPG-35, 0.9.658).
+- a view's `~dtor`, run when its borrow window closes (KPG-35, 0.9.658);
+- a window opened through an enclosing window's alias freezes that alias (KPG-40), and std's JSON imports beside
+  this package (KPG-39), both first released in 0.9.673.
 
 ## What is true here and nowhere else
 

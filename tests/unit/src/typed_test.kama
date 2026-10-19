@@ -20,7 +20,7 @@ import { std::collections::DynamicArray, std::collections::ConstView,
          postgres::types::TEXT_ARRAY, postgres::types::BOOL_ARRAY, postgres::types::FLOAT8_ARRAY,
          postgres::types::UUID_ARRAY, postgres::types::DATE_ARRAY, postgres::types::TIMESTAMPTZ_ARRAY,
          postgres::types::NUMERIC_ARRAY, postgres::types::BYTEA_ARRAY, postgres::types::JSONB_ARRAY,
-         std::memory::Owned,
+         std::memory::Owned, std::serialization::text::json::JsonValue, std::serialization::text::json::serializeJsonBuffer,
          postgres_unit_tests::check, postgres_unit_tests::unhex,
          postgres_unit_tests::codecTypes, postgres_unit_tests::codecTexts, postgres_unit_tests::codecBinaries };
 export { typedTests };
@@ -413,7 +413,7 @@ unsafe fn int32 ruleTests() {
 }
 
 // A value read whatever it is, as std's JsonValue reads one (its deserialize asks peekKind first): what the reader's
-// untyped reads give. Std's JsonValue itself cannot be imported here until KPG-39 is fixed.
+// untyped reads give, kind by kind. jsonValueTests below reads the same row into std's JsonValue itself.
 type enum Untyped implements Deserializable<This> {
     Null, Bool(bool value), Number(string text), Text(string text), List(isize count), Record(isize count);
 
@@ -523,11 +523,51 @@ unsafe fn int32 untypedTests() {
     return f;
 }
 
+// A JsonValue read, as its JSON text, or the error.
+unsafe fn string jsonOf(const ref Result<JsonValue, PgError> r) {
+    return match (r) {
+        case Ok(value: v): {
+            Result<string, Owned<Error>> text = serializeJsonBuffer(v: v);
+            return match (give text) { case Ok(value: t): give t; case Err(error: e): "(not writable)"; };
+        }
+        case Err(error: e): "error ".concat(other: e.message());
+    };
+}
+
+// std's JsonValue reads a column and a row as Untyped does: a number keeps the server's exact text (an int8 past 2^53
+// too), a bool is a bool, NULL is null, an array of one dimension is an array, and every other value is its PostgreSQL
+// text. Until kama 0.9.673 (KPG-39), importing std's JSON made this whole program fail to build, since CopyChunk holds
+// an Optional<int64> and is Sendable.
+unsafe fn int32 jsonValueTests() {
+    int32 f = 0;
+    Shape s = accountRow(withNick: false, withAvatar: true);
+    s.addText(name: "ratio", oid: FLOAT8, text: "0.1");
+    s.addText(name: "big", oid: INT8, text: "9007199254740993");
+    s.addText(name: "ok", oid: BOOL, text: "t");
+    Rows rows = s.rows();
+    Result<JsonValue, PgError> scores = column::<JsonValue>(rows: rows, row: 0, index: 7);
+    string got = jsonOf(r: scores);
+    f = f + check(ok: got.equals(other: "[1,2,4]"), what: "typed: an int4[] into std's JsonValue (".concat(other: got).concat(other: ")"));
+    Result<JsonValue, PgError> big = column::<JsonValue>(rows: rows, row: 0, index: 9);
+    Optional<int64> exact = match (big) { case Ok(value: v): v.asInt64(); case Err(error: e): Optional::None; };
+    bool kept = match (exact) { case Some(value: n): n == 9007199254740993i64; case None: false; };
+    got = jsonOf(r: big);
+    f = f + check(ok: kept && got.equals(other: "9007199254740993"), what: "typed: an int8 past 2^53 into std's JsonValue stays exact (".concat(other: got).concat(other: ")"));
+    Result<JsonValue, PgError> whole = rowAs::<JsonValue>(rows: rows, row: 0);
+    got = jsonOf(r: whole);
+    string want = "{\"id\":7,\"name\":\"ann\",\"ignored\":\"a column no field names\",\"nick\":null,\"mood\":\"sad\","
+        .concat(other: "\"avatar\":\"\\\\x0102ff\",\"created_at\":\"2026-09-30 12:34:56.789012+00\",\"scores\":[1,2,4],")
+        .concat(other: "\"ratio\":0.1,\"big\":9007199254740993,\"ok\":true}");
+    f = f + check(ok: got.equals(other: want), what: "typed: a row into std's JsonValue, its columns in order (".concat(other: got).concat(other: ")"));
+    return f;
+}
+
 unsafe fn int32 typedTests() {
     int32 f = 0;
     f = f + textTests();
     f = f + nativeTests();
     f = f + ruleTests();
     f = f + untypedTests();
+    f = f + jsonValueTests();
     return f;
 }

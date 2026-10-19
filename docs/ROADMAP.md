@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-18: phases 0–7 are done, and phase 8 is under way (S0, S0b and S1 are done). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-19: phases 0–7 are done, and phase 8 is under way (S0, S0b and S1 are done, and the port to kama 0.9.673). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -34,8 +34,9 @@ cases the container's libpq answered against the same server and files. Phase 5'
 package needs the 0.9.523 release that carries them ([KAMA_GAPS.md](../KAMA_GAPS.md)). Phase 7's tests replay the traces
 of libpq's `libpq_pipeline` message for message and the cases of `001_stream_rep.pl` and `003_load_balance_host_list.pl`,
 and ask the container's libpq about each `target_session_attrs` case against a primary and its standby. On kama 0.9.667,
-KPG-33 to KPG-38 are fixed. KPG-39 (fixed in 0.9.669) and KPG-40 (nesting through `tx.conn()` is intended; the freeze
-it relies on was fixed in 0.9.672) wait for the v0.9.672 release. Phase 8 is under way: its plan is below.
+KPG-33 to KPG-38 are fixed. KPG-39 (std's JSON beside this package) and KPG-40 (nesting through `tx.conn()` is intended,
+and the freeze it relies on is fixed) were verified on the 0.9.673 release, which the package now needs. No gap is
+open. Phase 8 is under way: its plan is below.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -50,7 +51,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b and S1 done; S2 next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1 and the port to kama 0.9.673 done; S2 next |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -117,6 +118,13 @@ it fail.
     The unit tests pin each one (the "release:" cases in `tests/unit/src/reset_test.kama`).
   - **Mutations:** `tools/mutations/s1.json`, 25 unit and 10 integration. The integration ones remove each statement of
     the long form in turn, and each removal fails a live check.
+- **The port to kama 0.9.673, done (2026-10-19).** No v0.9.672 was tagged, so 0.9.673 is the first release with
+  KPG-39's and KPG-40's fixes, and the floor is `>=0.9.673` (the maintainer approved the raise to the first release with
+  them).
+  - Both entries' repros ran as filed. The refusal of `tx` inside `inner` was checked, and both entries moved to FIXED.
+  - `typed_test.kama`'s `jsonValueTests` reads a column and a row into std's `JsonValue`. That program fails to build
+    on 0.9.667.
+  - The README's known issue is gone.
 - **S2, hardening.**
   - libpq's rule that a message of a short type over 30000 bytes is "lost synchronization with server" (fe-protocol3.c).
   - Bounds, each configurable: the read buffer that grows while a write waits, the notification queue, the
@@ -170,27 +178,11 @@ it fail.
 - **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
   for changes.
 
-**What the next session needs to know** (written 2026-10-18, at the end of S1):
-- **Where it stands.** S0, S0b and S1 are done, and the working tree is clean. Nothing is pushed: pushing waits for the
-  maintainer.
-- **First: port to kama v0.9.672, once it is tagged.** It was still not tagged at the end of S1 (the latest release was
-  v0.9.667): check `https://api.github.com/repos/cosmic-canopy/kama/releases`. If it is still not out, start S2 on
-  0.9.667 and port when it lands.
-  - **KPG-40, answered:** `borrow tx.conn().transaction() as inner` is intended. Keep it, and add no mint on the view.
-    Before 0.9.672 the inner window did not freeze `tx`, so the outer transaction could be committed from inside a
-    savepoint. The windows' check of the server's status made that harmless, but 0.9.672 refuses it.
-  - **KPG-39, fixed in 0.9.669:** std's JSON can be imported beside this package.
-  - **The floor, approved by the maintainer on 2026-10-18:** raise `"kama"` to `>=0.9.672` in the three manifests and in
-    both `KAMA_VERSION` pins of `.github/workflows/ci.yml`. 0.3.0 is unreleased, and 0.9.672 is the first compiler that
-    refuses `tx` inside `inner` and lets JSON be imported.
-  - Steps:
-    1. Download the release and check its checksum.
-    2. Run both entries' repros and the refusal of `tx` inside `inner`, and move both entries to FIXED.
-    3. Raise the floor.
-    4. Add a `JsonValue` test beside `typed_test.kama`'s `Untyped`.
-    5. Drop the README's known issue, and note it all in the CHANGELOG.
-    6. Run the full gate, and every mutation file (`s0b.json`, `s1.json`).
-- **Then S2**, as its bullet above says.
+**What the next session needs to know** (written 2026-10-19, after the port to kama 0.9.673):
+- **Where it stands.** S0, S0b and S1 are done, and so is the port to kama 0.9.673. The working tree is clean. Nothing is
+  pushed: pushing waits for the maintainer.
+- **No gap is open** in KAMA_GAPS.md. A new one goes there the moment it is hit.
+- **Next: S2**, as its bullet above says.
 - **The gate, per step:**
   - `tools/test.sh`, which runs the unit suite in debug and release;
   - `tools/test-integration.sh`, on 14–19 in debug, release and TLS;
@@ -200,8 +192,8 @@ it fail.
     update the mutation.
   - Run the integration mutations after the matrix, not beside it: both use the same servers.
   - A generator's output is committed: re-run it, and `git diff` must be empty (`tools/gen-reset-vectors.sh` for S1).
-- **The compiler.** Build with a release, as CI does. The dev tree (`../cstar/out`) is past the release, and
-  `~/.kama/bin/kama` is an old 0.9.440.
+- **The compiler.** Build with the v0.9.673 release, as CI does. The dev tree (`../cstar/out`) is past the release,
+  and `~/.kama/bin/kama` is an old 0.9.440.
   - To get one: `kama-macos-universal-vX.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its
     `.sha256` and unpacked anywhere (it holds `kama-macos-universal-vX/bin/kama`). A session's scratchpad does not
     outlive it, so download it again each session.

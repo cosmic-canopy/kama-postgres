@@ -6,8 +6,9 @@ it. Every entry with a repro was **run** on the version named. Nothing is inferr
 spec. An entry that is an absence cites the cstar files that show it instead. This file is excluded from
 the published package, as it is in `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.667`, the release (`v0.9.667`, from GitHub, checksum verified). KPG-33 to KPG-38 were
-re-run on it, with the repros as filed, before they moved to FIXED. Earlier rounds: `0.9.523` (KPG-31 and KPG-32
+**Current compiler:** `kama 0.9.673`, the release (`v0.9.673`, from GitHub, checksum verified). KPG-39 and KPG-40 were
+re-run on it, with the repros as filed, before they moved to FIXED. Earlier rounds: `0.9.667` (KPG-33 to KPG-38
+verified, KPG-39 and KPG-40 filed), `0.9.523` (KPG-31 and KPG-32
 verified, KPG-33 to KPG-38 filed), `0.9.519` (KPG-23 to KPG-30 verified), `0.9.506` (KPG-11 to KPG-22 verified, KPG-23
 to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to KPG-14 filed), `0.9.477` (KPG-1 also on
 Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.470` and the public `0.9.440`.
@@ -16,9 +17,7 @@ Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.47
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** KPG-39 (HIGH) and KPG-40 (LOW, a question), both answered by cstar and waiting to be verified on the v0.9.672
-release: KPG-39 is fixed in 0.9.669, and KPG-40 is intended, with the defect it turned up fixed in 0.9.672. Every
-earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** none. Every gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -29,31 +28,35 @@ earlier gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 ## OPEN
 
-### KPG-40 · LOW · Is a window inside a window, through a view's `ref` accessor, intended? — ANSWERED: yes
+None.
 
-**cstar's answer:** intended. Keep `borrow tx.conn().transaction() as inner`, and add no mint on the view
-(`@viewable … for view`): that would be a second spelling of the same nesting.
+## FIXED — kept for the record
+
+KPG-39 and KPG-40 were verified on 0.9.673. KPG-33 to KPG-38 were verified on 0.9.667. KPG-31 and KPG-32 were verified on 0.9.523, the first release with their fixes. KPG-23 to KPG-30 were verified on 0.9.519, KPG-11 to KPG-22 on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
+same repro as the original report.
+
+### KPG-40 · LOW · Is a window inside a window, through a view's `ref` accessor, intended? — ANSWERED: yes; its defect FIXED in 0.9.673
+
+**cstar's answer:** intended. `borrow tx.conn().transaction() as inner` stays, and there is no mint on the view
+(`@viewable … for view`), which would be a second spelling of the same nesting.
 - Opening a window through the enclosing window's alias is a reborrow, not a second name for the storage. The inner
   window freezes `tx` for its block, so only one of `tx` and `inner` is usable at a time, and the windows close inside
   out.
 - What SPEC refuses (`xfail/borrow_nested_same_place`) is a second window from the same root, where both names stay
   live: `borrow c.transaction() as t2` inside `tx` is refused ("two mutable views of one buffer").
 
-**A defect it turned up, fixed in 0.9.672.** Our soundness argument below was wrong for 0.9.667 to 0.9.671. There, the
-inner window did **not** freeze `tx`: `tx.conn().leave()` inside the savepoint was accepted, so the outer transaction
-could be committed from inside it.
-- The defect was wider than this case: a window minted on a call that returns a place froze nothing at all, so
-  `borrow h.items().viewMut() as v { h.items().add(…); }` was a use-after-free in safe code.
-- In 0.9.672, using `tx` inside `inner` is refused ("tx is frozen by the enclosing borrow"), and the repro below still
-  builds and prints `2 0`. SPEC's borrow rule 1 now says both things: a mint on a place-returning call freezes that
-  call's roots, and a window reached through an alias freezes the alias.
-- kama's tests now pin both: `tests/borrow_nested_through_alias` pins this shape as legal, and
-  `xfail/borrow_nested_alias_frozen` pins the refusal.
-- Here, the hole could not corrupt a session. A COMMIT or ROLLBACK through `tx` inside `inner` ends the block, which
-  the server reports, so both windows find their transaction over and send nothing. But 0.3.0 should need 0.9.672, so
-  that the compiler refuses it.
-
-**To do on v0.9.672:** run the repro below (`2 0`) and the refusal of `tx` inside `inner`, then move this entry to FIXED.
+**The defect it turned up, fixed in the 0.9.673 release** (cstar's 0.9.672; no 0.9.672 was tagged).
+- On 0.9.667 to 0.9.671 the inner window did not freeze `tx`, so `tx.conn().leave()` inside the savepoint was accepted,
+  and the outer transaction could be committed from inside it. More widely, a window minted on a call that returns a
+  place froze nothing: `borrow h.items().viewMut() as v { h.items().add(…); }` was a use-after-free in safe code.
+- Verified on v0.9.673 (checksum checked):
+  - The repro below, as filed, builds and prints `2 0`.
+  - The same program with `tx.conn().leave();` inside `inner` is refused: "`tx` is frozen by the enclosing `borrow`
+    (opened at line 20 as `inner`)". 0.9.667 checks it clean.
+  - This package checks and passes its tests unchanged on it. Nothing here used `tx` inside an inner window.
+- Here the hole could not corrupt a session. A COMMIT or ROLLBACK through `tx` inside `inner` ends the block, which the
+  server reports, so both windows find their transaction over and send nothing. The package now needs 0.9.673, so the
+  compiler refuses it outright.
 
 The question as filed:
 
@@ -96,20 +99,24 @@ fn int32 main() {
 
 - **Why we think it is sound here:** the view owns no storage that could move. The inner window freezes the alias
   `tx` (a place-returning call's receiver), so the outer transaction cannot be committed from inside the savepoint.
-  (Wrong before 0.9.672: see the answer above.)
+  (Wrong before 0.9.673: see the defect above.)
 - **If it should be refused,** the alternative we would follow is a mint on the view itself (a `@viewable` contract
   `for view`), so nesting reads `borrow tx.transaction() as inner`. Say which, and we will change before 0.3.0.
   (cstar: do not.)
 
-### KPG-39 · HIGH · Importing std's JSON makes `Optional<int64>` (and `uint64`, `float64`) not `Sendable`
+### KPG-39 · HIGH · Importing std's JSON made `Optional<int64>` (and `uint64`, `float64`) not `Sendable` — FIXED in 0.9.673
 
-**cstar: fixed in 0.9.669.** The JSON import no longer strips `Sendable` or `==` from `Optional<int64>`, `uint64` or
-`float64`, so `CopyChunk` builds unchanged. The fix ships in v0.9.672. **To do on v0.9.672:** run the repros below,
-move this entry to FIXED, add the `JsonValue` test the workaround names, and drop the README's known issue.
+Fixed in cstar's 0.9.669, first released in v0.9.673: "a generic instance named by an imported module … is judged
+against every conformance". Verified on v0.9.673 (checksum checked):
+- The repro below (the `Chunk` enum, with the `JsonNumber` import) builds. A `Sendable` resource holding
+  `Optional<int64>`, `Optional<uint64>` and `Optional<float64>` builds too.
+- On 0.9.667 the enum still fails, with the error quoted below.
+- `tests/unit/src/typed_test.kama` imports std's `JsonValue` and reads a column and a whole row into it
+  (`jsonValueTests`). On 0.9.667 that program fails to build, at `CopyChunk`; on 0.9.673 it passes. The README's known
+  issue is gone.
 
-**Found** porting to `kama 0.9.667` (the release), and the same on the dev build `0.9.668+g425eecff`: a unit test that
-reads a column into a `std::serialization::text::json::JsonValue` made the whole test program fail, in a file the test
-does not touch:
+**As filed,** porting to `kama 0.9.667`: a unit test that read a column into a `std::serialization::text::json::JsonValue`
+made the whole test program fail, in a file the test does not touch:
 
 ```
 src/copy.kama:29:0: error: `postgres::CopyChunk` declares `implements Sendable`, but its variant `Done` payload `rows`
@@ -139,15 +146,6 @@ conditional conformance that depended on imports.
 
 **Why HIGH:** an application that uses std's JSON and `@kama/postgres` does not compile, because `CopyChunk` holds an
 `Optional<int64>`. No code in the application is wrong.
-
-**Workaround:** none in the package. Changing `CopyChunk`'s public shape would be a workaround we would want to delete.
-`tests/unit/src/typed_test.kama` tests the reader's untyped reads (`peekKind`, `readNumberText`) through a small
-hand-written `Deserializable` instead of `JsonValue`. The `JsonValue` test is added when this is fixed.
-
-## FIXED — kept for the record
-
-KPG-33 to KPG-38 were verified on 0.9.667. KPG-31 and KPG-32 were verified on 0.9.523, the first release with their fixes. KPG-23 to KPG-30 were verified on 0.9.519, KPG-11 to KPG-22 on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
-same repro as the original report.
 
 ### KPG-38 · HIGH · Two files that use the same `type adapter` failed every release build — FIXED in 0.9.543
 

@@ -2,7 +2,7 @@
   "name": "postgres_integration_tests",
   "version": "0.1.0",
   "kind": "executable",
-  "kama": ">=0.9.667",
+  "kama": ">=0.9.673",
   "entry": "src/main.kama",
   "dependencies": { "@kama/postgres": { "path": "../.." }, "@kama/tls": { "version": "^0.1.3" } },
   "modules": { ".": { "visibility": "internal" } }

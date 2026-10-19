@@ -19,8 +19,13 @@ All notable changes to this package are recorded here. The format follows
   - It takes one round trip, and is sent at once rather than in front of the next command, as Npgsql sends it, so a
     failure is reported to the caller. A failed reset closes the connection.
   - Notifications already received are dropped.
+- A row or a column reads into std's `JsonValue`, now that a program can import std's JSON beside this package.
 
 ### Changed
+- **Needs kama ≥ 0.9.673.** It is the first release in which:
+  - a window opened through an enclosing window's alias freezes that alias, so `tx` cannot be used inside
+    `borrow tx.conn().transaction() as inner` (KPG-40);
+  - std's JSON can be imported beside this package (KPG-39).
 - **Breaking: `transaction()` is a borrow window**, `borrow conn.transaction() as tx { … }`, which kama 0.9.658 made
   possible: a view's destructor runs when its window closes (KPG-35).
   - The window sends BEGIN, or SAVEPOINT inside a transaction block, so a window inside a window nests.
@@ -46,6 +51,8 @@ All notable changes to this package are recorded here. The format follows
   kept the connection busy for ever, past `connect_timeout`. Only the side waited for counts now, and the deadline
   ends it as `timeout expired`. Found by @kama/redis, which runs the same loop over a scripted server that is always
   writable; a unit case here plays that server.
+- **0.2.1's known issue is gone.** A program that imports std's JSON and uses this package compiles. The bug was kama's
+  (KPG-39), and kama 0.9.673 fixes it.
 
 ## [0.2.1] — 2026-10-18
 

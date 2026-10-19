@@ -8,7 +8,7 @@ install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls)
 kama pkg add kama.json @kama/postgres --version ^0.2.0     # from the official registry, registry.kama-lang.org
 ```
 
-Needs **kama ≥ 0.9.667**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
+Needs **kama ≥ 0.9.673**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
 release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta.
 
 > **Status: early.** It connects, authenticates and runs queries, with typed parameters and typed rows, over TCP, a
@@ -57,7 +57,8 @@ Query q = pg"select name, qty from items where qty > ${least} and supplier is no
 Result<Rows, PgError> r = conn.query(q: q);
 ```
 
-`rowAs::<T>` reads a row into a `@generate(Deserializable)` type by column name. `prepare` gives a reusable
+`rowAs::<T>` reads a row into a `@generate(Deserializable)` type by column name. A row or a column also reads into
+std's `JsonValue`, when its shape is not known in advance. `prepare` gives a reusable
 `Statement`. `startRows`/`nextRows` read a large result a chunk at a time, and `openPortal`/`fetch` read a
 cursor inside a transaction.
 
@@ -286,15 +287,6 @@ A connection string can list several hosts, as libpq's can:
 - **Text columns from pipelined SQL the cache has not seen.** Such a query goes as libpq's PQsendQueryParams sends it,
   so its columns come back as text, and `column::<T>` reads them from text. A query the cache knows goes typed.
 - **Pipelines take no statement or portal names.** The two libpq_pipeline traces that name them are not replayed.
-
-## Known issue: std's JSON on kama 0.9.667
-
-A program that imports std's JSON (`std::serialization::text::json`, for `JsonValue` or `JsonNumber`) and uses this
-package fails `kama check`: "`postgres::CopyChunk` declares `implements Sendable`, but its variant `Done` payload `rows`
-(of type `Optional<int64>`) is not Sendable". Nothing in the program is wrong. Importing std's JSON makes
-`Optional<int64>`, `Optional<uint64>` and `Optional<float64>` lose `Sendable` everywhere. This is a kama compiler bug,
-filed as KPG-39 in this repository's KAMA_GAPS.md, and it is fixed in kama, not here. Until a kama release fixes it, a
-program that uses this package cannot also import std's JSON.
 
 ## What it covers
 

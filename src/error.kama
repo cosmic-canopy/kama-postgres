@@ -11,8 +11,13 @@ type enum PgError implements Error, Sendable {
     // A connection setting that cannot be used: a connection string that does not parse, an invalid value, a
     // service that is not defined.
     Config(string detail),
-    // The socket failed. A server that closed the connection is `UnexpectedEof`.
+    // The socket failed while connecting, or a stream of the caller's (copyFrom's Reader, copyTo's Writer) did.
     Io(IoError error),
+    // The connection failed while in use: a read or a write failed, or the server closed it. `detail` is libpq's words
+    // for it (pqsecure_raw_read and pqsecure_raw_write): "server closed the connection unexpectedly…" for a server
+    // that hung up (EOF, EPIPE, ECONNRESET), else "could not receive data from server: …" or "could not send data to
+    // server: …" with the operating system's words. `cause` is the operating system's error. The session is over.
+    Lost(string detail, IoError cause),
     // TLS failed: setting it up (a certificate or key file, the protocol versions), the handshake, the server's
     // certificate or name, or the session afterwards. `detail` is libpq's whole message ("SSL error: …",
     // "server certificate for \"h\" does not match host name \"x\"", "root certificate file … does not exist…").
@@ -57,6 +62,7 @@ type enum PgError implements Error, Sendable {
         return match (this) {
             case Config(detail: d): copy d;
             case Io(error: e): ioMessage(e: e);
+            case Lost(detail: d, cause: c): copy d;
             case Tls(detail: d, cause: c): copy d;
             case Timeout: "timeout expired";
             case Protocol(error: e): e.message();

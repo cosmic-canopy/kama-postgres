@@ -1,12 +1,15 @@
 #!/bin/sh
 # pg.sh — the PostgreSQL server the integration tests run against, in a container.
 #
-#   tools/pg.sh up    [--version N]     start (or reuse) postgres:N and a hot standby of it, wait until both accept logins
-#   tools/pg.sh down  [--version N]     remove the container
-#   tools/pg.sh env   [--version N]     print the PGTEST_* settings (also written to out/pgtest-N.env)
-#   tools/pg.sh psql  [--version N] [psql args…]   psql inside the container, as the superuser
-#   tools/pg.sh logs  [--version N]     the server log
-#   tools/pg.sh smoke [--version N]     log in once per auth method with the container's own psql
+#   tools/pg.sh up      [--version N]   start (or reuse) postgres:N and a hot standby of it, wait until both accept logins
+#   tools/pg.sh down    [--version N]   remove the container
+#   tools/pg.sh stop    [--version N]   stop the server (a fast shutdown); its data stays in the container
+#   tools/pg.sh start   [--version N]   start a stopped server again, and wait until it accepts logins
+#   tools/pg.sh restart [--version N]   stop and start it: what a session sees when the server restarts
+#   tools/pg.sh env     [--version N]   print the PGTEST_* settings (also written to out/pgtest-N.env)
+#   tools/pg.sh psql    [--version N] [psql args…]   psql inside the container, as the superuser
+#   tools/pg.sh logs    [--version N]   the server log
+#   tools/pg.sh smoke   [--version N]   log in once per auth method with the container's own psql
 #
 # N defaults to 18. Supported: 14 15 16 17 18, plus 19 while it is in beta. Each version gets its own
 # container (kama-pg-N) and host port (543N, bound to 127.0.0.1 only), so versions can run side by side.
@@ -49,6 +52,7 @@ SUPERPW=kp_super_pw
 SASLPREP_PW=$(printf '\357\274\253\357\274\260\302\255sasl\302\240prep\357\254\201')
 
 running() { [ "$("$RT" inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = "true" ]; }
+exists() { "$RT" inspect "$NAME" >/dev/null 2>&1; }
 standbyRunning() { [ "$("$RT" inspect -f '{{.State.Running}}' "$STANDBY" 2>/dev/null || true)" = "true" ]; }
 onNetwork() { "$RT" inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$NAME" 2>/dev/null | grep -q "$NET"; }
 
@@ -112,6 +116,12 @@ startStandby() {
 case "$cmd" in
     up)
         "$ROOT/tools/gen-test-certs.sh"
+        # A server stopped by `stop` is started again, with its data, rather than made anew.
+        if exists && ! running; then
+            "$RT" start "$NAME" >/dev/null
+            wait_ready
+            echo "pg.sh: $NAME started again on 127.0.0.1:$PORT"
+        fi
         # A server keeps the certificates it was created with (they are copied into PGDATA once). After a new PKI,
         # it would serve a certificate from a CA the tests no longer have: recreate it.
         if running && ! "$RT" exec "$NAME" sh -c 'cmp -s /certs/ca.crt "$PGDATA/ca.crt"' 2>/dev/null; then
@@ -152,6 +162,25 @@ case "$cmd" in
         "$RT" network rm "$NET" >/dev/null 2>&1 || true
         rm -f "$ENVFILE"
         echo "pg.sh: $NAME removed"
+        ;;
+    stop)
+        # The image stops postgres with SIGINT, a fast shutdown: each session is ended with FATAL 57P01, then the
+        # server exits. PGDATA is the container's own volume, so the data and configuration are kept.
+        exists || { echo "pg.sh: $NAME does not exist (tools/pg.sh up --version $VERSION)" >&2; exit 1; }
+        "$RT" stop -t 30 "$NAME" >/dev/null
+        echo "pg.sh: $NAME stopped"
+        ;;
+    start)
+        exists || { echo "pg.sh: $NAME does not exist (tools/pg.sh up --version $VERSION)" >&2; exit 1; }
+        running || "$RT" start "$NAME" >/dev/null
+        wait_ready
+        echo "pg.sh: $NAME ready on 127.0.0.1:$PORT"
+        ;;
+    restart)
+        exists || { echo "pg.sh: $NAME does not exist (tools/pg.sh up --version $VERSION)" >&2; exit 1; }
+        "$RT" restart -t 30 "$NAME" >/dev/null
+        wait_ready
+        echo "pg.sh: $NAME restarted on 127.0.0.1:$PORT"
         ;;
     env)
         write_env
@@ -201,7 +230,7 @@ EOF
         echo "pg.sh: smoke OK against $NAME"
         ;;
     *)
-        sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac

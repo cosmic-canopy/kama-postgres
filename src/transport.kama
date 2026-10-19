@@ -23,9 +23,10 @@ type contract Transport for resource implements Sendable {
     // Stop both directions. Called once, when the connection closes; the transport may still be dropped later.
     fn void shutdown();
     // libpq's account of a failure this transport reported (a read, write or wait that answered `error`, or a read
-    // of 0, which arrives as `UnexpectedEof`), when it has one of its own; `None` to report the `IoError` as it is
-    // (strerror's words, or libpq's "server closed the connection unexpectedly"). A TLS transport words its
-    // failures as libpq's TLS layer does ("SSL SYSCALL error: EOF detected", "SSL error: …").
+    // of 0, which arrives as `UnexpectedEof`), when it has one of its own; `None` to have it worded as libpq words a
+    // socket's (PgError::Lost: "server closed the connection unexpectedly…" for a peer that hung up, else "could not
+    // receive data from server: …" and the like). A TLS transport words its failures as libpq's TLS layer does
+    // ("SSL SYSCALL error: EOF detected", "SSL error: …").
     fn Optional<PgError> explain(IoError error);
 }
 

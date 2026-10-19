@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-19: phases 0–7 are done, and phase 8 is under way (S0, S0b and S1 are done, and the port to kama 0.9.673). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-19: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1 and S2 are done, and the port to kama 0.9.673). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -35,8 +35,9 @@ package needs the 0.9.523 release that carries them ([KAMA_GAPS.md](../KAMA_GAPS
 of libpq's `libpq_pipeline` message for message and the cases of `001_stream_rep.pl` and `003_load_balance_host_list.pl`,
 and ask the container's libpq about each `target_session_attrs` case against a primary and its standby. On kama 0.9.667,
 KPG-33 to KPG-38 are fixed. KPG-39 (std's JSON beside this package) and KPG-40 (nesting through `tx.conn()` is intended,
-and the freeze it relies on is fixed) were verified on the 0.9.673 release, which the package now needs. No gap is
-open. Phase 8 is under way: its plan is below.
+and the freeze it relies on is fixed) were verified on the 0.9.673 release, which the package now needs. KPG-41 (on
+macOS, a release build with `std::process` beside `std::concurrent` fails in clang) is open, found in S2c, with a
+workaround in the integration tests only. Phase 8 is under way: its plan is below.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -51,7 +52,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1 and the port to kama 0.9.673 done; S2 under way (S2a, S2d, S2b done) |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1 and the port to kama 0.9.673 done; S2 done; S3 next |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -153,8 +154,21 @@ it fail.
 
     Live: a result over the bound and a burst of notifications against each server. The garbling runs half its cases
     under tiny bounds.
-  - **S2c: `tools/pg.sh restart|stop|start`, and restart tests**, with libpq's words, over TLS too, driven from the
-    test program through `std::process::Command`.
+  - **S2c, done: server restarts.**
+    - `tools/pg.sh stop|start|restart`: a fast shutdown, PGDATA kept; `up` starts a stopped server again.
+    - A session's I/O failure is `PgError::Lost`, in libpq's words (pqsecure_raw_read, pqsecure_raw_write,
+      pqSocketCheck), where a plain socket used to print the OS's words ("Broken pipe"). After a failed write, what the
+      read finds is reported first, as libpq reads on after one.
+    - `tests/integration/src/restart_test.kama`, a leg of its own per version (`PGTEST_RESTART=1`): sessions across a
+      restart (plaintext, TLS, in a block, with a cached statement, a command in flight, `ping`, `resetSession`), a
+      connect while the server is down (libpq's refusal, word for word; a host list goes on to the standby), connects
+      every 250 ms while it starts, and sessions after it. Asked across a restart from the standby's container, the
+      server's psql printed the FATAL, then "server closed the connection unexpectedly…" (or "SSL connection has been
+      closed unexpectedly" over TLS). This client reports the FATAL, as it did before for a terminated backend.
+    - **KPG-41** (open): on macOS a release build with `std::process` beside `std::concurrent` fails in clang. The
+      restart group is `file @compileFor(!RELEASE)`, with a release twin (`restart_release.kama`), and the leg runs the
+      debug build. Delete both when it is fixed.
+
 - **S3, the pool** (`src/pool/`).
   - **Shape.** One `Channel<Slot>` (`Idle(conn, since, born)` or `Empty`) plus a permit channel. That bounds the total
     with no atomic and no mutex, and lets a sequential user keep one connection.
@@ -202,20 +216,26 @@ it fail.
 - **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
   for changes.
 
-**What the next session needs to know** (written 2026-10-19, after the port to kama 0.9.673):
-- **Where it stands.** S0, S0b and S1 are done, and so is the port to kama 0.9.673. The working tree is clean. Nothing is
-  pushed: pushing waits for the maintainer.
-- **No gap is open** in KAMA_GAPS.md. A new one goes there the moment it is hit.
-- **Next: S2**, as its bullet above says.
+**What the next session needs to know** (written 2026-10-19, after S2):
+- **Where it stands.** S0, S0b, S1 and S2 are done, and so is the port to kama 0.9.673. S2 is four commits: S2a (libpq's
+  header checks), S2d (the garbling), S2b (`Limits`) and S2c (restarts). The working tree is clean. Nothing is pushed:
+  pushing waits for the maintainer.
+- **One gap is open:** KPG-41, filed in KAMA_GAPS.md with its repro and the workaround to delete. Check whether a newer
+  kama release fixes it before working around anything else in that area.
+- **Next: S3, the pool**, as its bullet above says. What S2 gives it: `isClosed()` after any lost connection,
+  `PgError::Limit` for a bound reached, and `tools/pg.sh restart` for its restart tests (S5).
 - **The gate, per step:**
   - `tools/test.sh`, which runs the unit suite in debug and release;
-  - `tools/test-integration.sh`, on 14–19 in debug, release and TLS;
+  - `tools/test-integration.sh`, on 14–19 in debug, release and TLS, then the restart leg;
   - **`tools/mutate.sh tools/mutations/<step>.json --version 18`**. This runs each mutation in a copy of the tree and
-    exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json` and S1's 35 in `s1.json`. Write
-    a file per step, and re-run older files when their code changes. A `BAD-PATTERN` means the source moved on, so
-    update the mutation.
+    exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json`, S1's 35 in `s1.json` and S2's 47
+    in `s2.json`. Write a file per step, and re-run older files when their code changes. A `BAD-PATTERN` means the
+    source moved on, so update the mutation. PANICKED is a run that died before any case failed; an entry may expect
+    it, and may set `"env"` (the restart mutations set `PGTEST_RESTART=1`).
   - Run the integration mutations after the matrix, not beside it: both use the same servers.
-  - A generator's output is committed: re-run it, and `git diff` must be empty (`tools/gen-reset-vectors.sh` for S1).
+  - A generator's output is committed: re-run it, and `git diff` must be empty (`tools/gen-reset-vectors.sh` for S1,
+    `tools/gen-libpq-tables.sh` for S2a).
+  - Never edit a script while it runs: `sh` reads it as it goes.
 - **The compiler.** Build with the v0.9.673 release, as CI does. The dev tree (`../cstar/out`) is past the release,
   and `~/.kama/bin/kama` is an old 0.9.440.
   - To get one: `kama-macos-universal-vX.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its

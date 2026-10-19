@@ -7,7 +7,7 @@ spec. An entry that is an absence cites the cstar files that show it instead. Th
 the published package, as it is in `@kama/sodium`.
 
 **Current compiler:** `kama 0.9.673`, the release (`v0.9.673`, from GitHub, checksum verified). KPG-39 and KPG-40 were
-re-run on it, with the repros as filed, before they moved to FIXED. Earlier rounds: `0.9.667` (KPG-33 to KPG-38
+re-run on it, with the repros as filed, before they moved to FIXED. KPG-41 was filed on it. Earlier rounds: `0.9.667` (KPG-33 to KPG-38
 verified, KPG-39 and KPG-40 filed), `0.9.523` (KPG-31 and KPG-32
 verified, KPG-33 to KPG-38 filed), `0.9.519` (KPG-23 to KPG-30 verified), `0.9.506` (KPG-11 to KPG-22 verified, KPG-23
 to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to KPG-14 filed), `0.9.477` (KPG-1 also on
@@ -17,7 +17,7 @@ Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.47
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** none. Every gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** KPG-41 (HIGH). Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -28,7 +28,55 @@ changes the right design here, say so and we will follow it.
 
 ## OPEN
 
-None.
+### KPG-41 · HIGH · On macOS, a release build that uses `std::process::Command` beside `std::concurrent` fails in the C compiler
+
+Found in phase 8 (S2c), when the integration test program began to restart its server through `std::process::Command`
+(it already spawns isolates). The debug build is fine; the release build stops in clang:
+
+```
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/unistd.h:449:6: error: cannot apply asm label to function after its first use
+  449 | int      close(int) __DARWIN_ALIAS_C(close);
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/unistd.h:484:10: error: cannot apply asm label to function after its first use
+  484 | ssize_t  read(int, void *_LIBC_SIZE(__nbyte), size_t __nbyte) __DARWIN_ALIAS_C(read);
+2 errors generated.
+kama: clang failed (exit 1)
+```
+
+Reduced, one file, `kama 0.9.673` (the release), macOS arm64. Nothing is spawned and the Command is never run; the
+import of `Isolate` is enough:
+
+```kama
+import { core::println, std::process::Command, std::concurrent::Isolate };
+
+fn int32 main() {
+    Command c = Command.make(program: "true");
+    println(s: "made");
+    return 0;
+}
+```
+
+- `kama build c3.kama` builds and runs. `kama build c3.kama --release` fails as above.
+- The same file without the `Isolate` import builds in release. So does a program that spawns an isolate and makes no
+  `Command`.
+- With `--keep-c`, a failing release unit has `#include "kama_os.h"` in its prologue (line 8 of the unit for a program
+  that also spawns), ahead of `#include "kama_isolate.h"`. Without the `Command`, `kama_os.h` comes after
+  `kama_isolate.h`, as it does in this package's integration program at 47cf3d4, which builds.
+- In C alone, `#include "kama_runtime.h"`, `#include "kama_os.h"`, `#include "kama_isolate.h"` in that order fails the
+  same way. `kama_os.h` declares `read` and `close` itself, without macOS's asm label (its comment, at "NOT
+  <unistd.h>", explains why), and its inline functions use them. `kama_isolate.h` then includes `<unistd.h>` for
+  `sysconf`, whose declarations carry `__DARWIN_ALIAS_C`. The opposite order compiles.
+
+So it looks as if something in `std::process` moves `kama_os.h` into the release unit's prologue, ahead of
+`kama_isolate.h`. Two ways out suggest themselves: `kama_isolate.h` could declare `sysconf` itself instead of including
+`<unistd.h>`, as `kama_os.h` does for the rest, or the prologue's headers could keep the order the chunks would give.
+
+**Why HIGH:** a program that starts a process and spawns an isolate cannot be built for release on macOS. A server that
+runs a helper and keeps a pool of workers is that program.
+
+**Workaround here, to delete when this is fixed:** `tests/integration/src/restart_test.kama` is
+`file @compileFor(!RELEASE);`, and `main` runs it through a `@compileFor(!RELEASE)` function (its release twin says the
+group needs a debug build). `tools/test-integration.sh` runs the restart leg with the debug build. Once fixed: drop the
+gate and the twin, and run the leg in release like the TLS one.
 
 ## FIXED — kept for the record
 

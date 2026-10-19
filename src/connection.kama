@@ -2621,15 +2621,17 @@ type resource Connection implements Sendable, Transactional {
 
     // ---- helpers ----
 
-    // Send what is queued. A server that ended the session usually said why first: if a write fails, a FATAL
-    // ErrorResponse already waiting is the error reported, as libpq reports it.
+    // Send what is queued. A server that ended the session usually said why first. If a write fails, what the server
+    // sent before it went is read, as libpq reads on after a failed write (pqSendSome's write_failed): a FATAL
+    // ErrorResponse waiting is the error reported, else the read's own failure (the connection gone, in libpq's
+    // words), and the write's only when nothing more can be read.
     unsafe fn Result<Unit, PgError> flush(Deadline deadline) {
         Result<Unit, PgError> sent = this.wire.send(bytes: this.outbox.view(), deadline: deadline);
         this.outbox.clear();
         match (give sent) {
             case Ok(value: u): { return Result::Ok(value: Unit::Unit); }
             case Err(error: e): {
-                bool io = match (e) { case Io(error: x): true; case Tls(detail: d, cause: c): true; case _: false; };
+                bool io = match (e) { case Lost(detail: d, cause: c): true; case Tls(detail: d, cause: c): true; case _: false; };
                 if (io) {
                     Result<BackendMessage, PgError> waiting = this.nextMessage(deadline: Deadline.after(span: Duration.fromMillis(ms: 0i64)), framing: this.phase);
                     match (give waiting) {
@@ -2639,7 +2641,9 @@ type resource Connection implements Sendable, Transactional {
                                 case _: { }
                             };
                         }
-                        case Err(error: x): { }
+                        case Err(error: x): {
+                            if (!isTimeout(e: x)) { this.lose(); return Result::Err(error: give x); }
+                        }
                     };
                 }
                 this.lose();

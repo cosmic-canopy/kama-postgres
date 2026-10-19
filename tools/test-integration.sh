@@ -1,6 +1,8 @@
 #!/bin/sh
 # test-integration.sh — the live tests (tests/integration) against each supported PostgreSQL, debug and release, and
-# then once more in release over TLS (PGTEST_SSLMODE=require), so every query path runs encrypted too.
+# then once more in release over TLS (PGTEST_SSLMODE=require), so every query path runs encrypted too. Last, per
+# version, the restart leg (PGTEST_RESTART=1): the cases that stop, start and restart the server through tools/pg.sh,
+# run alone so that no other case meets a server going down.
 #
 #   tools/test-integration.sh                    every version: 14 15 16 17 18 19
 #   tools/test-integration.sh --version 18 …     the versions named
@@ -43,6 +45,12 @@ for v in $VERSIONS; do
     work="$tmp/work-$v-tls"; mkdir -p "$work/home"
     echo "== PostgreSQL $v (--release, sslmode=require)"
     if ( set -a; . "$ROOT/out/pgtest-$v.env"; set +a; PGTEST_SSLMODE=require PGTEST_TMP="$work" PGTEST_SOCKDIR="$sockets" "$tmp/integration--release" ); then :; else failed="$failed $v-tls"; fi
+    work="$tmp/work-$v-restart"; mkdir -p "$work/home"
+    # The debug build: a release build leaves the restart group out until KPG-41 is fixed (restart_release.kama).
+    echo "== PostgreSQL $v (--debug, restarts)"
+    if ( set -a; . "$ROOT/out/pgtest-$v.env"; set +a; PGTEST_RESTART=1 PGTEST_PGSH="$ROOT/tools/pg.sh" PGTEST_TMP="$work" PGTEST_SOCKDIR="$sockets" "$tmp/integration--debug" ); then :; else failed="$failed $v-restart"; fi
+    # The leg leaves the server running; this makes sure, with its standby back in recovery.
+    "$ROOT/tools/pg.sh" up --version "$v" >/dev/null
     [ "$DOWN" = 1 ] && "$ROOT/tools/pg.sh" down --version "$v" >/dev/null
 done
 if [ -n "$failed" ]; then echo "test-integration.sh: FAILED on$failed" >&2; exit 1; fi

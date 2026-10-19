@@ -1,0 +1,102 @@
+// A session's transport failing, worded as libpq words it (pqsecure_raw_read, pqsecure_raw_write, pqSocketCheck,
+// pqReadData at EOF): through a scripted server wrapped in a transport that fails one read, write or wait on purpose.
+// A server that hung up is "server closed the connection unexpectedly…" whatever the client was doing; any other
+// failure names what failed, with the error's own words. After a failed write, what the read finds comes first.
+import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::memory::Owned,
+         std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Transport,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome };
+export { lostTests };
+
+// A transport that passes everything to `inner` except the `writeAt`-th write, the `readAt`-th read and the first wait
+// after it (each counted from 1; 0 for none), which fail with the kind given. A read set to fail with `WouldBlock`
+// says nothing came, so that the wait after it is the one that fails.
+type resource Faulty implements Transport, Sendable {
+    Owned<Transport> inner;
+    isize writes = 0;
+    isize reads = 0;
+    isize writeAt = 0;
+    IoErrorKind writeKind;
+    isize readAt = 0;
+    IoErrorKind readKind;
+    bool waitFails = false;
+    IoErrorKind waitKind;
+
+    public ctor make(Owned<Transport> inner, isize writeAt, IoErrorKind writeKind, isize readAt, IoErrorKind readKind, bool waitFails, IoErrorKind waitKind) {
+        this.inner = give inner; this.writes = 0; this.reads = 0;
+        this.writeAt = writeAt; this.writeKind = writeKind; this.readAt = readAt; this.readKind = readKind;
+        this.waitFails = waitFails; this.waitKind = waitKind;
+    }
+
+    public unsafe fn Result<isize, IoError> read(View<uint8> into) {
+        this.reads = this.reads + 1;
+        if (this.reads == this.readAt) { return Result::Err(error: IoError.of(kind: this.readKind)); }
+        return this.inner.read(into: into);
+    }
+    public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
+        this.writes = this.writes + 1;
+        if (this.writes == this.writeAt) { return Result::Err(error: IoError.of(kind: this.writeKind)); }
+        return this.inner.write(bytes: bytes);
+    }
+    public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        if (this.waitFails && this.readAt > 0 && this.reads >= this.readAt) { return Result::Err(error: IoError.of(kind: this.waitKind)); }
+        return this.inner.wait(interest: interest, timeoutMs: timeoutMs);
+    }
+    public unsafe fn void shutdown() { this.inner.shutdown(); }
+    public unsafe fn Optional<PgError> explain(IoError error) { return this.inner.explain(error: error); }
+}
+
+fn string serverClosed() {
+    return "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request.";
+}
+
+// A session whose startup takes one write and one read (the fake answers whole, 4096 bytes at a time), then a query
+// that fails as the faults say. `hangUp`: the server is gone once the startup is done.
+unsafe fn string queried(isize writeAt, IoErrorKind writeKind, isize readAt, IoErrorKind readKind, bool waitFails, IoErrorKind waitKind, bool hangUp) {
+    DynamicArray<Step> s = DynamicArray.empty();
+    s.add(item: Step::Send(bytes: welcome()));
+    if (hangUp) { s.add(item: Step::Hangup); }
+    Wire rows = Wire.make(); rows.complete(tag: "SELECT 0"); rows.ready(status: 73ui8);
+    s.add(item: Step::Expect(tag: 81ui8, body: "", then: rows.bytes()));
+    Environment vars = testEnvironment();
+    string none = "";
+    Result<Config, PgError> c = resolveWith(text: none, env: vars);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return "config: ".concat(other: e.message()); } };
+    Owned<Transport> fake = new FakeServer.make(steps: give s, chunk: 4096, writeLimit: 4096);
+    Owned<Transport> faulty = new Faulty.make(inner: give fake, writeAt: writeAt, writeKind: writeKind, readAt: readAt, readKind: readKind, waitFails: waitFails, waitKind: waitKind);
+    Result<Connection, PgError> made = Connection.connectOver(transport: give faulty, config: config);
+    Connection conn = match (give made) { case Ok(value: x): give x; case Err(error: e): { return "connect: ".concat(other: e.message()); } };
+    Result<DynamicArray<Rows>, PgError> q = conn.simpleQuery(sql: "select");
+    string m = match (q) { case Ok(value: v): "(it ran)"; case Err(error: e): e.message(); };
+    bool lost = match (q) { case Ok(value: v): false; case Err(error: e): match (e) { case Lost(detail: d, cause: k): true; case _: false; }; };
+    if (!conn.isClosed()) { m = m.concat(other: " (still open)"); }
+    if (!lost) { m = m.concat(other: " (not Lost)"); }
+    return m;
+}
+
+unsafe fn int32 lostTests() {
+    int32 f = 0;
+    IoErrorKind none = IoErrorKind::Other;
+    string timedOut = IoError.of(kind: IoErrorKind::TimedOut).message();
+    string unreachable = IoError.of(kind: IoErrorKind::HostUnreachable).message();
+
+    string w = queried(writeAt: 2, writeKind: IoErrorKind::TimedOut, readAt: 0, readKind: none, waitFails: false, waitKind: none, hangUp: false);
+    f = f + check(ok: w.equals(other: "could not send data to server: ".concat(other: timedOut)), what: "lost: a write that fails, as pqsecure_raw_write words it: ".concat(other: w));
+    string r = queried(writeAt: 0, writeKind: none, readAt: 2, readKind: IoErrorKind::HostUnreachable, waitFails: false, waitKind: none, hangUp: false);
+    f = f + check(ok: r.equals(other: "could not receive data from server: ".concat(other: unreachable)), what: "lost: a read that fails, as pqsecure_raw_read words it: ".concat(other: r));
+    string reset = queried(writeAt: 0, writeKind: none, readAt: 2, readKind: IoErrorKind::ConnectionReset, waitFails: false, waitKind: none, hangUp: false);
+    f = f + check(ok: reset.equals(other: serverClosed()), what: "lost: a read reset by the peer is a server that hung up: ".concat(other: reset));
+    string pipe = queried(writeAt: 2, writeKind: IoErrorKind::BrokenPipe, readAt: 0, readKind: none, waitFails: false, waitKind: none, hangUp: false);
+    f = f + check(ok: pipe.equals(other: serverClosed()), what: "lost: a write into a closed pipe is a server that hung up: ".concat(other: pipe));
+    string polled = queried(writeAt: 0, writeKind: none, readAt: 2, readKind: IoErrorKind::WouldBlock, waitFails: true, waitKind: IoErrorKind::HostUnreachable, hangUp: false);
+    f = f + check(ok: polled.equals(other: "select() failed: ".concat(other: unreachable)), what: "lost: a wait that fails, as pqSocketCheck words it: ".concat(other: polled));
+    // A write that fails while the server has already gone: the read's account comes first, as libpq reads on after a
+    // failed write.
+    string gone = queried(writeAt: 2, writeKind: IoErrorKind::TimedOut, readAt: 0, readKind: none, waitFails: false, waitKind: none, hangUp: true);
+    f = f + check(ok: gone.equals(other: serverClosed()), what: "lost: after a failed write, a server that hung up is what is reported: ".concat(other: gone));
+    // The end of the stream mid-session.
+    string eof = queried(writeAt: 0, writeKind: none, readAt: 0, readKind: none, waitFails: false, waitKind: none, hangUp: true);
+    f = f + check(ok: eof.equals(other: serverClosed()), what: "lost: the end of the stream mid-session: ".concat(other: eof));
+    return f;
+}

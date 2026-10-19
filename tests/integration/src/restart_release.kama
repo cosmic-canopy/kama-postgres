@@ -1,0 +1,12 @@
+file @compileFor(RELEASE);   // KPG-41: delete this file when it is fixed
+
+// restart_test.kama in a release build. It drives tools/pg.sh through std::process, and a release build that has
+// std::process beside std::concurrent fails in the C compiler on macOS (KPG-41), so the group is left out of release
+// builds, and tools/test-integration.sh runs the restart leg with the debug one.
+import { core::println };
+export { restartTests };
+
+fn int32 restartTests() {
+    println(s: "  FAIL restart: the restart leg needs the debug build until KPG-41 is fixed");
+    return 1;
+}

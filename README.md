@@ -302,6 +302,23 @@ config.setLimits(limits: limits);
 
 Reaching a bound is `PgError::Limit`, which names the bound, its value and what was given up.
 
+## When the server restarts
+
+A session open across a restart is over. Its next call fails with what libpq reports in its place:
+
+- the server's own `FATAL:  terminating connection due to administrator command` (57P01), when it arrived before the
+  connection closed, as it usually does in a fast shutdown;
+- otherwise `PgError::Lost`, in libpq's words: "server closed the connection unexpectedly…" for a server that hung up,
+  "could not receive data from server: …" or "could not send data to server: …" with the operating system's words for
+  anything else;
+- over TLS, "SSL connection has been closed unexpectedly", or "SSL SYSCALL error: EOF detected".
+
+`isClosed()` is then true, and every later call is `PgError::Closed`. A pool reads `isClosed()` to drop such a
+connection. A connect while the server is down fails as libpq's does ("Connection refused" and its hint), and with
+several hosts it goes on to the next one. While the server starts, a connect may meet "the database system is starting
+up" (57P03), which also moves on to the next host. The integration suite restarts each server to check all of this, in
+plaintext and over TLS.
+
 ## Several hosts
 
 A connection string can list several hosts, as libpq's can:
@@ -357,6 +374,7 @@ KAMA=/path/to/kama tools/test.sh               # hermetic unit tests, debug and 
 KAMA=/path/to/kama tools/test-integration.sh   # live tests on PostgreSQL 14–18 and 19 beta, debug and release
 tools/test-integration.sh --version 18         # one version
 tools/pg.sh smoke --version 18                 # one login per auth and TLS method, with the server's own psql
+tools/pg.sh restart --version 18               # also stop and start: the server keeps its data
 tools/pg.sh down --version 18
 ```
 
@@ -364,7 +382,8 @@ The unit tests need no server. They include a scripted fake server that drives e
 hostile ones included, and runs Mbed TLS as the server for the TLS paths. Every reply of eighteen conversations is
 then changed in turn, ten ways, from a seed (`garble_test.kama`; `PGTEST_GARBLE_SEEDS=N` runs more): the client must
 never panic, and a protocol error must end the session. The integration tests start each server in
-podman or docker, and run the whole suite a second time over TLS. Their expected results come from libpq itself:
+podman or docker, run the whole suite a second time over TLS, and then restart, stop and start each server around the
+sessions of a last leg of their own. Their expected results come from libpq itself:
 PostgreSQL's own authentication, service-file and TLS tests (its negotiation matrix and its host-name cases, replayed
 by `tools/gen-ssl-vectors.sh`), and the server container's libpq asked case by case (`tools/gen-libpq-test-cases.sh`).
 

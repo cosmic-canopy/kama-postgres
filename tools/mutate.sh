@@ -44,6 +44,8 @@ rsync -a --exclude .git --exclude out "$ROOT/" "$tmp/tree/"
 [ -z "$VERSION" ] || "$KAMA" pkg install "$tmp/tree/tests/integration/kama.json" >/dev/null
 envfile=""
 [ -z "$VERSION" ] || envfile="$ROOT/out/pgtest-$VERSION.env"
+# The restart group drives the real servers' tools/pg.sh; an entry runs it with "env": {"PGTEST_RESTART": "1"}.
+PGTEST_PGSH="$ROOT/tools/pg.sh"; export PGTEST_PGSH
 
 python3 -I - "$tmp" "$KAMA" "$ROOT/$FILE" "$ROOT/out/test-certs" "$envfile" "$sockets" $IDS <<'PY'
 import json, os, subprocess, sys, tempfile

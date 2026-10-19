@@ -1,0 +1,181 @@
+file @compileFor(!RELEASE);   // KPG-41: std::process beside std::concurrent fails a release build on macOS
+// A server restart, against a real server: what each session open across it reports, a connect while the server is
+// down and while it starts, and the sessions after it. This group restarts the server, so it runs alone, as its own
+// leg of tools/test-integration.sh (PGTEST_RESTART=1), and drives tools/pg.sh (PGTEST_PGSH) through std::process.
+//
+// The expected words are libpq's, from its source: the server's FATAL 57P01 as a fast shutdown sends it, then what
+// libpq's reads report when the connection is gone (fe-secure.c, fe-secure-openssl.c). Which one a session sees first
+// depends on timing: the FATAL is sent as the server shuts down, and may or may not arrive before the connection
+// ends. Asked across a restart from the standby's container, the server's own psql printed the FATAL, then "server
+// closed the connection unexpectedly…" in plaintext, or "SSL connection has been closed unexpectedly" over TLS.
+import { std::collections::DynamicArray, std::process::Command, std::process::Output, std::process::Process,
+         std::process::ExitStatus, std::io::IoError, std::time::Duration, std::time::sleep, std::time::monotonicNow,
+         std::time::Instant,
+         postgres::Connection, postgres::PgError, postgres::Rows, postgres::Query, postgres::PipelineResult,
+         postgres::sqlstate::ADMIN_SHUTDOWN, postgres::sqlstate::CANNOT_CONNECT_NOW,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::open,
+         postgres_integration_tests::plainConninfoFor, postgres_integration_tests::scalar };
+export { restartTests };
+
+// libpq's words for a connection the server has dropped (pqsecure_raw_read and pqsecure_raw_write on EPIPE and
+// ECONNRESET, pqReadData at EOF), and, over TLS, pgtls_read's for a session ended with or without close_notify.
+fn string serverClosed() {
+    return "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request.";
+}
+
+fn bool lostWords(const ref string m, bool tls) {
+    if (m.equals(other: "FATAL:  terminating connection due to administrator command")) { return true; }
+    if (m.equals(other: serverClosed())) { return true; }
+    if (tls && (m.equals(other: "SSL connection has been closed unexpectedly") || m.equals(other: "SSL SYSCALL error: EOF detected"))) { return true; }
+    return false;
+}
+
+// Run tools/pg.sh with `what` (stop, start, restart) for this server's version; true when it succeeded.
+unsafe fn bool pgsh(const ref string what) {
+    Command c = Command.make(program: setting(name: "PGTEST_PGSH"));
+    c.arg(a: copy what);
+    c.arg(a: "--version");
+    c.arg(a: setting(name: "PGTEST_VERSION"));
+    Result<Output, IoError> r = c.run();
+    return match (r) { case Ok(value: o): o.status().success(); case Err(error: e): false; };
+}
+
+fn string tlsConninfo(const ref string user) {
+    return plainConninfoFor(user: user).replace(old: "sslmode=disable", with: "sslmode=require");
+}
+
+// The next call on a session the restart ended: libpq's words, then the session closed, then Closed for every call.
+unsafe fn int32 endedAcross(ref Connection c, const ref string what, bool tls, const ref Result<DynamicArray<Rows>, PgError> first) {
+    int32 f = 0;
+    string m = match (first) { case Ok(value: v): "(it ran)"; case Err(error: e): e.message(); };
+    f = f + check(ok: lostWords(m: m, tls: tls), what: "restart: ".concat(other: what).concat(other: " fails in libpq's words: ").concat(other: m));
+    f = f + check(ok: c.isClosed(), what: "restart: ".concat(other: what).concat(other: " is closed after it"));
+    Result<DynamicArray<Rows>, PgError> again = c.simpleQuery(sql: "select 1");
+    bool closed = match (again) { case Ok(value: v): false; case Err(error: e): match (e) { case Closed: true; case _: false; }; };
+    f = f + check(ok: closed, what: "restart: ".concat(other: what).concat(other: ", every later call is Closed"));
+    return f;
+}
+
+unsafe fn Connection opened(const ref string conninfo) {
+    Result<Connection, PgError> r = open(conninfo: conninfo);
+    return match (give r) {
+        case Ok(value: c): give c;
+        case Err(error: e): { string m = e.message(); panic(msg: "restart: connect before the restart: ".concat(other: m)); return opened(conninfo: conninfo); }
+    };
+}
+
+unsafe fn int32 acrossRestartTests() {
+    int32 f = 0;
+    Connection idle = opened(conninfo: plainConninfoFor(user: "kp_trust"));
+    Connection inBlock = opened(conninfo: plainConninfoFor(user: "kp_trust"));
+    string begun = scalar(c: inBlock, sql: "begin");
+    Connection cached = opened(conninfo: plainConninfoFor(user: "kp_trust"));
+    Result<Rows, PgError> warm = cached.query(q: Query.make(sql: "select 1"));
+    Connection secure = opened(conninfo: tlsConninfo(user: "kp_trust"));
+    Connection pinged = opened(conninfo: plainConninfoFor(user: "kp_trust"));
+    Connection reset = opened(conninfo: plainConninfoFor(user: "kp_trust"));
+    // A command in flight across the restart: a pipeline's pg_sleep, its sync sent.
+    Connection busy = opened(conninfo: plainConninfoFor(user: "kp_trust"));
+    Result<Unit, PgError> entered = busy.enterPipelineMode();
+    Result<Unit, PgError> sleeping = busy.sendQuery(q: Query.make(sql: "select pg_sleep(30)"));
+    Result<Unit, PgError> synced = busy.pipelineSync();
+
+    f = f + check(ok: pgsh(what: "restart"), what: "restart: tools/pg.sh restart");
+
+    Result<DynamicArray<Rows>, PgError> q1 = idle.simpleQuery(sql: "select 1");
+    f = f + endedAcross(c: ref idle, what: "an idle session", tls: false, first: q1);
+    Result<DynamicArray<Rows>, PgError> q2 = inBlock.simpleQuery(sql: "select 1");
+    f = f + endedAcross(c: ref inBlock, what: "a session in a transaction block", tls: false, first: q2);
+    Result<Rows, PgError> q3 = cached.query(q: Query.make(sql: "select 1"));
+    string m3 = match (q3) { case Ok(value: v): "(it ran)"; case Err(error: e): e.message(); };
+    f = f + check(ok: lostWords(m: m3, tls: false) && cached.isClosed(), what: "restart: a cached statement's session fails in libpq's words: ".concat(other: m3));
+    Result<DynamicArray<Rows>, PgError> q4 = secure.simpleQuery(sql: "select 1");
+    f = f + endedAcross(c: ref secure, what: "a TLS session", tls: true, first: q4);
+    Result<Unit, PgError> p = pinged.ping();
+    string pm = match (p) { case Ok(value: u): "(it answered)"; case Err(error: e): e.message(); };
+    f = f + check(ok: lostWords(m: pm, tls: false) && pinged.isClosed(), what: "restart: ping on a session the restart ended: ".concat(other: pm));
+    Result<Unit, PgError> rs = reset.resetSession();
+    string rm = match (rs) { case Ok(value: u): "(it reset)"; case Err(error: e): e.message(); };
+    f = f + check(ok: lostWords(m: rm, tls: false) && reset.isClosed(), what: "restart: resetSession on a session the restart ended: ".concat(other: rm));
+    Result<Optional<PipelineResult>, PgError> slept = busy.getResult();
+    bool shutdown = match (slept) {
+        case Ok(value: o): match (o) { case Some(value: r): match (r) { case Failed(error: e): e.sqlstate() == ADMIN_SHUTDOWN; case _: false; }; case None: false; };
+        case Err(error: e): lostWords(m: e.message(), tls: false);
+    };
+    f = f + check(ok: shutdown && busy.isClosed(), what: "restart: a command in flight ends with FATAL 57P01");
+
+    // After it: a new session, plain and over TLS.
+    Result<Connection, PgError> after = open(conninfo: plainConninfoFor(user: "kp_trust"));
+    string one = match (give after) { case Ok(value: c): { Connection k = give c; := scalar(c: k, sql: "select 1"); } case Err(error: e): e.message(); };
+    Result<Connection, PgError> afterTls = open(conninfo: tlsConninfo(user: "kp_trust"));
+    string two = match (give afterTls) { case Ok(value: c): { Connection k = give c; := scalar(c: k, sql: "select 2"); } case Err(error: e): e.message(); };
+    f = f + check(ok: one.equals(other: "1") && two.equals(other: "2"), what: "restart: new sessions after it, plain and over TLS: ".concat(other: one).concat(other: " ").concat(other: two));
+    return f;
+}
+
+// While the server is down: libpq's refusal, word for word; and a host list that goes on to the standby.
+unsafe fn int32 stoppedTests() {
+    int32 f = 0;
+    f = f + check(ok: pgsh(what: "stop"), what: "restart: tools/pg.sh stop");
+    string port = setting(name: "PGTEST_PORT");
+    Result<Connection, PgError> refused = open(conninfo: plainConninfoFor(user: "kp_trust"));
+    string m = match (refused) { case Ok(value: c): "(connected)"; case Err(error: e): e.message(); };
+    string want = "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?");
+    f = f + check(ok: m.equals(other: want), what: "restart: a connect while the server is down, in libpq's words: ".concat(other: m));
+    string standbyPort = setting(name: "PGTEST_STANDBY_PORT");
+    string both = "host=127.0.0.1,127.0.0.1 port=".concat(other: port).concat(other: ",").concat(other: standbyPort)
+        .concat(other: " dbname=kp_test user=kp_trust sslmode=disable connect_timeout=5");
+    Result<Connection, PgError> standby = open(conninfo: both);
+    string recovery = match (give standby) { case Ok(value: c): { Connection k = give c; := scalar(c: k, sql: "select pg_is_in_recovery()"); } case Err(error: e): e.message(); };
+    f = f + check(ok: recovery.equals(other: "t"), what: "restart: with the primary down, a host list goes on to the standby: ".concat(other: recovery));
+    return f;
+}
+
+// While the server starts: a connect every 250 ms until one succeeds, each failure in words libpq gives on the way
+// (the refusal; the lost connection, where the port's forwarder accepts before postgres listens; 57P03).
+unsafe fn int32 startingTests() {
+    int32 f = 0;
+    Command c = Command.make(program: setting(name: "PGTEST_PGSH"));
+    c.arg(a: "start");
+    c.arg(a: "--version");
+    c.arg(a: setting(name: "PGTEST_VERSION"));
+    Result<Process, IoError> launched = c.start();
+    Process starting = match (give launched) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "restart: tools/pg.sh start"); } };
+    string port = setting(name: "PGTEST_PORT");
+    string refusedText = "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?");
+    string lead = "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: ");
+    Instant began = monotonicNow();
+    bool up = false;
+    string strange = "";
+    isize tries = 0;
+    while (!up && (monotonicNow() - began).asNanos() < 60000000000i64) {
+        Result<Connection, PgError> r = open(conninfo: plainConninfoFor(user: "kp_trust").concat(other: " connect_timeout=2"));
+        match (give r) {
+            case Ok(value: k): { up = true; Connection done = give k; }
+            case Err(error: e): {
+                string m = e.message();
+                bool known = m.equals(other: refusedText) || m.equals(other: lead.concat(other: serverClosed()))
+                    || e.sqlstate() == CANNOT_CONNECT_NOW;
+                if (!known && strange.length() == 0) { strange = copy m; }
+                sleep(d: Duration.fromMillis(ms: 250i64));
+            }
+        };
+        tries = tries + 1;
+    }
+    Result<ExitStatus, IoError> waited = starting.wait();
+    bool ok = match (waited) { case Ok(value: s): s.success(); case Err(error: e): false; };
+    f = f + check(ok: up && ok, what: "restart: the server accepts a session once it has started (${tries} tries)");
+    f = f + check(ok: strange.length() == 0, what: "restart: every failed connect while it starts is in libpq's words: ".concat(other: strange));
+    return f;
+}
+
+unsafe fn int32 restartTests() {
+    int32 f = 0;
+    f = f + acrossRestartTests();
+    f = f + stoppedTests();
+    f = f + startingTests();
+    // Whatever happened, the server is left running.
+    bool running = pgsh(what: "start");
+    f = f + check(ok: running, what: "restart: the server is running at the end");
+    return f;
+}

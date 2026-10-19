@@ -5,7 +5,7 @@ import { std::collections::FixedArray, std::collections::DynamicArray, std::coll
          postgres::protocol::Frame, postgres::protocol::Framing, postgres::protocol::frame, postgres::protocol::decode,
          postgres::protocol::BackendMessage, postgres::protocol::ProtocolError, postgres::protocol::ErrorFields,
          postgres::protocol::HEADER_BYTES, postgres::protocol::STARTUP_ERROR_MAX, postgres::protocol::invalidErrorText };
-export { Wire, Deadline, strerror };
+export { Wire, Deadline, strerror, serverClosedText };
 
 // postgres::wire — messages over a `Transport`: framing the bytes that arrive into backend messages, and writing
 // frontend bytes out, each step bounded by a deadline. Internal: a connection is the only user.
@@ -16,6 +16,15 @@ fn string strerror(const ref IoError e) {
     Optional<string> words = e.osMessage();
     return match (give words) { case Some(value: w): give w; case None: e.message(); };
 }
+
+// libpq's words for a connection the server dropped: pqReadData at EOF, and pqsecure_raw_read and pqsecure_raw_write
+// on EPIPE and ECONNRESET.
+fn string serverClosedText() {
+    return "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request.";
+}
+
+// What the wire was doing when the transport failed, which decides libpq's words for it.
+type enum Doing { Reading, Writing, Waiting }
 
 // When a wait must end: never, or at an instant of the monotonic clock.
 type value Deadline implements Sendable {
@@ -180,14 +189,14 @@ type resource Wire implements Sendable {
             match (w) {
                 case Ok(value: n): { if (n > 0) { sent = sent + n; } else { wait = true; } }
                 case Err(error: e): {
-                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };
+                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e, doing: Doing::Writing)); } };
                 }
             };
             if (wait) {
                 Interest want = Interest::Write;
                 if (reading) { want = Interest::ReadWrite; }
                 Result<Ready, IoError> ready = this.link.wait(interest: want, timeoutMs: deadline.remainingMs());
-                Ready r = match (ready) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: this.failure(error: e)); } };
+                Ready r = match (ready) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: this.failure(error: e, doing: Doing::Waiting)); } };
                 if (!r.writable && !(reading && r.readable)) { return Result::Err(error: PgError::Timeout); }
                 if (reading && r.readable) {
                     reading = this.drain();
@@ -235,7 +244,7 @@ type resource Wire implements Sendable {
                     return Result::Ok(value: true);
                 }
                 case Err(error: e): {
-                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };
+                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e, doing: Doing::Reading)); } };
                 }
             };
             if (wait) {
@@ -270,11 +279,11 @@ type resource Wire implements Sendable {
             bool wait = false;
             match (r) {
                 case Ok(value: n): {
-                    if (n == 0) { return Result::Err(error: this.failure(error: IoError.of(kind: IoErrorKind::UnexpectedEof))); }
+                    if (n == 0) { return Result::Err(error: this.failure(error: IoError.of(kind: IoErrorKind::UnexpectedEof), doing: Doing::Reading)); }
                     this.end = this.end + n;
                 }
                 case Err(error: e): {
-                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e)); } };
+                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e, doing: Doing::Reading)); } };
                 }
             };
             if (wait) {
@@ -287,18 +296,27 @@ type resource Wire implements Sendable {
 
     unsafe fn Result<Unit, PgError> await(Interest interest, Deadline deadline) {
         Result<Ready, IoError> w = this.link.wait(interest: interest, timeoutMs: deadline.remainingMs());
-        Ready r = match (w) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: this.failure(error: e)); } };
+        Ready r = match (w) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: this.failure(error: e, doing: Doing::Waiting)); } };
         // Only the side asked for counts: a transport ready for the other one has not let this one proceed.
         bool ready = match (interest) { case Read: r.readable; case Write: r.writable; case ReadWrite: r.readable || r.writable; case _: r.readable || r.writable; };
         if (!ready) { return Result::Err(error: PgError::Timeout); }
         return Result::Ok(value: Unit::Unit);
     }
 
-    // A failure the transport reported, in its own words when it has them (a TLS transport's), else as the I/O
-    // error it is.
-    fn PgError failure(IoError error) {
+    // A failure the transport reported, in its own words when it has them (a TLS transport's), else in libpq's for a
+    // socket (pqsecure_raw_read, pqsecure_raw_write, pqSocketCheck): a server that hung up, whatever the wire was doing,
+    // is "server closed the connection unexpectedly…", and anything else names what failed, with the OS's words.
+    fn PgError failure(IoError error, Doing doing) {
         Optional<PgError> own = this.link.explain(error: error);
-        return match (give own) { case Some(value: p): give p; case None: PgError::Io(error: error); };
+        match (give own) { case Some(value: p): { return give p; } case None: { } };
+        bool dropped = match (error.kind()) { case UnexpectedEof: true; case BrokenPipe: true; case ConnectionReset: true; case _: false; };
+        if (dropped) { return PgError::Lost(detail: serverClosedText(), cause: error); }
+        string lead = match (doing) {
+            case Reading: "could not receive data from server: ";
+            case Writing: "could not send data to server: ";
+            case Waiting: "select() failed: ";
+        };
+        return PgError::Lost(detail: lead.concat(other: strerror(e: error)), cause: error);
     }
 
     // Space for `needed` bytes from `start`: the unread bytes move to the front, and the buffer doubles until

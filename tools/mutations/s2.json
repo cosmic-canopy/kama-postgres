@@ -302,5 +302,86 @@
   "old": "while (room > 0 && this.pending.length() >= room) {",
   "new": "while (room > 0 && this.pending.length() > room + 100) {",
   "expect": "limits: past five notifications the newest are kept"
+ },
+ {
+  "id": "C1",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "case Writing: \"could not send data to server: \";",
+  "new": "case Writing: \"could not write to server: \";",
+  "expect": "lost: a write that fails"
+ },
+ {
+  "id": "C2",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "case Reading: \"could not receive data from server: \";",
+  "new": "case Reading: \"could not read from server: \";",
+  "expect": "lost: a read that fails"
+ },
+ {
+  "id": "C3",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "bool dropped = match (error.kind()) { case UnexpectedEof: true; case BrokenPipe: true; case ConnectionReset: true; case _: false; };",
+  "new": "bool dropped = match (error.kind()) { case UnexpectedEof: true; case BrokenPipe: true; case _: false; };",
+  "expect": "lost: a read reset by the peer"
+ },
+ {
+  "id": "C4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "if (!isTimeout(e: x)) { this.lose(); return Result::Err(error: give x); }",
+  "new": "if (false) { this.lose(); return Result::Err(error: give x); }",
+  "expect": "lost: after a failed write"
+ },
+ {
+  "id": "C5",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "case Waiting: \"select() failed: \";",
+  "new": "case Waiting: \"poll failed: \";",
+  "expect": "lost: a wait that fails"
+ },
+ {
+  "id": "C6",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "if (dropped) { return PgError::Lost(detail: serverClosedText(), cause: error); }",
+  "new": "if (dropped) { return PgError::Io(error: error); }",
+  "expect": "lost: the end of the stream mid-session"
+ },
+ {
+  "id": "IC1",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "if (fatal) { this.lose(); done = true; }",
+  "new": "if (fatal) { done = true; }",
+  "expect": "restart: an idle session is closed after it",
+  "env": {
+   "PGTEST_RESTART": "1"
+  }
+ },
+ {
+  "id": "IC2",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "if (e.isFatal()) { this.lose(); return Result::Err(error: PgError::Server(error: give e)); }\n                    failed.add(item: PgError::Server(error: give e));\n                    ended = true;",
+  "new": "if (e.isFatal()) { return Result::Err(error: PgError::Server(error: give e)); }\n                    failed.add(item: PgError::Server(error: give e));\n                    ended = true;",
+  "expect": "restart: a command in flight ends with FATAL 57P01",
+  "env": {
+   "PGTEST_RESTART": "1"
+  }
+ },
+ {
+  "id": "IC3",
+  "suite": "integration",
+  "file": "src/session/route.kama",
+  "old": "string hint = \"\\tIs the server running on that host and accepting TCP/IP connections?\";",
+  "new": "string hint = \"\\tIs the server running?\";",
+  "expect": "restart: a connect while the server is down",
+  "env": {
+   "PGTEST_RESTART": "1"
+  }
  }
 ]

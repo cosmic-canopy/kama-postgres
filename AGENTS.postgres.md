@@ -59,7 +59,11 @@ release it is built and tested with, and the first with everything this package 
     `Garble`): the client must never panic, and a protocol error must end the session. A new kind of reply goes into
     one of its exercises. `PGTEST_GARBLE_SEEDS=N` runs more seeds, and `PGTEST_GARBLE_TRACE=1` names each case first.
   - `tests/integration` needs a live server. `tools/test-integration.sh` starts each version itself (all of
-    14–19 by default, `--version N` for one) and runs the suite debug and release. `types_test.kama` reads every
+    14–19 by default, `--version N` for one) and runs the suite debug and release. A last leg per version
+    (`PGTEST_RESTART=1`) runs only `restart_test.kama`, which stops, starts and restarts the server through
+    `tools/pg.sh` (`PGTEST_PGSH`) with `std::process`. It runs the debug build: until KPG-41 is fixed, the group is
+    `file @compileFor(!RELEASE)`, with `restart_release.kama` as its release twin. Never run it beside anything else
+    that uses the same server. `types_test.kama` reads every
     codec vector on each version: its binary bytes, its text both ways, and its kama value sent back.
   - `tools/mutate.sh <file> [--version N]` tests the tests. Each mutation in `tools/mutations/*.json` changes the
     source in a copy of the tree and must make the case it names fail. A test is not called good until one does.
@@ -106,6 +110,8 @@ release it is built and tested with, and the first with everything this package 
     upstream's md5 section of `001_password.pl`.
   - The database `kp_notice` raises a NOTICE on every login (a login event trigger, 17 and later), for testing
     startup notices.
+  - `tools/pg.sh stop|start|restart` act on the primary's own container: a fast shutdown (the image's STOPSIGNAL is
+    SIGINT), with PGDATA kept. `up` starts a stopped server again rather than making a new one.
   - `tools/pg.sh smoke` logs in once per method with the container's own psql. When an integration test
     fails, run it first: it separates "the server is misconfigured" from "the client is wrong".
   - A hot standby streams from each server: `kama-pg-N-standby` on port 544N (`PGTEST_STANDBY_PORT`), made with
@@ -191,7 +197,9 @@ release it is built and tested with, and the first with everything this package 
 - **Notices go to std::log** under the tag `postgres` (WARNING as warn, NOTICE/INFO as info, DEBUG/LOG as
   debug), unless the connection has a `NoticeHandler`. Notices raised during startup always go to the log.
 - **I/O is a `Transport`:** non-blocking `read`/`write` and `wait(interest:, timeoutMs:)`, plus `explain(error:)`,
-  which words a failure as libpq does for that layer (a plain socket answers None).
+  which words a failure as libpq does for that layer (a plain socket answers None, and `Wire.failure` then words it as
+  libpq's socket layer does: `PgError::Lost`, "server closed the connection unexpectedly…" for a peer that hung up, else
+  "could not receive data from server: …", "could not send data to server: …" or "select() failed: …").
   - `TcpTransport` is a non-blocking `TcpStream` plus a `std::net::Poller`. The internal module
     `postgres::wire` frames messages over any transport, with deadlines.
   - `UnixTransport` is the same for a socket host (a directory, or `@name` on Linux). Its connect is

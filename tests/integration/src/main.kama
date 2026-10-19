@@ -6,7 +6,8 @@ import { core::println, core::env, std::log::setLogSink, postgres_integration_te
          postgres_integration_tests::sessionTests, postgres_integration_tests::socketTests,
          postgres_integration_tests::extendedTests, postgres_integration_tests::typesTests, postgres_integration_tests::tlsTests,
          postgres_integration_tests::tlsLibpqTests, postgres_integration_tests::cancelTests, postgres_integration_tests::notifyTests, postgres_integration_tests::transactionTests, postgres_integration_tests::copyTests, postgres_integration_tests::cacheTests, postgres_integration_tests::pipelineTests, postgres_integration_tests::batchTests, postgres_integration_tests::tsaTests, postgres_integration_tests::lbTests,
-         postgres_integration_tests::resetTests, postgres_integration_tests::limitsTests };
+         postgres_integration_tests::resetTests, postgres_integration_tests::limitsTests,
+         postgres_integration_tests::restartTests };
 export { check, setting };
 
 fn int32 check(bool ok, string what) {
@@ -23,8 +24,20 @@ unsafe fn string setting(string name) {
     };
 }
 
+// The restart leg: tools/test-integration.sh sets PGTEST_RESTART=1 to run the cases that take the server down, alone.
+unsafe fn bool restarting() {
+    Optional<string> v = env(name: "PGTEST_RESTART");
+    return match (v) { case Some(value: s): s.equals(other: "1"); case None: false; };
+}
+
 fn int32 main() {
     setLogSink(s: capture);
+    if (restarting()) {
+        int32 r = restartTests();
+        if (r != 0) { println(s: "postgres integration tests (restarts): ${r} failed"); return 1; }
+        println(s: "postgres integration tests (restarts): OK");
+        return 0;
+    }
     int32 failed = 0;
     failed = failed + authTests();
     failed = failed + queryTests();

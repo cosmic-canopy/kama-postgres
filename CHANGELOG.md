@@ -46,6 +46,17 @@ All notable changes to this package are recorded here. The format follows
     end and dropped, the call fails, and the session and its transaction go on.
 
   Reaching a bound is the new `PgError::Limit`. `takeNotifications` no longer takes quadratic time.
+- **`PgError::Lost`: a session's connection failing, in libpq's words** (pqsecure_raw_read and pqsecure_raw_write): a
+  server that hung up (the end of the stream, EPIPE, ECONNRESET) is "server closed the connection unexpectedly…"
+  whatever the client was doing, any other failure is "could not receive data from server: …", "could not send data
+  to server: …" or "select() failed: …" with the operating system's words, and the `IoError` is kept as the cause.
+  Before, a plain socket's failure printed the operating system's words alone ("Broken pipe"). After a failed write,
+  what the read finds is reported first, as libpq reads on after one.
+- **Server restarts are tested.** `tools/pg.sh stop|start|restart` (a fast shutdown; the data is kept), and a restart
+  leg per server in `tools/test-integration.sh`: sessions open across a restart (plaintext, TLS, in a transaction
+  block, with a cached statement, a command in flight, `ping` and `resetSession`), a connect while the server is down
+  and while it starts, and the sessions after it. The words a session may report are libpq's; asked across a restart,
+  the server's own psql printed the FATAL and then the lost connection.
 - **Seeded mutations of every scripted reply** (`tests/unit/src/garble_test.kama`). Eighteen conversations carry every
   backend message this client reads, in each state it can arrive in: startup with each authentication method and a
   protocol downgrade, the simple and extended protocols, the statement cache, a portal, COPY both ways, a pipeline, a
@@ -70,6 +81,8 @@ All notable changes to this package are recorded here. The format follows
   - BEGIN's options are `tx.setOptions(options:)`, since a mint takes no arguments, and BEGIN's outcome is
     `tx.began()`, since a mint cannot return a Result.
 - **Needs `@kama/tls` ≥ 0.1.3**, the first whose `TlsError` is `Sendable`.
+- **Breaking:** a session's I/O failure is `PgError::Lost(detail, cause)` instead of `PgError::Io`. `Io` stays for a
+  failure to connect and for the caller's own streams (`copyFrom`'s Reader, `copyTo`'s Writer).
 - **Breaking:** `postgres::protocol::frame` takes a `Framing` (`Startup`, `Session` or `CopyOut`), and `Frame` has an
   `OldError` case. A header libpq refuses is `ProtocolError::SyncLost(tag, length)`, its length signed as libpq reads it.
 - The receive buffer grows only as a message's bytes arrive. A header that declares a 1 GiB message no longer costs

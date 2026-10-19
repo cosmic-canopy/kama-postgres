@@ -220,10 +220,25 @@ it fail.
 - **Where it stands.** S0, S0b, S1 and S2 are done, and so is the port to kama 0.9.673. S2 is four commits: S2a (libpq's
   header checks), S2d (the garbling), S2b (`Limits`) and S2c (restarts). The working tree is clean. Nothing is pushed:
   pushing waits for the maintainer.
-- **One gap is open:** KPG-41, filed in KAMA_GAPS.md with its repro and the workaround to delete. Check whether a newer
-  kama release fixes it before working around anything else in that area.
-- **Next: S3, the pool**, as its bullet above says. What S2 gives it: `isClosed()` after any lost connection,
-  `PgError::Limit` for a bound reached, and `tools/pg.sh restart` for its restart tests (S5).
+- **One gap is open: KPG-41** (KAMA_GAPS.md, with its repro and the workaround to delete). On macOS, a release build
+  that has `std::process` beside `std::concurrent` fails in clang. A `Channel` is enough to set it off, not only an
+  isolate, and it still fails on v0.9.675.
+  - **It matters to S3.** The package does not import `std::concurrent` today; the pool will (a `Channel`, and a
+    maintenance isolate). From then on, an application on macOS that uses the pool and starts a process cannot build
+    for release. Tell the maintainer before S3 lands, so cstar can weigh it. A newer kama may already fix it: run the
+    repro (`c3.kama` in the entry) with `--release` first.
+  - In this repo it touches only the integration tests: the restart group is `file @compileFor(!RELEASE)`, with
+    `restart_release.kama` as its release twin, and the restart leg runs the debug build.
+- **Next: S3, the pool**, as its bullet above says. Where to start:
+  - **Release** (S3's decision above) is already public. Read `isClosed()`, `pipelineStatus()` and `transactionStatus()`
+    (Active is busy), then call `resetSession()`, which rolls back too. With the reset off, call `settle()` only when
+    the status is not Idle.
+  - **Acquire** is `Receiver.recvTimeout` (std::concurrent). Read the `Channel` drop rule in AGENTS.postgres.md first:
+    claim `sender()` and `receiver()` before the `Channel` drops.
+  - **Each connection's bounds** come from its `Config` (`Limits`), so the pool's connections take the pool's
+    `Config.setLimits`. A connection that hit `readBuffer` or `parameters` is closed, and release must drop it.
+  - **Restart tests (S5)** have `tools/pg.sh restart|stop|start`, and the restart leg's way of driving them
+    (`restart_test.kama`, `PGTEST_PGSH`). The pool's live restart cases belong in that leg.
 - **The gate, per step:**
   - `tools/test.sh`, which runs the unit suite in debug and release;
   - `tools/test-integration.sh`, on 14–19 in debug, release and TLS, then the restart leg;
@@ -238,6 +253,9 @@ it fail.
   - Never edit a script while it runs: `sh` reads it as it goes.
 - **The compiler.** Build with the v0.9.673 release, as CI does. The dev tree (`../cstar/out`) is past the release,
   and `~/.kama/bin/kama` is an old 0.9.440.
+  - **v0.9.675 came out on 2026-10-19.** At `4305a81`, the package and both test programs check clean on it, and the
+    unit suite passes on it in debug and release. The floor and CI stay at 0.9.673: raising them is the maintainer's
+    call, made in one commit (`"kama"` in the three manifests, `KAMA_VERSION` in ci.yml).
   - To get one: `kama-macos-universal-vX.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its
     `.sha256` and unpacked anywhere (it holds `kama-macos-universal-vX/bin/kama`). A session's scratchpad does not
     outlive it, so download it again each session.
@@ -248,7 +266,9 @@ it fail.
   and the locks pin 0.1.4. kama-tls is busy with its own roadmap, so ask the maintainer before you need something there.
 - **The servers.** `kama-pg-14` to `kama-pg-19` and their standbys are running under podman (`tools/pg.sh`). The
   superuser's reset test leaves one object behind, by design: `kp_reset_seq`, a sequence in `kp_test`, made with
-  `if not exists`.
+  `if not exists`. The restart leg leaves each primary running, and `test-integration.sh` runs `pg.sh up` after it.
+- **CI has not run the restart leg yet.** It ran here under podman on macOS only. CI's integration job (docker on Linux)
+  runs it from the first push of S2.
 - **Other sessions commit here.** @kama/redis's session committed `bacbcc4` to this repo during S0b. Read `git status`
   and `git log` before committing, and stage only your own files.
 

@@ -7,7 +7,8 @@ spec. An entry that is an absence cites the cstar files that show it instead. Th
 the published package, as it is in `@kama/sodium`.
 
 **Current compiler:** `kama 0.9.673`, the release (`v0.9.673`, from GitHub, checksum verified). KPG-39 and KPG-40 were
-re-run on it, with the repros as filed, before they moved to FIXED. KPG-41 was filed on it. Earlier rounds: `0.9.667` (KPG-33 to KPG-38
+re-run on it, with the repros as filed, before they moved to FIXED. KPG-41 was filed on it, and still fails on
+`v0.9.675` (checked the same day). Earlier rounds: `0.9.667` (KPG-33 to KPG-38
 verified, KPG-39 and KPG-40 filed), `0.9.523` (KPG-31 and KPG-32
 verified, KPG-33 to KPG-38 filed), `0.9.519` (KPG-23 to KPG-30 verified), `0.9.506` (KPG-11 to KPG-22 verified, KPG-23
 to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to KPG-14 filed), `0.9.477` (KPG-1 also on
@@ -55,9 +56,11 @@ fn int32 main() {
 }
 ```
 
-- `kama build c3.kama` builds and runs. `kama build c3.kama --release` fails as above.
+- `kama build c3.kama` builds and runs. `kama build c3.kama --release` fails as above, on `v0.9.673` and on `v0.9.675`.
 - The same file without the `Isolate` import builds in release. So does a program that spawns an isolate and makes no
   `Command`.
+- A `Channel` in place of the `Isolate` fails the same way: `std::concurrent::Channel` and `Sender`, a channel made and
+  its sender taken, beside the `Command`.
 - With `--keep-c`, a failing release unit has `#include "kama_os.h"` in its prologue (line 8 of the unit for a program
   that also spawns), ahead of `#include "kama_isolate.h"`. Without the `Command`, `kama_os.h` comes after
   `kama_isolate.h`, as it does in this package's integration program at 47cf3d4, which builds.
@@ -70,8 +73,10 @@ So it looks as if something in `std::process` moves `kama_os.h` into the release
 `kama_isolate.h`. Two ways out suggest themselves: `kama_isolate.h` could declare `sysconf` itself instead of including
 `<unistd.h>`, as `kama_os.h` does for the rest, or the prologue's headers could keep the order the chunks would give.
 
-**Why HIGH:** a program that starts a process and spawns an isolate cannot be built for release on macOS. A server that
-runs a helper and keeps a pool of workers is that program.
+**Why HIGH:** a program that starts a process and uses a channel or an isolate cannot be built for release on macOS. A
+server that runs a helper and keeps a pool of workers is that program. This package's next step is a connection pool,
+built on `std::concurrent`'s `Channel` and a maintenance isolate, so once it lands, an application on macOS that uses the
+pool and starts a process will not build for release, through no fault of its own.
 
 **Workaround here, to delete when this is fixed:** `tests/integration/src/restart_test.kama` is
 `file @compileFor(!RELEASE);`, and `main` runs it through a `@compileFor(!RELEASE)` function (its release twin says the

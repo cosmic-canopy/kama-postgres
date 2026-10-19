@@ -56,6 +56,8 @@ release it is built and tested with, and the first with everything this package 
   - `tests/integration` needs a live server. `tools/test-integration.sh` starts each version itself (all of
     14–19 by default, `--version N` for one) and runs the suite debug and release. `types_test.kama` reads every
     codec vector on each version: its binary bytes, its text both ways, and its kama value sent back.
+  - `tools/mutate.sh <file> [--version N]` tests the tests. Each mutation in `tools/mutations/*.json` changes the
+    source in a copy of the tree and must make the case it names fail. A test is not called good until one does.
   - Vectors come from upstream by script:
     - RFCs for the crypto;
     - libpq's own URI regression file for connection strings;

@@ -1,0 +1,210 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!this.live || !open || done || this.txEnded != epoch) { return; }",
+  "new": "        if (!this.live || !open) { return; }",
+  "expect": "window: BEGIN, a helper's INSERT, tx.commit()"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/transaction.kama",
+  "old": "    unsafe ~Transaction() { this.host[0].settleWindow(point: this.point, epoch: this.epoch, open: this.open, done: this.done); }",
+  "new": "    unsafe ~Transaction() { }",
+  "expect": "window: falling through rolls back"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!this.live || !open || done || this.txEnded != epoch) { return; }",
+  "new": "        if (!this.live || !open || done) { return; }",
+  "expect": "window: a COMMIT through conn() counts"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (status == 73ui8 && this.txStatus != 73ui8) { this.txEnded = this.txEnded + 1i64; }",
+  "new": "        if (false && status == 73ui8) { this.txEnded = this.txEnded + 1i64; }",
+  "expect": "window: a COMMIT that fails is the commit's error"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/transaction.kama",
+  "old": "        if (ended) { this.done = true; }",
+  "new": "        if (false) { this.done = ended; }",
+  "expect": "nested: SAVEPOINT sp_1, RELEASE by inner.commit()"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        return this.command(sql: \"ROLLBACK TO SAVEPOINT sp_${point}; RELEASE SAVEPOINT sp_${point}\");",
+  "new": "        return this.command(sql: \"ROLLBACK TO SAVEPOINT sp_${point}\");",
+  "expect": "nested: a failed inner window is rolled back"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (!this.live || !open || done || this.txEnded != epoch) { return; }",
+  "new": "        if (!this.live || !open || done || this.txStatus == 73ui8) { return; }",
+  "expect": "nested: a block begun after the window's ended"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "case Err(error: e): { this.unbegun.add(item: give e); open = false; } };",
+  "new": "case Err(error: e): { this.unbegun.add(item: give e); } };",
+  "expect": "unbegun: began() gives BEGIN's refusal once"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            return Result::Err(error: PgError::Usage(detail: \"the transaction did not begin, and began() has returned why\"));",
+  "new": "            return Result::Ok(value: Unit::Unit);",
+  "expect": "unbegun: began() gives BEGIN's refusal once"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.txStatus != 73ui8) {   // 'I'",
+  "new": "        if (this.txStatus == 84ui8) {   // 'I'",
+  "expect": "nested: SAVEPOINT in a failed block is refused"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (mint == this.mints) {",
+  "new": "        if (true) {",
+  "expect": "unbegun: a later mint drops an unclaimed error"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/transaction.kama",
+  "old": "        if (!this.open) { return this.host[0].unbegunError(mint: this.mint); }",
+  "new": "        if (!this.open) { return Result::Err(error: PgError::Usage(detail: \"not begun\")); }",
+  "expect": "unbegun: commit() gives BEGIN's error"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/transaction.kama",
+  "old": "        if (this.done || this.host[0].blocksEnded() != this.epoch) {",
+  "new": "        if (false) {",
+  "expect": "window: a COMMIT through conn() counts, and tx.commit() after it is refused"
+ },
+ {
+  "id": "M14",
+  "suite": "unit",
+  "file": "src/transaction.kama",
+  "old": "        if (modes.length() == 0) { return Result::Ok(value: Unit::Unit); }\n",
+  "new": "",
+  "expect": "options: SET TRANSACTION with every mode"
+ },
+ {
+  "id": "M15",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Result<Unit, PgError> drained = this.discardRows();\n        Result<Unit, PgError> back = this.rollback();",
+  "new": "        Result<Unit, PgError> back = this.rollback();",
+  "expect": "abandoned: rows left unread are read off"
+ },
+ {
+  "id": "M16",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.close();\n    }\n\n    friend postgres::Transaction",
+  "new": "    }\n\n    friend postgres::Transaction",
+  "expect": "abandoned: a COPY left open closes"
+ },
+ {
+  "id": "M17",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (this.txStatus != 73ui8) { this.abandon(r: back); }",
+  "new": "        bool server = match (back) { case Ok(value: u): true; case Err(error: e): isServerError(e: e); };\n        if (!server) { this.abandon(r: back); }",
+  "expect": "abandoned: a ROLLBACK refused, still in the block"
+ },
+ {
+  "id": "M18",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        bool kept = match (back) { case Ok(value: u): true; case Err(error: e): this.live && isServerError(e: e); };",
+  "new": "        bool kept = match (back) { case Ok(value: u): true; case Err(error: e): false; };",
+  "expect": "abandoned: a savepoint not rolled back to"
+ },
+ {
+  "id": "M19",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            this.savepoints = point;\n",
+  "new": "",
+  "expect": "nested: windows take sp_1 and sp_2"
+ },
+ {
+  "id": "M20",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (commit) { return this.commit(); }",
+  "new": "            if (commit) { return this.rollback(); }",
+  "expect": "window: BEGIN, a helper's INSERT, tx.commit()"
+ },
+ {
+  "id": "IM1",
+  "suite": "integration",
+  "file": "src/transaction.kama",
+  "old": "    unsafe ~Transaction() { this.host[0].settleWindow(point: this.point, epoch: this.epoch, open: this.open, done: this.done); }",
+  "new": "    unsafe ~Transaction() { }",
+  "expect": "a window that falls through, or returns its error, keeps nothing"
+ },
+ {
+  "id": "IM2",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "            if (commit) { return this.commit(); }",
+  "new": "            if (commit) { return this.rollback(); }",
+  "expect": "tx.commit() keeps the row"
+ },
+ {
+  "id": "IM3",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        return this.command(sql: \"ROLLBACK TO SAVEPOINT sp_${point}; RELEASE SAVEPOINT sp_${point}\");",
+  "new": "        return this.rollback();",
+  "expect": "inner windows are undone, the outer commits"
+ },
+ {
+  "id": "IM4",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        if (!this.live || !open || done || this.txEnded != epoch) { return; }",
+  "new": "        if (!this.live || !open || done || this.txStatus == 73ui8) { return; }",
+  "expect": "a block begun after the window's COMMIT is left open"
+ },
+ {
+  "id": "IM5",
+  "suite": "integration",
+  "file": "src/transaction.kama",
+  "old": "        if (modes.length() == 0) { return Result::Ok(value: Unit::Unit); }",
+  "new": "        if (true) { return Result::Ok(value: Unit::Unit); }",
+  "expect": "SERIALIZABLE READ ONLY DEFERRABLE, as the server sees it"
+ },
+ {
+  "id": "IM6",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        this.close();\n    }\n\n    friend postgres::Transaction",
+  "new": "    }\n\n    friend postgres::Transaction",
+  "expect": "a COPY left open in a window closes the connection"
+ }
+]

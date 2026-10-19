@@ -84,9 +84,26 @@ it fail.
     the savepoint only.
 - **S1, connection groundwork.**
   - `Connection.ping()`: an empty query, with ReadyForQuery back.
-  - `Connection.resetSession()`: Npgsql's reset that keeps prepared statements (CLOSE ALL, SET SESSION AUTHORIZATION
-    DEFAULT, RESET ALL, UNLISTEN *, `pg_advisory_unlock_all()`, DISCARD SEQUENCES, DISCARD TEMP). The list is read
-    from Npgsql's pinned source, not typed from memory.
+  - `Connection.resetSession()`: Npgsql's reset, read from its pinned source and not typed from memory. The source is
+    Npgsql v10.0.3 (2026-05-27, the latest release on 2026-10-18), `src/Npgsql/Internal/NpgsqlConnector.cs` (SHA256
+    `7a13d79578e0a0874c5842532d450d496f7d52c0f66d3fa7c1a2984a83465274`), `GenerateResetMessage()` and `Reset()`.
+    What it says:
+    - **The statements**, in this order and in one message: `SET SESSION AUTHORIZATION DEFAULT;RESET ALL;CLOSE ALL;
+      UNLISTEN *;SELECT pg_advisory_unlock_all();DISCARD SEQUENCES;DISCARD TEMP`. The list this bullet held before was
+      in another order.
+    - **The gates:** each statement after the first two depends on the server's version (`Supports*` in
+      `src/Npgsql/Internal/NpgsqlDatabaseInfo.cs`, SHA256 `5483a434b61c705dbfc6bff23267b1472063864fa4a6e1c901b34b0d5d07832d`;
+      Redshift's in `src/Npgsql/PostgresDatabaseInfo.cs`, SHA256
+      `5cbf08c0a67e6ae68751b573c821a7eddf8fc12a1507fe102c65537697cb8656`). Every gate holds on 14–19.
+    - **With nothing prepared**, Npgsql sends `DISCARD ALL` instead, which also deallocates. Here the statement cache
+      and `prepare()` keep named statements, so S1 decides when nothing is prepared, and must empty the cache along
+      with a `DISCARD ALL`.
+    - **A transaction block is rolled back first**, since `DISCARD ALL` cannot run inside one. `Connection.settle()`
+      (S0b) is that rollback.
+    - **It costs Npgsql no round trip:** `PrependInternalMessage` sends the reset in front of the connection's next
+      command. The decision below says "one round trip", so S1 decides between prepending it, as Npgsql does, and
+      sending it on release.
+    - Fetch the three files again by script and check their hashes; do not trust this summary over them.
   - Whatever state the pool needs in order to decide what to do on release.
 - **S2, hardening.**
   - libpq's rule that a message of a short type over 30000 bytes is "lost synchronization with server" (fe-protocol3.c).
@@ -132,24 +149,49 @@ it fail.
 - **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
   for changes.
 
-**What the next session needs to know:**
-- **The compiler.** Build with the released 0.9.667, as CI does. The dev tree (`../cstar/out`) is past the release,
-  and `~/.kama/bin/kama` is an old 0.9.440.
-  - To get it: `kama-macos-universal-v0.9.667.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its
-    `.sha256` and unpacked anywhere.
-  - Run with `KAMA=<dir>/bin/kama tools/test.sh`, or `curl -fsSL https://kama-lang.org/install.sh | KAMA_VERSION=v0.9.667 sh`.
-- **kama-tls.** `../kama-tls` is readable again. The package needs `@kama/tls` ≥ 0.1.3 (its `TlsError` is `Sendable`),
-  and the locks pin 0.1.4.
-- **Before S1: port to kama v0.9.672, once it is tagged.** It is not yet: the latest release on 2026-10-18 is v0.9.667.
-  It carries both answers, so the package should need it for 0.3.0.
+**What the next session needs to know** (written 2026-10-18, at the end of S0b):
+- **Where it stands.** S0 and S0b are done. The working tree is clean, and main is 4 commits ahead of origin: @kama/redis's
+  handshake fix (`bacbcc4`), the `@kama/tls` ^0.1.3 floor with `Sendable` errors (`201ada9`), S0b (`33bde18`), and
+  KPG-39/KPG-40's answers (`05e8031`), plus the commit that wrote this. Nothing is pushed: pushing waits for the
+  maintainer.
+- **First: port to kama v0.9.672, once it is tagged.** It was not tagged on 2026-10-18 (the latest release was v0.9.667):
+  check `https://api.github.com/repos/cosmic-canopy/kama/releases`. If it is still not out, start S1 on 0.9.667 and port
+  when it lands.
   - **KPG-40, answered:** `borrow tx.conn().transaction() as inner` is intended. Keep it, and add no mint on the view.
     Before 0.9.672 the inner window did not freeze `tx`, so the outer transaction could be committed from inside a
     savepoint. The windows' check of the server's status made that harmless, but 0.9.672 refuses it.
   - **KPG-39, fixed in 0.9.669:** std's JSON can be imported beside this package.
-  - Steps: download the release and check its checksum. Run both repros, plus the refusal of `tx` inside `inner`, and
-    move the two entries to FIXED. Raise `"kama"` to `>=0.9.672` in the three manifests and the CI pin. Add a
-    `JsonValue` test beside `typed_test.kama`'s `Untyped`. Drop the README's known issue, and note it all in the
-    CHANGELOG. Then run the full gate.
+  - **The floor:** raise `"kama"` to `>=0.9.672` in the three manifests and in both `KAMA_VERSION` pins of
+    `.github/workflows/ci.yml`. That is the recommendation put to the maintainer, who had not answered yet: 0.3.0 is
+    unreleased, and 0.9.672 is the first compiler that refuses `tx` inside `inner` and lets JSON be imported. Confirm
+    it before raising.
+  - Steps:
+    1. Download the release and check its checksum.
+    2. Run both entries' repros and the refusal of `tx` inside `inner`, and move both entries to FIXED.
+    3. Raise the floor.
+    4. Add a `JsonValue` test beside `typed_test.kama`'s `Untyped`.
+    5. Drop the README's known issue, and note it all in the CHANGELOG.
+    6. Run the full gate.
+- **Then S1**, as its bullet above says, with the facts it records from Npgsql's source.
+- **The gate, per step:**
+  - `tools/test.sh`, which runs the unit suite in debug and release;
+  - `tools/test-integration.sh`, on 14–19 in debug, release and TLS;
+  - **`tools/mutate.sh tools/mutations/<step>.json --version 18`**. This runs each mutation in a copy of the tree and
+    exits 1 unless every one makes its targeted case fail. S0b's 26 are in `tools/mutations/s0b.json`. Write a file per
+    step, and re-run older files when their code changes. A `BAD-PATTERN` means the source moved on, so update the
+    mutation.
+- **The compiler.** Build with a release, as CI does. The dev tree (`../cstar/out`) is past the release, and
+  `~/.kama/bin/kama` is an old 0.9.440.
+  - To get one: `kama-macos-universal-vX.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its
+    `.sha256` and unpacked anywhere (it holds `kama-macos-universal-vX/bin/kama`).
+  - Run with `KAMA=<that>/bin/kama tools/test.sh`, or `curl -fsSL https://kama-lang.org/install.sh | KAMA_VERSION=vX sh`.
+  - **The editor's diagnostics come from that old 0.9.440 language server.** It rejects a view's `~dtor` and cannot
+    resolve this package's imports, so ignore it and trust `kama check`.
+- **kama-tls.** `../kama-tls` is readable again. The package needs `@kama/tls` ≥ 0.1.3 (its `TlsError` is `Sendable`),
+  and the locks pin 0.1.4. kama-tls is busy with its own roadmap, so ask the maintainer before you need something there.
+- **The servers.** `kama-pg-14` to `kama-pg-19` and their standbys are running under podman (`tools/pg.sh`).
+- **Other sessions commit here.** @kama/redis's session committed `bacbcc4` to this repo during S0b. Read `git status`
+  and `git log` before committing, and stage only your own files.
 
 ## Decided, and why
 

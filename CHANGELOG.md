@@ -10,6 +10,15 @@ All notable changes to this package are recorded here. The format follows
 - `Transaction`, the transaction a borrow window scopes, which `transaction()` now mints. Its methods are `conn()`,
   `began()`, `commit()`, `rollback()` and `setOptions(options:)`, which runs SET TRANSACTION.
 - `TransactionOptions.modes()`: the transaction modes, as BEGIN and SET TRANSACTION take them.
+- `Connection.ping()`: an empty query, which the server answers in a failed transaction block too.
+- `Connection.resetSession()`: Npgsql 10.0.3's session reset, read from its source.
+  - It rolls back an open block.
+  - It sends `DISCARD ALL` when nothing is prepared. Otherwise it sends DISCARD ALL's parts except deallocating
+    statements, so the statement cache and `prepare`d statements stay usable.
+  - Each part is gated on the server's version as Npgsql gates it.
+  - It takes one round trip, and is sent at once rather than in front of the next command, as Npgsql sends it, so a
+    failure is reported to the caller. A failed reset closes the connection.
+  - Notifications already received are dropped.
 
 ### Changed
 - **Breaking: `transaction()` is a borrow window**, `borrow conn.transaction() as tx { … }`, which kama 0.9.658 made

@@ -1,0 +1,27 @@
+export { resetQuery };
+
+// The session reset a pooled connection is sent when it is returned (Connection.resetSession), as Npgsql v10.0.3 makes
+// it. Read from Npgsql's source, not typed from memory: src/Npgsql/Internal/NpgsqlConnector.cs (SHA256 7a13d795…3274),
+// GenerateResetMessage() and Reset(); the gates in src/Npgsql/Internal/NpgsqlDatabaseInfo.cs (5483a434…832d) and
+// src/Npgsql/PostgresDatabaseInfo.cs (5cbf08c0…8656); and DISCARD ALL in src/Npgsql/PregeneratedMessages.cs
+// (b60ae0c5…b6a3). tools/gen-reset-vectors.sh reads the same files into the unit tests' expected texts, so a test fails
+// if this drifts from them.
+//
+// PostgresDatabaseInfo also refuses UNLISTEN for Redshift; Npgsql's comment there says the check is never used, since no
+// reset is made for a server without DISCARD, so it is not ported.
+
+// The Query text that resets a session on a server of `version` (PQserverVersion), or None for a server below 8.3, which
+// has no DISCARD and to which Npgsql sends no reset (SupportsDiscard). DISCARD ALL when no statement is prepared, since
+// it also deallocates them; otherwise each statement of DISCARD ALL but DEALLOCATE ALL and DISCARD PLANS, in Npgsql's
+// order, as far as the server has it. It runs outside a transaction block: DISCARD ALL cannot run inside one.
+fn Optional<string> resetQuery(int32 version, bool prepared) {
+    if (version < 80300) { return Optional::None; }                          // SupportsDiscard: 8.3
+    if (!prepared) { return Optional::Some(value: "DISCARD ALL"); }
+    string sql = "SET SESSION AUTHORIZATION DEFAULT;RESET ALL;";
+    if (version >= 80300) { sql = sql.concat(other: "CLOSE ALL;"); }                     // SupportsCloseAll: 8.3
+    if (version >= 60400) { sql = sql.concat(other: "UNLISTEN *;"); }                    // SupportsUnlisten: 6.4
+    if (version >= 80200) { sql = sql.concat(other: "SELECT pg_advisory_unlock_all();"); }   // SupportsAdvisoryLocks: 8.2
+    if (version >= 90400) { sql = sql.concat(other: "DISCARD SEQUENCES;"); }             // SupportsDiscardSequences: 9.4
+    if (version >= 80300) { sql = sql.concat(other: "DISCARD TEMP"); }                   // SupportsDiscardTemp: 8.3
+    return Optional::Some(value: give sql);
+}

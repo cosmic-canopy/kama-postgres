@@ -33,7 +33,8 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::Dialer, postgres::DialTarget, postgres::SslCertMode, postgres::sqlstate::sqlstateCode,
          postgres::secure::EncryptionPlan, postgres::secure::Fallback, postgres::secure::Secured, postgres::secure::secure,
          postgres::secure::TlsSession,
-         postgres::session::Opener, postgres::session::Opened, postgres::session::CancelRoute };
+         postgres::session::Opener, postgres::session::Opened, postgres::session::CancelRoute,
+         postgres::session::resetQuery };
 export { Connection, TransactionStatus };
 
 // postgres::Connection — one session with a server: connecting as libpq connects (every host and address in
@@ -76,6 +77,10 @@ type resource Connection implements Sendable, Transactional {
     bool rowLimited = false;  // its Execute had a row limit, so it may end in PortalSuspended
     DynamicArray<FieldDescription> openFields;
     int64 statements = 0i64;  // the names given so far: s0, s1, …
+    // The statements prepared (prepare, sendPrepare) and not yet known closed (closeStatement, a pipeline's Close): what
+    // resetSession reads as Npgsql's NumPrepared. A failed prepare or a Statement dropped unclosed may leave it high,
+    // which only costs the long reset.
+    int64 statementsOpen = 0i64;
     int64 portals = 0i64;     // p0, p1, …
     Optional<TlsSession> tls;          // what TLS settled, when the session is encrypted
     bool refusedBeforeAuth = false;    // startup ended on an ErrorResponse before AuthenticationOk
@@ -129,6 +134,7 @@ type resource Connection implements Sendable, Transactional {
         this.rowLimited = false;
         this.openFields = DynamicArray.empty();
         this.statements = 0i64;
+        this.statementsOpen = 0i64;
         this.portals = 0i64;
         this.tls = Optional::None;
         this.refusedBeforeAuth = false;
@@ -173,6 +179,7 @@ type resource Connection implements Sendable, Transactional {
         this.rowLimited = false;
         this.openFields = DynamicArray.empty();
         this.statements = 0i64;
+        this.statementsOpen = 0i64;
         this.portals = 0i64;
         this.tls = Optional::None;
         this.refusedBeforeAuth = false;
@@ -657,6 +664,7 @@ type resource Connection implements Sendable, Transactional {
         string name = "s${n}";
         Result<Described, PgError> d = this.parseAndDescribe(name: name, sql: sql);
         Described shape = match (give d) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        this.statementsOpen = this.statementsOpen + 1i64;
         return Result::Ok(value: Statement.make(name: give name, sql: copy sql, types: copy shape.types(), fields: copy shape.fields()));
     }
 
@@ -668,7 +676,14 @@ type resource Connection implements Sendable, Transactional {
         this.outbox.clear();
         bool framed = sendCloseStatement(w: this.outbox, name: statement.name());
         sendSync(w: this.outbox);
-        return this.closeExchange();
+        Result<Unit, PgError> closed = this.closeExchange();
+        match (closed) { case Ok(value: u): { this.forgetStatement(); } case Err(error: e): { } };
+        return closed;
+    }
+
+    // A statement the server confirmed closed is no longer one resetSession must keep.
+    fn void forgetStatement() {
+        if (this.statementsOpen > 0i64) { this.statementsOpen = this.statementsOpen - 1i64; }
     }
 
     // ---- chunked rows ----
@@ -882,6 +897,72 @@ type resource Connection implements Sendable, Transactional {
         return match (give r) { case Ok(value: rows): Result::Ok(value: Unit::Unit); case Err(error: e): Result::Err(error: give e); };
     }
 
+    // ---- checking and resetting a session ----
+
+    // Whether the server still answers: an empty query, which it answers with EmptyQueryResponse and ReadyForQuery (pgx's
+    // Ping sends one too, a comment). It is refused as any command is, and runs in a failed transaction block, where an
+    // empty query is not refused. A result in the answer ends the session: the server did not run what was sent.
+    public unsafe fn Result<Unit, PgError> ping() {
+        Result<DynamicArray<Rows>, PgError> r = this.simpleQuery(sql: "");
+        DynamicArray<Rows> results = match (give r) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+        if (results.length() > 0) { return Result::Err(error: this.broken(detail: "unexpected response from server: a result for an empty query")); }
+        return Result::Ok(value: Unit::Unit);
+    }
+
+    // Return the session to the state a new one starts in, as Npgsql resets a pooled connection when it is returned
+    // (NpgsqlConnector.Reset, v10.0.3): a transaction block is rolled back, then the Query postgres::session::resetQuery
+    // makes resets the server's session state. That is DISCARD ALL when no statement is prepared on this connection, and
+    // otherwise every part of DISCARD ALL but deallocating them (SET SESSION AUTHORIZATION DEFAULT, RESET ALL, CLOSE ALL,
+    // UNLISTEN *, pg_advisory_unlock_all(), DISCARD SEQUENCES, DISCARD TEMP), so the statement cache and `prepare`d
+    // statements stay usable. A statement is prepared while the cache holds a named one, or a `prepare` is not closed. A
+    // server below 8.3 has no DISCARD, and Npgsql sends it no reset: only the rollback is done.
+    //
+    // It costs one round trip: the ROLLBACK, when one is needed, and the reset go in one write, as two Query messages,
+    // since DISCARD ALL cannot share one with ROLLBACK. Npgsql sends the reset in front of the connection's next command
+    // instead; here it is sent now, so a failure is the caller's to see, not the next command's after that command ran.
+    // Notifications already received are dropped, since UNLISTEN * undid what they came from. The notice handler and the
+    // query timeout are this client's settings, not the session's, and stay as they are.
+    //
+    // It is refused as any command is (closed, pipeline mode, a result or a COPY in progress), and when the server
+    // reported no server_version, since which reset it takes is then not known. A reset that fails leaves the session half
+    // reset, so the connection is closed, as Npgsql breaks it, and the error is returned.
+    public unsafe fn Result<Unit, PgError> resetSession() {
+        Result<Unit, PgError> ok = this.idle();
+        match (give ok) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        int32 version = this.serverVersion();
+        if (version == 0) {
+            return Result::Err(error: PgError::Usage(detail: "the server did not report server_version, so which session reset it takes is not known"));
+        }
+        CacheMode mode = this.cache.mode();
+        bool named = match (mode) { case Statements: true; case _: false; };
+        bool prepared = this.statementsOpen > 0i64 || (named && this.cache.length() > 0);
+        Optional<string> reset = resetQuery(version: version, prepared: prepared);
+        bool resets = match (reset) { case Some(value: q): true; case None: false; };
+        bool block = this.txStatus != 73ui8;   // 'T' or 'E'
+        if (block || resets) {
+            this.arm();
+            this.outbox.clear();
+            if (block) { bool framed = sendQuery(w: this.outbox, sql: "ROLLBACK"); }
+            match (reset) { case Some(value: q): { bool framed = sendQuery(w: this.outbox, sql: q); } case None: { } };
+            Result<Unit, PgError> sent = this.flush(deadline: this.due);
+            match (give sent) { case Ok(value: u): { } case Err(error: e): { this.close(); return Result::Err(error: give e); } };
+            if (block) {
+                Result<DynamicArray<Rows>, PgError> back = this.collect();
+                match (give back) { case Ok(value: r): { } case Err(error: e): { this.close(); return Result::Err(error: give e); } };
+            }
+            if (resets) {
+                Result<DynamicArray<Rows>, PgError> done = this.collect();
+                match (give done) { case Ok(value: r): { } case Err(error: e): { this.close(); return Result::Err(error: give e); } };
+            }
+            if (this.txStatus != 73ui8) {
+                this.close();
+                return Result::Err(error: PgError::Protocol(error: ProtocolError::Violation(detail: "the session was still in a transaction block after its reset")));
+            }
+        }
+        this.pending = DynamicArray.empty();
+        return Result::Ok(value: Unit::Unit);
+    }
+
     // ---- pipeline mode ----
 
     // libpq's PQpipelineStatus.
@@ -973,6 +1054,7 @@ type resource Connection implements Sendable, Transactional {
         if (!sendParse(w: this.outbox, name: name, sql: sql, params: none)) { return Result::Err(error: nulInQuery()); }
         bool d = sendDescribeStatement(w: this.outbox, name: name);
         this.queue.add(item: PipelineCommand.prepare(name: give name, sql: copy sql));
+        this.statementsOpen = this.statementsOpen + 1i64;
         return this.flushPast(bytes: PIPELINE_FLUSH);
     }
 
@@ -1038,9 +1120,9 @@ type resource Connection implements Sendable, Transactional {
         }
         if (head.isClose()) {
             Result<Unit, PgError> closed = this.readClose();
-            return match (give closed) {
-                case Ok(value: u): Result::Ok(value: Optional::Some(value: PipelineResult::Closed));
-                case Err(error: e): this.failedInPipeline(e: give e);
+            match (give closed) {
+                case Ok(value: u): { this.forgetStatement(); return Result::Ok(value: Optional::Some(value: PipelineResult::Closed)); }
+                case Err(error: e): { return this.failedInPipeline(e: give e); }
             };
         }
         if (head.isPrepare()) {

@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-18: phases 0–7 are done, and phase 8 is under way (S0 and S0b are done). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-18: phases 0–7 are done, and phase 8 is under way (S0, S0b and S1 are done). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -50,7 +50,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1) and S0b done; S1 next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b and S1 done; S2 next |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -82,29 +82,41 @@ it fail.
     taken as the window opens. A window that cannot roll back closes the connection, as pgx's Rollback does.
     `setOptions` on a savepoint is the server's to take (READ ONLY) or refuse (an isolation level, 25001), which fails
     the savepoint only.
-- **S1, connection groundwork.**
-  - `Connection.ping()`: an empty query, with ReadyForQuery back.
-  - `Connection.resetSession()`: Npgsql's reset, read from its pinned source and not typed from memory. The source is
-    Npgsql v10.0.3 (2026-05-27, the latest release on 2026-10-18), `src/Npgsql/Internal/NpgsqlConnector.cs` (SHA256
-    `7a13d79578e0a0874c5842532d450d496f7d52c0f66d3fa7c1a2984a83465274`), `GenerateResetMessage()` and `Reset()`.
-    What it says:
-    - **The statements**, in this order and in one message: `SET SESSION AUTHORIZATION DEFAULT;RESET ALL;CLOSE ALL;
-      UNLISTEN *;SELECT pg_advisory_unlock_all();DISCARD SEQUENCES;DISCARD TEMP`. The list this bullet held before was
-      in another order.
-    - **The gates:** each statement after the first two depends on the server's version (`Supports*` in
-      `src/Npgsql/Internal/NpgsqlDatabaseInfo.cs`, SHA256 `5483a434b61c705dbfc6bff23267b1472063864fa4a6e1c901b34b0d5d07832d`;
-      Redshift's in `src/Npgsql/PostgresDatabaseInfo.cs`, SHA256
-      `5cbf08c0a67e6ae68751b573c821a7eddf8fc12a1507fe102c65537697cb8656`). Every gate holds on 14–19.
-    - **With nothing prepared**, Npgsql sends `DISCARD ALL` instead, which also deallocates. Here the statement cache
-      and `prepare()` keep named statements, so S1 decides when nothing is prepared, and must empty the cache along
-      with a `DISCARD ALL`.
-    - **A transaction block is rolled back first**, since `DISCARD ALL` cannot run inside one. `Connection.settle()`
-      (S0b) is that rollback.
-    - **It costs Npgsql no round trip:** `PrependInternalMessage` sends the reset in front of the connection's next
-      command. The decision below says "one round trip", so S1 decides between prepending it, as Npgsql does, and
-      sending it on release.
-    - Fetch the three files again by script and check their hashes; do not trust this summary over them.
-  - Whatever state the pool needs in order to decide what to do on release.
+- **S1, done: connection groundwork.**
+  - `Connection.ping()`: an empty query, with ReadyForQuery back. A result in its answer ends the session.
+  - `Connection.resetSession()`: Npgsql's reset, in `src/session/reset.kama`.
+    - **Its source:** Npgsql v10.0.3 (2026-05-27, commit `d3768398c178`), four files pinned by SHA256:
+      - `src/Npgsql/Internal/NpgsqlConnector.cs` (`7a13d795…3274`): `GenerateResetMessage()` and `Reset()`;
+      - `NpgsqlDatabaseInfo.cs` (`5483a434…832d`) and `PostgresDatabaseInfo.cs` (`5cbf08c0…8656`): the gates;
+      - `PregeneratedMessages.cs` (`b60ae0c5…b6a3`): the texts of DISCARD ALL and ROLLBACK.
+
+      `tools/gen-reset-vectors.sh` reads them into the unit tests' expected texts (`tests/unit/src/reset_vectors.kama`).
+    - **The statements**, in one Query: `SET SESSION AUTHORIZATION DEFAULT;RESET ALL;CLOSE ALL;UNLISTEN *;SELECT
+      pg_advisory_unlock_all();DISCARD SEQUENCES;DISCARD TEMP`.
+    - **The gates** are Npgsql's:
+      - CLOSE ALL and DISCARD TEMP from 8.3;
+      - UNLISTEN from 6.4;
+      - the advisory unlock from 8.2;
+      - DISCARD SEQUENCES from 9.4;
+      - nothing at all below 8.3.
+
+      Redshift's UNLISTEN check is not ported: Npgsql's own comment says it is never used.
+    - **With nothing prepared, it sends DISCARD ALL**, whose tag empties the cache (`noteTag`). "Prepared" means a named
+      statement in the cache, or a `prepare()` not closed (`statementsOpen`, which may count high but never low).
+    - **A block is rolled back first**, with ROLLBACK and the reset as two Query messages in one write. PostgreSQL 18.4
+      refuses `ROLLBACK;DISCARD ALL` in one Query ("DISCARD ALL cannot run inside a transaction block").
+    - **It is sent at once, not prepended** (see the decision below). A failure closes the connection, as Npgsql's
+      Break does. A server that reported no `server_version` is refused.
+    - **Queued notifications are dropped.** The notice handler and the query timeout stay as they are: the pool
+      restores its own (S3).
+  - **What release reads is already public:**
+    - `isClosed()`;
+    - `pipelineStatus()`;
+    - `transactionStatus()`, which is Active while a result, a chunked stream or a COPY is open.
+
+    The unit tests pin each one (the "release:" cases in `tests/unit/src/reset_test.kama`).
+  - **Mutations:** `tools/mutations/s1.json`, 25 unit and 10 integration. The integration ones remove each statement of
+    the long form in turn, and each removal fails a live check.
 - **S2, hardening.**
   - libpq's rule that a message of a short type over 30000 bytes is "lost synchronization with server" (fe-protocol3.c).
   - Bounds, each configurable: the read buffer that grows while a write waits, the notification queue, the
@@ -126,6 +138,11 @@ it fail.
     - `Connection.settle()` (S0b) is the rollback half: it reads off an open result, sends ROLLBACK, and closes a
       connection still in a block. Release must check `pipelineStatus()` itself, because `transactionStatus()` says
       Idle in pipeline mode once the queue drains.
+    - As S1 built it: release reads `isClosed()`, `pipelineStatus()` and `transactionStatus()` (Active is busy), then
+      calls `resetSession()`, which does the rollback too.
+    - With the reset turned off, release calls `settle()` only when the status is not Idle, since `settle()` sends
+      ROLLBACK even on an idle session.
+    - Release puts back the pool's own notice handler and query timeout, which the reset leaves alone.
     - `borrow lease.conn().transaction() as tx` compiles over a lease whose `fn ref Connection conn()` returns
       `this.slot[0]` (probed on 0.9.667).
 - **S4, maintenance.** One isolate per pool, stopped when the pool drops. It closes idle and expired connections, pings
@@ -144,52 +161,58 @@ it fail.
 **Decisions:**
 - **On release, roll back and reset the session.** Npgsql and asyncpg do; pgx and deadpool do not. It is the safer
   default and costs one round trip. A pool can turn it off.
+- **The reset is sent as the connection is released, not in front of its next command** (decided 2026-10-18, in S1).
+  Npgsql prepends it, which saves the round trip. But a reset that fails would then surface on the next user's command,
+  after that command had been sent and possibly run. Sent at once, a failure is the releaser's, and the pool closes the
+  connection. asyncpg, and pgbouncer's `server_reset_query`, also reset before the connection is used again.
 - **A maintenance isolate.** pgxpool, HikariCP, Npgsql, sqlx and bb8 all have one.
 - **Windows is phase 9.**
 - **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
   for changes.
 
-**What the next session needs to know** (written 2026-10-18, at the end of S0b):
-- **Where it stands.** S0 and S0b are done. The working tree is clean, and main is 4 commits ahead of origin: @kama/redis's
-  handshake fix (`bacbcc4`), the `@kama/tls` ^0.1.3 floor with `Sendable` errors (`201ada9`), S0b (`33bde18`), and
-  KPG-39/KPG-40's answers (`05e8031`), plus the commit that wrote this. Nothing is pushed: pushing waits for the
+**What the next session needs to know** (written 2026-10-18, at the end of S1):
+- **Where it stands.** S0, S0b and S1 are done, and the working tree is clean. Nothing is pushed: pushing waits for the
   maintainer.
-- **First: port to kama v0.9.672, once it is tagged.** It was not tagged on 2026-10-18 (the latest release was v0.9.667):
-  check `https://api.github.com/repos/cosmic-canopy/kama/releases`. If it is still not out, start S1 on 0.9.667 and port
-  when it lands.
+- **First: port to kama v0.9.672, once it is tagged.** It was still not tagged at the end of S1 (the latest release was
+  v0.9.667): check `https://api.github.com/repos/cosmic-canopy/kama/releases`. If it is still not out, start S2 on
+  0.9.667 and port when it lands.
   - **KPG-40, answered:** `borrow tx.conn().transaction() as inner` is intended. Keep it, and add no mint on the view.
     Before 0.9.672 the inner window did not freeze `tx`, so the outer transaction could be committed from inside a
     savepoint. The windows' check of the server's status made that harmless, but 0.9.672 refuses it.
   - **KPG-39, fixed in 0.9.669:** std's JSON can be imported beside this package.
-  - **The floor:** raise `"kama"` to `>=0.9.672` in the three manifests and in both `KAMA_VERSION` pins of
-    `.github/workflows/ci.yml`. That is the recommendation put to the maintainer, who had not answered yet: 0.3.0 is
-    unreleased, and 0.9.672 is the first compiler that refuses `tx` inside `inner` and lets JSON be imported. Confirm
-    it before raising.
+  - **The floor, approved by the maintainer on 2026-10-18:** raise `"kama"` to `>=0.9.672` in the three manifests and in
+    both `KAMA_VERSION` pins of `.github/workflows/ci.yml`. 0.3.0 is unreleased, and 0.9.672 is the first compiler that
+    refuses `tx` inside `inner` and lets JSON be imported.
   - Steps:
     1. Download the release and check its checksum.
     2. Run both entries' repros and the refusal of `tx` inside `inner`, and move both entries to FIXED.
     3. Raise the floor.
     4. Add a `JsonValue` test beside `typed_test.kama`'s `Untyped`.
     5. Drop the README's known issue, and note it all in the CHANGELOG.
-    6. Run the full gate.
-- **Then S1**, as its bullet above says, with the facts it records from Npgsql's source.
+    6. Run the full gate, and every mutation file (`s0b.json`, `s1.json`).
+- **Then S2**, as its bullet above says.
 - **The gate, per step:**
   - `tools/test.sh`, which runs the unit suite in debug and release;
   - `tools/test-integration.sh`, on 14–19 in debug, release and TLS;
   - **`tools/mutate.sh tools/mutations/<step>.json --version 18`**. This runs each mutation in a copy of the tree and
-    exits 1 unless every one makes its targeted case fail. S0b's 26 are in `tools/mutations/s0b.json`. Write a file per
-    step, and re-run older files when their code changes. A `BAD-PATTERN` means the source moved on, so update the
-    mutation.
+    exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json` and S1's 35 in `s1.json`. Write
+    a file per step, and re-run older files when their code changes. A `BAD-PATTERN` means the source moved on, so
+    update the mutation.
+  - Run the integration mutations after the matrix, not beside it: both use the same servers.
+  - A generator's output is committed: re-run it, and `git diff` must be empty (`tools/gen-reset-vectors.sh` for S1).
 - **The compiler.** Build with a release, as CI does. The dev tree (`../cstar/out`) is past the release, and
   `~/.kama/bin/kama` is an old 0.9.440.
   - To get one: `kama-macos-universal-vX.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its
-    `.sha256` and unpacked anywhere (it holds `kama-macos-universal-vX/bin/kama`).
+    `.sha256` and unpacked anywhere (it holds `kama-macos-universal-vX/bin/kama`). A session's scratchpad does not
+    outlive it, so download it again each session.
   - Run with `KAMA=<that>/bin/kama tools/test.sh`, or `curl -fsSL https://kama-lang.org/install.sh | KAMA_VERSION=vX sh`.
   - **The editor's diagnostics come from that old 0.9.440 language server.** It rejects a view's `~dtor` and cannot
     resolve this package's imports, so ignore it and trust `kama check`.
 - **kama-tls.** `../kama-tls` is readable again. The package needs `@kama/tls` ≥ 0.1.3 (its `TlsError` is `Sendable`),
   and the locks pin 0.1.4. kama-tls is busy with its own roadmap, so ask the maintainer before you need something there.
-- **The servers.** `kama-pg-14` to `kama-pg-19` and their standbys are running under podman (`tools/pg.sh`).
+- **The servers.** `kama-pg-14` to `kama-pg-19` and their standbys are running under podman (`tools/pg.sh`). The
+  superuser's reset test leaves one object behind, by design: `kp_reset_seq`, a sequence in `kp_test`, made with
+  `if not exists`.
 - **Other sessions commit here.** @kama/redis's session committed `bacbcc4` to this repo during S0b. Read `git status`
   and `git log` before committing, and stage only your own files.
 

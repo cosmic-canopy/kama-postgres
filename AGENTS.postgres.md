@@ -76,6 +76,8 @@ release it is built and tested with, and the first with everything this package 
     - for which server a connect settles on, `001_stream_rep.pl` and `003_load_balance_host_list.pl`
       (`tools/gen-session-vectors.sh`); and a `target_session_attrs` table in `tools/gen-libpq-test-cases.sh`,
       asked of a libpq on the host network against the primary and its standby.
+    - for the session reset, Npgsql's own source (`tools/gen-reset-vectors.sh`): its statements, their version gates,
+      and DISCARD ALL.
 
     A message this client prints is libpq's message, compared exactly. The one exception is where libpq quotes
     OpenSSL ("SSL error: %s", "could not load private key file \"%s\": %s"): there the frame is libpq's and the words are
@@ -135,6 +137,13 @@ release it is built and tested with, and the first with everything this package 
   - An unknown query with the cache off still describes first: Parse and Describe, then Bind, Execute and Sync.
   - A server error about a statement names `sc…`, not the unnamed statement. A test that compares a message with
     the unnamed statement in it uses an uncached connection (`overUncached` in the unit tests).
+- **A session reset is Npgsql's** (`Connection.resetSession`, `src/session/reset.kama`).
+  - It rolls back an open block, then resets, in one write. It is sent at once, not in front of the next command as
+    Npgsql sends it, so a failure is the caller's. A failed reset closes the connection.
+  - DISCARD ALL goes when nothing is prepared. Otherwise the long form keeps the cache's statements. "Prepared" is a
+    named statement in the cache, or `statementsOpen` above 0, so anything new that prepares or closes a user statement
+    must keep that count.
+  - `ping()` is an empty query. A pool's release reads `isClosed()`, `pipelineStatus()` and `transactionStatus()`.
 - **A cancel goes the way the session went.** `postgres::session::CancelRoute` keeps a copy of the `Config`, the
   host index and the `DialTarget`, and `Opener` dials it again. A cancel runs the session's encryption plan, sends
   CancelRequest, and waits for the server to close. A query timeout cancels through the same route, then waits the

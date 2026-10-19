@@ -1,0 +1,282 @@
+[
+ {
+  "id": "M1",
+  "suite": "unit",
+  "file": "src/session/reset.kama",
+  "old": "    if (version < 80300) { return Optional::None; }",
+  "new": "    if (version < 80200) { return Optional::None; }",
+  "expect": "reset: server_version 8.2.0 gets"
+ },
+ {
+  "id": "M2",
+  "suite": "unit",
+  "file": "src/session/reset.kama",
+  "old": "if (version >= 80300) { sql = sql.concat(other: \"CLOSE ALL;\"); }",
+  "new": "if (version >= 80400) { sql = sql.concat(other: \"CLOSE ALL;\"); }",
+  "expect": "reset: server_version 8.3.0 gets the long form"
+ },
+ {
+  "id": "M3",
+  "suite": "unit",
+  "file": "src/session/reset.kama",
+  "old": "if (version >= 60400) { sql = sql.concat(other: \"UNLISTEN *;\"); }",
+  "new": "if (version >= 80400) { sql = sql.concat(other: \"UNLISTEN *;\"); }",
+  "expect": "reset: server_version 8.3.0 gets the long form"
+ },
+ {
+  "id": "M4",
+  "suite": "unit",
+  "file": "src/session/reset.kama",
+  "old": "if (version >= 80200) { sql = sql.concat(other: \"SELECT pg_advisory_unlock_all();\"); }",
+  "new": "if (version >= 80400) { sql = sql.concat(other: \"SELECT pg_advisory_unlock_all();\"); }",
+  "expect": "reset: server_version 8.3.0 gets the long form"
+ },
+ {
+  "id": "M5",
+  "suite": "unit",
+  "file": "src/session/reset.kama",
+  "old": "if (version >= 90400) { sql = sql.concat(other: \"DISCARD SEQUENCES;\"); }",
+  "new": "if (version >= 90300) { sql = sql.concat(other: \"DISCARD SEQUENCES;\"); }",
+  "expect": "reset: server_version 9.3.99 gets the long form"
+ },
+ {
+  "id": "M6",
+  "suite": "unit",
+  "file": "src/session/reset.kama",
+  "old": "if (version >= 90400) { sql = sql.concat(other: \"DISCARD SEQUENCES;\"); }",
+  "new": "if (version >= 90500) { sql = sql.concat(other: \"DISCARD SEQUENCES;\"); }",
+  "expect": "reset: server_version 9.4.0 gets the long form"
+ },
+ {
+  "id": "M7",
+  "suite": "unit",
+  "file": "src/session/reset.kama",
+  "old": "if (version >= 80300) { sql = sql.concat(other: \"DISCARD TEMP\"); }",
+  "new": "if (version >= 80400) { sql = sql.concat(other: \"DISCARD TEMP\"); }",
+  "expect": "reset: server_version 8.3.0 gets the long form"
+ },
+ {
+  "id": "M8",
+  "suite": "unit",
+  "file": "src/session/reset.kama",
+  "old": "string sql = \"SET SESSION AUTHORIZATION DEFAULT;RESET ALL;\";",
+  "new": "string sql = \"RESET ALL;SET SESSION AUTHORIZATION DEFAULT;\";",
+  "expect": "reset: server_version 18.4 gets the long form"
+ },
+ {
+  "id": "M9",
+  "suite": "unit",
+  "file": "src/session/reset.kama",
+  "old": "if (!prepared) { return Optional::Some(value: \"DISCARD ALL\"); }",
+  "new": "if (!prepared) { return Optional::Some(value: \"DISCARD PLANS\"); }",
+  "expect": "reset: DISCARD ALL alone when nothing is prepared"
+ },
+ {
+  "id": "M10",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        bool prepared = this.statementsOpen > 0i64 || (named && this.cache.length() > 0);",
+  "new": "        bool prepared = false;",
+  "expect": "reset: a cached statement keeps the long form"
+ },
+ {
+  "id": "M11",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        bool prepared = this.statementsOpen > 0i64 || (named && this.cache.length() > 0);",
+  "new": "        bool prepared = named && this.cache.length() > 0;",
+  "expect": "reset: a prepared statement not closed keeps the long form"
+ },
+ {
+  "id": "M12",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        bool prepared = this.statementsOpen > 0i64 || (named && this.cache.length() > 0);",
+  "new": "        bool prepared = this.statementsOpen > 0i64;",
+  "expect": "reset: a cached statement keeps the long form"
+ },
+ {
+  "id": "M13",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.statementsOpen = this.statementsOpen + 1i64;\n        return Result::Ok(value: Statement.make(",
+  "new": "        return Result::Ok(value: Statement.make(",
+  "expect": "reset: a prepared statement not closed keeps the long form"
+ },
+ {
+  "id": "M14",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.queue.add(item: PipelineCommand.prepare(name: give name, sql: copy sql));\n        this.statementsOpen = this.statementsOpen + 1i64;",
+  "new": "        this.queue.add(item: PipelineCommand.prepare(name: give name, sql: copy sql));",
+  "expect": "reset: a statement a pipeline prepared keeps the long form"
+ },
+ {
+  "id": "M15",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        match (closed) { case Ok(value: u): { this.forgetStatement(); } case Err(error: e): { } };",
+  "new": "        match (closed) { case Ok(value: u): { } case Err(error: e): { } };",
+  "expect": "reset: a statement prepared and closed leaves DISCARD ALL"
+ },
+ {
+  "id": "M16",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                case Ok(value: u): { this.forgetStatement(); return Result::Ok(value: Optional::Some(value: PipelineResult::Closed)); }",
+  "new": "                case Ok(value: u): { return Result::Ok(value: Optional::Some(value: PipelineResult::Closed)); }",
+  "expect": "reset: a statement a pipeline closed leaves DISCARD ALL"
+ },
+ {
+  "id": "M17",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        bool block = this.txStatus != 73ui8;   // 'T' or 'E'",
+  "new": "        bool block = this.txStatus == 84ui8;",
+  "expect": "reset: a failed block is rolled back too"
+ },
+ {
+  "id": "M18",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (block || resets) {",
+  "new": "        if (resets) {",
+  "expect": "reset: below 8.3 a block is rolled back"
+ },
+ {
+  "id": "M19",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (block) { bool framed = sendQuery(w: this.outbox, sql: \"ROLLBACK\"); }",
+  "new": "            if (block) { bool framed = sendQuery(w: this.outbox, sql: \"ROLLBACK\"); Result<Unit, PgError> early = this.flush(deadline: this.due); Result<DynamicArray<Rows>, PgError> waited = this.collect(); this.outbox.clear(); }",
+  "expect": "reset: in a block, ROLLBACK and the reset go in one write"
+ },
+ {
+  "id": "M20",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                match (give done) { case Ok(value: r): { } case Err(error: e): { this.close(); return Result::Err(error: give e); } };",
+  "new": "                match (give done) { case Ok(value: r): { } case Err(error: e): { return Result::Err(error: give e); } };",
+  "expect": "reset: an error in the reset closes the connection"
+ },
+ {
+  "id": "M21",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "            if (this.txStatus != 73ui8) {\n                this.close();",
+  "new": "            if (false) {\n                this.close();",
+  "expect": "reset: a session still in a block after it closes the connection"
+ },
+ {
+  "id": "M22",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (version == 0) {\n            return Result::Err(error: PgError::Usage(detail: \"the server did not report server_version",
+  "new": "        if (version == -1) {\n            return Result::Err(error: PgError::Usage(detail: \"the server did not report server_version",
+  "expect": "reset: refused when the server reported no version"
+ },
+ {
+  "id": "M23",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        this.pending = DynamicArray.empty();\n        return Result::Ok(value: Unit::Unit);\n    }\n\n    // ---- pipeline mode ----",
+  "new": "        return Result::Ok(value: Unit::Unit);\n    }\n\n    // ---- pipeline mode ----",
+  "expect": "reset: notifications received before it and during it are dropped"
+ },
+ {
+  "id": "M24",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        if (results.length() > 0) { return Result::Err(error: this.broken(detail: \"unexpected response from server: a result for an empty query\")); }\n",
+  "new": "",
+  "expect": "ping: a result for an empty query ends the session"
+ },
+ {
+  "id": "M25",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "        Result<DynamicArray<Rows>, PgError> r = this.simpleQuery(sql: \"\");\n        DynamicArray<Rows> results",
+  "new": "        Result<DynamicArray<Rows>, PgError> r = this.simpleQuery(sql: \"-- ping\");\n        DynamicArray<Rows> results",
+  "expect": "ping: an empty query, answered"
+ },
+ {
+  "id": "IM1",
+  "suite": "integration",
+  "file": "src/session/reset.kama",
+  "old": "string sql = \"SET SESSION AUTHORIZATION DEFAULT;RESET ALL;\";",
+  "new": "string sql = \"RESET ALL;\";",
+  "expect": "reset, superuser: SET SESSION AUTHORIZATION DEFAULT"
+ },
+ {
+  "id": "IM2",
+  "suite": "integration",
+  "file": "src/session/reset.kama",
+  "old": "string sql = \"SET SESSION AUTHORIZATION DEFAULT;RESET ALL;\";",
+  "new": "string sql = \"SET SESSION AUTHORIZATION DEFAULT;\";",
+  "expect": "reset, long form: RESET ALL"
+ },
+ {
+  "id": "IM3",
+  "suite": "integration",
+  "file": "src/session/reset.kama",
+  "old": "    if (version >= 80300) { sql = sql.concat(other: \"CLOSE ALL;\"); }                     // SupportsCloseAll: 8.3\n",
+  "new": "",
+  "expect": "reset, long form: CLOSE ALL"
+ },
+ {
+  "id": "IM4",
+  "suite": "integration",
+  "file": "src/session/reset.kama",
+  "old": "    if (version >= 60400) { sql = sql.concat(other: \"UNLISTEN *;\"); }                    // SupportsUnlisten: 6.4\n",
+  "new": "",
+  "expect": "reset, long form: UNLISTEN *"
+ },
+ {
+  "id": "IM5",
+  "suite": "integration",
+  "file": "src/session/reset.kama",
+  "old": "    if (version >= 80200) { sql = sql.concat(other: \"SELECT pg_advisory_unlock_all();\"); }   // SupportsAdvisoryLocks: 8.2\n",
+  "new": "",
+  "expect": "reset, long form: pg_advisory_unlock_all()"
+ },
+ {
+  "id": "IM6",
+  "suite": "integration",
+  "file": "src/session/reset.kama",
+  "old": "    if (version >= 90400) { sql = sql.concat(other: \"DISCARD SEQUENCES;\"); }             // SupportsDiscardSequences: 9.4\n",
+  "new": "",
+  "expect": "reset, superuser: DISCARD SEQUENCES"
+ },
+ {
+  "id": "IM7",
+  "suite": "integration",
+  "file": "src/session/reset.kama",
+  "old": "    if (version >= 80300) { sql = sql.concat(other: \"DISCARD TEMP\"); }                   // SupportsDiscardTemp: 8.3\n",
+  "new": "",
+  "expect": "reset, long form: DISCARD TEMP"
+ },
+ {
+  "id": "IM8",
+  "suite": "integration",
+  "file": "src/session/reset.kama",
+  "old": "if (!prepared) { return Optional::Some(value: \"DISCARD ALL\"); }",
+  "new": "if (!prepared) { return Optional::Some(value: \"DISCARD PLANS\"); }",
+  "expect": "reset, DISCARD ALL: a PREPAREd statement is kept by the long form only"
+ },
+ {
+  "id": "IM9",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        bool block = this.txStatus != 73ui8;   // 'T' or 'E'",
+  "new": "        bool block = false;",
+  "expect": "reset, DISCARD ALL: the reset runs in a block, which it rolls back"
+ },
+ {
+  "id": "IM10",
+  "suite": "integration",
+  "file": "src/connection.kama",
+  "old": "        bool prepared = this.statementsOpen > 0i64 || (named && this.cache.length() > 0);",
+  "new": "        bool prepared = false;",
+  "expect": "reset, long form: the cached statement is kept"
+ }
+]

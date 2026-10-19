@@ -1,0 +1,189 @@
+// Connection.ping and Connection.resetSession on a real server: an empty query answered, in a failed block too, and
+// refused once the session is gone; and every piece of session state Npgsql's reset claims to clear, made and then
+// read back after it, in both forms. The long form keeps the statement cache's statements (and a PREPAREd one) and
+// clears the rest; DISCARD ALL clears those too. Each kind of state is checked as made before the reset, so a check
+// after it cannot pass by accident.
+import { std::collections::DynamicArray,
+         postgres::Connection, postgres::Config, postgres::PgError, postgres::Rows, postgres::Query, postgres::CacheMode,
+         postgres::TransactionStatus, postgres::Notification, postgres::column,
+         postgres::conninfo::ConnInfo, postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::conninfoFor,
+         postgres_integration_tests::quietEnvironment, postgres_integration_tests::open, postgres_integration_tests::scalar };
+export { resetTests };
+
+unsafe fn Result<Connection, PgError> openAs(const ref string conninfo, CacheMode mode) {
+    Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: conninfo);
+    ConnInfo info = match (give parsed) { case Ok(value: i): give i; case Err(error: e): { return Result::Err(error: PgError::Config(detail: e.message())); } };
+    Result<Config, PgError> c = Config.resolve(info: give info, environment: quietEnvironment());
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    bool off = match (mode) { case Off: true; case _: false; };
+    isize capacity = 512;
+    if (off) { capacity = 0; }
+    config.setStatementCache(mode: mode, capacity: capacity);
+    return Connection.connect(config: config);
+}
+
+unsafe fn string superuserConninfo() {
+    string user = setting(name: "PGTEST_SUPERUSER");
+    string pw = setting(name: "PGTEST_SUPERUSER_PASSWORD");
+    return conninfoFor(user: user).concat(other: " password=").concat(other: pw);
+}
+
+fn string said(const ref Result<Unit, PgError> r) { return match (r) { case Ok(value: u): "ok"; case Err(error: e): e.message(); }; }
+
+// `select $1::int4 + 1` with 7, through the extended protocol (and so the statement cache): "8", or the error.
+unsafe fn string eight(ref Connection c) {
+    Query q = Query.make(sql: "select $1::int4 + 1");
+    q.add(value: 7);
+    Result<Rows, PgError> r = c.query(q: q);
+    return match (give r) {
+        case Ok(value: rows): {
+            Result<int32, PgError> v = column::<int32>(rows: rows, row: 0, index: 0);
+            return match (give v) { case Ok(value: n): "${n}"; case Err(error: e): e.message(); };
+        }
+        case Err(error: e): e.message();
+    };
+}
+
+// ---- ping ----
+
+unsafe fn int32 pingTests() {
+    int32 f = 0;
+    Result<Connection, PgError> a = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection c = match (give a) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "ping: connect (".concat(other: e.message()).concat(other: ")")); } };
+    Result<Unit, PgError> r1 = c.ping();
+    f = f + check(ok: said(r: r1).equals(other: "ok") && c.transactionStatus() == TransactionStatus::Idle, what: "ping: answered (".concat(other: said(r: r1)).concat(other: ")"));
+
+    string begun = scalar(c: c, sql: "begin");
+    string failed = scalar(c: c, sql: "select 1/0");
+    Result<Unit, PgError> r2 = c.ping();
+    f = f + check(ok: said(r: r2).equals(other: "ok") && c.transactionStatus() == TransactionStatus::Failed,
+                  what: "ping: answered in a failed block, which stays failed (".concat(other: said(r: r2)).concat(other: ")"));
+    string rolled = scalar(c: c, sql: "rollback");
+
+    Result<Connection, PgError> b = open(conninfo: conninfoFor(user: "kp_trust"));
+    Connection killer = match (give b) { case Ok(value: x): give x; case Err(error: e): { return f + check(ok: false, what: "ping: second connection"); } };
+    int32 pid = c.processId();
+    string done = scalar(c: killer, sql: "select pg_terminate_backend(".concat(other: "${pid}").concat(other: ", 5000)"));
+    Result<Unit, PgError> r3 = c.ping();
+    bool lost = match (r3) { case Ok(value: u): false; case Err(error: e): true; };
+    f = f + check(ok: done.equals(other: "t") && lost && c.isClosed(), what: "ping: a session ended elsewhere fails it, and is closed (".concat(other: said(r: r3)).concat(other: ")"));
+    killer.close();
+    return f;
+}
+
+// ---- the reset ----
+
+// Make every kind of state the reset clears, inside a transaction block (a WITH HOLD cursor, a LISTEN and a
+// notification not taken, an advisory lock, a temp table, a PREPAREd statement, application_name), check each was
+// made, reset, and check each again. `longForm` says which reset this connection must get: it keeps PREPAREd
+// statements, DISCARD ALL does not.
+unsafe fn int32 dirtyThenReset(ref Connection c, const ref string form, bool longForm) {
+    int32 f = 0;
+    Optional<string> reported = c.parameter(name: "application_name");
+    string startName = match (reported) { case Some(value: v): copy v; case None: "(none)"; };
+    string s1 = scalar(c: c, sql: "set application_name = 'kp_reset'");
+    string s2 = scalar(c: c, sql: "declare kp_reset_cursor cursor with hold for select 1");
+    string s3 = scalar(c: c, sql: "listen kp_reset_channel");
+    string s4 = scalar(c: c, sql: "notify kp_reset_channel, 'left over'");
+    string s5 = scalar(c: c, sql: "select pg_advisory_lock(4242)");
+    string s6 = scalar(c: c, sql: "create temp table kp_reset_temp (a int)");
+    string s7 = scalar(c: c, sql: "prepare kp_reset_plan as select 1");
+    string s8 = scalar(c: c, sql: "begin");
+    string s9 = scalar(c: c, sql: "insert into kp_reset_temp values (1)");
+
+    string name = scalar(c: c, sql: "show application_name");
+    string cursors = scalar(c: c, sql: "select count(*) from pg_cursors");
+    string channels = scalar(c: c, sql: "select count(*) from pg_listening_channels()");
+    string locks = scalar(c: c, sql: "select count(*) from pg_locks where locktype = 'advisory' and pid = pg_backend_pid()");
+    string temp = scalar(c: c, sql: "select to_regclass('pg_temp.kp_reset_temp') is not null");
+    string plans = scalar(c: c, sql: "select count(*) from pg_prepared_statements where name = 'kp_reset_plan'");
+    bool made = name.equals(other: "kp_reset") && cursors.equals(other: "1") && channels.equals(other: "1") && locks.equals(other: "1")
+                && temp.equals(other: "t") && plans.equals(other: "1") && c.transactionStatus() == TransactionStatus::InTransaction;
+    f = f + check(ok: made, what: form.concat(other: ": the state is made (").concat(other: name).concat(other: " ").concat(other: cursors).concat(other: " ")
+                  .concat(other: channels).concat(other: " ").concat(other: locks).concat(other: " ").concat(other: temp).concat(other: " ").concat(other: plans).concat(other: ")"));
+
+    Result<Unit, PgError> r = c.resetSession();
+    f = f + check(ok: said(r: r).equals(other: "ok") && c.transactionStatus() == TransactionStatus::Idle && !c.isClosed(),
+                  what: form.concat(other: ": the reset runs in a block, which it rolls back (").concat(other: said(r: r)).concat(other: ")"));
+
+    Optional<string> now = c.parameter(name: "application_name");
+    string nowName = match (now) { case Some(value: v): copy v; case None: "(none)"; };
+    string shown = scalar(c: c, sql: "show application_name");
+    f = f + check(ok: nowName.equals(other: startName) && shown.equals(other: startName),
+                  what: form.concat(other: ": RESET ALL, and the parameter it reports (").concat(other: shown).concat(other: ")"));
+    string cursorsAfter = scalar(c: c, sql: "select count(*) from pg_cursors");
+    f = f + check(ok: cursorsAfter.equals(other: "0"), what: form.concat(other: ": CLOSE ALL closes the WITH HOLD cursor (").concat(other: cursorsAfter).concat(other: ")"));
+    string channelsAfter = scalar(c: c, sql: "select count(*) from pg_listening_channels()");
+    DynamicArray<Notification> left = c.takeNotifications();
+    isize leftOver = left.length();
+    f = f + check(ok: channelsAfter.equals(other: "0") && leftOver == 0,
+                  what: form.concat(other: ": UNLISTEN *, and the notification queued is dropped (").concat(other: channelsAfter).concat(other: ", ${leftOver})"));
+    string locksAfter = scalar(c: c, sql: "select count(*) from pg_locks where locktype = 'advisory' and pid = pg_backend_pid()");
+    f = f + check(ok: locksAfter.equals(other: "0"), what: form.concat(other: ": pg_advisory_unlock_all() (").concat(other: locksAfter).concat(other: ")"));
+    string tempAfter = scalar(c: c, sql: "select to_regclass('pg_temp.kp_reset_temp') is null");
+    f = f + check(ok: tempAfter.equals(other: "t"), what: form.concat(other: ": DISCARD TEMP drops the temp table (").concat(other: tempAfter).concat(other: ")"));
+    string plansAfter = scalar(c: c, sql: "select count(*) from pg_prepared_statements where name = 'kp_reset_plan'");
+    string kept = "0";
+    if (longForm) { kept = "1"; }
+    f = f + check(ok: plansAfter.equals(other: kept), what: form.concat(other: ": a PREPAREd statement is kept by the long form only (").concat(other: plansAfter).concat(other: ")"));
+    return f;
+}
+
+unsafe fn int32 longFormTests() {
+    int32 f = 0;
+    Result<Connection, PgError> m = openAs(conninfo: conninfoFor(user: "kp_trust"), mode: CacheMode::Statements);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset, long form: connect (".concat(other: e.message()).concat(other: ")")); } };
+    string before = eight(c: ref c);
+    f = f + dirtyThenReset(c: ref c, form: "reset, long form", longForm: true);
+    string statements = scalar(c: c, sql: "select count(*) from pg_prepared_statements where name = 'sc0'");
+    string after = eight(c: ref c);
+    f = f + check(ok: before.equals(other: "8") && statements.equals(other: "1") && after.equals(other: "8"),
+                  what: "reset, long form: the cached statement is kept, and runs (".concat(other: statements).concat(other: ", ").concat(other: after).concat(other: ")"));
+    return f;
+}
+
+unsafe fn int32 discardAllTests() {
+    int32 f = 0;
+    Result<Connection, PgError> m = openAs(conninfo: conninfoFor(user: "kp_trust"), mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset, DISCARD ALL: connect (".concat(other: e.message()).concat(other: ")")); } };
+    f = f + dirtyThenReset(c: ref c, form: "reset, DISCARD ALL", longForm: false);
+    string all = scalar(c: c, sql: "select count(*) from pg_prepared_statements");
+    string after = eight(c: ref c);
+    f = f + check(ok: all.equals(other: "0") && after.equals(other: "8"), what: "reset, DISCARD ALL: no statement is left, and the session runs on (".concat(other: all).concat(other: ")"));
+    return f;
+}
+
+// What only a superuser's session shows: SET SESSION AUTHORIZATION DEFAULT, and DISCARD SEQUENCES on a sequence that
+// is not a temporary one (DISCARD TEMP drops a temp sequence, after which lastval() fails anyway).
+unsafe fn int32 superuserTests() {
+    int32 f = 0;
+    string superuser = setting(name: "PGTEST_SUPERUSER");
+    Result<Connection, PgError> m = openAs(conninfo: superuserConninfo(), mode: CacheMode::Statements);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset, superuser: connect (".concat(other: e.message()).concat(other: ")")); } };
+    string before = eight(c: ref c);
+    string s1 = scalar(c: c, sql: "create sequence if not exists kp_reset_seq");
+    string s2 = scalar(c: c, sql: "select nextval('kp_reset_seq') > 0");
+    string last = scalar(c: c, sql: "select lastval() > 0");
+    string s3 = scalar(c: c, sql: "set session authorization kp_trust");
+    string who = scalar(c: c, sql: "select session_user");
+    f = f + check(ok: before.equals(other: "8") && s2.equals(other: "t") && who.equals(other: "kp_trust") && last.equals(other: "t"),
+                  what: "reset, superuser: the state is made (".concat(other: who).concat(other: ", ").concat(other: last).concat(other: ")"));
+    Result<Unit, PgError> r = c.resetSession();
+    string whoAfter = scalar(c: c, sql: "select session_user");
+    f = f + check(ok: said(r: r).equals(other: "ok") && whoAfter.equals(other: superuser),
+                  what: "reset, superuser: SET SESSION AUTHORIZATION DEFAULT (".concat(other: whoAfter).concat(other: ")"));
+    string lastAfter = scalar(c: c, sql: "select lastval()");
+    f = f + check(ok: lastAfter.contains(substring: "lastval is not yet defined in this session"),
+                  what: "reset, superuser: DISCARD SEQUENCES forgets the session's last value (".concat(other: lastAfter).concat(other: ")"));
+    return f;
+}
+
+unsafe fn int32 resetTests() {
+    int32 f = 0;
+    f = f + pingTests();
+    f = f + longFormTests();
+    f = f + discardAllTests();
+    f = f + superuserTests();
+    return f;
+}

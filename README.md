@@ -232,6 +232,36 @@ request") is returned. The connection can then be used again. If the server does
 the connection is closed and the call returns `PgError::Timeout`. A connection made with `connectOver` has no way to
 send a cancel, so it closes at the timeout.
 
+## Checking and resetting a session
+
+`conn.ping()` sends an empty query, as pgx's Ping does. The server answers it in a failed transaction block too. An
+error means the session is gone.
+
+`conn.resetSession()` returns the session to the state a new one starts in, so a connection can be handed to someone
+else. It is Npgsql's reset, read from Npgsql 10.0.3's source:
+- **An open transaction block is rolled back first.**
+- **With nothing prepared, it sends `DISCARD ALL`.** "Prepared" means a named statement in the cache, or a `prepare()`
+  not yet closed.
+- **Otherwise it sends every part of DISCARD ALL except deallocating statements**, so the cache and prepared
+  statements stay usable:
+
+  ```sql
+  SET SESSION AUTHORIZATION DEFAULT;RESET ALL;CLOSE ALL;UNLISTEN *;SELECT pg_advisory_unlock_all();DISCARD SEQUENCES;DISCARD TEMP
+  ```
+- **Older servers get what they support**, as Npgsql decides it. Below 8.3 there is no DISCARD, and only the rollback
+  is done.
+
+It takes one round trip. The rollback and the reset go in one write. Npgsql sends the reset in front of the
+connection's next command instead. Here a failure is reported to whoever is resetting the session, and never lands on
+the next command after that command has run. A reset that fails leaves the session half reset, so the connection is
+closed and the error returned.
+
+What it does not touch:
+- **Notifications already received are dropped**, since `UNLISTEN *` undid the LISTENs they came from.
+- **The notice handler and the query timeout stay as they are.** They are this client's settings, not the session's.
+
+It is refused, as any command is, while a result, a COPY or pipeline mode is in progress.
+
 ## Notifications
 
 `waitForNotification(timeout:)` returns the next LISTEN/NOTIFY notification. If none arrives in time it returns `None`,
@@ -287,6 +317,7 @@ program that uses this package cannot also import std's JSON.
   through `std::uuid` and `std::time`.
 - **Everything else:**
   - Transactions and savepoints, COPY in and out, LISTEN/NOTIFY, query cancellation and timeouts.
+  - `ping()`, and `resetSession()`, Npgsql's session reset.
   - Full `ErrorResponse` fields with SQLSTATE constants.
   - A connection pool shared across isolates (phase 8, not there yet).
 

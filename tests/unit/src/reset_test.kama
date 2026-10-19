@@ -1,0 +1,674 @@
+// Connection.ping and Connection.resetSession against a scripted server: the empty query and what may answer it, and
+// Npgsql's session reset byte for byte (reset_vectors.kama, generated from Npgsql's source by tools/gen-reset-vectors.sh):
+// DISCARD ALL or the long form by what is prepared, the version gates, the ROLLBACK sent in the same write when a block
+// is open, a reset that fails closing the connection, and the states a pool's release reads before it resets.
+//
+// A reset that should send nothing is followed by a sentinel (SELECT 1). A statement the script does not expect is
+// answered FATAL; one past its end is never answered, and the client times out. Either way the sentinel then fails.
+import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode, std::memory::Owned,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
+         postgres::Statement, postgres::Transport, postgres::TransactionStatus, postgres::PipelineStatus,
+         postgres::PipelineResult, postgres::CacheMode, postgres::CopyInfo, postgres::Notification, postgres::column,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire,
+         postgres_unit_tests::resetRollback, postgres_unit_tests::resetDiscardAll, postgres_unit_tests::resetServerVersion,
+         postgres_unit_tests::resetVersionNumber, postgres_unit_tests::resetLongForm, postgres_unit_tests::resetShortForm };
+export { resetTests };
+
+comptime uint8 IDLE = 73ui8;     // 'I'
+comptime uint8 INTX = 84ui8;     // 'T'
+comptime uint8 FAILED = 69ui8;   // 'E'
+comptime uint8 QUERY = 81ui8;    // 'Q'
+comptime uint8 PARSE = 80ui8;    // 'P'
+comptime uint8 BIND = 66ui8;     // 'B'
+comptime uint8 DESCRIBE = 68ui8; // 'D'
+comptime uint8 EXECUTE = 69ui8;  // 'E'
+comptime uint8 SYNC = 83ui8;     // 'S'
+comptime uint8 CLOSE = 67ui8;    // 'C'
+
+// ---- the script ----
+
+// A startup that reports `version` as server_version ("" reports none).
+fn DynamicArray<uint8> welcomeAt(const ref string version) {
+    Wire m = Wire.make();
+    m.auth(code: 0);
+    if (version.length() > 0) { m.parameter(name: "server_version", value: version); }
+    m.parameter(name: "client_encoding", value: "UTF8");
+    m.parameter(name: "application_name", value: "");
+    m.backendKey(pid: 4242, keyLength: 4);
+    m.ready(status: IDLE);
+    return m.bytes();
+}
+
+fn DynamicArray<Step> openingAt(const ref string version) {
+    DynamicArray<Step> s = DynamicArray.empty();
+    s.add(item: Step::Send(bytes: welcomeAt(version: version)));
+    return s;
+}
+
+fn DynamicArray<Step> opening() { return openingAt(version: "18.4"); }
+
+// Connect over the script, with the statement cache in `mode` (Off has no capacity).
+unsafe fn Result<Connection, PgError> scripted(DynamicArray<Step> steps, CacheMode mode) {
+    Environment env = testEnvironment();
+    string none = "";
+    Result<Config, PgError> c = resolveWith(text: none, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    bool off = match (mode) { case Off: true; case _: false; };
+    isize capacity = 512;
+    if (off) { capacity = 0; }
+    config.setStatementCache(mode: mode, capacity: capacity);
+    Owned<Transport> fake = new FakeServer.make(steps: give steps, chunk: 1, writeLimit: 3);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+unsafe fn string hexOf(const ref string s) { return hexEncode(bytes: s.bytes()); }
+
+// The simple query `sql` must come next; reply with `reply` (nothing, when it is empty).
+unsafe fn Step queried(const ref string sql, Wire reply) {
+    return Step::Expect(tag: QUERY, body: hexOf(s: sql).concat(other: "00"), then: reply.bytes());
+}
+unsafe fn Step unanswered(const ref string sql) {
+    return Step::Expect(tag: QUERY, body: hexOf(s: sql).concat(other: "00"), then: DynamicArray.empty());
+}
+unsafe fn Step completes(const ref string sql, const ref string tag, uint8 status) {
+    Wire w = Wire.make();
+    w.complete(tag: tag);
+    w.ready(status: status);
+    return queried(sql: sql, reply: give w);
+}
+fn Step quiet(uint8 tag, const ref string body) { return Step::Expect(tag: tag, body: copy body, then: DynamicArray.empty()); }
+fn Step answer(uint8 tag, Wire reply) { return Step::Expect(tag: tag, body: "", then: reply.bytes()); }
+
+// The sentinel: SELECT 1, ready and idle.
+unsafe fn Step sentinel() { return completes(sql: "SELECT 1", tag: "SELECT 1", status: IDLE); }
+
+// The sentinel runs, so nothing was sent before it that the script did not expect.
+unsafe fn bool sentinelRuns(ref Connection c) {
+    Result<DynamicArray<Rows>, PgError> r = c.simpleQuery(sql: "SELECT 1");
+    bool answered = match (r) { case Ok(value: rows): true; case Err(error: e): false; };
+    return answered && !c.isClosed();
+}
+
+// The answer to the reset `sql`: each statement's CommandComplete, with the tag PostgreSQL 18.4 gives it (as psql shows
+// them), pg_advisory_unlock_all()'s row of one empty value, then ReadyForQuery, idle.
+unsafe fn Wire resetAnswer(const ref string sql, uint8 status) {
+    Wire w = Wire.make();
+    foreach (string part in sql.split(separator: ";")) {
+        if (part.startsWith(prefix: "SET ")) { w.complete(tag: "SET"); }
+        else if (part.startsWith(prefix: "RESET")) { w.complete(tag: "RESET"); }
+        else if (part.startsWith(prefix: "CLOSE")) { w.complete(tag: "CLOSE CURSOR ALL"); }
+        else if (part.startsWith(prefix: "UNLISTEN")) { w.complete(tag: "UNLISTEN"); }
+        else if (part.startsWith(prefix: "SELECT")) {
+            w.columns(names: one(a: "pg_advisory_unlock_all"));
+            w.row(values: one(a: ""));
+            w.complete(tag: "SELECT 1");
+        }
+        else { w.complete(tag: part); }
+    }
+    w.ready(status: status);
+    return w;
+}
+
+// The reset `sql` must come next, and the server answers it.
+unsafe fn Step resets(const ref string sql) { return queried(sql: sql, reply: resetAnswer(sql: sql, status: IDLE)); }
+
+fn DynamicArray<string> one(const ref string a) { DynamicArray<string> v = DynamicArray.empty(); v.add(item: copy a); return v; }
+fn DynamicArray<uint32> oids(uint32 a) { DynamicArray<uint32> v = DynamicArray.empty(); v.add(item: a); return v; }
+fn DynamicArray<int32> ints(int32 a) { DynamicArray<int32> v = DynamicArray.empty(); v.add(item: a); return v; }
+
+// The server's description of `select $1 + 1`: an int4 parameter, an int4 column.
+fn Wire description() {
+    Wire d = Wire.make();
+    d.parseComplete();
+    d.parameterTypes(oids: oids(a: 23ui32));
+    d.typedColumns(names: one(a: "n"), oids: oids(a: 23ui32));
+    d.ready(status: IDLE);
+    return d;
+}
+
+fn Wire result(int32 v) { Wire e = Wire.make(); e.bindComplete(); e.intRow(values: ints(a: v)); e.complete(tag: "SELECT 1"); e.ready(status: IDLE); return e; }
+
+// Parse of statement `name` with no types, Describe of it, and Sync.
+unsafe fn void prepares(ref DynamicArray<Step> s, const ref string name, const ref string sql) {
+    s.add(item: quiet(tag: PARSE, body: hexOf(s: name).concat(other: "00").concat(other: hexOf(s: sql)).concat(other: "000000")));
+    s.add(item: quiet(tag: DESCRIBE, body: "53".concat(other: hexOf(s: name)).concat(other: "00")));
+    s.add(item: answer(tag: SYNC, reply: description()));
+}
+
+// Bind of statement `name` with the int4 parameter 7, binary result, then Execute and Sync.
+unsafe fn void runs(ref DynamicArray<Step> s, const ref string name, Wire reply) {
+    s.add(item: quiet(tag: BIND, body: "00".concat(other: hexOf(s: name)).concat(other: "00 0001 0001 0001 00000004 00000007 0001 0001")));
+    s.add(item: quiet(tag: EXECUTE, body: "00 00000000"));
+    s.add(item: answer(tag: SYNC, reply: give reply));
+}
+
+// Close of statement `name`, and Sync.
+unsafe fn void closes(ref DynamicArray<Step> s, const ref string name) {
+    s.add(item: quiet(tag: CLOSE, body: "53".concat(other: hexOf(s: name)).concat(other: "00")));
+    Wire w = Wire.make(); w.closeComplete(); w.ready(status: IDLE);
+    s.add(item: answer(tag: SYNC, reply: give w));
+}
+
+unsafe fn string ran(ref Connection c, const ref string sql) {
+    Query q = Query.make(sql: copy sql);
+    q.add(value: 7);
+    Result<Rows, PgError> r = c.query(q: q);
+    return match (give r) {
+        case Ok(value: rows): {
+            Result<int32, PgError> v = column::<int32>(rows: rows, row: 0, index: 0);
+            return match (give v) { case Ok(value: n): "${n}"; case Err(error: e): e.message(); };
+        }
+        case Err(error: e): e.message();
+    };
+}
+
+fn string said(const ref Result<Unit, PgError> r) { return match (r) { case Ok(value: u): "ok"; case Err(error: e): e.message(); }; }
+
+fn bool isProtocolError(const ref Result<Unit, PgError> r) {
+    return match (r) { case Ok(value: u): false; case Err(error: e): match (e) { case Protocol(error: p): true; case _: false; }; };
+}
+
+// The case of reset_vectors.kama for the server that reports `version`.
+fn isize vectorAt(const ref string version) {
+    DynamicArray<string> versions = resetServerVersion();
+    isize i = 0;
+    while (i < versions.length()) {
+        if (versions[i].equals(other: version)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// The long form for PostgreSQL 18.4, from the vectors.
+fn string fullReset() {
+    DynamicArray<string> forms = resetLongForm();
+    isize at = vectorAt(version: "18.4");
+    return copy forms[at];
+}
+
+// ---- ping ----
+
+unsafe fn int32 pingAnswered() {
+    int32 f = 0;
+    Wire w = Wire.make(); w.emptyQuery(); w.ready(status: IDLE);
+    DynamicArray<Step> s = opening();
+    s.add(item: queried(sql: "", reply: give w));
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Statements);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "ping: connect"); } };
+    Result<Unit, PgError> r = c.ping();
+    string got = said(r: r);
+    f = f + check(ok: got.equals(other: "ok") && c.transactionStatus() == TransactionStatus::Idle && sentinelRuns(c: ref c),
+                  what: "ping: an empty query, answered by EmptyQueryResponse and ReadyForQuery (".concat(other: got).concat(other: ")"));
+    return f;
+}
+
+unsafe fn int32 pingInFailedBlock() {
+    Wire w = Wire.make(); w.emptyQuery(); w.ready(status: FAILED);
+    DynamicArray<Step> s = opening();
+    s.add(item: queried(sql: "", reply: give w));
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Statements);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "ping: connect, failed block"); } };
+    Result<Unit, PgError> r = c.ping();
+    string got = said(r: r);
+    return check(ok: got.equals(other: "ok") && c.transactionStatus() == TransactionStatus::Failed,
+                 what: "ping: answered in a failed block, which stays failed (".concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 pingGivenARow() {
+    Wire w = Wire.make(); w.columns(names: one(a: "x")); w.row(values: one(a: "1")); w.complete(tag: "SELECT 1"); w.ready(status: IDLE);
+    DynamicArray<Step> s = opening();
+    s.add(item: queried(sql: "", reply: give w));
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Statements);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "ping: connect, a row"); } };
+    Result<Unit, PgError> r = c.ping();
+    string got = said(r: r);
+    return check(ok: isProtocolError(r: r) && c.isClosed(), what: "ping: a result for an empty query ends the session (".concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 pingGivenFatal() {
+    Wire w = Wire.make(); w.report(tag: 69ui8, severity: "FATAL", code: "57P01", message: "terminating connection due to administrator command");
+    DynamicArray<Step> s = opening();
+    s.add(item: queried(sql: "", reply: give w));
+    s.add(item: Step::Hangup);
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Statements);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "ping: connect, FATAL"); } };
+    Result<Unit, PgError> r = c.ping();
+    string got = said(r: r);
+    return check(ok: got.equals(other: "FATAL:  terminating connection due to administrator command") && c.isClosed(),
+                 what: "ping: a FATAL answer is the error, and the connection is closed (".concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 pingRefused() {
+    int32 f = 0;
+    DynamicArray<Step> s = opening();
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Statements);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "ping: connect, refusals"); } };
+    Result<Unit, PgError> entered = c.enterPipelineMode();
+    Result<Unit, PgError> inPipeline = c.ping();
+    string piped = said(r: inPipeline);
+    f = f + check(ok: piped.equals(other: "synchronous command execution functions are not allowed in pipeline mode"),
+                  what: "ping: refused in pipeline mode, in libpq's words (".concat(other: piped).concat(other: ")"));
+    Result<Unit, PgError> left = c.exitPipelineMode();
+    c.close();
+    Result<Unit, PgError> closed = c.ping();
+    bool isClosedError = match (closed) { case Ok(value: u): false; case Err(error: e): match (e) { case Closed: true; case _: false; }; };
+    f = f + check(ok: isClosedError, what: "ping: a closed connection is Closed");
+    return f;
+}
+
+// ---- the two forms ----
+
+unsafe fn int32 discardAllWhenNothingPrepared() {
+    DynamicArray<Step> s = opening();
+    s.add(item: resets(sql: resetDiscardAll()));
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, DISCARD ALL"); } };
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    return check(ok: got.equals(other: "ok") && sentinelRuns(c: ref c), what: "reset: DISCARD ALL alone when nothing is prepared (".concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 longFormKeepsTheCache() {
+    string sql = "select $1 + 1";
+    string full = fullReset();
+    DynamicArray<Step> s = opening();
+    prepares(s: ref s, name: "sc0", sql: sql);
+    runs(s: ref s, name: "sc0", reply: result(v: 8));
+    s.add(item: resets(sql: full));
+    runs(s: ref s, name: "sc0", reply: result(v: 8));
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Statements);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, cached"); } };
+    string before = ran(c: ref c, sql: sql);
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    string after = ran(c: ref c, sql: sql);
+    return check(ok: before.equals(other: "8") && got.equals(other: "ok") && after.equals(other: "8"),
+                 what: "reset: a cached statement keeps the long form, and the cache with it (".concat(other: got).concat(other: ", ").concat(other: after).concat(other: ")"));
+}
+
+unsafe fn int32 longFormForAPreparedStatement() {
+    string sql = "select $1 + 1";
+    string full = fullReset();
+    DynamicArray<Step> s = opening();
+    prepares(s: ref s, name: "s0", sql: sql);
+    s.add(item: resets(sql: full));
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, prepared"); } };
+    Result<Statement, PgError> p = c.prepare(sql: sql);
+    bool made = match (p) { case Ok(value: st): true; case Err(error: e): false; };
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    return check(ok: made && got.equals(other: "ok") && sentinelRuns(c: ref c),
+                 what: "reset: a prepared statement not closed keeps the long form (".concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 discardAllOnceClosed() {
+    string sql = "select $1 + 1";
+    DynamicArray<Step> s = opening();
+    prepares(s: ref s, name: "s0", sql: sql);
+    closes(s: ref s, name: "s0");
+    s.add(item: resets(sql: resetDiscardAll()));
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, closed"); } };
+    Result<Statement, PgError> p = c.prepare(sql: sql);
+    match (give p) {
+        case Ok(value: st): {
+            Result<Unit, PgError> shut = c.closeStatement(statement: give st);
+            Result<Unit, PgError> r = c.resetSession();
+            string got = said(r: r);
+            return check(ok: said(r: shut).equals(other: "ok") && got.equals(other: "ok") && sentinelRuns(c: ref c),
+                         what: "reset: a statement prepared and closed leaves DISCARD ALL (".concat(other: got).concat(other: ")"));
+        }
+        case Err(error: e): { return check(ok: false, what: "reset: prepare, to close"); }
+    };
+}
+
+unsafe fn int32 pipelinePrepareKeepsTheLongForm() {
+    string sql = "select $1 + 1";
+    string full = fullReset();
+    DynamicArray<Step> s = opening();
+    prepares(s: ref s, name: "s0", sql: sql);
+    s.add(item: resets(sql: full));
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, pipeline prepare"); } };
+    Result<Unit, PgError> e1 = c.enterPipelineMode();
+    Result<Unit, PgError> p = c.sendPrepare(sql: sql);
+    Result<Unit, PgError> synced = c.pipelineSync();
+    Result<Optional<PipelineResult>, PgError> g1 = c.getResult();
+    Result<Optional<PipelineResult>, PgError> g2 = c.getResult();
+    Result<Unit, PgError> e2 = c.exitPipelineMode();
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    return check(ok: said(r: e2).equals(other: "ok") && got.equals(other: "ok") && sentinelRuns(c: ref c),
+                 what: "reset: a statement a pipeline prepared keeps the long form (".concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 pipelineCloseLeavesDiscardAll() {
+    string sql = "select $1 + 1";
+    DynamicArray<Step> s = opening();
+    prepares(s: ref s, name: "s0", sql: sql);
+    closes(s: ref s, name: "s0");
+    s.add(item: resets(sql: resetDiscardAll()));
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, pipeline close"); } };
+    Result<Statement, PgError> p = c.prepare(sql: sql);
+    match (give p) {
+        case Ok(value: st): {
+            Result<Unit, PgError> e1 = c.enterPipelineMode();
+            Result<Unit, PgError> q = c.sendClosePrepared(statement: give st);
+            Result<Unit, PgError> synced = c.pipelineSync();
+            Result<Optional<PipelineResult>, PgError> g1 = c.getResult();
+            Result<Optional<PipelineResult>, PgError> g2 = c.getResult();
+            Result<Unit, PgError> e2 = c.exitPipelineMode();
+            Result<Unit, PgError> r = c.resetSession();
+            string got = said(r: r);
+            return check(ok: said(r: e2).equals(other: "ok") && got.equals(other: "ok") && sentinelRuns(c: ref c),
+                         what: "reset: a statement a pipeline closed leaves DISCARD ALL (".concat(other: got).concat(other: ")"));
+        }
+        case Err(error: e): { return check(ok: false, what: "reset: prepare, to close in a pipeline"); }
+    };
+}
+
+// ---- a transaction block: ROLLBACK first, in the same write ----
+
+// The ROLLBACK is not answered until the reset has arrived too: a client that waited for its answer before sending
+// the reset would time out.
+unsafe fn int32 rollbackInTheSameWrite() {
+    Wire both = Wire.make();
+    both.complete(tag: "ROLLBACK"); both.ready(status: IDLE);
+    both.complete(tag: "DISCARD ALL"); both.ready(status: IDLE);
+    DynamicArray<Step> s = opening();
+    s.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: INTX));
+    s.add(item: unanswered(sql: resetRollback()));
+    s.add(item: queried(sql: resetDiscardAll(), reply: give both));
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, in a block"); } };
+    Result<DynamicArray<Rows>, PgError> b = c.simpleQuery(sql: "BEGIN");
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    return check(ok: got.equals(other: "ok") && c.transactionStatus() == TransactionStatus::Idle && sentinelRuns(c: ref c),
+                 what: "reset: in a block, ROLLBACK and the reset go in one write (".concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 rollbackFromAFailedBlock() {
+    Wire failure = Wire.make();
+    failure.report(tag: 69ui8, severity: "ERROR", code: "22012", message: "division by zero");
+    failure.ready(status: FAILED);
+    Wire both = Wire.make();
+    both.complete(tag: "ROLLBACK"); both.ready(status: IDLE);
+    both.complete(tag: "DISCARD ALL"); both.ready(status: IDLE);
+    DynamicArray<Step> s = opening();
+    s.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: INTX));
+    s.add(item: queried(sql: "SELECT 1/0", reply: give failure));
+    s.add(item: unanswered(sql: resetRollback()));
+    s.add(item: queried(sql: resetDiscardAll(), reply: give both));
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, failed block"); } };
+    Result<DynamicArray<Rows>, PgError> b = c.simpleQuery(sql: "BEGIN");
+    Result<DynamicArray<Rows>, PgError> z = c.simpleQuery(sql: "SELECT 1/0");
+    bool failedFirst = c.transactionStatus() == TransactionStatus::Failed;
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    return check(ok: failedFirst && got.equals(other: "ok") && c.transactionStatus() == TransactionStatus::Idle && sentinelRuns(c: ref c),
+                 what: "reset: a failed block is rolled back too (".concat(other: got).concat(other: ")"));
+}
+
+// ---- the version gates ----
+
+// Case `i` of the vectors, with a statement prepared (the long form) or not (the short one).
+unsafe fn int32 gateCase(isize i, bool withStatement) {
+    DynamicArray<string> versions = resetServerVersion();
+    DynamicArray<int32> numbers = resetVersionNumber();
+    DynamicArray<string> forms = resetLongForm();
+    DynamicArray<string> shorts = resetShortForm();
+    string version = copy versions[i];
+    int32 number = numbers[i];
+    string expected = copy shorts[i];
+    if (withStatement) { expected = copy forms[i]; }
+    string sql = "select $1 + 1";
+    DynamicArray<Step> s = openingAt(version: version);
+    if (withStatement) { prepares(s: ref s, name: "s0", sql: sql); }
+    if (expected.length() > 0) { s.add(item: resets(sql: expected)); }
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, ".concat(other: version)); } };
+    if (withStatement) {
+        Result<Statement, PgError> p = c.prepare(sql: sql);
+        bool made = match (p) { case Ok(value: st): true; case Err(error: e): false; };
+        if (!made) { return check(ok: false, what: "reset: prepare, ".concat(other: version)); }
+    }
+    int32 reported = c.serverVersion();
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    string form = "the short form";
+    if (withStatement) { form = "the long form"; }
+    if (expected.length() == 0) { form = form.concat(other: ", which is none"); }
+    return check(ok: reported == number && got.equals(other: "ok") && sentinelRuns(c: ref c),
+                 what: "reset: server_version ".concat(other: version).concat(other: " gets ").concat(other: form).concat(other: " (").concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 gateTests() {
+    int32 f = 0;
+    DynamicArray<string> versions = resetServerVersion();
+    isize i = 0;
+    while (i < versions.length()) {
+        f = f + gateCase(i: i, withStatement: true);
+        f = f + gateCase(i: i, withStatement: false);
+        i = i + 1;
+    }
+    return f;
+}
+
+// Below 8.3 there is no reset, but a block is still rolled back.
+unsafe fn int32 rollbackOnlyBelowDiscard() {
+    DynamicArray<Step> s = openingAt(version: "8.2.99");
+    s.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: INTX));
+    s.add(item: completes(sql: resetRollback(), tag: "ROLLBACK", status: IDLE));
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, 8.2"); } };
+    Result<DynamicArray<Rows>, PgError> b = c.simpleQuery(sql: "BEGIN");
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    return check(ok: got.equals(other: "ok") && c.transactionStatus() == TransactionStatus::Idle && sentinelRuns(c: ref c),
+                 what: "reset: below 8.3 a block is rolled back and nothing more is sent (".concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 refusedWithNoVersion() {
+    DynamicArray<Step> s = openingAt(version: "");
+    s.add(item: sentinel());
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, no version"); } };
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    return check(ok: got.equals(other: "the server did not report server_version, so which session reset it takes is not known") && sentinelRuns(c: ref c),
+                 what: "reset: refused when the server reported no version, and the session goes on (".concat(other: got).concat(other: ")"));
+}
+
+// ---- a reset that fails closes the connection ----
+
+unsafe fn int32 failureCloses(Wire reply, const ref string what) {
+    DynamicArray<Step> s = opening();
+    s.add(item: queried(sql: resetDiscardAll(), reply: give reply));
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, ".concat(other: what)); } };
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    bool failed = match (r) { case Ok(value: u): false; case Err(error: e): true; };
+    return check(ok: failed && c.isClosed(), what: "reset: ".concat(other: what).concat(other: " closes the connection (").concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 failureTests() {
+    int32 f = 0;
+    Wire refused = Wire.make();
+    refused.report(tag: 69ui8, severity: "ERROR", code: "25001", message: "DISCARD ALL cannot run inside a transaction block");
+    refused.ready(status: IDLE);
+    f = f + failureCloses(reply: give refused, what: "an error in the reset");
+
+    Wire misplaced = Wire.make();
+    misplaced.parseComplete();
+    misplaced.complete(tag: "DISCARD ALL");
+    misplaced.ready(status: IDLE);
+    f = f + failureCloses(reply: give misplaced, what: "a message out of place in its answer");
+
+    Wire still = Wire.make();
+    still.complete(tag: "DISCARD ALL");
+    still.ready(status: INTX);
+    f = f + failureCloses(reply: give still, what: "a session still in a block after it");
+    return f;
+}
+
+// ---- what the reset leaves on this side ----
+
+unsafe fn int32 notificationsDropped() {
+    Wire earlier = Wire.make();
+    earlier.notification(pid: 99, channel: "jobs", payload: "before");
+    earlier.complete(tag: "SELECT 1");
+    earlier.ready(status: IDLE);
+    Wire during = Wire.make();
+    during.notification(pid: 99, channel: "jobs", payload: "during");
+    during.complete(tag: "DISCARD ALL");
+    during.ready(status: IDLE);
+    DynamicArray<Step> s = opening();
+    s.add(item: queried(sql: "SELECT 1", reply: give earlier));
+    s.add(item: queried(sql: resetDiscardAll(), reply: give during));
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, notifications"); } };
+    Result<DynamicArray<Rows>, PgError> q = c.simpleQuery(sql: "SELECT 1");
+    Result<Unit, PgError> r = c.resetSession();
+    DynamicArray<Notification> left = c.takeNotifications();
+    isize n = left.length();
+    return check(ok: said(r: r).equals(other: "ok") && n == 0,
+                 what: "reset: notifications received before it and during it are dropped (${n} left)");
+}
+
+unsafe fn int32 parameterFollowsReset() {
+    Wire set = Wire.make();
+    set.parameter(name: "application_name", value: "worker");
+    set.complete(tag: "SET");
+    set.ready(status: IDLE);
+    Wire back = Wire.make();
+    back.parameter(name: "application_name", value: "");
+    back.complete(tag: "DISCARD ALL");
+    back.ready(status: IDLE);
+    DynamicArray<Step> s = opening();
+    s.add(item: queried(sql: "SET application_name = 'worker'", reply: give set));
+    s.add(item: queried(sql: resetDiscardAll(), reply: give back));
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "reset: connect, parameter"); } };
+    Result<DynamicArray<Rows>, PgError> q = c.simpleQuery(sql: "SET application_name = 'worker'");
+    Optional<string> before = c.parameter(name: "application_name");
+    string was = match (before) { case Some(value: v): copy v; case None: "(none)"; };
+    Result<Unit, PgError> r = c.resetSession();
+    Optional<string> after = c.parameter(name: "application_name");
+    string now = match (after) { case Some(value: v): copy v; case None: "(none)"; };
+    return check(ok: was.equals(other: "worker") && said(r: r).equals(other: "ok") && now.length() == 0,
+                 what: "reset: a parameter the reset changes is reported, and kept (".concat(other: was).concat(other: " -> '").concat(other: now).concat(other: "')"));
+}
+
+// ---- what a pool's release reads ----
+
+unsafe fn int32 duringCopy() {
+    Wire g = Wire.make(); g.copyResponse(tag: 71ui8);
+    DynamicArray<Step> s = opening();
+    s.add(item: queried(sql: "COPY t FROM STDIN", reply: give g));
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "release: connect, COPY"); } };
+    Result<CopyInfo, PgError> started = c.startCopyIn(sql: "COPY t FROM STDIN");
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    return check(ok: c.transactionStatus() == TransactionStatus::Active && got.equals(other: "another command is already in progress") && !c.isClosed(),
+                 what: "release: a COPY in progress is Active, and the reset is refused (".concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 duringStream() {
+    int32 f = 0;
+    string sql = "select $1 + 1";
+    Wire rows = Wire.make(); rows.bindComplete();
+    int32 i = 1;
+    while (i <= 3) { rows.intRow(values: ints(a: i)); i = i + 1; }
+    rows.complete(tag: "SELECT 3"); rows.ready(status: IDLE);
+    DynamicArray<Step> s = opening();
+    s.add(item: quiet(tag: PARSE, body: ""));
+    s.add(item: quiet(tag: DESCRIBE, body: ""));
+    s.add(item: answer(tag: SYNC, reply: description()));
+    s.add(item: quiet(tag: BIND, body: ""));
+    s.add(item: quiet(tag: EXECUTE, body: ""));
+    s.add(item: answer(tag: SYNC, reply: give rows));
+    s.add(item: resets(sql: resetDiscardAll()));
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "release: connect, stream"); } };
+    Query q = Query.make(sql: copy sql);
+    q.add(value: 7);
+    Result<Unit, PgError> started = c.startRows(q: q);
+    Result<Rows, PgError> chunk = c.nextRows(maxRows: 1);
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    f = f + check(ok: c.transactionStatus() == TransactionStatus::Active && got.equals(other: "another command is already in progress"),
+                  what: "release: a result read in chunks is Active, and the reset is refused (".concat(other: got).concat(other: ")"));
+    Result<Unit, PgError> drained = c.discardRows();
+    Result<Unit, PgError> again = c.resetSession();
+    string later = said(r: again);
+    f = f + check(ok: later.equals(other: "ok"), what: "release: once the rows are read off, the reset runs (".concat(other: later).concat(other: ")"));
+    return f;
+}
+
+unsafe fn int32 inPipelineMode() {
+    DynamicArray<Step> s = opening();
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "release: connect, pipeline"); } };
+    Result<Unit, PgError> entered = c.enterPipelineMode();
+    Result<Unit, PgError> r = c.resetSession();
+    string got = said(r: r);
+    return check(ok: c.transactionStatus() == TransactionStatus::Idle && c.pipelineStatus() == PipelineStatus::On
+                     && got.equals(other: "synchronous command execution functions are not allowed in pipeline mode"),
+                 what: "release: pipeline mode with nothing queued reads Idle, so pipelineStatus() is what says On; the reset is refused (".concat(other: got).concat(other: ")"));
+}
+
+unsafe fn int32 onceClosed() {
+    DynamicArray<Step> s = opening();
+    Result<Connection, PgError> m = scripted(steps: give s, mode: CacheMode::Off);
+    Connection c = match (give m) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "release: connect, closed"); } };
+    c.close();
+    Result<Unit, PgError> r = c.resetSession();
+    bool isClosedError = match (r) { case Ok(value: u): false; case Err(error: e): match (e) { case Closed: true; case _: false; }; };
+    return check(ok: c.transactionStatus() == TransactionStatus::Unknown && isClosedError,
+                 what: "release: a closed connection is Unknown, and the reset is Closed");
+}
+
+unsafe fn int32 resetTests() {
+    int32 f = 0;
+    f = f + pingAnswered();
+    f = f + pingInFailedBlock();
+    f = f + pingGivenARow();
+    f = f + pingGivenFatal();
+    f = f + pingRefused();
+    f = f + discardAllWhenNothingPrepared();
+    f = f + longFormKeepsTheCache();
+    f = f + longFormForAPreparedStatement();
+    f = f + discardAllOnceClosed();
+    f = f + pipelinePrepareKeepsTheLongForm();
+    f = f + pipelineCloseLeavesDiscardAll();
+    f = f + rollbackInTheSameWrite();
+    f = f + rollbackFromAFailedBlock();
+    f = f + gateTests();
+    f = f + rollbackOnlyBelowDiscard();
+    f = f + refusedWithNoVersion();
+    f = f + failureTests();
+    f = f + notificationsDropped();
+    f = f + parameterFollowsReset();
+    f = f + duringCopy();
+    f = f + duringStream();
+    f = f + inPipelineMode();
+    f = f + onceClosed();
+    return f;
+}

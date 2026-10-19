@@ -138,6 +138,30 @@ unsafe fn int32 copyTests() {
         case Err(error: x): { f = f + check(ok: false, what: "copy: connect 4"); }
     };
 
+    // A ParameterStatus over 30000 bytes during COPY OUT: getCopyDataMessage takes it, where a session would not.
+    DynamicArray<Step> s4b = opening();
+    DynamicArray<uint8> longValue = DynamicArray.empty();
+    isize filled = 0;
+    while (filled < 30001) { longValue.add(item: 112ui8); filled = filled + 1; }
+    Wire withParam = Wire.make(); withParam.copyResponse(tag: 72ui8); withParam.copyData(data: "1\n");
+    withParam.longParameter(name: "search_path", value: longValue.view());
+    withParam.copyDone(); withParam.complete(tag: "COPY 1"); withParam.ready(status: 73ui8);
+    s4b.add(item: statement(sql: copyOut, reply: give withParam));
+    Result<Connection, PgError> m4b = scripted(steps: give s4b);
+    match (give m4b) {
+        case Ok(value: x): {
+            Connection g = give x;
+            Result<CopyInfo, PgError> st = g.startCopyOut(sql: copyOut);
+            Result<CopyChunk, PgError> a = g.getCopyData();
+            Result<CopyChunk, PgError> z = g.getCopyData();
+            string seq = chunkText(r: a).concat(other: " ").concat(other: chunkText(r: z));
+            Optional<string> path = g.parameter(name: "search_path");
+            isize got = match (path) { case Some(value: p): p.length(); case None: 0; };
+            f = f + check(ok: seq.equals(other: "data:310a done:1") && got == 30001, what: "copy: a ParameterStatus over 30000 bytes during COPY OUT is taken (".concat(other: seq).concat(other: ")"));
+        }
+        case Err(error: x): { f = f + check(ok: false, what: "copy: connect 4b"); }
+    };
+
     // The wrong direction is ended at once; a statement that is no COPY runs, and is refused.
     DynamicArray<Step> s5 = opening();
     Wire g5 = Wire.make(); g5.copyResponse(tag: 71ui8);

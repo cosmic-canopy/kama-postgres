@@ -1,6 +1,6 @@
 import { std::collections::DynamicArray, std::collections::ConstView, std::encoding::utf8::decode,
-         std::encoding::utf8::Utf8Error };
-export { MessageWriter, Cursor, ProtocolError, MAX_MESSAGE };
+         std::encoding::utf8::Utf8Error, syncLossFormat };
+export { MessageWriter, Cursor, ProtocolError, MAX_MESSAGE, cFormat };
 
 // postgres::protocol — the PostgreSQL v3 wire protocol as data: building every frontend message, and framing
 // and decoding every backend one. No I/O happens here. A connection moves the bytes; this module only says
@@ -22,8 +22,11 @@ comptime int64 MAX_MESSAGE = 1073741823i64;
 type enum ProtocolError implements Error, Sendable {
     // The message ended before a field it must contain.
     Truncated(uint8 tag),
-    // A declared length below the minimum (4 bytes for the length itself), or past the message end.
+    // A declared length past the message end.
     BadLength(uint8 tag, int64 length),
+    // A header libpq would not believe (pqParseInput3): a length under 4, or a length over 30000 for a type that is
+    // never that long. The framing cannot be trusted after it, so the session ends.
+    SyncLost(uint8 tag, int32 length),
     // A declared length over MAX_MESSAGE.
     TooLarge(uint8 tag, int64 length),
     // A tag this client does not know, or a known one where the protocol forbids it.
@@ -41,6 +44,7 @@ type enum ProtocolError implements Error, Sendable {
         return match (this) {
             case Truncated(tag: t): "message '${t}' ended early";
             case BadLength(tag: t, length: n): "message '${t}' declared an impossible length ${n}";
+            case SyncLost(tag: t, length: n): cFormat(format: syncLossFormat(), c: t, d: n);
             case TooLarge(tag: t, length: n): "message '${t}' declared ${n} bytes, over the 1 GiB limit";
             case Unexpected(tag: t): "unexpected message '${t}'";
             case NotUtf8(tag: t): "message '${t}' carries text that is not UTF-8";
@@ -48,6 +52,32 @@ type enum ProtocolError implements Error, Sendable {
             case Violation(detail: d): copy d;
         };
     }
+}
+
+// A libpq message format, printed as C's printf prints it, for the two conversions libpq's protocol messages use. %c
+// is the byte itself, and a NUL ends the text there, as it ends a C string; a byte that is not ASCII prints as U+FFFD,
+// since a message is UTF-8. %d is `d` in decimal, and %% is %.
+unsafe fn string cFormat(const ref string format, uint8 c, int32 d) {
+    DynamicArray<uint8> text = DynamicArray.empty();
+    isize i = 0;
+    while (i < format.length()) {
+        if (format[i] == 37ui8 && i + 1 < format.length()) {   // '%'
+            uint8 conversion = format[i + 1];
+            i = i + 2;
+            if (conversion == 99ui8) {                // 'c'
+                if (c == 0ui8) { break; }
+                if (c < 128ui8) { text.add(item: c); } else { text.add(item: 239ui8); text.add(item: 191ui8); text.add(item: 189ui8); }
+            } else if (conversion == 100ui8) {        // 'd'
+                string digits = "${d}";
+                foreach (uint8 b in digits) { text.add(item: b); }
+            } else { text.add(item: conversion); }
+            continue;
+        }
+        text.add(item: format[i]);
+        i = i + 1;
+    }
+    Result<string, Utf8Error> s = decode(bytes: text.view());
+    return match (give s) { case Ok(value: v): give v; case Err(error: e): ""; };
 }
 
 fn bool hasNul(ConstView<uint8> b) {

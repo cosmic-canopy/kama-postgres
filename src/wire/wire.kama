@@ -1,8 +1,10 @@
-import { std::collections::FixedArray, std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::memory::Owned,
-         std::net::Interest, std::net::Ready, std::time::Instant, std::time::Duration, std::time::monotonicNow,
-         postgres::Transport, postgres::PgError,
-         postgres::protocol::Frame, postgres::protocol::frame, postgres::protocol::decode,
-         postgres::protocol::BackendMessage, postgres::protocol::ProtocolError, postgres::protocol::HEADER_BYTES };
+import { std::collections::FixedArray, std::collections::DynamicArray, std::collections::ConstView, std::io::IoError,
+         std::io::IoErrorKind, std::memory::Owned, std::net::Interest, std::net::Ready, std::time::Instant,
+         std::time::Duration, std::time::monotonicNow, std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error,
+         postgres::Transport, postgres::PgError, postgres::ServerError,
+         postgres::protocol::Frame, postgres::protocol::Framing, postgres::protocol::frame, postgres::protocol::decode,
+         postgres::protocol::BackendMessage, postgres::protocol::ProtocolError, postgres::protocol::ErrorFields,
+         postgres::protocol::HEADER_BYTES, postgres::protocol::STARTUP_ERROR_MAX, postgres::protocol::invalidErrorText };
 export { Wire, Deadline, strerror };
 
 // postgres::wire — messages over a `Transport`: framing the bytes that arrive into backend messages, and writing
@@ -46,8 +48,8 @@ type value Deadline implements Sendable {
     }
 }
 
-// The receive buffer starts at libpq's size and grows to hold the largest message it is given, up to the
-// protocol's 1 GiB cap. Once it has drained, a buffer grown past RETAIN_BYTES is given back.
+// The receive buffer starts at libpq's size and grows as a message's bytes arrive, up to the protocol's 1 GiB cap.
+// Once it has drained, a buffer grown past RETAIN_BYTES is given back.
 comptime isize INITIAL_BYTES = 16384;
 comptime isize RETAIN_BYTES = 1048576;
 
@@ -77,18 +79,25 @@ type resource Wire implements Sendable {
         this.end = preread.length();
     }
 
-    // The next message from the server. The bytes of every message are checked before anything is believed
-    // (postgres::protocol): a malformed one is `Protocol`, and the connection cannot recover its framing after it.
-    public unsafe fn Result<BackendMessage, PgError> receive(Deadline deadline) {
+    // The next message from the server, read where `framing` says (before authentication, in a session, during COPY
+    // OUT). The bytes of every message are checked before anything is believed (postgres::protocol): a malformed one
+    // is `Protocol`, and the connection cannot recover its framing after it.
+    public unsafe fn Result<BackendMessage, PgError> receive(Deadline deadline, Framing framing) {
+        bool startup = match (framing) { case Startup: true; case _: false; };
+        isize scanned = 1;   // a pre-3.0 error's bytes already searched for its NUL, from `start`
         while (true) {
-            Frame f = frame(buf: this.buf.slice(from: this.start, count: this.end - this.start));
+            Frame f = frame(buf: this.buf.slice(from: this.start, count: this.end - this.start), framing: framing);
             match (give f) {
                 case Complete(tag: t, total: n): {
                     Result<BackendMessage, ProtocolError> m = decode(tag: t, body: this.buf.slice(from: this.start + HEADER_BYTES, count: n - HEADER_BYTES));
                     this.consume(n: n);
                     return match (give m) {
                         case Ok(value: v): Result::Ok(value: give v);
-                        case Err(error: e): Result::Err(error: PgError::Protocol(error: give e));
+                        case Err(error: e): {
+                            // PQconnectPoll's words for an ErrorResponse it cannot read before authentication.
+                            if (startup && t == 69ui8) { return Result::Err(error: PgError::Protocol(error: ProtocolError::Violation(detail: invalidErrorText()))); }
+                            := Result::Err(error: PgError::Protocol(error: give e));
+                        }
                     };
                 }
                 case Incomplete(needed: k): {
@@ -96,9 +105,46 @@ type resource Wire implements Sendable {
                     match (give filled) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
                 }
                 case Invalid(error: e): { return Result::Err(error: PgError::Protocol(error: give e)); }
+                case OldError: {
+                    Optional<Result<BackendMessage, PgError>> read = this.oldError(scanned: scanned);
+                    match (give read) {
+                        case Some(value: r): { return give r; }
+                        case None: {
+                            scanned = this.end - this.start;
+                            Result<Unit, PgError> more = this.fill(needed: this.end - this.start + 1, deadline: deadline);
+                            match (give more) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                        }
+                    };
+                }
             };
         }
         return Result::Err(error: PgError::Closed);
+    }
+
+    // A pre-3.0 server's error before authentication, as PQconnectPoll reads it: the text after the 'E' up to a NUL,
+    // returned as the server's error. None while no NUL has come and there is room for more; past STARTUP_ERROR_MAX
+    // bytes without one, the message is refused. The search goes on from the `scanned` bytes already searched.
+    unsafe fn Optional<Result<BackendMessage, PgError>> oldError(isize scanned) {
+        isize i = this.start + scanned;
+        while (i < this.end && this.buf[i] != 0ui8) { i = i + 1; }
+        if (i < this.end) {
+            Result<string, Utf8Error> text = utf8Decode(bytes: this.buf.slice(from: this.start + 1, count: i - this.start - 1));
+            this.consume(n: i + 1 - this.start);
+            return match (give text) {
+                case Ok(value: t): {
+                    DynamicArray<uint8> codes = DynamicArray.empty();
+                    DynamicArray<string> texts = DynamicArray.empty();
+                    codes.add(item: 77ui8);   // 'M': the text is all the server said
+                    texts.add(item: give t);
+                    := Optional::Some(value: Result::Err(error: PgError::Server(error: ServerError.make(fields: ErrorFields.make(codes: give codes, texts: give texts)))));
+                }
+                case Err(error: e): Optional::Some(value: Result::Err(error: PgError::Protocol(error: ProtocolError::NotUtf8(tag: 69ui8))));
+            };
+        }
+        if (this.end - this.start - 1 > cast<isize>(STARTUP_ERROR_MAX)) {
+            return Optional::Some(value: Result::Err(error: PgError::Protocol(error: ProtocolError::Violation(detail: invalidErrorText()))));
+        }
+        return Optional::None;
     }
 
     // Write all of `bytes`, waiting for the transport as often as it needs, until `deadline`. While a write must wait,
@@ -185,10 +231,16 @@ type resource Wire implements Sendable {
         this.end = 0;
     }
 
-    // Read until at least `needed` bytes from `start` are buffered.
+    // Read until at least `needed` bytes from `start` are buffered. The buffer grows only as bytes arrive, doubling up
+    // to what is needed, so a header that declares a large message costs nothing until its body comes.
     unsafe fn Result<Unit, PgError> fill(isize needed, Deadline deadline) {
-        this.makeRoom(needed: needed);
         while (this.end - this.start < needed) {
+            if (this.end == this.buf.length()) {
+                isize want = (this.end - this.start) * 2;
+                if (want < INITIAL_BYTES) { want = INITIAL_BYTES; }
+                if (want > needed) { want = needed; }
+                this.makeRoom(needed: want);
+            }
             Result<isize, IoError> r = this.link.read(into: this.buf.sliceMut(from: this.end, count: this.buf.length() - this.end));
             bool wait = false;
             match (r) {

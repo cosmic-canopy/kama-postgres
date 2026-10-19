@@ -181,9 +181,38 @@ unsafe fn int32 startupNoticeTests() {
     return f;
 }
 
+// libpq's limit on a short type's length, against a real server: PostgreSQL 18 reports search_path, and a ParameterStatus
+// over 30000 bytes is lost synchronization, as the container's psql says ("got message type \"S\", length 33905" for
+// this list). Before 18 the SET is not reported, and the session goes on.
+unsafe fn int32 syncLossTests() {
+    int32 f = 0;
+    string list = "s0";
+    int32 i = 1;
+    while (i < 5000) { list = list.concat(other: ",s${i}"); i = i + 1; }
+    Result<Connection, PgError> r = open(conninfo: conninfoFor(user: "kp_trust"));
+    match (give r) {
+        case Ok(value: c): {
+            int32 version = c.serverVersion();
+            Result<DynamicArray<Rows>, PgError> set = c.simpleQuery(sql: "set search_path = ".concat(other: list));
+            string m = match (set) { case Ok(value: v): "succeeded"; case Err(error: e): e.message(); };
+            if (version >= 180000) {
+                bool lost = m.startsWith(prefix: "lost synchronization with server: got message type \"S\", length ");
+                f = f + check(ok: lost && c.isClosed(), what: "sync loss: a reported search_path over 30000 bytes ends the session, as in libpq: ".concat(other: m));
+            } else {
+                string one = scalar(c: c, sql: "select 1");
+                f = f + check(ok: m.equals(other: "succeeded") && one.equals(other: "1"), what: "sync loss: before 18 search_path is not reported: ".concat(other: m));
+                c.close();
+            }
+        }
+        case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: "sync loss: connect: ".concat(other: m)); }
+    };
+    return f;
+}
+
 unsafe fn int32 sessionTests() {
     int32 f = 0;
     f = f + protocolTests();
+    f = f + syncLossTests();
     f = f + terminationTests();
     f = f + unreachableTests();
     f = f + isolateTests();

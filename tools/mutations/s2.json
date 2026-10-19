@@ -1,0 +1,130 @@
+[
+ {
+  "id": "A1",
+  "suite": "unit",
+  "file": "src/protocol/backend.kama",
+  "old": "if (len > SHORT_MESSAGE_LIMIT && !mayBeLong)",
+  "new": "if (len > SHORT_MESSAGE_LIMIT + 1 && !mayBeLong)",
+  "expect": "frame: every type and length in each place, as libpq decides it"
+ },
+ {
+  "id": "A2",
+  "suite": "unit",
+  "file": "src/protocol/framing.kama",
+  "old": " || tag == 116ui8;\n}",
+  "new": ";\n}",
+  "expect": "frame: every type and length in each place, as libpq decides it"
+ },
+ {
+  "id": "A3",
+  "suite": "unit",
+  "file": "src/protocol/backend.kama",
+  "old": "bool mayBeLong = isLongMessageType(tag: tag) || (copyOut && isCopyOutMessageType(tag: tag));",
+  "new": "bool mayBeLong = isLongMessageType(tag: tag);",
+  "expect": "copy: a ParameterStatus over 30000 bytes during COPY OUT is taken"
+ },
+ {
+  "id": "A4",
+  "suite": "unit",
+  "file": "src/protocol/backend.kama",
+  "old": "int32 len = truncate<int32>(word);",
+  "new": "int32 len = truncate<int32>(word & 2147483647ui32);",
+  "expect": "frame: a length is signed"
+ },
+ {
+  "id": "A5",
+  "suite": "unit",
+  "file": "src/protocol/backend.kama",
+  "old": "if (startup && !isStartupMessageType(tag: tag)) {",
+  "new": "if (false) {",
+  "expect": "header: a NoticeResponse before authentication"
+ },
+ {
+  "id": "A6",
+  "suite": "unit",
+  "file": "src/protocol/backend.kama",
+  "old": "if (tag == 82ui8 && (len < AUTH_REQUEST_MIN || len > AUTH_REQUEST_MAX)) {",
+  "new": "if (tag == 82ui8 && (len < AUTH_REQUEST_MIN || len > AUTH_REQUEST_MAX + 1)) {",
+  "expect": "frame: every type and length in each place, as libpq decides it"
+ },
+ {
+  "id": "A7",
+  "suite": "unit",
+  "file": "src/protocol/backend.kama",
+  "old": "if (tag == 69ui8 && (len < STARTUP_ERROR_MIN || len > STARTUP_ERROR_MAX)) { return Frame::OldError; }",
+  "new": "",
+  "expect": "header: a pre-3.0 error is the server's text"
+ },
+ {
+  "id": "A8",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "if (this.end - this.start - 1 > cast<isize>(STARTUP_ERROR_MAX)) {",
+  "new": "if (this.end - this.start - 1 > cast<isize>(STARTUP_ERROR_MAX) * 100) {",
+  "expect": "header: a pre-3.0 error with no end"
+ },
+ {
+  "id": "A9",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "if (startup && t == 69ui8) {",
+  "new": "if (false) {",
+  "expect": "header: an ErrorResponse that does not parse, before authentication"
+ },
+ {
+  "id": "A10",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "this.phase = Framing::Session;   // PQconnectPoll's CONNECTION_AUTH_OK reads through pqParseInput3",
+  "new": "",
+  "expect": "header: connect for the long Z"
+ },
+ {
+  "id": "A11",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "Result<BackendMessage, PgError> received = this.receiveAs(framing: Framing::CopyOut);",
+  "new": "Result<BackendMessage, PgError> received = this.receive();",
+  "expect": "copy: a ParameterStatus over 30000 bytes during COPY OUT is taken"
+ },
+ {
+  "id": "A12",
+  "suite": "unit",
+  "file": "src/protocol/buffer.kama",
+  "old": "if (c == 0ui8) { break; }",
+  "new": "if (c == 0ui8) { }",
+  "expect": "cFormat: a NUL ends the text"
+ },
+ {
+  "id": "A13",
+  "suite": "unit",
+  "file": "src/protocol/buffer.kama",
+  "old": "if (c < 128ui8) { text.add(item: c); }",
+  "new": "if (c < 255ui8) { text.add(item: c); }",
+  "expect": "cFormat: a byte that is not ASCII"
+ },
+ {
+  "id": "A14",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "scanned = this.end - this.start;",
+  "new": "scanned = this.end - this.start + 1;",
+  "expect": "header: a pre-3.0 error is the server's text"
+ },
+ {
+  "id": "A15",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "unsafe fn string unexpected(uint8 tag) { return cFormat(format: unexpectedFormat(), c: tag, d: 0); }",
+  "new": "unsafe fn string unexpected(uint8 tag) { return \"unexpected response from server\"; }",
+  "expect": "hostile: a DataRow before BindComplete"
+ },
+ {
+  "id": "IA1",
+  "suite": "integration",
+  "file": "src/protocol/backend.kama",
+  "old": "if (len > SHORT_MESSAGE_LIMIT && !mayBeLong)",
+  "new": "if (len > SHORT_MESSAGE_LIMIT * 2 && !mayBeLong)",
+  "expect": "sync loss: a reported search_path over 30000 bytes ends the session"
+ }
+]

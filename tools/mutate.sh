@@ -8,13 +8,15 @@
 #
 # A mutation file is a JSON list. Each entry is
 #   {"id": "M1", "suite": "unit" | "integration", "file": "src/…", "old": "…", "new": "…", "expect": "…"}
-# and `old` must occur exactly once in `file`. `expect` is part of the check's name (what `check` prints after FAIL).
+# and `old` must occur exactly once in `file`. `expect` is part of the check's name (what `check` prints after FAIL),
+# or PANICKED for a mutation the program must die of. An entry may add "env": {"NAME": "value", …} for its run.
 #
 # The tree is copied to a scratch directory (without .git and out/), so the working tree is never touched. For each
 # mutation, the copy's file is changed, the suite is built in debug and run, and the file is put back. The verdict:
 #   CAUGHT            the targeted case failed;
 #   FAILED-ELSEWHERE  other cases failed, not that one (strengthen the targeted case);
 #   SURVIVED          nothing failed;
+#   PANICKED          the program died (a panic, a signal) before any case failed, and `expect` is not PANICKED;
 #   BAD-PATTERN       `old` is not in the file exactly once (the source moved on: update the mutation);
 #   BUILD-FAILED      the mutation does not compile.
 # It exits 1 unless every mutation run is CAUGHT. `kama` is $KAMA or the PATH; an integration run needs the server up
@@ -81,13 +83,19 @@ for m in json.load(open(path)):
         os.makedirs(os.path.join(work, "home"))
         try:
             r = subprocess.run([exe], capture_output=True, text=True, timeout=900,
-                               env=dict(env, PGTEST_TMP=work, PGTEST_SOCKDIR=sockets))
+                               env=dict(env, PGTEST_TMP=work, PGTEST_SOCKDIR=sockets, **m.get("env", {})))
             fails = [l.strip()[5:] for l in r.stdout.splitlines() if l.strip().startswith("FAIL ")]
+            # A run that ends badly with no case failed died before one could: a panic, or a signal.
+            if not fails and r.returncode != 0:
+                fails = ["PANICKED: " + (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]]
         except subprocess.TimeoutExpired:
             fails = ["(timed out)"]
         hits = [f for f in fails if m["expect"] in f]
         if hits:
             verdict, shown = "CAUGHT", hits[0]
+        elif fails and fails[0].startswith("PANICKED"):
+            verdict, shown = "PANICKED", fails[0]
+            missed += 1
         else:
             verdict, shown = ("FAILED-ELSEWHERE", fails[0]) if fails else ("SURVIVED", "")
             missed += 1

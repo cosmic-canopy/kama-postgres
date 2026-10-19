@@ -268,7 +268,7 @@ unsafe fn int32 hostileStartupTests() {
     DynamicArray<Step> e = steps();
     e.add(item: Step::Send(bytes: early.bytes()));
     string em = failure(script: give e, conninfo: "user=u dbname=d");
-    f = f + check(ok: em.contains(substring: "expected authentication request from server"), what: "hostile: ReadyForQuery before authentication: ".concat(other: em));
+    f = f + check(ok: em.equals(other: "expected authentication request from server, but received Z"), what: "hostile: ReadyForQuery before authentication, in libpq's words: ".concat(other: em));
 
     // A length no server sends.
     Wire huge = Wire.make();
@@ -278,7 +278,7 @@ unsafe fn int32 hostileStartupTests() {
     DynamicArray<Step> hg = steps();
     hg.add(item: Step::Send(bytes: huge.bytes()));
     string hm = failure(script: give hg, conninfo: "user=u dbname=d");
-    f = f + check(ok: hm.contains(substring: "over the 1 GiB limit"), what: "hostile: a 2 GiB length is refused before anything is allocated: ".concat(other: hm));
+    f = f + check(ok: hm.equals(other: "received invalid authentication request"), what: "hostile: an authentication request over 2000 bytes is refused on its header: ".concat(other: hm));
 
     // A message cut short, then the end of the stream.
     Wire cut = Wire.make();
@@ -529,8 +529,104 @@ unsafe fn int32 notificationTests() {
     return f;
 }
 
+// libpq's checks on a message header (fe-connect.c before authentication, fe-protocol3.c after it), through a
+// connection: each refusal in libpq's words, and a long type still read.
+unsafe fn int32 headerTests() {
+    int32 f = 0;
+    // A NoticeResponse before authentication: PQconnectPoll accepts only R, E and v.
+    Wire notice = Wire.make(); notice.report(tag: 78ui8, severity: "NOTICE", code: "00000", message: "hello");
+    DynamicArray<Step> n = steps();
+    n.add(item: Step::Send(bytes: notice.bytes()));
+    string nm = failure(script: give n, conninfo: "user=u dbname=d");
+    f = f + check(ok: nm.equals(other: "expected authentication request from server, but received N"), what: "header: a NoticeResponse before authentication: ".concat(other: nm));
+
+    // A pre-3.0 server's error: the text after the 'E', to its NUL.
+    DynamicArray<uint8> old = DynamicArray.empty();
+    string oldText = "Eprotocol version 2 error triggered";
+    foreach (uint8 b in oldText) { old.add(item: b); }
+    old.add(item: 0ui8);
+    DynamicArray<Step> o = steps();
+    o.add(item: Step::Send(bytes: give old));
+    string om = failure(script: give o, conninfo: "user=u dbname=d");
+    f = f + check(ok: om.equals(other: "protocol version 2 error triggered"), what: "header: a pre-3.0 error is the server's text: ".concat(other: om));
+
+    // The same, with no NUL in 30000 bytes.
+    DynamicArray<uint8> endless = DynamicArray.empty();
+    endless.add(item: 69ui8);
+    isize i = 0;
+    while (i < 30001) { endless.add(item: 120ui8); i = i + 1; }
+    DynamicArray<Step> en = steps();
+    en.add(item: Step::Send(bytes: give endless));
+    string enm = failure(script: give en, conninfo: "user=u dbname=d");
+    f = f + check(ok: enm.equals(other: "received invalid error message"), what: "header: a pre-3.0 error with no end: ".concat(other: enm));
+
+    // An ErrorResponse before authentication whose fields do not parse.
+    DynamicArray<uint8> torn = DynamicArray.empty();
+    torn.add(item: 69ui8); torn.add(item: 0ui8); torn.add(item: 0ui8); torn.add(item: 0ui8); torn.add(item: 8ui8);
+    torn.add(item: 120ui8); torn.add(item: 120ui8); torn.add(item: 120ui8); torn.add(item: 120ui8);
+    DynamicArray<Step> tn = steps();
+    tn.add(item: Step::Send(bytes: give torn));
+    string tnm = failure(script: give tn, conninfo: "user=u dbname=d");
+    f = f + check(ok: tnm.equals(other: "received invalid error message"), what: "header: an ErrorResponse that does not parse, before authentication: ".concat(other: tnm));
+
+    // In a session: a short type over 30000 bytes is lost synchronization, and the session ends.
+    DynamicArray<uint8> bigZ = DynamicArray.empty();
+    bigZ.add(item: 90ui8); bigZ.add(item: 0ui8); bigZ.add(item: 0ui8); bigZ.add(item: 117ui8); bigZ.add(item: 49ui8);
+    DynamicArray<Step> z = steps();
+    z.add(item: Step::Send(bytes: give bigZ));
+    Result<Connection, PgError> zr = session(afterStartup: give z);
+    match (give zr) {
+        case Ok(value: c): {
+            Result<DynamicArray<Rows>, PgError> q = c.simpleQuery(sql: "select");
+            string zm = match (q) { case Ok(value: v): "succeeded"; case Err(error: e): e.message(); };
+            f = f + check(ok: zm.equals(other: "lost synchronization with server: got message type \"Z\", length 30001") && c.isClosed(), what: "header: a ReadyForQuery over 30000 bytes ends the session: ".concat(other: zm));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "header: connect for the long Z"); }
+    };
+
+    // A ParameterStatus over 30000 bytes (PostgreSQL 18 reports search_path) is lost synchronization in a session too.
+    DynamicArray<uint8> filler = DynamicArray.empty();
+    i = 0;
+    while (i < 30000) { filler.add(item: 120ui8); i = i + 1; }
+    Wire param = Wire.make();
+    param.longParameter(name: "search_path", value: filler.view());
+    param.complete(tag: "SET"); param.ready(status: 73ui8);
+    DynamicArray<Step> ps = steps();
+    ps.add(item: Step::Send(bytes: param.bytes()));
+    Result<Connection, PgError> pr = session(afterStartup: give ps);
+    match (give pr) {
+        case Ok(value: c): {
+            Result<DynamicArray<Rows>, PgError> q = c.simpleQuery(sql: "set search_path = ...");
+            string pm = match (q) { case Ok(value: v): "succeeded"; case Err(error: e): e.message(); };
+            f = f + check(ok: pm.equals(other: "lost synchronization with server: got message type \"S\", length 30017") && c.isClosed(), what: "header: a ParameterStatus over 30000 bytes in a session: ".concat(other: pm));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "header: connect for the long S"); }
+    };
+
+    // A NoticeResponse over 30000 bytes is a long type: read, and the query goes on.
+    Wire bigN = Wire.make();
+    string longMessage = "";
+    i = 0;
+    while (i < 3001) { longMessage = longMessage.concat(other: "0123456789"); i = i + 1; }
+    bigN.report(tag: 78ui8, severity: "NOTICE", code: "00000", message: longMessage);
+    bigN.complete(tag: "SELECT 0"); bigN.ready(status: 73ui8);
+    DynamicArray<Step> ns = steps();
+    ns.add(item: Step::Send(bytes: bigN.bytes()));
+    Result<Connection, PgError> nr = session(afterStartup: give ns);
+    match (give nr) {
+        case Ok(value: c): {
+            Result<DynamicArray<Rows>, PgError> q = c.simpleQuery(sql: "select");
+            string qm = match (q) { case Ok(value: v): "succeeded"; case Err(error: e): e.message(); };
+            f = f + check(ok: qm.equals(other: "succeeded") && !c.isClosed(), what: "header: a NoticeResponse over 30000 bytes is read: ".concat(other: qm));
+        }
+        case Err(error: e): { f = f + check(ok: false, what: "header: connect for the long N"); }
+    };
+    return f;
+}
+
 unsafe fn int32 connectionTests() {
     int32 f = 0;
+    f = f + headerTests();
     f = f + notificationTests();
     f = f + authenticationTests();
     f = f + negotiationTests();

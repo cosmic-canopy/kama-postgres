@@ -51,7 +51,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1 and the port to kama 0.9.673 done; S2 next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1 and the port to kama 0.9.673 done; S2 under way (S2a done) |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -125,12 +125,24 @@ it fail.
   - `typed_test.kama`'s `jsonValueTests` reads a column and a row into std's `JsonValue`. That program fails to build
     on 0.9.667.
   - The README's known issue is gone.
-- **S2, hardening.**
-  - libpq's rule that a message of a short type over 30000 bytes is "lost synchronization with server" (fe-protocol3.c).
-  - Bounds, each configurable: the read buffer that grows while a write waits, the notification queue, the
-    ParameterStatus count, and an optional limit on a buffered result (off by default).
-  - `tools/pg.sh restart|stop|start`, and restart tests, with libpq's words, over TLS too.
-  - Seeded mutations of every scripted reply. Each must end in a `PgError`, never a panic.
+- **S2, hardening**, in four commits, in this order (planned with the maintainer on 2026-10-19):
+  - **S2a, done: libpq's checks on a message header.** `frame(buf, framing)` checks a header as libpq does where it
+    is read (`Framing::Startup`, `Session`, `CopyOut`), on the header alone:
+    - in a session, a length under 4, or over 30000 for a type outside `VALID_LONG_MESSAGE_TYPE`, is "lost
+      synchronization", and during COPY OUT a ParameterStatus may be long (getCopyDataMessage);
+    - before authentication, only R, E and v, checked on the first byte, R and v within 8–2000 bytes, and an E outside
+      8–30000 bytes read as a pre-3.0 error's text.
+
+    `tools/gen-libpq-tables.sh` reads the types, limits and messages from the pinned fe-protocol3.c, fe-connect.c and
+    protocol.h (`src/protocol/framing.kama`), and works out libpq's outcome for every type and length in each place
+    (`tests/unit/src/framing_vectors.kama`). The buffer grows only as bytes arrive. Live: PostgreSQL 18 reports
+    `search_path`, and one over 30000 bytes loses synchronization here as it does in psql.
+  - **S2d, next: seeded mutations of every scripted reply.** Each must end in a `PgError`, never a panic.
+  - **S2b: bounds, each configurable** (an `Optional`, None turning it off): the read buffer that grows while a write
+    waits, the notification queue (the oldest dropped, with a warning and a count), the ParameterStatus count, and an
+    optional limit on a buffered result (off by default; the rest is read and dropped, and the session kept).
+  - **S2c: `tools/pg.sh restart|stop|start`, and restart tests**, with libpq's words, over TLS too, driven from the
+    test program through `std::process::Command`.
 - **S3, the pool** (`src/pool/`).
   - **Shape.** One `Channel<Slot>` (`Idle(conn, since, born)` or `Empty`) plus a permit channel. That bounds the total
     with no atomic and no mutex, and lets a sequential user keep one connection.

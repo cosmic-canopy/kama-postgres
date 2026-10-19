@@ -20,6 +20,21 @@ All notable changes to this package are recorded here. The format follows
     failure is reported to the caller. A failed reset closes the connection.
   - Notifications already received are dropped.
 - A row or a column reads into std's `JsonValue`, now that a program can import std's JSON beside this package.
+- **libpq's checks on a message header**, made on the header alone, before the body is waited for or room is made
+  for it:
+  - in a session, a length under 4, or over 30000 for a type that is never that long, is "lost synchronization with
+    server: got message type "%c", length %d", and the session ends (fe-protocol3.c). The long types are libpq's
+    `VALID_LONG_MESSAGE_TYPE`; during COPY OUT a ParameterStatus may be long too, as libpq's COPY reader takes it.
+    PostgreSQL 18 reports `search_path`, so a `SET search_path` over 30000 bytes now ends the session here as it does
+    in libpq;
+  - before authentication, only an authentication request, NegotiateProtocolVersion or an error is accepted, checked
+    on its first byte, and the first two must be 8–2000 bytes ("received invalid authentication request", "received
+    invalid protocol negotiation message"). An ErrorResponse outside 8–30000 bytes is a pre-3.0 server's error text,
+    read to its NUL as libpq reads it, and one that does not parse is "received invalid error message";
+  - the type byte in libpq's messages prints as C's `%c` prints it (a NUL ends the message there).
+
+  The long types, the limits and the messages are read from libpq's source by `tools/gen-libpq-tables.sh`
+  (`src/protocol/framing.kama`), and the unit tests check every type and length in each place against libpq's outcome.
 
 ### Changed
 - **Needs kama ≥ 0.9.673.** It is the first release in which:
@@ -37,6 +52,11 @@ All notable changes to this package are recorded here. The format follows
   - BEGIN's options are `tx.setOptions(options:)`, since a mint takes no arguments, and BEGIN's outcome is
     `tx.began()`, since a mint cannot return a Result.
 - **Needs `@kama/tls` ≥ 0.1.3**, the first whose `TlsError` is `Sendable`.
+- **Breaking:** `postgres::protocol::frame` takes a `Framing` (`Startup`, `Session` or `CopyOut`), and `Frame` has an
+  `OldError` case. A header libpq refuses is `ProtocolError::SyncLost(tag, length)`, its length signed as libpq reads it.
+- The receive buffer grows only as a message's bytes arrive. A header that declares a 1 GiB message no longer costs
+  1 GiB before any of it has come.
+- A NoticeResponse before authentication is refused, as libpq refuses it. A server sends none there.
 - `PgError` is `Sendable`, and so are `ServerError`, `ConnectError`, `ConnectAttempt`, `ProtocolError` and
   `ErrorFields`, so an error can cross isolates (a `Channel<PgError>`, or a `Sendable` type that holds one).
 

@@ -122,6 +122,10 @@ type resource Wire {
     public fn void parameter(const ref string name, const ref string value) {
         this.w.begin(tag: 83ui8); bool a = this.w.putCString(s: name); bool b = this.w.putCString(s: value); this.w.end();
     }
+    // A ParameterStatus whose value is given as bytes, however long.
+    public fn void longParameter(const ref string name, ConstView<uint8> value) {
+        this.w.begin(tag: 83ui8); bool a = this.w.putCString(s: name); this.w.putBytes(b: value); this.w.putU8(v: 0ui8); this.w.end();
+    }
     public fn void backendKey(int32 pid, isize keyLength) {
         this.w.begin(tag: 75ui8); this.w.putI32(v: pid);
         isize i = 0;

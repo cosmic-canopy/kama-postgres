@@ -81,7 +81,9 @@ release it is built and tested with, and the first with everything this package 
     - for the session reset, Npgsql's own source (`tools/gen-reset-vectors.sh`): its statements, their version gates,
       and DISCARD ALL.
 
-    A message this client prints is libpq's message, compared exactly. The one exception is where libpq quotes
+    A message this client prints is libpq's message, compared exactly. Where libpq prints a type byte with `%c`, the
+    byte prints as C prints it, through `postgres::protocol::cFormat`: an ASCII byte as itself, a NUL ending the message
+    there, and any other byte as U+FFFD, since a message here is UTF-8. The one exception is where libpq quotes
     OpenSSL ("SSL error: %s", "could not load private key file \"%s\": %s"): there the frame is libpq's and the words are
     @kama/tls's, and the tests compare the frame (`sameAsLibpq` in tests/integration/src/tls_libpq_test.kama).
   - The unit tests' FakeServer runs Mbed TLS as the server when made with `secure`, and plays the server
@@ -258,6 +260,10 @@ release it is built and tested with, and the first with everything this package 
     that is why the error types (and `@kama/tls`'s `TlsError`) declare it.
 
 - **Nothing from the server is trusted.**
+  - Every header is checked as libpq checks it, on the header alone (`frame(buf, framing)`, with the rules generated
+    from libpq's source into `src/protocol/framing.kama`): a short type over 30000 bytes is lost synchronization, and
+    startup accepts only R, E and v, each within libpq's bounds.
+  - The buffer grows only as bytes arrive, never to a length a header merely declares.
   - Every length is bounded before it is used.
   - Every text field is validated as UTF-8.
   - A malformed message is `PgError::Protocol`, never a panic. The unit tests feed truncated and oversized

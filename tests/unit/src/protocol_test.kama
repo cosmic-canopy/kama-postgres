@@ -10,7 +10,9 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::protocol::bind, postgres::protocol::execute, postgres::protocol::describePortal,
          postgres::protocol::closeStatement, postgres::protocol::sync, postgres::protocol::saslInitialResponse,
          postgres::protocol::password,
-         postgres::protocol::Frame, postgres::protocol::frame, postgres::protocol::decode,
+         postgres::protocol::Frame, postgres::protocol::Framing, postgres::protocol::frame, postgres::protocol::decode,
+         postgres::protocol::cFormat, std::fmt::parse as parseNumber, std::fmt::ParseError,
+         postgres_unit_tests::framingLengths, postgres_unit_tests::framingRules,
          postgres::protocol::BackendMessage, postgres::protocol::FieldDescription, postgres::protocol::RowValues,
          postgres::protocol::ErrorFields,
          postgres_unit_tests::check };
@@ -130,21 +132,150 @@ fn int32 frontendTests() {
 
 fn bool isIncomplete(Frame fr, isize needed) { return match (fr) { case Incomplete(needed: n): n == needed; case _: false; }; }
 fn bool isComplete(Frame fr, uint8 tag, isize total) { return match (fr) { case Complete(tag: t, total: n): t == tag && n == total; case _: false; }; }
-fn bool isBadLength(Frame fr) { return match (fr) { case Invalid(error: e): match (e) { case BadLength(tag: t, length: n): true; case _: false; }; case _: false; }; }
 fn bool isTooLarge(Frame fr) { return match (fr) { case Invalid(error: e): match (e) { case TooLarge(tag: t, length: n): true; case _: false; }; case _: false; }; }
+fn string invalidText(Frame fr) { return match (fr) { case Invalid(error: e): e.message(); case _: "(not invalid)"; }; }
 
-fn int32 framingTests() {
+// What a header came to, as framing_vectors.kama spells libpq's outcome: o reads on, s is lost synchronization, x is not
+// an authentication request, a and n an invalid authentication request or protocol negotiation, e a pre-3.0 error.
+fn string letterOf(Frame fr) {
+    return match (fr) {
+        case Incomplete(needed: n): "o";
+        case Complete(tag: t, total: n): "o";
+        case OldError: "e";
+        case Invalid(error: e): violationLetter(e: e);
+    };
+}
+
+fn string violationLetter(const ref ProtocolError e) {
+    return match (e) {
+        case SyncLost(tag: t, length: n): "s";
+        case Violation(detail: d): {
+            if (d.startsWith(prefix: "expected authentication request from server, but received")) { return "x"; }
+            if (d.equals(other: "received invalid authentication request")) { return "a"; }
+            if (d.equals(other: "received invalid protocol negotiation message")) { return "n"; }
+            := "?";
+        }
+        case _: "?";
+    };
+}
+
+fn DynamicArray<uint8> headerOf(uint8 tag, int32 length) {
+    DynamicArray<uint8> h = DynamicArray.empty();
+    h.add(item: tag);
+    h.add(item: truncate<uint8>(length >> 24)); h.add(item: truncate<uint8>(length >> 16));
+    h.add(item: truncate<uint8>(length >> 8)); h.add(item: truncate<uint8>(length));
+    return h;
+}
+
+fn Framing framingNamed(const ref string place) {
+    if (place.equals(other: "Startup")) { return Framing::Startup; }
+    if (place.equals(other: "CopyOut")) { return Framing::CopyOut; }
+    return Framing::Session;
+}
+
+// The outcomes framing_vectors.kama gives a type in a place: its own rule's, or the place's "*" rule.
+fn string outcomesFor(const ref DynamicArray<string> rules, const ref string place, uint8 tag) {
+    string rest = "";
+    isize i = 0;
+    while (i < rules.length()) {
+        DynamicArray<string> parts = DynamicArray.empty();
+        string rule = copy rules[i];
+        foreach (string p in rule.split(separator: "|")) { parts.add(item: give p); }
+        if (parts[0].equals(other: place)) {
+            if (parts[1].equals(other: "*")) { rest = copy parts[2]; }
+            else {
+                string types = copy parts[1];
+                foreach (string t in types.split(separator: " ")) {
+                    Result<int32, ParseError> n = parseNumber::<int32>(s: t);
+                    bool named = match (n) { case Ok(value: v): v == cast<int32>(tag); case Err(error: e): false; };
+                    if (named) { return copy parts[2]; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return rest;
+}
+
+// Every type × every length of framing_vectors.kama × the three places, against libpq's outcome.
+unsafe fn int32 framingVectorTests() {
+    int32 f = 0;
+    DynamicArray<int32> lengths = framingLengths();
+    DynamicArray<string> rules = framingRules();
+    DynamicArray<string> places = DynamicArray.empty();
+    places.add(item: "Startup"); places.add(item: "Session"); places.add(item: "CopyOut");
+    isize checked = 0;
+    isize wrong = 0;
+    string first = "";
+    isize p = 0;
+    while (p < places.length()) {
+        Framing framing = framingNamed(place: places[p]);
+        int32 t = 0;
+        while (t < 256) {
+            uint8 tag = cast<uint8>(t);
+            string want = outcomesFor(rules: rules, place: places[p], tag: tag);
+            isize li = 0;
+            while (li < lengths.length()) {
+                DynamicArray<uint8> h = headerOf(tag: tag, length: lengths[li]);
+                string got = letterOf(fr: frame(buf: h.view(), framing: framing));
+                string expect = want.substring(start: li, end: li + 1);
+                checked = checked + 1;
+                if (!got.equals(other: expect)) {
+                    if (wrong == 0) {
+                        int32 n = lengths[li];
+                        first = places[p].concat(other: " type ${t} length ${n}: got ").concat(other: got).concat(other: ", libpq ").concat(other: expect);
+                    }
+                    wrong = wrong + 1;
+                }
+                li = li + 1;
+            }
+            t = t + 1;
+        }
+        p = p + 1;
+    }
+    f = f + check(ok: checked == 3 * 256 * lengths.length() && wrong == 0, what: "frame: every type and length in each place, as libpq decides it: ".concat(other: first));
+    return f;
+}
+
+unsafe fn int32 framingTests() {
     int32 f = 0;
     DynamicArray<uint8> nothing = DynamicArray.empty();
-    f = f + check(ok: isIncomplete(fr: frame(buf: nothing.view()), needed: 5), what: "frame: an empty buffer needs a header");
+    f = f + check(ok: isIncomplete(fr: frame(buf: nothing.view(), framing: Framing::Session), needed: 5), what: "frame: an empty buffer needs a header");
     DynamicArray<uint8> header = unhex(text: "5a 00000005");
-    f = f + check(ok: isIncomplete(fr: frame(buf: header.view()), needed: 6), what: "frame: a header alone needs its body");
+    f = f + check(ok: isIncomplete(fr: frame(buf: header.view(), framing: Framing::Session), needed: 6), what: "frame: a header alone needs its body");
     DynamicArray<uint8> ready = unhex(text: "5a 00000005 49 5a");
-    f = f + check(ok: isComplete(fr: frame(buf: ready.view()), tag: 90ui8, total: 6), what: "frame: one whole message, with the next one's first byte after it");
+    f = f + check(ok: isComplete(fr: frame(buf: ready.view(), framing: Framing::Session), tag: 90ui8, total: 6), what: "frame: one whole message, with the next one's first byte after it");
     DynamicArray<uint8> tiny = unhex(text: "5a 00000003 00");
-    f = f + check(ok: isBadLength(fr: frame(buf: tiny.view())), what: "frame: a length under 4 is invalid");
+    string tm = invalidText(fr: frame(buf: tiny.view(), framing: Framing::Session));
+    f = f + check(ok: tm.equals(other: "lost synchronization with server: got message type \"Z\", length 3"), what: "frame: a length under 4 is lost synchronization, in libpq's words: ".concat(other: tm));
+    DynamicArray<uint8> negative = unhex(text: "44 ffffffff");
+    string nm = invalidText(fr: frame(buf: negative.view(), framing: Framing::Session));
+    f = f + check(ok: nm.equals(other: "lost synchronization with server: got message type \"D\", length -1"), what: "frame: a length is signed, as libpq's msgLength is: ".concat(other: nm));
+    DynamicArray<uint8> overShort = unhex(text: "5a 00007531");
+    string lm = invalidText(fr: frame(buf: overShort.view(), framing: Framing::Session));
+    f = f + check(ok: lm.equals(other: "lost synchronization with server: got message type \"Z\", length 30001"), what: "frame: a short type over 30000 bytes: ".concat(other: lm));
     DynamicArray<uint8> huge = unhex(text: "44 7fffffff");
-    f = f + check(ok: isTooLarge(fr: frame(buf: huge.view())), what: "frame: a length over 1 GiB is refused before anything is allocated");
+    f = f + check(ok: isTooLarge(fr: frame(buf: huge.view(), framing: Framing::Session)), what: "frame: a length over 1 GiB is refused before anything is allocated");
+    // A type is checked on its first byte before authentication, before its length has come.
+    DynamicArray<uint8> lone = unhex(text: "5a");
+    string zm = invalidText(fr: frame(buf: lone.view(), framing: Framing::Startup));
+    f = f + check(ok: zm.equals(other: "expected authentication request from server, but received Z"), what: "frame: startup refuses a type on its first byte: ".concat(other: zm));
+    DynamicArray<uint8> loneR = unhex(text: "52");
+    f = f + check(ok: isIncomplete(fr: frame(buf: loneR.view(), framing: Framing::Startup), needed: 5), what: "frame: startup waits for an authentication request's length");
+    // 'S' over 30000 bytes is taken during COPY OUT, as getCopyDataMessage takes it, and is lost synchronization elsewhere.
+    DynamicArray<uint8> bigS = unhex(text: "53 00007531");
+    f = f + check(ok: isIncomplete(fr: frame(buf: bigS.view(), framing: Framing::CopyOut), needed: 30002), what: "frame: a long ParameterStatus during COPY OUT");
+    f = f + check(ok: letterOf(fr: frame(buf: bigS.view(), framing: Framing::Session)).equals(other: "s"), what: "frame: a long ParameterStatus in a session");
+
+    // %c as C's printf prints it: the byte, U+FFFD for one that is not ASCII, and a NUL ends the text.
+    string fmt = "type \"%c\", length %d";
+    string plain = cFormat(format: fmt, c: 90ui8, d: -7);
+    string high = cFormat(format: fmt, c: 200ui8, d: 5);
+    string nul = cFormat(format: fmt, c: 0ui8, d: 5);
+    f = f + check(ok: plain.equals(other: "type \"Z\", length -7"), what: "cFormat: %c and a negative %d: ".concat(other: plain));
+    f = f + check(ok: high.equals(other: "type \"\u{FFFD}\", length 5"), what: "cFormat: a byte that is not ASCII: ".concat(other: high));
+    f = f + check(ok: nul.equals(other: "type \""), what: "cFormat: a NUL ends the text, as in C: ".concat(other: nul));
+    f = f + framingVectorTests();
     return f;
 }
 
@@ -159,7 +290,7 @@ fn bool isErr(Result<BackendMessage, ProtocolError> r) { return match (give r) {
 
 fn bool errIs(Result<BackendMessage, ProtocolError> r, int32 kind) {
     ProtocolError e = match (give r) { case Ok(value: m): { return false; } case Err(error: x): give x; };
-    int32 k = match (e) { case Truncated(tag: t): 1; case BadLength(tag: t, length: n): 2; case TooLarge(tag: t, length: n): 3;
+    int32 k = match (e) { case Truncated(tag: t): 1; case BadLength(tag: t, length: n): 2; case SyncLost(tag: t, length: n): 2; case TooLarge(tag: t, length: n): 3;
                           case Unexpected(tag: t): 4; case NotUtf8(tag: t): 5; case Malformed(tag: t, what: w): 6; case Violation(detail: d): 7; };
     return k == kind;
 }
@@ -307,7 +438,7 @@ fn int32 robustnessTests() {
     return f;
 }
 
-fn int32 protocolTests() {
+unsafe fn int32 protocolTests() {
     int32 f = 0;
     f = f + frontendTests();
     f = f + framingTests();

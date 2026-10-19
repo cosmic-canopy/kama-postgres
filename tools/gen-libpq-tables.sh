@@ -7,8 +7,14 @@
 #                                       StartupMessage (EnvironmentOptions, e.g. PGTZ -> timezone)
 #   tests/unit/src/uri_vectors.kama     libpq's URI regression cases (src/interfaces/libpq/t/001_uri.pl): the
 #                                       input, what libpq_uri_regress prints, and the error it reports
+#   src/protocol/framing.kama           libpq's checks on a backend message's header: the types that may be long
+#                                       (VALID_LONG_MESSAGE_TYPE), the ones getCopyDataMessage takes during COPY OUT,
+#                                       the startup bounds (PQconnectPoll's CONNECTION_AWAITING_RESPONSE), and the
+#                                       messages, as libpq's format strings
+#   tests/unit/src/framing_vectors.kama what libpq does with a header of each type and length, in each place it
+#                                       reads one, worked out from the same source by this script
 #
-# Both generated files are committed. This script is how they were made, and how they are checked: run it, and
+# Every generated file is committed. This script is how they were made, and how they are checked: run it, and
 # `git diff` must be empty. The PostgreSQL source is pinned to one commit of REL_18_STABLE, and each file by
 # SHA256. PG_SRC_DIR may name a directory holding fe-connect.c and 001_uri.pl already (hashes still checked).
 #
@@ -20,6 +26,8 @@ set -eu
 COMMIT=c45ba888d7af7b38e33832a0e240e34ca98ef866
 FE_CONNECT_SHA=44a6e386cbfd67ebe768d6ef5493098119c2e6b4796239d53e5ed7b122b206a5
 URI_TEST_SHA=91e1b99121e0117dd8d58336c9818ac941cbffb01455f74c3e0ef1217fe145e6
+FE_PROTOCOL3_SHA=0d0dab827459251bf529288e786d26a16ef817870fde556bd429ad919cd03464
+PROTOCOL_H_SHA=c22ee0a135f0c9153703897ab24036ea6a37b5c9eea73398d1bf8e6bf3c80790
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
@@ -32,6 +40,8 @@ fetch() {  # fetch <path in the postgres tree> <local name> <sha256>
 }
 fetch src/interfaces/libpq/fe-connect.c fe-connect.c "$FE_CONNECT_SHA"
 fetch src/interfaces/libpq/t/001_uri.pl 001_uri.pl "$URI_TEST_SHA"
+fetch src/interfaces/libpq/fe-protocol3.c fe-protocol3.c "$FE_PROTOCOL3_SHA"
+fetch src/include/libpq/protocol.h protocol.h "$PROTOCOL_H_SHA"
 
 # A kama string literal: backslash and double quote escaped; "${" cannot appear in these inputs (checked).
 mkdir -p "$ROOT/src/conninfo"
@@ -115,4 +125,142 @@ perl -e '
     }
 ' "$tmp/001_uri.pl" "$COMMIT" > "$ROOT/tests/unit/src/uri_vectors.kama"
 
-echo "gen-libpq-tables: $(grep -c 'k.add' "$ROOT/src/conninfo/keywords.kama") keywords, $(grep -c 'e.add' "$ROOT/src/conninfo/keywords.kama") environment options, $(grep -c 'v.add' "$ROOT/tests/unit/src/uri_vectors.kama" | awk '{print $1/4}') URI cases (PostgreSQL ${COMMIT%${COMMIT#????????}})"
+# ---- framing: libpq's checks on a backend message header ------------------------------------------------------
+# The sources' own words are matched exactly, and the script dies if one has moved, rather than guessing.
+perl -0777 -e '
+    my ($p3, $fc, $ph) = map { local $/; open my $f, "<", $_ or die "$_"; <$f> } @ARGV[0 .. 2];
+    my $commit = $ARGV[3];
+    my $out = $ARGV[4];
+    my $vec = $ARGV[5];
+    my %byte;
+    while ($ph =~ /#define PqMsg_(\w+)\s+\x27(.)\x27/g) { $byte{$1} = ord($2); }
+    sub bytes_of { my @n = @_; map { exists $byte{$_} or die "no PqMsg_$_ in protocol.h"; $byte{$_} } @n; }
+
+    $p3 =~ /#define VALID_LONG_MESSAGE_TYPE\(id\) \\\n(.*?)\n\n/s or die "no VALID_LONG_MESSAGE_TYPE";
+    my @long = ($1 =~ /PqMsg_(\w+)/g);
+    @long >= 7 or die "only " . scalar(@long) . " long types";
+
+    $p3 =~ /\nvoid\npqParseInput3\(PGconn \*conn\)\n\{(.*?)\n\}\n/s or die "no pqParseInput3";
+    my $parse = $1;
+    $parse =~ /if \(msgLength < (\d+)\)\s*\{\s*handleSyncLoss\(conn, id, msgLength\);/ or die "no minimum length in pqParseInput3";
+    my $min = $1;
+    $parse =~ /if \(msgLength > (\d+) && !VALID_LONG_MESSAGE_TYPE\(id\)\)\s*\{\s*handleSyncLoss\(conn, id, msgLength\);/
+        or die "no short-type limit in pqParseInput3";
+    my $short = $1;
+    $parse =~ /libpq_append_conn_error\(conn, "(unexpected response from server; first received character was \\"%c\\")", id\);/
+        or die "no unexpected-response message";
+    my $unexpected = $1;
+
+    $p3 =~ /\nhandleSyncLoss\(PGconn \*conn, char id, int msgLength\)\n\{\n\s*libpq_append_conn_error\(conn, "((?:[^"\\]|\\.)*)",\s*id, msgLength\);/
+        or die "no handleSyncLoss";
+    my $syncloss = $1;
+
+    $p3 =~ /\ngetCopyDataMessage\(PGconn \*conn\)\n\{(.*?)\n\}\n/s or die "no getCopyDataMessage";
+    my $copy = $1;
+    $copy =~ /if \(msgLength < $min\)\s*\{\s*handleSyncLoss/ or die "getCopyDataMessage no longer checks the minimum";
+    $copy =~ /switch \(id\)\s*\{(.*?)case PqMsg_CopyDone:/s or die "no switch in getCopyDataMessage";
+    my @copyout = ($1 =~ /case PqMsg_(\w+):/g);
+    @copyout >= 3 or die "only " . scalar(@copyout) . " COPY OUT types";
+
+    $fc =~ /if \(beresp != PqMsg_(\w+) &&\s*beresp != PqMsg_(\w+) &&\s*beresp != PqMsg_(\w+)\)\s*\{\s*libpq_append_conn_error\(conn, "(expected authentication request from server, but received %c)",/
+        or die "no startup type check";
+    my @startup = ($1, $2, $3);
+    my $expected = $4;
+    $fc =~ /if \(beresp == PqMsg_AuthenticationRequest &&\s*\(msgLength < (\d+) \|\| msgLength > (\d+)\)\)\s*\{\s*libpq_append_conn_error\(conn, "([^"]+)"\);/
+        or die "no authentication request bounds";
+    my ($authMin, $authMax, $authText) = ($1, $2, $3);
+    $fc =~ /if \(beresp == PqMsg_NegotiateProtocolVersion &&\s*\(msgLength < (\d+) \|\| msgLength > (\d+)\)\)\s*\{\s*libpq_append_conn_error\(conn, "([^"]+)"\);/
+        or die "no protocol negotiation bounds";
+    my ($negMin, $negMax, $negText) = ($1, $2, $3);
+    $fc =~ /#define MAX_ERRLEN (\d+)\s*if \(beresp == PqMsg_ErrorResponse &&\s*\(msgLength < (\d+) \|\| msgLength > MAX_ERRLEN\)\)(.*?)#undef MAX_ERRLEN/s
+        or die "no startup error bounds";
+    my ($errMax, $errMin, $oldBody) = ($1, $2, $3);
+    $oldBody =~ /if \(avail > MAX_ERRLEN\)\s*\{\s*libpq_append_conn_error\(conn, "([^"]+)"\);/ or die "no pre-3.0 error limit";
+    my $errText = $1;
+    for my $t ($syncloss, $unexpected, $expected, $authText, $negText, $errText) { die "\${ in a message" if $t =~ /\$\{/; }
+
+    sub tests {
+        my @n = @_;
+        my $names = join(", ", map { sprintf("%s \x27%s\x27", $_, chr($byte{$_})) } @n);
+        return "    // $names\n    return " . join(" || ", map { sprintf("tag == %dui8", $_) } bytes_of(@n)) . ";\n";
+    }
+    open my $o, ">", $out or die;
+    print $o "// GENERATED by tools/gen-libpq-tables.sh from PostgreSQL REL_18_STABLE ($commit),\n";
+    print $o "// src/interfaces/libpq/fe-protocol3.c, fe-connect.c and src/include/libpq/protocol.h. Do not edit: change the\n";
+    print $o "// script and run it again.\n//\n";
+    print $o "// What libpq believes of a backend message header before it reads the body. Its messages are kept as libpq\x27s\n";
+    print $o "// format strings, which postgres::protocol::cFormat prints as C\x27s printf does.\n";
+    print $o "export { isLongMessageType, isCopyOutMessageType, isStartupMessageType, MIN_MESSAGE_LENGTH, SHORT_MESSAGE_LIMIT,\n";
+    print $o "         AUTH_REQUEST_MIN, AUTH_REQUEST_MAX, NEGOTIATE_MIN, NEGOTIATE_MAX, STARTUP_ERROR_MIN, STARTUP_ERROR_MAX,\n";
+    print $o "         syncLossFormat, unexpectedFormat, expectedAuthFormat, invalidAuthText, invalidNegotiationText,\n";
+    print $o "         invalidErrorText };\n\n";
+    print $o "// The types whose length may be over SHORT_MESSAGE_LIMIT (VALID_LONG_MESSAGE_TYPE).\n";
+    print $o "fn bool isLongMessageType(uint8 tag) {\n" . tests(@long) . "}\n\n";
+    print $o "// The types getCopyDataMessage takes itself during COPY OUT, so with no check on a short type\x27s length.\n";
+    print $o "fn bool isCopyOutMessageType(uint8 tag) {\n" . tests(@copyout) . "}\n\n";
+    print $o "// The types PQconnectPoll accepts while it waits for an authentication request.\n";
+    print $o "fn bool isStartupMessageType(uint8 tag) {\n" . tests(@startup) . "}\n\n";
+    print $o "// pqParseInput3: a length under MIN_MESSAGE_LENGTH, or over SHORT_MESSAGE_LIMIT for a type that is not long, is\n";
+    print $o "// lost synchronization.\n";
+    print $o "comptime int32 MIN_MESSAGE_LENGTH = $min;\ncomptime int32 SHORT_MESSAGE_LIMIT = $short;\n";
+    print $o "// PQconnectPoll: an authentication request, a NegotiateProtocolVersion and an ErrorResponse before authentication\n";
+    print $o "// must have a length within these. An ErrorResponse outside them is a pre-3.0 server\x27s error text.\n";
+    print $o "comptime int32 AUTH_REQUEST_MIN = $authMin;\ncomptime int32 AUTH_REQUEST_MAX = $authMax;\n";
+    print $o "comptime int32 NEGOTIATE_MIN = $negMin;\ncomptime int32 NEGOTIATE_MAX = $negMax;\n";
+    print $o "comptime int32 STARTUP_ERROR_MIN = $errMin;\ncomptime int32 STARTUP_ERROR_MAX = $errMax;\n\n";
+    print $o "fn string syncLossFormat() { return \"$syncloss\"; }\n";
+    print $o "fn string unexpectedFormat() { return \"$unexpected\"; }\n";
+    print $o "fn string expectedAuthFormat() { return \"$expected\"; }\n";
+    print $o "fn string invalidAuthText() { return \"$authText\"; }\n";
+    print $o "fn string invalidNegotiationText() { return \"$negText\"; }\n";
+    print $o "fn string invalidErrorText() { return \"$errText\"; }\n";
+    close $o;
+
+    # The expected outcome for each place, type and length, worked out here from the values above.
+    my %isLong = map { $_ => 1 } bytes_of(@long);
+    my %isCopy = map { $_ => 1 } bytes_of(@copyout);
+    my %isStart = map { $_ => 1 } bytes_of(@startup);
+    my ($R, $v, $E) = bytes_of("AuthenticationRequest", "NegotiateProtocolVersion", "ErrorResponse");
+    my @lengths = (-1, 3, 4, 7, 8, 2000, 2001, 30000, 30001);
+    sub verdict {
+        my ($place, $t, $n) = @_;
+        if ($place eq "Startup") {
+            return "x" unless $isStart{$t};
+            return "a" if $t == $R && ($n < $authMin || $n > $authMax);
+            return "n" if $t == $v && ($n < $negMin || $n > $negMax);
+            return "e" if $t == $E && ($n < $errMin || $n > $errMax);
+            return "o";
+        }
+        return "s" if $n < $min;
+        return "o" if $place eq "CopyOut" && $isCopy{$t};
+        return "s" if $n > $short && !$isLong{$t};
+        return "o";
+    }
+    open my $w, ">", $vec or die;
+    print $w "// GENERATED by tools/gen-libpq-tables.sh from PostgreSQL REL_18_STABLE ($commit),\n";
+    print $w "// src/interfaces/libpq/fe-protocol3.c, fe-connect.c and src/include/libpq/protocol.h. Do not edit: change the\n";
+    print $w "// script and run it again.\n//\n";
+    print $w "// What libpq does with a message header of each type and length, in each place it reads one: Startup\n";
+    print $w "// (PQconnectPoll, waiting for an authentication request), Session (pqParseInput3) and CopyOut\n";
+    print $w "// (getCopyDataMessage). A rule is \"place|types|outcomes\": the types as decimal bytes, or * for every type no other\n";
+    print $w "// rule of that place names; one letter per length of framingLengths(): o reads on, s is lost synchronization, x is\n";
+    print $w "// not an authentication request, a an invalid authentication request, n an invalid protocol negotiation\n";
+    print $w "// message, e a pre-3.0 error.\n";
+    print $w "import { std::collections::DynamicArray };\nexport { framingLengths, framingRules };\n\n";
+    print $w "fn DynamicArray<int32> framingLengths() {\n    DynamicArray<int32> v = DynamicArray.empty();\n";
+    print $w "    v.add(item: $_);\n" for @lengths;
+    print $w "    return v;\n}\n\n";
+    print $w "fn DynamicArray<string> framingRules() {\n    DynamicArray<string> v = DynamicArray.empty();\n";
+    for my $place ("Startup", "Session", "CopyOut") {
+        my %group;
+        for my $t (0 .. 255) { push @{$group{join("", map { verdict($place, $t, $_) } @lengths)}}, $t; }
+        my @keys = sort { scalar(@{$group{$b}}) <=> scalar(@{$group{$a}}) || $a cmp $b } keys %group;
+        my $rest = shift @keys;
+        for my $k (sort @keys) { print $w "    v.add(item: \"$place|" . join(" ", @{$group{$k}}) . "|$k\");\n"; }
+        print $w "    v.add(item: \"$place|*|$rest\");\n";
+    }
+    print $w "    return v;\n}\n";
+    close $w;
+' "$tmp/fe-protocol3.c" "$tmp/fe-connect.c" "$tmp/protocol.h" "$COMMIT" "$ROOT/src/protocol/framing.kama" "$ROOT/tests/unit/src/framing_vectors.kama"
+
+echo "gen-libpq-tables: $(grep -c 'k.add' "$ROOT/src/conninfo/keywords.kama") keywords, $(grep -c 'e.add' "$ROOT/src/conninfo/keywords.kama") environment options, $(grep -c 'v.add' "$ROOT/tests/unit/src/uri_vectors.kama" | awk '{print $1/4}') URI cases, $(grep -c 'v.add(item: "' "$ROOT/tests/unit/src/framing_vectors.kama") framing rules (PostgreSQL ${COMMIT%${COMMIT#????????}})"

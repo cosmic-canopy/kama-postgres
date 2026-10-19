@@ -1,6 +1,9 @@
 import { std::collections::DynamicArray, std::collections::ConstView,
-         postgres::protocol::Cursor, postgres::protocol::ProtocolError, postgres::protocol::MAX_MESSAGE };
-export { Frame, frame, decode, BackendMessage, FieldDescription, RowValues, ErrorFields, CopyFormats,
+         postgres::protocol::Cursor, postgres::protocol::ProtocolError, postgres::protocol::MAX_MESSAGE,
+         postgres::protocol::cFormat, isLongMessageType, isCopyOutMessageType, isStartupMessageType, MIN_MESSAGE_LENGTH,
+         SHORT_MESSAGE_LIMIT, AUTH_REQUEST_MIN, AUTH_REQUEST_MAX, NEGOTIATE_MIN, NEGOTIATE_MAX, STARTUP_ERROR_MIN,
+         STARTUP_ERROR_MAX, expectedAuthFormat, invalidAuthText, invalidNegotiationText };
+export { Frame, Framing, frame, decode, BackendMessage, FieldDescription, RowValues, ErrorFields, CopyFormats,
          HEADER_BYTES };
 
 // Every message a server sends: framing a byte stream into messages, and decoding one message's body into
@@ -17,15 +20,44 @@ type enum Frame {
     // One whole message: its type byte, and its total size including the header.
     Complete(uint8 tag, isize total),
     // A header no server would send. The connection cannot recover its framing.
-    Invalid(ProtocolError error)
+    Invalid(ProtocolError error),
+    // Before authentication, an 'E' whose length is not an ErrorResponse's: a pre-3.0 server's error, which is the
+    // text after the 'E' up to a NUL.
+    OldError
 }
 
-fn Frame frame(ConstView<uint8> buf) {
-    if (buf.length() < HEADER_BYTES) { return Frame::Incomplete(needed: HEADER_BYTES); }
+// Where a header is read, which decides what libpq believes of it (postgres::protocol::framing has its rules):
+// waiting for an authentication request (PQconnectPoll), in a session (pqParseInput3), or during COPY OUT
+// (getCopyDataMessage), which takes its own messages without the check on a short type's length.
+type enum Framing implements Sendable { Startup, Session, CopyOut }
+
+// The checks are libpq's, in its order, and made on the header alone: a header no server would send is refused
+// before its body is waited for or room is made for it.
+unsafe fn Frame frame(ConstView<uint8> buf, Framing framing) {
+    if (buf.length() < 1) { return Frame::Incomplete(needed: HEADER_BYTES); }
     uint8 tag = buf[0];
-    int64 len = (cast<int64>(buf[1]) << 24) | (cast<int64>(buf[2]) << 16) | (cast<int64>(buf[3]) << 8) | cast<int64>(buf[4]);
-    if (len < 4i64) { return Frame::Invalid(error: ProtocolError::BadLength(tag: tag, length: len)); }
-    if (len > MAX_MESSAGE) { return Frame::Invalid(error: ProtocolError::TooLarge(tag: tag, length: len)); }
+    bool startup = match (framing) { case Startup: true; case _: false; };
+    bool copyOut = match (framing) { case CopyOut: true; case _: false; };
+    if (startup && !isStartupMessageType(tag: tag)) {
+        return Frame::Invalid(error: ProtocolError::Violation(detail: cFormat(format: expectedAuthFormat(), c: tag, d: 0)));
+    }
+    if (buf.length() < HEADER_BYTES) { return Frame::Incomplete(needed: HEADER_BYTES); }
+    uint32 word = (cast<uint32>(buf[1]) << 24) | (cast<uint32>(buf[2]) << 16) | (cast<uint32>(buf[3]) << 8) | cast<uint32>(buf[4]);
+    int32 len = truncate<int32>(word);   // libpq's msgLength is a signed int
+    if (startup) {
+        if (tag == 82ui8 && (len < AUTH_REQUEST_MIN || len > AUTH_REQUEST_MAX)) {            // 'R'
+            return Frame::Invalid(error: ProtocolError::Violation(detail: invalidAuthText()));
+        }
+        if (tag == 118ui8 && (len < NEGOTIATE_MIN || len > NEGOTIATE_MAX)) {                 // 'v'
+            return Frame::Invalid(error: ProtocolError::Violation(detail: invalidNegotiationText()));
+        }
+        if (tag == 69ui8 && (len < STARTUP_ERROR_MIN || len > STARTUP_ERROR_MAX)) { return Frame::OldError; }   // 'E'
+    } else {
+        if (len < MIN_MESSAGE_LENGTH) { return Frame::Invalid(error: ProtocolError::SyncLost(tag: tag, length: len)); }
+        bool mayBeLong = isLongMessageType(tag: tag) || (copyOut && isCopyOutMessageType(tag: tag));
+        if (len > SHORT_MESSAGE_LIMIT && !mayBeLong) { return Frame::Invalid(error: ProtocolError::SyncLost(tag: tag, length: len)); }
+    }
+    if (cast<int64>(len) > MAX_MESSAGE) { return Frame::Invalid(error: ProtocolError::TooLarge(tag: tag, length: cast<int64>(len))); }
     isize total = cast<isize>(len) + 1;
     if (buf.length() < total) { return Frame::Incomplete(needed: total); }
     return Frame::Complete(tag: tag, total: total);

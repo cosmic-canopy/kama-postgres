@@ -9,6 +9,7 @@ import { std::collections::DynamicArray, std::collections::ConstView, std::encod
          postgres::logNotice, postgres::Rows,
          postgres::wire::Wire, postgres::wire::Deadline, postgres::wire::strerror,
          postgres::protocol::MessageWriter, postgres::protocol::BackendMessage, postgres::protocol::ProtocolError,
+         postgres::protocol::Framing, postgres::protocol::cFormat, postgres::protocol::unexpectedFormat,
          postgres::protocol::FieldDescription, postgres::protocol::RowValues, postgres::protocol::ErrorFields,
          postgres::protocol::ScramClient, postgres::protocol::ChannelBinding, postgres::protocol::AuthError,
          postgres::protocol::md5Password, postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
@@ -84,6 +85,7 @@ type resource Connection implements Sendable, Transactional {
     int64 portals = 0i64;     // p0, p1, …
     Optional<TlsSession> tls;          // what TLS settled, when the session is encrypted
     bool refusedBeforeAuth = false;    // startup ended on an ErrorResponse before AuthenticationOk
+    Framing phase;                     // how a header is read: Startup until AuthenticationOk, then Session
     // How a cancel request reaches the server again: the route the connect took (None over a caller's transport),
     // and how connections are opened (this client's sockets, or the caller's Dialer).
     Optional<CancelRoute> route;
@@ -138,6 +140,7 @@ type resource Connection implements Sendable, Transactional {
         this.portals = 0i64;
         this.tls = Optional::None;
         this.refusedBeforeAuth = false;
+        this.phase = Framing::Startup;
         this.route = Optional::None;
         this.dialing = Opener.builtIn();
         this.timeoutSetting = Optional::None;
@@ -183,6 +186,7 @@ type resource Connection implements Sendable, Transactional {
         this.portals = 0i64;
         this.tls = Optional::None;
         this.refusedBeforeAuth = false;
+        this.phase = Framing::Startup;
         this.route = Optional::None;
         this.dialing = Opener.builtIn();
         this.timeoutSetting = Optional::None;
@@ -1425,7 +1429,7 @@ type resource Connection implements Sendable, Transactional {
         if (this.copyMode != 2ui8) { return Result::Err(error: PgError::Usage(detail: "no COPY in progress")); }
         this.arm();
         while (true) {
-            Result<BackendMessage, PgError> received = this.receive();
+            Result<BackendMessage, PgError> received = this.receiveAs(framing: Framing::CopyOut);
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };
             if (background(m: m)) { this.absorb(m: give m); continue; }
             match (give m) {
@@ -1570,7 +1574,7 @@ type resource Connection implements Sendable, Transactional {
     // what follows: read what has arrived, without waiting. Its error ends the COPY.
     unsafe fn Result<Unit, PgError> copyStillWanted() {
         while (true) {
-            Result<BackendMessage, PgError> r = this.wire.receive(deadline: Deadline.after(span: Duration.zero()));
+            Result<BackendMessage, PgError> r = this.wire.receive(deadline: Deadline.after(span: Duration.zero()), framing: this.phase);
             match (give r) {
                 case Ok(value: m): {
                     if (background(m: m)) { this.absorb(m: give m); continue; }
@@ -1646,9 +1650,12 @@ type resource Connection implements Sendable, Transactional {
 
     // The next message of a command's result, within the query timeout. When it passes, the command is cancelled, and
     // the server's answer is waited for until the grace passes too, which ends the session.
-    unsafe fn Result<BackendMessage, PgError> receive() {
+    unsafe fn Result<BackendMessage, PgError> receive() { return this.receiveAs(framing: this.phase); }
+
+    // The same, read as `framing` says: getCopyData reads as COPY OUT.
+    unsafe fn Result<BackendMessage, PgError> receiveAs(Framing framing) {
         while (true) {
-            Result<BackendMessage, PgError> r = this.wire.receive(deadline: this.due);
+            Result<BackendMessage, PgError> r = this.wire.receive(deadline: this.due, framing: framing);
             bool late = match (r) { case Err(error: e): isTimeout(e: e); case Ok(value: m): false; };
             if (!late) { return r; }
             if (this.cancelling) { return Result::Err(error: PgError::Timeout); }
@@ -2144,7 +2151,7 @@ type resource Connection implements Sendable, Transactional {
         if (this.pending.length() > 0) { return Result::Ok(value: Optional::Some(value: this.pending.remove(index: 0))); }
         Deadline until = match (timeout) { case Some(value: t): Deadline.after(span: t); case None: Deadline.none(); };
         while (true) {
-            Result<BackendMessage, PgError> received = this.wire.receive(deadline: until);
+            Result<BackendMessage, PgError> received = this.wire.receive(deadline: until, framing: this.phase);
             match (give received) {
                 case Ok(value: m): {
                     if (background(m: m)) { this.absorb(m: give m); }
@@ -2267,7 +2274,7 @@ type resource Connection implements Sendable, Transactional {
         int32 saslStage = 0;            // 0 none, 1 client-first sent, 2 client-final sent, 3 server verified
         DynamicArray<ScramClient> scram = DynamicArray.empty();   // zero or one
         while (true) {
-            Result<BackendMessage, PgError> received = this.wire.receive(deadline: deadline);
+            Result<BackendMessage, PgError> received = this.wire.receive(deadline: deadline, framing: this.phase);
             BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
             if (!authenticated) {
                 match (give m) {
@@ -2279,6 +2286,7 @@ type resource Connection implements Sendable, Transactional {
                             return Result::Err(error: PgError::Auth(detail: "server did not complete authentication: it sent AuthenticationOk before proving that it knows the password"));
                         }
                         authenticated = true;
+                        this.phase = Framing::Session;   // PQconnectPoll's CONNECTION_AUTH_OK reads through pqParseInput3
                     }
                     case AuthenticationCleartextPassword: {
                         Result<Unit, PgError> allowed = expected(config: config, code: AUTH_PASSWORD, finished: finished);
@@ -2351,9 +2359,9 @@ type resource Connection implements Sendable, Transactional {
                         this.refusedBeforeAuth = true;
                         return Result::Err(error: PgError::Server(error: ServerError.make(fields: give f)));
                     }
-                    case NoticeResponse(fields: f): { this.deliver(fields: give f); }
                     case _: {
-                        return Result::Err(error: violation(detail: "expected authentication request from server, but received a message of another kind"));
+                        // Unreachable: a header of any other type was refused as it was read (Framing::Startup).
+                        return Result::Err(error: violation(detail: "unexpected response from server: a message out of place before authentication"));
                     }
                 };
             } else {
@@ -2538,7 +2546,7 @@ type resource Connection implements Sendable, Transactional {
             case Err(error: e): {
                 bool io = match (e) { case Io(error: x): true; case Tls(detail: d, cause: c): true; case _: false; };
                 if (io) {
-                    Result<BackendMessage, PgError> waiting = this.wire.receive(deadline: Deadline.after(span: Duration.fromMillis(ms: 0i64)));
+                    Result<BackendMessage, PgError> waiting = this.wire.receive(deadline: Deadline.after(span: Duration.fromMillis(ms: 0i64)), framing: this.phase);
                     match (give waiting) {
                         case Ok(value: m): {
                             match (give m) {
@@ -2747,13 +2755,7 @@ fn PgError negotiation(const ref string what) { return violation(detail: what); 
 fn PgError violation(const ref string detail) { return PgError::Protocol(error: ProtocolError::Violation(detail: copy detail)); }
 
 // libpq's message for a message out of place, naming its type byte.
-unsafe fn string unexpected(uint8 tag) {
-    DynamicArray<uint8> one = DynamicArray.empty();
-    one.add(item: tag);
-    Result<string, Utf8Error> c = utf8Decode(bytes: one.view());
-    string shown = match (give c) { case Ok(value: s): give s; case Err(error: e): "?"; };
-    return "unexpected response from server; first received character was \"".concat(other: shown).concat(other: "\"");
-}
+unsafe fn string unexpected(uint8 tag) { return cFormat(format: unexpectedFormat(), c: tag, d: 0); }
 
 // pg_fe_sendauth's messages for a method this client does not speak.
 fn string unsupportedMethod(int32 code) {

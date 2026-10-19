@@ -19,9 +19,9 @@ import { std::collections::DynamicArray, std::collections::View, std::collection
          std::encoding::base64::DecodeError, std::encoding::utf8::decode as utf8Decode,
          std::encoding::utf8::Utf8Error, std::encoding::hex::encode as hexEncode, std::digest::pbkdf2, std::digest::sha256::Sha256,
          postgres_unit_tests::traceFrontend,
-         std::digest::sha256::hmacSha256, std::digest::sha256::sha256,
+         std::digest::sha256::hmacSha256, std::digest::sha256::sha256, std::random::Rng,
          postgres::Transport, postgres::PgError, postgres::protocol::MessageWriter, postgres::protocol::md5Password };
-export { FakeServer, Step, Wire, ServerSide };
+export { FakeServer, Step, Wire, ServerSide, Garble, GarbleKind };
 
 // What the server does with the next message from the client.
 type enum Step implements Sendable {
@@ -63,6 +63,35 @@ type enum Step implements Sendable {
     // A simple query asking a server's role, answered as a primary or a standby would: SHOW transaction_read_only
     // ("on" on a standby), anything else as pg_is_in_recovery() ("t" on a standby).
     AnswerRole(bool standby)
+}
+
+// What may be done to one reply (garble_test.kama).
+type enum GarbleKind implements Sendable {
+    FlipByte,      // one byte XORed with a non-zero mask
+    ShortLength,   // the length field set to 3
+    OverShort,     // the length field set to 30001, over libpq's limit for a short type
+    HugeLength,    // the length field set to 2^31 - 1
+    AnyLength,     // the length field set to any value
+    Truncate,      // the reply cut short, and the server gone after it
+    Retag,         // another type byte
+    Drop,          // the reply not sent
+    Duplicate,     // the reply sent twice
+    Insert         // up to 8 bytes put into the reply
+}
+
+// One seeded change to one reply of a fake: the `target`-th message it sends, counted from 0 over every message (-1
+// changes none), changed as `kind` says, with each choice drawn from `seed`.
+type value Garble implements Sendable {
+    uint64 seed = 0ui64;
+    isize target = -1;
+    GarbleKind kind;
+
+    public ctor of(uint64 seed, isize target, GarbleKind kind) { this.seed = seed; this.target = target; this.kind = kind; }
+    public ctor none() { this.seed = 0ui64; this.target = -1; this.kind = GarbleKind::FlipByte; }
+
+    public const fn uint64 seedOf() { return this.seed; }
+    public const fn isize targetOf() { return this.target; }
+    public const fn GarbleKind kindOf() { return this.kind; }
 }
 
 // The server's side of the TLS session: what the client sent waits in `inbound` for the engine, and what the engine
@@ -277,6 +306,13 @@ type resource FakeServer implements Transport, Sendable {
     isize backlog = -1;
     DynamicArray<uint8> held;   // a late reply (Step::Late), given to the client after one wait in vain
     DynamicArray<Sender<string>> tracer;   // zero or one: each message after startup, as PQtrace prints it
+    // A garbled server (garbled, garbledSecure): every reply goes through `garble`, and each message's number in the
+    // count goes to `replyCount` when there is one. Once a reply is cut short (`severed`), nothing more is sent.
+    bool garbling = false;
+    Garble garble;
+    isize replies = 0;
+    bool severed = false;
+    DynamicArray<Sender<isize>> replyCount;   // zero or one
 
     public ctor make(DynamicArray<Step> steps, isize chunk, isize writeLimit) {
         this.steps = give steps; this.next = 0;
@@ -290,6 +326,40 @@ type resource FakeServer implements Transport, Sendable {
         this.endPoint = DynamicArray.empty(); this.sniWanted = "";
         this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
         this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.garbling = false; this.garble = Garble.none(); this.replies = 0; this.severed = false; this.replyCount = DynamicArray.empty();
+    }
+
+    // `make`, with every reply sent through `garble`; each message's number goes to the one sender in `counts`, if any.
+    public ctor garbled(DynamicArray<Step> steps, isize chunk, isize writeLimit, Garble garble, DynamicArray<Sender<isize>> counts) {
+        this.steps = give steps; this.next = 0;
+        this.toClient = DynamicArray.empty(); this.readAt = 0;
+        this.fromClient = DynamicArray.empty(); this.parsedAt = 0;
+        this.startupSeen = false; this.hungUp = false;
+        this.chunk = chunk; this.writeLimit = writeLimit;
+        this.clientFirstBare = ""; this.serverFirst = ""; this.scramPassword = ""; this.gs2Header = "n,,";
+        this.tlsConfig = DynamicArray.empty(); this.engine = DynamicArray.empty();
+        this.tlsMode = false; this.established = false; this.directAccepted = false;
+        this.endPoint = DynamicArray.empty(); this.sniWanted = "";
+        this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.garbling = true; this.garble = garble; this.replies = 0; this.severed = false; this.replyCount = give counts;
+    }
+
+    // `secure`, garbled: the plaintext replies go through `garble` before they are encrypted.
+    public ctor garbledSecure(DynamicArray<Step> steps, isize chunk, isize writeLimit, TlsConfig config, Garble garble, DynamicArray<Sender<isize>> counts) {
+        this.steps = give steps; this.next = 0;
+        this.toClient = DynamicArray.empty(); this.readAt = 0;
+        this.fromClient = DynamicArray.empty(); this.parsedAt = 0;
+        this.startupSeen = false; this.hungUp = false;
+        this.chunk = chunk; this.writeLimit = writeLimit;
+        this.clientFirstBare = ""; this.serverFirst = ""; this.scramPassword = ""; this.gs2Header = "n,,";
+        this.tlsConfig = DynamicArray.empty(); this.tlsConfig.add(item: give config);
+        this.engine = DynamicArray.empty();
+        this.tlsMode = false; this.established = false; this.directAccepted = false;
+        this.endPoint = DynamicArray.empty(); this.sniWanted = "";
+        this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.garbling = true; this.garble = garble; this.replies = 0; this.severed = false; this.replyCount = give counts;
     }
 
     // `make`, telling `tracer` each message the client sends after its startup packet, as PQtrace prints it.
@@ -304,7 +374,8 @@ type resource FakeServer implements Transport, Sendable {
         this.tlsMode = false; this.established = false; this.directAccepted = false;
         this.endPoint = DynamicArray.empty(); this.sniWanted = "";
         this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
-        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty(); this.tracer.add(item: give tracer);
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.garbling = false; this.garble = Garble.none(); this.replies = 0; this.severed = false; this.replyCount = DynamicArray.empty(); this.tracer.add(item: give tracer);
     }
 
     // `make`, blocked on its own output past `backlog` bytes of unread replies (see `backlog`).
@@ -320,6 +391,7 @@ type resource FakeServer implements Transport, Sendable {
         this.endPoint = DynamicArray.empty(); this.sniWanted = "";
         this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
         this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = backlog; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.garbling = false; this.garble = Garble.none(); this.replies = 0; this.severed = false; this.replyCount = DynamicArray.empty();
     }
 
     // A server with TLS: it answers an SSLRequest 'S' and serves the script over `config` (and takes a direct
@@ -339,6 +411,7 @@ type resource FakeServer implements Transport, Sendable {
         this.endPoint = give endPoint; this.sniWanted = give sni;
         this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
         this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.garbling = false; this.garble = Garble.none(); this.replies = 0; this.severed = false; this.replyCount = DynamicArray.empty();
     }
 
     // A server in policy mode: TLS on (`config`, taking an SSLRequest or a direct ClientHello) or off, an injection
@@ -358,7 +431,9 @@ type resource FakeServer implements Transport, Sendable {
         this.tlsMode = false; this.established = false; this.directAccepted = sslOn;
         this.endPoint = DynamicArray.empty(); this.sniWanted = "";
         this.policy = true; this.injection = give injection; this.hbaTypes = give types; this.hbaUsers = give users;
-        this.overSocket = socket; this.events = DynamicArray.empty(); this.events.add(item: give events); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty(); this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.overSocket = socket; this.events = DynamicArray.empty(); this.events.add(item: give events); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.garbling = false; this.garble = Garble.none(); this.replies = 0; this.severed = false; this.replyCount = DynamicArray.empty(); this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.garbling = false; this.garble = Garble.none(); this.replies = 0; this.severed = false; this.replyCount = DynamicArray.empty();
     }
 
     unsafe fn void event(const ref string name) {
@@ -531,6 +606,7 @@ type resource FakeServer implements Transport, Sendable {
             // This wait ends without the late reply; it is there for the next.
             foreach (uint8 b in this.held) { this.toClient.add(item: b); }
             this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.garbling = false; this.garble = Garble.none(); this.replies = 0; this.severed = false; this.replyCount = DynamicArray.empty();
             return Result::Ok(value: Ready.of(readable: false, writable: !this.blocked()));
         }
         bool readable = this.readAt < this.toClient.length() || this.hungUp;
@@ -707,7 +783,10 @@ type resource FakeServer implements Transport, Sendable {
                 isize last = this.toClient.length() - 1;
                 if (last >= 0) { this.toClient[last] = this.toClient[last] ^ 1ui8; }
             }
-            case Late(then: t): { foreach (uint8 b in t) { this.held.add(item: b); } }
+            case Late(then: t): {
+                DynamicArray<uint8> late = this.garbledIfAsked(b: t.view());
+                foreach (uint8 b in late) { this.held.add(item: b); }
+            }
             case AnswerRole(standby: sb): {
                 string asked = cString(body: body, from: 0);
                 string value = "f";
@@ -797,8 +876,81 @@ type resource FakeServer implements Transport, Sendable {
         this.hungUp = true;
     }
 
-    // A reply: in plaintext, or once TLS is up, through the engine.
+    // `b` as the garble leaves it (`b` itself when there is none): each message in it numbered, and the target
+    // changed. Bytes that are not whole messages (an SSLRequest's one-byte answer, a pre-3.0 error) count as one.
+    unsafe fn DynamicArray<uint8> garbledIfAsked(ConstView<uint8> b) {
+        DynamicArray<uint8> result = DynamicArray.empty();
+        if (!this.garbling) { isize k = 0; while (k < b.length()) { result.add(item: b[k]); k = k + 1; } return result; }
+        if (this.severed) { return result; }
+        isize at = 0;
+        while (at < b.length()) {
+            isize end = b.length();
+            if (b.length() - at >= 5) {
+                isize len = (cast<isize>(b[at + 1]) << 24) | (cast<isize>(b[at + 2]) << 16) | (cast<isize>(b[at + 3]) << 8) | cast<isize>(b[at + 4]);
+                if (len >= 4 && at + 1 + len <= b.length()) { end = at + 1 + len; }
+            }
+            DynamicArray<uint8> unit = DynamicArray.empty();
+            isize i = at;
+            while (i < end) { unit.add(item: b[i]); i = i + 1; }
+            if (this.replyCount.length() > 0) { SendResult<isize> counted = this.replyCount[0].send(item: this.replies); }
+            if (this.replies == this.garble.targetOf()) { unit = this.damaged(unit: give unit); }
+            this.replies = this.replies + 1;
+            foreach (uint8 x in unit) { result.add(item: x); }
+            if (this.severed) { return result; }
+            at = end;
+        }
+        return result;
+    }
+
+    // One reply, changed as the garble says.
+    unsafe fn DynamicArray<uint8> damaged(DynamicArray<uint8> unit) {
+        Rng rng = Rng.seeded(seed: this.garble.seedOf());
+        DynamicArray<uint8> u = give unit;
+        isize n = u.length();
+        match (this.garble.kindOf()) {
+            case FlipByte: { if (n > 0) { isize i = rng.below(n: n); u[i] = u[i] ^ truncate<uint8>(1 + rng.below(n: 255)); } }
+            case ShortLength: { setLength(u: ref u, length: 3ui32); }
+            case OverShort: { setLength(u: ref u, length: 30001ui32); }
+            case HugeLength: { setLength(u: ref u, length: 2147483647ui32); }
+            case AnyLength: { setLength(u: ref u, length: truncate<uint32>(rng.next())); }
+            case Truncate: {
+                isize keep = 0;
+                if (n > 0) { keep = rng.below(n: n); }
+                DynamicArray<uint8> part = DynamicArray.empty();
+                isize i = 0;
+                while (i < keep) { part.add(item: u[i]); i = i + 1; }
+                u = give part;
+                this.severed = true;
+                this.hungUp = true;
+            }
+            case Retag: { if (n > 0) { u[0] = u[0] ^ truncate<uint8>(1 + rng.below(n: 255)); } }
+            case Drop: { u = DynamicArray.empty(); }
+            case Duplicate: { isize i = 0; while (i < n) { u.add(item: u[i]); i = i + 1; } }
+            case Insert: {
+                isize at = rng.below(n: n + 1);
+                isize count = 1 + rng.below(n: 8);
+                DynamicArray<uint8> grown = DynamicArray.empty();
+                isize i = 0;
+                while (i < n) {
+                    if (i == at) { isize k = 0; while (k < count) { grown.add(item: truncate<uint8>(rng.next())); k = k + 1; } }
+                    grown.add(item: u[i]);
+                    i = i + 1;
+                }
+                if (at == n) { isize k = 0; while (k < count) { grown.add(item: truncate<uint8>(rng.next())); k = k + 1; } }
+                u = give grown;
+            }
+        };
+        return u;
+    }
+
+    // A reply: through the garble when there is one, then in plaintext, or once TLS is up, through the engine.
     unsafe fn void queue(ConstView<uint8> b) {
+        if (!this.garbling) { this.deliver(b: b); return; }
+        DynamicArray<uint8> changed = this.garbledIfAsked(b: b);
+        this.deliver(b: changed.view());
+    }
+
+    unsafe fn void deliver(ConstView<uint8> b) {
         if (this.tlsMode && this.established) {
             isize sent = 0;
             while (sent < b.length()) {
@@ -811,6 +963,15 @@ type resource FakeServer implements Transport, Sendable {
         isize i = 0;
         while (i < b.length()) { this.toClient.add(item: b[i]); i = i + 1; }
     }
+}
+
+// ---- garbling ----
+
+// The four bytes of a message's length field, set to `length`.
+fn void setLength(ref DynamicArray<uint8> u, uint32 length) {
+    if (u.length() < 5) { return; }
+    u[1] = truncate<uint8>(length >> 24); u[2] = truncate<uint8>(length >> 16);
+    u[3] = truncate<uint8>(length >> 8); u[4] = truncate<uint8>(length);
 }
 
 // The NUL-terminated string at `from`.

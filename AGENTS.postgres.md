@@ -55,6 +55,9 @@ release it is built and tested with, and the first with everything this package 
     and release.
     It includes a scripted fake server (`fake_server.kama`) that drives `Connection` through every startup and
     query path, hostile ones included: a reply a byte at a time, writes three bytes at a time, silence, hangups.
+    `garble_test.kama` changes each reply of its conversations in turn, ten ways, seeded (`FakeServer.garbled`, a
+    `Garble`): the client must never panic, and a protocol error must end the session. A new kind of reply goes into
+    one of its exercises. `PGTEST_GARBLE_SEEDS=N` runs more seeds, and `PGTEST_GARBLE_TRACE=1` names each case first.
   - `tests/integration` needs a live server. `tools/test-integration.sh` starts each version itself (all of
     14–19 by default, `--version N` for one) and runs the suite debug and release. `types_test.kama` reads every
     codec vector on each version: its binary bytes, its text both ways, and its kama value sent back.

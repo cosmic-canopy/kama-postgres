@@ -51,7 +51,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1 and the port to kama 0.9.673 done; S2 under way (S2a done) |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1 and the port to kama 0.9.673 done; S2 under way (S2a, S2d done) |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -137,7 +137,11 @@ it fail.
     protocol.h (`src/protocol/framing.kama`), and works out libpq's outcome for every type and length in each place
     (`tests/unit/src/framing_vectors.kama`). The buffer grows only as bytes arrive. Live: PostgreSQL 18 reports
     `search_path`, and one over 30000 bytes loses synchronization here as it does in psql.
-  - **S2d, next: seeded mutations of every scripted reply.** Each must end in a `PgError`, never a panic.
+  - **S2d, done: seeded mutations of every scripted reply** (`tests/unit/src/garble_test.kama`). Eighteen conversations
+    carry every backend message in each state; each reply in turn is changed ten ways (`GarbleKind`), seeded, through
+    `FakeServer.garbled`. A run must end in a result or a `PgError` with a message, never a panic, and a protocol error
+    must end the session. It found one thing to fix: a pre-3.0 error with an empty text, now "received invalid error
+    message". 500 seeds (a million cases, 80 seconds in release) find nothing more.
   - **S2b: bounds, each configurable** (an `Optional`, None turning it off): the read buffer that grows while a write
     waits, the notification queue (the oldest dropped, with a warning and a count), the ParameterStatus count, and an
     optional limit on a buffered result (off by default; the rest is read and dropped, and the session kept).

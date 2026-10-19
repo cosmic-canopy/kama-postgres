@@ -35,6 +35,13 @@ All notable changes to this package are recorded here. The format follows
 
   The long types, the limits and the messages are read from libpq's source by `tools/gen-libpq-tables.sh`
   (`src/protocol/framing.kama`), and the unit tests check every type and length in each place against libpq's outcome.
+- **Seeded mutations of every scripted reply** (`tests/unit/src/garble_test.kama`). Eighteen conversations carry every
+  backend message this client reads, in each state it can arrive in: startup with each authentication method and a
+  protocol downgrade, the simple and extended protocols, the statement cache, a portal, COPY both ways, a pipeline, a
+  notification, `ping` and `resetSession`, a transaction window, and TLS. Each reply in turn is changed ten ways (a
+  flipped byte, four kinds of bad length, cut short, another type, dropped, sent twice, bytes inserted), with every
+  choice drawn from a seed. The client must answer with a result or a `PgError` that says something, never panic, and
+  end the session after a protocol error. `PGTEST_GARBLE_SEEDS` runs more seeds; 500 (a million cases) find nothing.
 
 ### Changed
 - **Needs kama ≥ 0.9.673.** It is the first release in which:
@@ -57,6 +64,8 @@ All notable changes to this package are recorded here. The format follows
 - The receive buffer grows only as a message's bytes arrive. A header that declares a 1 GiB message no longer costs
   1 GiB before any of it has come.
 - A NoticeResponse before authentication is refused, as libpq refuses it. A server sends none there.
+- A pre-3.0 error whose text is empty is "received invalid error message", where libpq reports an empty error: what it
+  holds is a v3 header with a length under 8. Found by the seeded mutations of every scripted reply (below).
 - `PgError` is `Sendable`, and so are `ServerError`, `ConnectError`, `ConnectAttempt`, `ProtocolError` and
   `ErrorFields`, so an error can cross isolates (a `Channel<PgError>`, or a `Sendable` type that holds one).
 

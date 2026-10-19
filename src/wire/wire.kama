@@ -124,9 +124,16 @@ type resource Wire implements Sendable {
     // A pre-3.0 server's error before authentication, as PQconnectPoll reads it: the text after the 'E' up to a NUL,
     // returned as the server's error. None while no NUL has come and there is room for more; past STARTUP_ERROR_MAX
     // bytes without one, the message is refused. The search goes on from the `scanned` bytes already searched.
+    //
+    // Stricter than libpq in one case: an empty text, which libpq reports as an empty error, is refused in its words
+    // for an error it cannot read. What it holds is a v3 header with a length under 8, and nothing a person can act on.
     unsafe fn Optional<Result<BackendMessage, PgError>> oldError(isize scanned) {
         isize i = this.start + scanned;
         while (i < this.end && this.buf[i] != 0ui8) { i = i + 1; }
+        if (i == this.start + 1) {
+            this.consume(n: 2);
+            return Optional::Some(value: Result::Err(error: PgError::Protocol(error: ProtocolError::Violation(detail: invalidErrorText()))));
+        }
         if (i < this.end) {
             Result<string, Utf8Error> text = utf8Decode(bytes: this.buf.slice(from: this.start + 1, count: i - this.start - 1));
             this.consume(n: i + 1 - this.start);

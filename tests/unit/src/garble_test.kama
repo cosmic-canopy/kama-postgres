@@ -1,0 +1,529 @@
+// Seeded mutations of every reply a scripted server sends (fake_server.kama's Garble). Each exercise is one conversation
+// a client has with a server, and together they carry every backend message this client reads, in each state it can
+// arrive in. A clean run of an exercise counts its replies; then each reply in turn is changed in each way GarbleKind
+// names, with every choice drawn from a seed.
+//
+// Whatever comes back, the client must answer with a result or a PgError, and never panic: a panic ends this program,
+// which fails the run. An error must say something, and after a protocol error the session must be over. Nothing can
+// hang: the fake never blocks, so a reply that does not come is a timeout at once.
+//
+// PGTEST_GARBLE_SEEDS=N runs N seeds instead of one, and PGTEST_GARBLE_TRACE=1 prints each case before it runs, which
+// names the one a panic ended.
+import { core::env, core::println, std::collections::DynamicArray, std::memory::Owned, std::time::Duration,
+         std::fmt::parse as parseNumber, std::fmt::ParseError,
+         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::RecvResult,
+         tls::TlsConfig,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
+         postgres::Portal, postgres::Transport, postgres::CacheMode, postgres::CopyInfo, postgres::CopyChunk,
+         postgres::Notification, postgres::PipelineResult, postgres::column, postgres::protocol::md5Password,
+         postgres::protocol::PROTOCOL_3_0,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire,
+         postgres_unit_tests::Garble, postgres_unit_tests::GarbleKind, postgres_unit_tests::welcome,
+         postgres_unit_tests::serverTls };
+export { garbleTests };
+
+comptime uint8 IDLE = 73ui8;     // 'I'
+comptime uint8 INTX = 84ui8;     // 'T'
+comptime uint8 PARSE = 80ui8;    // 'P'
+comptime uint8 BIND = 66ui8;     // 'B'
+comptime uint8 DESCRIBE = 68ui8; // 'D'
+comptime uint8 EXECUTE = 69ui8;  // 'E'
+comptime uint8 SYNC = 83ui8;     // 'S'
+comptime uint8 CLOSE = 67ui8;    // 'C'
+comptime uint8 QUERY = 81ui8;    // 'Q'
+comptime uint8 COPY_DATA = 100ui8;   // 'd'
+comptime uint8 COPY_DONE = 99ui8;    // 'c'
+
+comptime isize EXERCISES = 18;
+comptime isize KINDS = 10;
+
+// ---- the script ----
+
+fn Step quiet(uint8 tag) { return Step::Expect(tag: tag, body: "", then: DynamicArray.empty()); }
+fn Step answer(uint8 tag, Wire reply) { return Step::Expect(tag: tag, body: "", then: reply.bytes()); }
+fn DynamicArray<string> one(const ref string a) { DynamicArray<string> v = DynamicArray.empty(); v.add(item: copy a); return v; }
+fn DynamicArray<uint32> oneOid(uint32 a) { DynamicArray<uint32> v = DynamicArray.empty(); v.add(item: a); return v; }
+fn DynamicArray<int32> oneInt(int32 a) { DynamicArray<int32> v = DynamicArray.empty(); v.add(item: a); return v; }
+fn DynamicArray<Step> opening() { DynamicArray<Step> s = DynamicArray.empty(); s.add(item: Step::Send(bytes: welcome())); return s; }
+
+// A simple query's answer: one text column, `count` rows, its tag, ready.
+fn Wire rowsOf(isize count, uint8 status) {
+    Wire w = Wire.make();
+    w.columns(names: one(a: "v"));
+    isize i = 0;
+    while (i < count) { w.row(values: one(a: "x")); i = i + 1; }
+    w.complete(tag: "SELECT ${count}");
+    w.ready(status: status);
+    return w;
+}
+
+fn Wire completed(const ref string tag, uint8 status) { Wire w = Wire.make(); w.complete(tag: tag); w.ready(status: status); return w; }
+
+// An unnamed statement described (no cache): Parse, Describe, Sync, and its description.
+fn void described(ref DynamicArray<Step> s, uint8 status, bool rows) {
+    s.add(item: quiet(tag: PARSE));
+    s.add(item: quiet(tag: DESCRIBE));
+    Wire d = Wire.make();
+    d.parseComplete();
+    d.parameterTypes(oids: oneOid(a: 23ui32));
+    if (rows) { d.typedColumns(names: one(a: "n"), oids: oneOid(a: 23ui32)); } else { d.noData(); }
+    d.ready(status: status);
+    s.add(item: answer(tag: SYNC, reply: give d));
+}
+
+// What exercise `e` is, for a case's name.
+fn string exerciseName(isize e) {
+    if (e == 0) { return "trust, a query"; }
+    if (e == 1) { return "cleartext password"; }
+    if (e == 2) { return "md5"; }
+    if (e == 3) { return "SCRAM"; }
+    if (e == 4) { return "protocol 3.2 negotiated down"; }
+    if (e == 5) { return "a refused startup"; }
+    if (e == 6) { return "a simple query with every kind of reply"; }
+    if (e == 7) { return "an extended query"; }
+    if (e == 8) { return "a cached statement, twice, and NoData"; }
+    if (e == 9) { return "a portal, suspended"; }
+    if (e == 10) { return "COPY TO STDOUT"; }
+    if (e == 11) { return "COPY FROM STDIN"; }
+    if (e == 12) { return "a pipeline"; }
+    if (e == 13) { return "a notification while idle"; }
+    if (e == 14) { return "ping and resetSession"; }
+    if (e == 15) { return "a transaction window"; }
+    if (e == 16) { return "sslmode=prefer, answered N"; }
+    return "a TLS session";
+}
+
+fn string kindName(isize k) {
+    if (k == 0) { return "a flipped byte"; }
+    if (k == 1) { return "length 3"; }
+    if (k == 2) { return "length 30001"; }
+    if (k == 3) { return "length 2^31-1"; }
+    if (k == 4) { return "any length"; }
+    if (k == 5) { return "cut short"; }
+    if (k == 6) { return "another type"; }
+    if (k == 7) { return "dropped"; }
+    if (k == 8) { return "sent twice"; }
+    return "bytes inserted";
+}
+
+fn GarbleKind kindOf(isize k) {
+    if (k == 0) { return GarbleKind::FlipByte; }
+    if (k == 1) { return GarbleKind::ShortLength; }
+    if (k == 2) { return GarbleKind::OverShort; }
+    if (k == 3) { return GarbleKind::HugeLength; }
+    if (k == 4) { return GarbleKind::AnyLength; }
+    if (k == 5) { return GarbleKind::Truncate; }
+    if (k == 6) { return GarbleKind::Retag; }
+    if (k == 7) { return GarbleKind::Drop; }
+    if (k == 8) { return GarbleKind::Duplicate; }
+    return GarbleKind::Insert;
+}
+
+// The replies of exercise `e` that are garbled: all of them, except where an exercise's own exchange is costly to run
+// (SCRAM's key derivation, a TLS handshake) and the replies after it are carried by other exercises.
+fn isize targetsFor(isize e, isize replies) {
+    if (e == 3 && replies > 4) { return 4; }
+    if (e == 17 && replies > 3) { return 3; }
+    return replies;
+}
+
+unsafe fn DynamicArray<Step> scriptFor(isize e) {
+    DynamicArray<Step> s = DynamicArray.empty();
+    if (e == 0 || e == 16 || e == 17) {
+        s = opening();
+        s.add(item: answer(tag: QUERY, reply: rowsOf(count: 2, status: IDLE)));
+    } else if (e == 1) {
+        Wire ask = Wire.make(); ask.auth(code: 3);
+        s.add(item: Step::Send(bytes: ask.bytes()));
+        s.add(item: Step::Password(text: "pw", then: welcome()));
+        s.add(item: answer(tag: QUERY, reply: rowsOf(count: 1, status: IDLE)));
+    } else if (e == 2) {
+        Wire ask = Wire.make(); ask.authMd5(a: 1ui8, b: 2ui8, c: 3ui8, d: 4ui8);
+        InlineArray<uint8>#(4) salt = [1ui8, 2ui8, 3ui8, 4ui8];
+        string user = "u";
+        string pw = "pw";
+        s.add(item: Step::Send(bytes: ask.bytes()));
+        s.add(item: Step::Password(text: md5Password(user: user, password: pw, salt: salt), then: welcome()));
+        s.add(item: answer(tag: QUERY, reply: rowsOf(count: 1, status: IDLE)));
+    } else if (e == 3) {
+        DynamicArray<string> mechanisms = one(a: "SCRAM-SHA-256");
+        Wire ask = Wire.make(); ask.authSasl(mechanisms: mechanisms);
+        s.add(item: Step::Send(bytes: ask.bytes()));
+        s.add(item: Step::ScramFirst(password: "pw", extend: true));
+        s.add(item: Step::ScramFinal(signature: "right", then: welcome()));
+    } else if (e == 4) {
+        DynamicArray<string> none = DynamicArray.empty();
+        Wire down = Wire.make(); down.negotiate(version: PROTOCOL_3_0, unrecognized: none);
+        DynamicArray<uint8> reply = down.bytes();
+        DynamicArray<uint8> w = welcome();
+        foreach (uint8 b in w) { reply.add(item: b); }
+        s.add(item: Step::Send(bytes: give reply));
+        s.add(item: answer(tag: QUERY, reply: rowsOf(count: 1, status: IDLE)));
+    } else if (e == 5) {
+        Wire refused = Wire.make(); refused.report(tag: 69ui8, severity: "FATAL", code: "28P01", message: "password authentication failed for user \"u\"");
+        s.add(item: Step::Send(bytes: refused.bytes()));
+    } else if (e == 6) {
+        s = opening();
+        Wire w = Wire.make();
+        w.columns(names: one(a: "v")); w.row(values: one(a: "a")); w.row(values: one(a: "NULL!")); w.complete(tag: "SELECT 2");
+        w.report(tag: 78ui8, severity: "NOTICE", code: "00000", message: "a notice");
+        w.notification(pid: 7, channel: "ch", payload: "hello");
+        w.parameter(name: "application_name", value: "garbled");
+        w.complete(tag: "INSERT 0 1");
+        w.emptyQuery();
+        w.report(tag: 69ui8, severity: "ERROR", code: "42601", message: "syntax error at or near \"bad\"");
+        w.ready(status: IDLE);
+        s.add(item: answer(tag: QUERY, reply: give w));
+        s.add(item: answer(tag: QUERY, reply: completed(tag: "SELECT 0", status: IDLE)));
+    } else if (e == 7) {
+        s = opening();
+        described(s: ref s, status: IDLE, rows: true);
+        s.add(item: quiet(tag: BIND));
+        s.add(item: quiet(tag: EXECUTE));
+        Wire r = Wire.make(); r.bindComplete(); r.intRow(values: oneInt(a: 8)); r.complete(tag: "SELECT 1"); r.ready(status: IDLE);
+        s.add(item: answer(tag: SYNC, reply: give r));
+    } else if (e == 8) {
+        s = opening();
+        // The cache's first run: Parse with a name, Describe, then Bind and Execute; its second, Bind and Execute.
+        s.add(item: quiet(tag: PARSE));
+        s.add(item: quiet(tag: DESCRIBE));
+        Wire d = Wire.make(); d.parseComplete(); d.parameterTypes(oids: oneOid(a: 23ui32)); d.noData(); d.ready(status: IDLE);
+        s.add(item: answer(tag: SYNC, reply: give d));
+        s.add(item: quiet(tag: BIND));
+        s.add(item: quiet(tag: EXECUTE));
+        Wire r1 = Wire.make(); r1.bindComplete(); r1.complete(tag: "INSERT 0 1"); r1.ready(status: IDLE);
+        s.add(item: answer(tag: SYNC, reply: give r1));
+        s.add(item: quiet(tag: BIND));
+        s.add(item: quiet(tag: EXECUTE));
+        Wire r2 = Wire.make(); r2.bindComplete(); r2.complete(tag: "INSERT 0 1"); r2.ready(status: IDLE);
+        s.add(item: answer(tag: SYNC, reply: give r2));
+    } else if (e == 9) {
+        s = opening();
+        s.add(item: answer(tag: QUERY, reply: completed(tag: "BEGIN", status: INTX)));
+        described(s: ref s, status: INTX, rows: true);
+        s.add(item: quiet(tag: BIND));
+        Wire bound = Wire.make(); bound.bindComplete(); bound.ready(status: INTX);
+        s.add(item: answer(tag: SYNC, reply: give bound));
+        s.add(item: quiet(tag: EXECUTE));
+        Wire part = Wire.make(); part.intRow(values: oneInt(a: 1)); part.intRow(values: oneInt(a: 2)); part.portalSuspended(); part.ready(status: INTX);
+        s.add(item: answer(tag: SYNC, reply: give part));
+        s.add(item: quiet(tag: EXECUTE));
+        Wire rest = Wire.make(); rest.intRow(values: oneInt(a: 3)); rest.complete(tag: "SELECT 1"); rest.ready(status: INTX);
+        s.add(item: answer(tag: SYNC, reply: give rest));
+        s.add(item: quiet(tag: CLOSE));
+        Wire closed = Wire.make(); closed.closeComplete(); closed.ready(status: INTX);
+        s.add(item: answer(tag: SYNC, reply: give closed));
+    } else if (e == 10) {
+        s = opening();
+        Wire w = Wire.make();
+        w.copyResponse(tag: 72ui8); w.copyData(data: "1\n"); w.copyData(data: "2\n"); w.copyDone(); w.complete(tag: "COPY 2"); w.ready(status: IDLE);
+        s.add(item: answer(tag: QUERY, reply: give w));
+    } else if (e == 11) {
+        s = opening();
+        Wire g = Wire.make(); g.copyResponse(tag: 71ui8);
+        s.add(item: answer(tag: QUERY, reply: give g));
+        s.add(item: quiet(tag: COPY_DATA));
+        s.add(item: quiet(tag: COPY_DATA));
+        s.add(item: answer(tag: COPY_DONE, reply: completed(tag: "COPY 2", status: IDLE)));
+    } else if (e == 12) {
+        s = opening();
+        isize q = 0;
+        while (q < 2) {
+            s.add(item: quiet(tag: PARSE));
+            s.add(item: quiet(tag: BIND));
+            s.add(item: quiet(tag: DESCRIBE));
+            Wire w = Wire.make(); w.parseComplete(); w.bindComplete(); w.columns(names: one(a: "v")); w.row(values: one(a: "1")); w.complete(tag: "SELECT 1");
+            s.add(item: answer(tag: EXECUTE, reply: give w));
+            q = q + 1;
+        }
+        Wire z = Wire.make(); z.ready(status: IDLE);
+        s.add(item: answer(tag: SYNC, reply: give z));
+    } else if (e == 13) {
+        s = opening();
+        Wire w = Wire.make(); w.complete(tag: "LISTEN"); w.ready(status: IDLE); w.notification(pid: 9, channel: "ch", payload: "later");
+        s.add(item: answer(tag: QUERY, reply: give w));
+    } else if (e == 14) {
+        s = opening();
+        Wire empty = Wire.make(); empty.emptyQuery(); empty.ready(status: IDLE);
+        s.add(item: answer(tag: QUERY, reply: give empty));
+        s.add(item: answer(tag: QUERY, reply: completed(tag: "DISCARD ALL", status: IDLE)));
+    } else if (e == 15) {
+        s = opening();
+        s.add(item: answer(tag: QUERY, reply: completed(tag: "BEGIN", status: INTX)));
+        s.add(item: answer(tag: QUERY, reply: completed(tag: "INSERT 0 1", status: INTX)));
+        s.add(item: answer(tag: QUERY, reply: completed(tag: "COMMIT", status: IDLE)));
+    }
+    return s;
+}
+
+fn string conninfoFor(isize e) {
+    if (e == 1 || e == 2 || e == 3) { return "user=u dbname=d password=pw connect_timeout=2"; }
+    if (e == 4) { return "user=u dbname=d max_protocol_version=latest connect_timeout=2"; }
+    if (e == 16) { return "user=u dbname=d sslmode=prefer connect_timeout=2"; }
+    if (e == 17) { return "user=u dbname=d sslmode=require connect_timeout=2"; }
+    return "user=u dbname=d connect_timeout=2";
+}
+
+// Connect for exercise `e` over a fake garbling as `g` says, its replies numbered to `counts` (zero or one sender).
+unsafe fn Result<Connection, PgError> connectFor(isize e, Garble g, DynamicArray<Sender<isize>> counts) {
+    Environment vars = testEnvironment();
+    Result<Config, PgError> c = resolveWith(text: conninfoFor(e: e), env: vars);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: x): { return Result::Err(error: give x); } };
+    if (e == 7 || e == 9 || e == 12) { config.setStatementCache(mode: CacheMode::Off, capacity: 0); }
+    if (e == 17) {
+        TlsConfig server = serverTls(alpn: true, only13: false, askCert: false);
+        Owned<Transport> secure = new FakeServer.garbledSecure(steps: scriptFor(e: e), chunk: 4096, writeLimit: 4096, config: give server, garble: g, counts: give counts);
+        return Connection.connectOver(transport: give secure, config: config);
+    }
+    Owned<Transport> fake = new FakeServer.garbled(steps: scriptFor(e: e), chunk: 4096, writeLimit: 4096, garble: g, counts: give counts);
+    return Connection.connectOver(transport: give fake, config: config);
+}
+
+// ---- the rules ----
+
+// What a call came to: "" when it kept the rules, else which it broke. An error must say something, and a protocol
+// error must leave the session over.
+unsafe fn string judged<T>(const ref Result<T, PgError> r, const ref Connection c, const ref string call) {
+    return match (r) {
+        case Ok(value: v): "";
+        case Err(error: e): judgedError(e: e, c: c, call: call);
+    };
+}
+
+unsafe fn string judgedError(const ref PgError e, const ref Connection c, const ref string call) {
+    string m = e.message();
+    if (m.length() == 0) { return call.concat(other: " failed with no message"); }
+    bool protocol = match (e) { case Protocol(error: p): true; case _: false; };
+    if (protocol && !c.isClosed()) { return call.concat(other: " failed with a protocol error that left the session open: ").concat(other: m); }
+    return "";
+}
+
+fn string firstOf(const ref string a, const ref string b) { if (a.length() > 0) { return copy a; } return copy b; }
+
+fn bool failed<T>(const ref Result<T, PgError> r) { return match (r) { case Ok(value: v): false; case Err(error: e): true; }; }
+
+// What the client does in exercise `e`, over its connection. Every call is made whatever the one before it came to,
+// so a session that a garbled reply ended is also asked again, and must say it is closed. Gives the first rule broken
+// ("" for none), and whether any call failed (`errors`).
+unsafe fn string act(isize e, ref Connection c, ref bool errors) {
+    string broken = "";
+    if (e == 0 || e == 1 || e == 2 || e == 4 || e == 16 || e == 17) {
+        Result<DynamicArray<Rows>, PgError> r = c.simpleQuery(sql: "select v");
+        broken = firstOf(a: broken, b: judged(r: r, c: c, call: "simpleQuery"));
+        errors = errors || failed(r: r);
+    } else if (e == 6) {
+        Result<DynamicArray<Rows>, PgError> r = c.simpleQuery(sql: "select v; insert; ; bad");
+        broken = firstOf(a: broken, b: judged(r: r, c: c, call: "simpleQuery"));
+        Result<DynamicArray<Rows>, PgError> again = c.simpleQuery(sql: "select");
+        broken = firstOf(a: broken, b: judged(r: again, c: c, call: "simpleQuery after"));
+        errors = errors || failed(r: again);
+    } else if (e == 7) {
+        Query q = Query.make(sql: "select $1 + 1"); q.add(value: 7);
+        Result<Rows, PgError> r = c.query(q: q);
+        broken = firstOf(a: broken, b: judged(r: r, c: c, call: "query"));
+        errors = errors || failed(r: r);
+        match (r) {
+            case Ok(value: rows): { if (rows.rowCount() > 0) { Result<int32, PgError> v = column::<int32>(rows: rows, row: 0, index: 0); errors = errors || failed(r: v); } }
+            case Err(error: x): { }
+        };
+    } else if (e == 8) {
+        Query q = Query.make(sql: "insert into t values ($1)"); q.add(value: 7);
+        Result<Optional<int64>, PgError> r1 = c.execute(q: q);
+        broken = firstOf(a: broken, b: judged(r: r1, c: c, call: "execute"));
+        Result<Optional<int64>, PgError> r2 = c.execute(q: q);
+        broken = firstOf(a: broken, b: judged(r: r2, c: c, call: "execute again"));
+        errors = errors || failed(r: r1) || failed(r: r2);
+    } else if (e == 9) {
+        Result<DynamicArray<Rows>, PgError> b = c.simpleQuery(sql: "begin");
+        broken = firstOf(a: broken, b: judged(r: b, c: c, call: "begin"));
+        Result<Portal, PgError> opened = c.openPortal(q: Query.make(sql: "select g"));
+        broken = firstOf(a: broken, b: judged(r: opened, c: c, call: "openPortal"));
+        errors = errors || failed(r: b) || failed(r: opened);
+        match (give opened) {
+            case Ok(value: p): {
+                Portal portal = give p;
+                Result<Rows, PgError> first = c.fetch(portal: ref portal, maxRows: 2);
+                broken = firstOf(a: broken, b: judged(r: first, c: c, call: "fetch"));
+                Result<Rows, PgError> second = c.fetch(portal: ref portal, maxRows: 2);
+                broken = firstOf(a: broken, b: judged(r: second, c: c, call: "fetch again"));
+                Result<Unit, PgError> closed = c.closePortal(portal: give portal);
+                broken = firstOf(a: broken, b: judged(r: closed, c: c, call: "closePortal"));
+                errors = errors || failed(r: first) || failed(r: second) || failed(r: closed);
+            }
+            case Err(error: x): { }
+        };
+    } else if (e == 10) {
+        Result<CopyInfo, PgError> st = c.startCopyOut(sql: "COPY t TO STDOUT");
+        broken = firstOf(a: broken, b: judged(r: st, c: c, call: "startCopyOut"));
+        errors = errors || failed(r: st);
+        isize n = 0;
+        bool more = true;
+        while (more && n < 6) {
+            Result<CopyChunk, PgError> chunk = c.getCopyData();
+            broken = firstOf(a: broken, b: judged(r: chunk, c: c, call: "getCopyData"));
+            errors = errors || failed(r: chunk);
+            more = match (chunk) { case Ok(value: k): match (k) { case Data(bytes: d): true; case Done(rows: r): false; }; case Err(error: x): false; };
+            n = n + 1;
+        }
+    } else if (e == 11) {
+        Result<CopyInfo, PgError> st = c.startCopyIn(sql: "COPY t FROM STDIN");
+        broken = firstOf(a: broken, b: judged(r: st, c: c, call: "startCopyIn"));
+        Result<Unit, PgError> p1 = c.putCopyData(bytes: "1\n".bytes());
+        broken = firstOf(a: broken, b: judged(r: p1, c: c, call: "putCopyData"));
+        Result<Unit, PgError> p2 = c.putCopyData(bytes: "2\n".bytes());
+        broken = firstOf(a: broken, b: judged(r: p2, c: c, call: "putCopyData again"));
+        Result<Optional<int64>, PgError> ended = c.endCopyIn();
+        broken = firstOf(a: broken, b: judged(r: ended, c: c, call: "endCopyIn"));
+        errors = errors || failed(r: st) || failed(r: p1) || failed(r: p2) || failed(r: ended);
+    } else if (e == 12) {
+        Result<Unit, PgError> entered = c.enterPipelineMode();
+        Result<Unit, PgError> q1 = c.sendQuery(q: Query.make(sql: "select 1"));
+        broken = firstOf(a: broken, b: judged(r: q1, c: c, call: "sendQuery"));
+        Result<Unit, PgError> q2 = c.sendQuery(q: Query.make(sql: "select 2"));
+        broken = firstOf(a: broken, b: judged(r: q2, c: c, call: "sendQuery again"));
+        Result<Unit, PgError> synced = c.pipelineSync();
+        broken = firstOf(a: broken, b: judged(r: synced, c: c, call: "pipelineSync"));
+        errors = errors || failed(r: q1) || failed(r: q2) || failed(r: synced);
+        isize n = 0;
+        while (n < 5) {
+            Result<Optional<PipelineResult>, PgError> got = c.getResult();
+            broken = firstOf(a: broken, b: judged(r: got, c: c, call: "getResult"));
+            errors = errors || failed(r: got);
+            n = n + 1;
+        }
+        Result<Unit, PgError> exited = c.exitPipelineMode();
+        broken = firstOf(a: broken, b: judged(r: exited, c: c, call: "exitPipelineMode"));
+    } else if (e == 13) {
+        Result<DynamicArray<Rows>, PgError> l = c.simpleQuery(sql: "listen ch");
+        broken = firstOf(a: broken, b: judged(r: l, c: c, call: "listen"));
+        Result<Optional<Notification>, PgError> n = c.waitForNotification(timeout: Optional::Some(value: Duration.zero()));
+        broken = firstOf(a: broken, b: judged(r: n, c: c, call: "waitForNotification"));
+        bool none = match (n) { case Ok(value: o): match (o) { case Some(value: x): false; case None: true; }; case Err(error: x): true; };
+        errors = errors || failed(r: l) || none;
+    } else if (e == 14) {
+        Result<Unit, PgError> p = c.ping();
+        broken = firstOf(a: broken, b: judged(r: p, c: c, call: "ping"));
+        Result<Unit, PgError> reset = c.resetSession();
+        broken = firstOf(a: broken, b: judged(r: reset, c: c, call: "resetSession"));
+        errors = errors || failed(r: p) || failed(r: reset);
+    } else if (e == 15) {
+        borrow c.transaction() as tx {
+            Result<Unit, PgError> b = tx.began();
+            if (failed(r: b)) { errors = true; }
+            Result<DynamicArray<Rows>, PgError> ins = tx.conn().simpleQuery(sql: "insert");
+            if (failed(r: ins)) { errors = true; }
+            Result<Unit, PgError> done = tx.commit();
+            if (failed(r: done)) { errors = true; }
+        }
+        // A window that could not end its transaction closed the connection; either way the next call says so.
+        Result<DynamicArray<Rows>, PgError> after = c.simpleQuery(sql: "select");
+        broken = firstOf(a: broken, b: judged(r: after, c: c, call: "after the window"));
+    }
+    return broken;
+}
+
+// One case: exercise `e` with garble `g`. "" when the rules held; else what broke. `errors` says whether anything failed.
+unsafe fn string runCase(isize e, Garble g, ref bool errors) {
+    DynamicArray<Sender<isize>> none = DynamicArray.empty();
+    Result<Connection, PgError> made = connectFor(e: e, g: g, counts: give none);
+    return match (give made) {
+        case Ok(value: x): {
+            Connection c = give x;
+            string broken = act(e: e, c: ref c, errors: ref errors);
+            c.close();
+            Result<DynamicArray<Rows>, PgError> closed = c.simpleQuery(sql: "select");
+            bool says = match (closed) { case Ok(value: v): false; case Err(error: y): match (y) { case Closed: true; case _: false; }; };
+            if (!says) { broken = firstOf(a: broken, b: "a call after close() was not refused as Closed"); }
+            := give broken;
+        }
+        case Err(error: x): {
+            errors = true;
+            string m = x.message();
+            string why = "";
+            if (m.length() == 0) { why = "connect failed with no message"; }
+            := give why;
+        }
+    };
+}
+
+// The replies of exercise `e`, as a clean run counts them, and whether that run kept the rules.
+unsafe fn isize repliesOf(isize e, ref string broken) {
+    Channel<isize> channel = Channel.bounded(capacity: 4096);
+    Receiver<isize> rx = channel.receiver();
+    DynamicArray<Sender<isize>> counts = DynamicArray.empty();
+    counts.add(item: channel.sender());
+    Result<Connection, PgError> made = connectFor(e: e, g: Garble.none(), counts: give counts);
+    bool errors = false;
+    match (give made) {
+        case Ok(value: x): { Connection c = give x; broken = act(e: e, c: ref c, errors: ref errors); c.close(); }
+        case Err(error: x): { }
+    };
+    isize n = 0;
+    bool more = true;
+    while (more) {
+        RecvResult<isize> r = rx.tryRecv();
+        more = match (r) { case Received(item: i): true; case _: false; };
+        if (more) { n = n + 1; }
+    }
+    return n;
+}
+
+unsafe fn isize seedCount() {
+    Optional<string> v = env(name: "PGTEST_GARBLE_SEEDS");
+    string text = match (give v) { case Some(value: s): give s; case None: "1"; };
+    Result<int32, ParseError> n = parseNumber::<int32>(s: text);
+    return match (n) { case Ok(value: k): cast<isize>(k); case Err(error: e): 1; };
+}
+
+unsafe fn bool tracing() {
+    Optional<string> v = env(name: "PGTEST_GARBLE_TRACE");
+    return match (v) { case Some(value: s): s.equals(other: "1"); case None: false; };
+}
+
+unsafe fn int32 garbleTests() {
+    int32 f = 0;
+    isize seeds = seedCount();
+    bool trace = tracing();
+    isize cases = 0;
+    isize withErrors = 0;
+    isize e = 0;
+    while (e < EXERCISES) {
+        string clean = "";
+        isize replies = repliesOf(e: e, broken: ref clean);
+        string name = exerciseName(e: e);
+        f = f + check(ok: replies > 0 && clean.length() == 0, what: "garble: ".concat(other: name).concat(other: " runs clean, with ${replies} replies ").concat(other: clean));
+        isize targets = targetsFor(e: e, replies: replies);
+        string firstBroken = "";
+        isize brokenCount = 0;
+        isize seed = 0;
+        while (seed < seeds) {
+            isize t = 0;
+            while (t < targets) {
+                isize k = 0;
+                while (k < KINDS) {
+                    uint64 mixed = cast<uint64>(seed) * 1000003ui64 + cast<uint64>(e * 1009 + t * 31 + k);
+                    Garble g = Garble.of(seed: mixed, target: t, kind: kindOf(k: k));
+                    string label = name.concat(other: ", reply ${t}, ").concat(other: kindName(k: k)).concat(other: ", seed ${seed}");
+                    if (trace) { println(s: "garble: ".concat(other: label)); }
+                    bool errors = false;
+                    string broken = runCase(e: e, g: g, errors: ref errors);
+                    cases = cases + 1;
+                    if (errors) { withErrors = withErrors + 1; }
+                    if (broken.length() > 0) {
+                        if (brokenCount == 0) { firstBroken = label.concat(other: ": ").concat(other: broken); }
+                        brokenCount = brokenCount + 1;
+                    }
+                    k = k + 1;
+                }
+                t = t + 1;
+            }
+            seed = seed + 1;
+        }
+        f = f + check(ok: brokenCount == 0, what: "garble: ".concat(other: name).concat(other: ", every reply garbled: ${brokenCount} broke the rules, first ").concat(other: firstBroken));
+        e = e + 1;
+    }
+    // The garbling did something: most cases end in an error. Were the fake to pass replies through untouched, none would.
+    f = f + check(ok: cases > 1000 && withErrors * 2 > cases, what: "garble: ${cases} cases, ${withErrors} of them ending in an error");
+    return f;
+}

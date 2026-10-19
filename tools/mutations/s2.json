@@ -126,5 +126,37 @@
   "old": "if (len > SHORT_MESSAGE_LIMIT && !mayBeLong)",
   "new": "if (len > SHORT_MESSAGE_LIMIT * 2 && !mayBeLong)",
   "expect": "sync loss: a reported search_path over 30000 bytes ends the session"
+ },
+ {
+  "id": "D1",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                case Err(error: e): { this.lose(); return Result::Err(error: give e); }\n            };\n            match (give m) {\n                case RowDescription(fields: f): {\n                    if (columns >= 0)",
+  "new": "                case Err(error: e): { return Result::Err(error: give e); }\n            };\n            match (give m) {\n                case RowDescription(fields: f): {\n                    if (columns >= 0)",
+  "expect": "garble: a simple query with every kind of reply, every reply garbled"
+ },
+ {
+  "id": "D2",
+  "suite": "unit",
+  "file": "src/wire/wire.kama",
+  "old": "if (i == this.start + 1) {",
+  "new": "if (false) {",
+  "expect": "garble: a refused startup, every reply garbled"
+ },
+ {
+  "id": "D3",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "Result<BackendMessage, PgError> received = this.receiveAs(framing: Framing::CopyOut);\n            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { this.lose(); return Result::Err(error: give e); } };",
+  "new": "Result<BackendMessage, PgError> received = this.receiveAs(framing: Framing::CopyOut);\n            BackendMessage m = match (give received) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };",
+  "expect": "garble: COPY TO STDOUT, every reply garbled"
+ },
+ {
+  "id": "D4",
+  "suite": "unit",
+  "file": "src/connection.kama",
+  "old": "                    if (r.columnCount() != columns) { return this.violation(detail: \"unexpected field count in \\\"D\\\" message\"); }\n",
+  "new": "",
+  "expect": "PANICKED"
  }
 ]

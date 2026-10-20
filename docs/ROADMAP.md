@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-19: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1 and S2 are done, and the port to kama 0.9.673). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-20: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2 and S3 are done, and the port to kama 0.9.673). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -52,7 +52,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1 and the port to kama 0.9.673 done; S2 done; S3 next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2 and S3 done; S4 next |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -169,33 +169,44 @@ it fail.
       restart group is `file @compileFor(!RELEASE)`, with a release twin (`restart_release.kama`), and the leg runs the
       debug build. Delete both when it is fixed.
 
-- **S3, the pool** (`src/pool/`).
-  - **Shape.** One `Channel<Slot>` (`Idle(conn, since, born)` or `Empty`) plus a permit channel. That bounds the total
-    with no atomic and no mutex, and lets a sequential user keep one connection.
-  - **API.**
-    - `Pool.make(config:, options:)`.
-    - `pool.share()` gives a Sendable `PoolShare`, which `Pool.join(share:)` turns into a pool in another isolate.
-    - `acquire(timeout:)` gives a `Lease`, which returns its connection on drop.
-    - `run(body:)`.
-  - **Defaults** are pgxpool's: max size max(4, cpus), min idle 0, a lifetime of 1 h with jitter, an idle timeout of
-    30 min, and a health check every minute. The acquire timeout is 30 s, as sqlx and HikariCP use.
-  - **Release.** A closed, busy, COPY or pipeline connection is closed. One inside a transaction is rolled back, then
-    reset (decision below).
-    - `Connection.settle()` (S0b) is the rollback half: it reads off an open result, sends ROLLBACK, and closes a
-      connection still in a block. Release must check `pipelineStatus()` itself, because `transactionStatus()` says
-      Idle in pipeline mode once the queue drains.
-    - As S1 built it: release reads `isClosed()`, `pipelineStatus()` and `transactionStatus()` (Active is busy), then
-      calls `resetSession()`, which does the rollback too.
-    - With the reset turned off, release calls `settle()` only when the status is not Idle, since `settle()` sends
-      ROLLBACK even on an idle session.
-    - Release puts back the pool's own notice handler and query timeout, which the reset leaves alone.
-    - `borrow lease.conn().transaction() as tx` compiles over a lease whose `fn ref Connection conn()` returns
-      `this.slot[0]` (probed on 0.9.667).
+- **S3, done: the pool** (`src/pool/`, `postgres::pool`).
+  - **Shape, as planned:** two bounded channels of `maxSize`, `slots` (`Idle(conn, expires)` or `Empty`) and
+    `permits` (filled at the start). Acquire takes an idle connection, else a permit (and connects), else waits on
+    `slots` until `acquireTimeout`. Freed capacity goes into `slots` as `Empty`, never back to `permits`, so a waiter
+    wakes for it. No lock, no atomic; a sequential user keeps one connection.
+  - **API, as built:**
+    - `Pool.make(config:, options:)`, and `Pool.makeWith(connector:, config:, options:)` with a `Connector`
+      (`open(config:)`, `fork()`), the seam for the unit tests and for a `Dialer`.
+    - `pool.acquire()` → `Lease`; `lease.conn()` is a `ref Connection`, which feeds a `ref Connection` parameter and
+      a `borrow … transaction() as tx` window.
+    - `pool.share()` → `PoolShare` (`Sendable`); `Pool.join(share: ref)` in another isolate. Only the pool that made
+      the channels can share: only a `Channel` makes new ends for itself. A joined pool's `share()` is `Usage`.
+    - `PoolOptions` (`Limits`' pattern): `maxSize`, `lifetime`, `lifetimeJitter`, `acquireTimeout`, `reset`,
+      `queryTimeout`, `queryGrace`. Only what S3 honours; S4 adds its own.
+    - `PgError::PoolTimeout`, sqlx's words.
+  - **Decided while building (2026-10-19):**
+    - **No `run(body:)`.** The lease gives its connection back on every path out of its scope, so a body-taking form
+      would be a second way to do one thing, as `transaction(body:)` was.
+    - **`acquire()` takes no timeout:** it is pool policy (`acquireTimeout`), as HikariCP and sqlx have it.
+    - **Lifetime jitter defaults to 90 s**, HikariCP's 2.5% of the hour (pgxpool's default is none), so connections
+      made together are not all replaced together.
+  - **Release, as built:** closed, busy (Active), pipeline mode or past its lifetime → closed and `Empty`. Otherwise the
+    pool's query timeout is put back (so it bounds the reset), the notice handler cleared, and `resetSession()` run (or,
+    reset off, `settle()` when not Idle, through a `friend` grant). A connection that ends up closed → `Empty`.
+  - **Tests:**
+    - Unit (`tests/unit/src/pool_test.kama`): `ScriptConnector` opens each connection over the next script, so every
+      message a release sends is checked. The cases are the bound and the timeout, a waiter in another isolate woken by
+      a release, each kind of busy connection, the rollback and reset, the reset off, a failed reset, a failed connect,
+      both lifetimes, the settings put back, and the refusals.
+    - Integration (`tests/integration/src/pool_test.kama`), plaintext and TLS: the reset seen live (settings, temporary
+      tables, advisory locks, LISTEN, prepared statements), a transaction left open seen aborted (`pg_xact_status`),
+      and four isolates sharing a pool of 2, each seeing at most 2 sessions in `pg_stat_activity`.
+    - Mutations: `tools/mutations/s3.json`.
 - **S4, maintenance.** One isolate per pool, stopped when the pool drops. It closes idle and expired connections, pings
     the rest, and keeps min idle. Acquire also pings a connection that has been idle for more than 1 s.
 - **S5, pool tests.**
-  - Unit, through a counting Dialer: the bound, timeouts, replacement, the reset's exact messages, reaping.
-  - Integration: N isolates (`pg_stat_activity` never over the maximum), a server restart, TLS.
+  - Unit, through `ScriptConnector` (S3's): what S3's cases leave, and reaping.
+  - Integration: S3 has N isolates under the bound and TLS; S5 adds a server restart, in the restart leg.
 - **S6, examples.** `examples/<name>/`, each its own executable project, as in @kama/sodium: quickstart, typed rows,
   transactions, COPY from a CSV file, a LISTEN/NOTIFY worker, a pool shared by isolates, a batch. `tools/test.sh`
   builds them; `tools/test-integration.sh` runs them live.
@@ -216,59 +227,69 @@ it fail.
 - **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
   for changes.
 
-**What the next session needs to know** (written 2026-10-19, after S2):
-- **Where it stands.** S0, S0b, S1 and S2 are done, and so is the port to kama 0.9.673. S2 is four commits: S2a (libpq's
-  header checks), S2d (the garbling), S2b (`Limits`) and S2c (restarts). The working tree is clean. Nothing is pushed:
-  pushing waits for the maintainer.
-- **One gap is open: KPG-41** (KAMA_GAPS.md, with its repro and the workaround to delete). On macOS, a release build
-  that has `std::process` beside `std::concurrent` fails in clang. A `Channel` is enough to set it off, not only an
-  isolate, and it still fails on v0.9.675.
-  - **It matters to S3.** The package does not import `std::concurrent` today; the pool will (a `Channel`, and a
-    maintenance isolate). From then on, an application on macOS that uses the pool and starts a process cannot build
-    for release. Tell the maintainer before S3 lands, so cstar can weigh it. A newer kama may already fix it: run the
-    repro (`c3.kama` in the entry) with `--release` first.
-  - In this repo it touches only the integration tests: the restart group is `file @compileFor(!RELEASE)`, with
-    `restart_release.kama` as its release twin, and the restart leg runs the debug build.
-- **Next: S3, the pool**, as its bullet above says. Where to start:
-  - **Release** (S3's decision above) is already public. Read `isClosed()`, `pipelineStatus()` and `transactionStatus()`
-    (Active is busy), then call `resetSession()`, which rolls back too. With the reset off, call `settle()` only when
-    the status is not Idle.
-  - **Acquire** is `Receiver.recvTimeout` (std::concurrent). Read the `Channel` drop rule in AGENTS.postgres.md first:
-    claim `sender()` and `receiver()` before the `Channel` drops.
-  - **Each connection's bounds** come from its `Config` (`Limits`), so the pool's connections take the pool's
-    `Config.setLimits`. A connection that hit `readBuffer` or `parameters` is closed, and release must drop it.
-  - **Restart tests (S5)** have `tools/pg.sh restart|stop|start`, and the restart leg's way of driving them
-    (`restart_test.kama`, `PGTEST_PGSH`). The pool's live restart cases belong in that leg.
+**What the next session needs to know** (written 2026-10-20, after S3):
+- **Where it stands.** S0, S0b, S1, S2 and S3 are done, and so is the port to kama 0.9.673. Nothing is pushed: pushing
+  waits for the maintainer.
+- **First: the next kama release, which is a port, not just a version.** cstar's tree (0.9.690 on 2026-10-20) carries:
+  - KPG-41's fix (`fce00971`, 0.9.677);
+  - KR-214 (0.9.680): a `Result` in statement position is refused, `_ = expr;` is the one explicit discard, and
+    channels return `Result` (`send` → `Result<Unit, Undelivered<T>>`, `tryRecv`/`recvTimeout` →
+    `Result<T, RecvError>`; `SendResult` and `RecvResult` are gone);
+  - `main` returns the platform's exit status (0.9.681, 0.9.684): `fn int32 main()` is refused, `fn uint8 main()` it is;
+  - a value a statement discards is dropped at the statement's end (0.9.676).
+
+  Checked against that tree before the release, the package had 10 errors, the unit tests 16 and the integration tests
+  13 at the first stage (the channel types and `main`), and more may follow once those clear. The maintainer approved
+  raising the floor to the first release with KPG-41's fix (2026-10-19). The port is one commit:
+  - run KPG-41's repro (`c3.kama`) with `--release` and move the entry to FIXED;
+  - delete the workaround: `restart_test.kama`'s `file @compileFor(!RELEASE)`, `restart_release.kama`, and the
+    debug-only restart leg in `tools/test-integration.sh`;
+  - port the channel calls: the pool's are all in `Ends` (`src/pool/pool.kama`); the tests' are spread across
+    `tests/*/src`;
+  - raise `"kama"` in the three manifests, `KAMA_VERSION` in ci.yml, and the floor in AGENTS.postgres.md and the
+    README, whose examples' `main` also changes;
+  - the whole gate, with every mutation file (s0b, s1, s2, s3), since 0.9.676 changes when values drop.
+- **Next: S4, maintenance**, as its bullet above says. What S3 leaves for it:
+  - `PoolOptions` gets `minIdle`, `idleTimeout` (30 min) and `healthCheck` (1 min) then, and `Slot::Idle` gets a
+    `since`.
+  - The maintenance isolate needs its own ends of the channels: `Factories.mint()`, as `share()` does.
+  - It must keep the slot count. A path that puts one slot too many deadlocks a release in `send` on a full channel.
+  - It stops when the pool drops. No `select` exists, so a stop channel it polls with `recvTimeout` (the health
+    check's period) is the shape: `Empty` (timed out) means do a round, `Closed` means stop.
+- **S5's unit tests** go through `ScriptConnector` (`tests/unit/src/pool_test.kama`), which traces every connection's
+  messages into the test's log. The pool's live restart cases go in the restart leg (`restart_test.kama`,
+  `PGTEST_RESTART=1`).
 - **The gate, per step:**
   - `tools/test.sh`, which runs the unit suite in debug and release;
   - `tools/test-integration.sh`, on 14–19 in debug, release and TLS, then the restart leg;
   - **`tools/mutate.sh tools/mutations/<step>.json --version 18`**. This runs each mutation in a copy of the tree and
-    exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json`, S1's 35 in `s1.json` and S2's 47
-    in `s2.json`. Write a file per step, and re-run older files when their code changes. A `BAD-PATTERN` means the
-    source moved on, so update the mutation. PANICKED is a run that died before any case failed; an entry may expect
-    it, and may set `"env"` (the restart mutations set `PGTEST_RESTART=1`).
+    exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json`, S1's 35 in `s1.json`, S2's 47
+    in `s2.json` and S3's 27 in `s3.json`. Write a file per step, and re-run older files when their code changes. A
+    `BAD-PATTERN` means the source moved on, so update the mutation. PANICKED is a run that died before any case
+    failed; an entry may expect it, and may set `"env"` (the restart mutations set `PGTEST_RESTART=1`) and `"timeout"`.
+    A run that times out is judged by what it printed first, since a pool mutant can fail its case and then deadlock
+    (S3's P5).
+  - A mutation whose code another line already guarantees is equivalent: rewrite the code or drop the mutation, and do
+    not keep one that cannot fail. S3 dropped a check of `isClosed()` that the final check made redundant.
   - Run the integration mutations after the matrix, not beside it: both use the same servers.
   - A generator's output is committed: re-run it, and `git diff` must be empty (`tools/gen-reset-vectors.sh` for S1,
     `tools/gen-libpq-tables.sh` for S2a).
   - Never edit a script while it runs: `sh` reads it as it goes.
-- **The compiler.** Build with the v0.9.673 release, as CI does. The dev tree (`../cstar/out`) is past the release,
-  and `~/.kama/bin/kama` is an old 0.9.440.
-  - **v0.9.675 came out on 2026-10-19.** At `4305a81`, the package and both test programs check clean on it, and the
-    unit suite passes on it in debug and release. The floor and CI stay at 0.9.673: raising them is the maintainer's
-    call, made in one commit (`"kama"` in the three manifests, `KAMA_VERSION` in ci.yml).
+- **The compiler.** Build with the v0.9.673 release, as CI does, until the port above. The dev tree (`../cstar/out`) is
+  past the release, and `~/.kama/bin/kama` is an old 0.9.440.
   - To get one: `kama-macos-universal-vX.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its
     `.sha256` and unpacked anywhere (it holds `kama-macos-universal-vX/bin/kama`). A session's scratchpad does not
     outlive it, so download it again each session.
   - Run with `KAMA=<that>/bin/kama tools/test.sh`, or `curl -fsSL https://kama-lang.org/install.sh | KAMA_VERSION=vX sh`.
   - **The editor's diagnostics come from that old 0.9.440 language server.** It rejects a view's `~dtor` and cannot
     resolve this package's imports, so ignore it and trust `kama check`.
-- **kama-tls.** `../kama-tls` is readable again. The package needs `@kama/tls` ≥ 0.1.3 (its `TlsError` is `Sendable`),
-  and the locks pin 0.1.4. kama-tls is busy with its own roadmap, so ask the maintainer before you need something there.
-- **The servers.** `kama-pg-14` to `kama-pg-19` and their standbys are running under podman (`tools/pg.sh`). The
-  superuser's reset test leaves one object behind, by design: `kp_reset_seq`, a sequence in `kp_test`, made with
-  `if not exists`. The restart leg leaves each primary running, and `test-integration.sh` runs `pg.sh up` after it.
-- **CI has not run the restart leg yet.** It ran here under podman on macOS only. CI's integration job (docker on Linux)
-  runs it from the first push of S2.
+- **kama-tls.** `../kama-tls` is readable. The package needs `@kama/tls` ≥ 0.1.3 (its `TlsError` is `Sendable`), and
+  the locks pin 0.1.4. kama-tls is busy with its own roadmap, so ask the maintainer before you need something there.
+- **The servers.** `kama-pg-14` to `kama-pg-19` and their standbys run under podman (`tools/pg.sh`). The superuser's
+  reset test leaves one object behind, by design: `kp_reset_seq`, a sequence in `kp_test`, made with `if not exists`.
+  The restart leg leaves each primary running, and `test-integration.sh` runs `pg.sh up` after it.
+- **CI has not run the restart leg yet.** It has run here under podman on macOS only. CI's integration job (docker on
+  Linux) runs it from the first push of S2.
 - **Other sessions commit here.** @kama/redis's session committed `bacbcc4` to this repo during S0b. Read `git status`
   and `git log` before committing, and stage only your own files.
 

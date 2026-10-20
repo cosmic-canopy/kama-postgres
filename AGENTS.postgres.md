@@ -215,12 +215,26 @@ release it is built and tested with, and the first with everything this package 
   - Handlers are `Owned<Contract>`, where the contract `implements Sendable`.
   - Never put a `Shared` in a `Connection`; it is a non-atomic count.
 
-- **The pool shares connections through a channel.**
-  - Idle connections sit in a `Channel<Connection>`. The pool claims `sender()` and `receiver()` before
-    the `Channel` drops, because dropping it closes any side nobody claimed.
-  - A lease keeps its connection in a zero-or-one `DynamicArray`, since a destructor cannot `give` a
-    field but can `pop()`. It returns the connection through a `Shared` return path.
-  - `acquire(timeout:)` is `recvTimeout`.
+- **The pool is two channels** (`src/pool/pool.kama`, `postgres::pool`), with no lock and no atomic.
+  - `slots` carries `Slot`s, each `Idle(conn, expires)` or `Empty`. `permits` holds the capacity no connection has used
+    yet, `maxSize` of it at first. Capacity freed later goes into `slots` as `Empty`, never back to `permits`, so a
+    waiter blocked on `slots` wakes for it.
+  - Every path keeps permits + slots + leases + connects under way equal to `maxSize`. A path that puts one slot too
+    many deadlocks a release in `send` on a full channel (a mutation showed it), so a change to acquire or release must
+    keep the count.
+  - Every channel call is in `Ends`, the one place KR-214 (channels returning `Result`) changes.
+  - Only a `Channel` makes new ends for itself, so the pool that made the channels keeps them (`Factories`), and only
+    that pool can `share()`. Claim `sender()` and `receiver()` before a `Channel` drops: dropping it closes any side
+    nobody claimed.
+  - A `PoolShare` keeps its `PoolCore` in a zero-or-one `DynamicArray`, and `Pool.join(share:)` takes a `ref`. So a
+    caller's own `Sendable` bundle can hold a share as a field and join it, since nothing moves a field out.
+  - The `Pool` and its leases hold a `Shared<Home>`; a lease's destructor gives its connection back through it. So
+    neither is `Sendable`; `PoolShare` and `PoolCore` are.
+  - A lease keeps its connection in a zero-or-one `DynamicArray`, since a destructor can `pop()` a field but not `give`
+    it.
+  - `Connection.settle()` is private; `PoolCore` has a `friend` grant for release with the reset off.
+  - `Pool.makeWith(connector:)` is the seam: the unit tests' `ScriptConnector` opens each connection over the next
+    script, so every message a release sends is checked.
 
 - **Language habits this code base needs, each learned from a compiler error:**
   - A `resource` field is always private.
@@ -243,6 +257,9 @@ release it is built and tested with, and the first with everything this package 
   - A row a loop drops must still be moved: `else { RowValues dropped = give r; }`.
   - `float` is reserved, as every C keyword is; so is `out`.
   - A resource that implements `Copyable<This>` must say its bare hand-off: `Copyable<This>(bare: give)`.
+  - Nothing moves a field out of a resource, not even out of a by-value parameter. A type whose contents must be
+    handed on keeps them in a zero-or-one `DynamicArray` and `pop()`s them (`PoolShare`).
+  - `when` is reserved, as a name too.
   - `DynamicArray.remove` returns `T` and `pop` returns `Optional<T>`.
   - A static function is called with `::` (`Connection::visit(…)`); `.` on a type calls a constructor.
   - A function that must build a resource through a private constructor gets a `friend` grant, or is a `static` of

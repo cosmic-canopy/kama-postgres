@@ -14,7 +14,7 @@ release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta.
 > **Status: early.** It connects, authenticates and runs queries, with typed parameters and typed rows, over TCP, a
 > Unix-domain socket or TLS (every `sslmode`, client certificates, SCRAM-SHA-256-PLUS). The statement cache,
 > transactions and savepoints, COPY, waiting for notifications, pipelining and batches, cancellation and query timeouts,
-> `target_session_attrs` and `load_balance_hosts` came in 0.2.0. Not there yet: a pool. See [docs/ROADMAP.md](docs/ROADMAP.md). In 0.x, a minor version may break the API.
+> `target_session_attrs` and `load_balance_hosts` came in 0.2.0, and a pool shared by isolates is coming in 0.3.0. See [docs/ROADMAP.md](docs/ROADMAP.md). In 0.x, a minor version may break the API.
 
 ## Using it
 
@@ -263,6 +263,47 @@ What it does not touch:
 
 It is refused, as any command is, while a result, a COPY or pipeline mode is in progress.
 
+## A pool
+
+`postgres::pool` keeps connections for the isolates of a program to share, as pgxpool, HikariCP and Npgsql keep theirs.
+`acquire()` returns a `Lease`, and the lease gives its connection back when it is dropped, on every path out of its
+scope. `lease.conn()` is the connection: pass it wherever a `ref Connection` goes, or open a transaction window on it.
+
+```kama
+PoolOptions options = PoolOptions.defaults();
+options.maxSize = 8;
+Result<Pool, PgError> made = Pool.make(config: config, options: options);
+Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { println(s: e.message()); return 1; } };
+
+Result<Lease, PgError> got = pool.acquire();
+Lease lease = match (give got) { case Ok(value: l): give l; case Err(error: e): { println(s: e.message()); return 1; } };
+borrow lease.conn().transaction() as tx {
+    Result<Optional<int64>, PgError> moved = tx.conn().execute(q: pg"update stock set shelf = 'B' where shelf = 'A'");
+    Result<Unit, PgError> done = tx.commit();
+}
+```
+
+A pool belongs to the isolate that made it. To use it from another, `pool.share()` makes a `PoolShare`, which is
+`Sendable`, and `Pool.join(share: s)` in that isolate makes a pool over the same connections, with the same maxSize
+between them all. Only the pool that made the connections' channels can share them.
+
+- **The bound.** At most `maxSize` connections are open at once, leased and idle together, across every isolate. A
+  connection is made only when one is acquired and none is idle. One acquire at a time keeps using one connection.
+- **Waiting.** While every connection is leased, `acquire()` waits for one to come back, up to `acquireTimeout`, and
+  then fails with `PgError::PoolTimeout`. A connect that fails is acquire's error, and its place in the pool is given
+  back.
+- **Release.** A connection that is closed, busy (a result, a stream or a COPY still open) or in pipeline mode is
+  closed, not kept. Otherwise its session is reset (`resetSession()`, above), which rolls back an open transaction
+  block, and a reset that fails closes the connection. With `reset` off, only an open block is rolled back, as pgx does.
+  The pool's query timeout is put back, and a notice handler set through the lease is cleared.
+- **Lifetime.** A connection is closed once it has been open for `lifetime`, plus a random part of `lifetimeJitter`, so
+  that connections made together are not all replaced together.
+
+The defaults are pgxpool's: `maxSize` max(4, the CPUs online), a `lifetime` of one hour. Then a `lifetimeJitter` of 90
+seconds (HikariCP's 2.5%), an `acquireTimeout` of 30 seconds (sqlx's and HikariCP's), and `reset` on (Npgsql's and
+asyncpg's). `Pool.makeWith(connector:, config:, options:)` takes a `Connector` that makes the connections, for a pool
+that connects through a `Dialer` or sets each session up its own way.
+
 ## Notifications
 
 `waitForNotification(timeout:)` returns the next LISTEN/NOTIFY notification. If none arrives in time it returns `None`,
@@ -363,7 +404,7 @@ A connection string can list several hosts, as libpq's can:
   - Transactions and savepoints, COPY in and out, LISTEN/NOTIFY, query cancellation and timeouts.
   - `ping()`, and `resetSession()`, Npgsql's session reset.
   - Full `ErrorResponse` fields with SQLSTATE constants.
-  - A connection pool shared across isolates (phase 8, not there yet).
+  - A connection pool shared across isolates.
 
 No GSSAPI/Kerberos/SSPI: a server that asks for them gets a clear error.
 

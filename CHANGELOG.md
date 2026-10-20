@@ -57,6 +57,18 @@ All notable changes to this package are recorded here. The format follows
   block, with a cached statement, a command in flight, `ping` and `resetSession`), a connect while the server is down
   and while it starts, and the sessions after it. The words a session may report are libpq's; asked across a restart,
   the server's own psql printed the FATAL and then the lost connection.
+- **`postgres::pool`: a connection pool shared by isolates.**
+  - `Pool.make(config:, options:)` and `pool.acquire()`, which returns a `Lease`. The lease gives its connection back
+    when it is dropped, and `lease.conn()` is the connection.
+  - `pool.share()` and `Pool.join(share:)` use one pool from several isolates, with one bound between them.
+  - At most `maxSize` connections, made only when acquired. `acquire()` waits up to `acquireTimeout`, then fails with
+    the new `PgError::PoolTimeout`.
+  - Release closes a connection that is closed, busy, in pipeline mode or past its lifetime. Otherwise it resets the
+    session (`resetSession()`, which rolls back too), or, with `reset` off, rolls back an open block only. It also puts
+    back the pool's query timeout and clears a notice handler.
+  - `PoolOptions.defaults()` are pgxpool's (max(4, CPUs), a one-hour lifetime), with HikariCP's 90 seconds of lifetime
+    jitter and a 30-second acquire timeout.
+  - `Pool.makeWith(connector:, …)` takes a `Connector` that makes the connections.
 - **Seeded mutations of every scripted reply** (`tests/unit/src/garble_test.kama`). Eighteen conversations carry every
   backend message this client reads, in each state it can arrive in: startup with each authentication method and a
   protocol downgrade, the simple and extended protocols, the statement cache, a portal, COPY both ways, a pipeline, a
@@ -90,6 +102,7 @@ All notable changes to this package are recorded here. The format follows
 - A NoticeResponse before authentication is refused, as libpq refuses it. A server sends none there.
 - A pre-3.0 error whose text is empty is "received invalid error message", where libpq reports an empty error: what it
   holds is a v3 header with a length under 8. Found by the seeded mutations of every scripted reply (below).
+- **Breaking:** `PgError` has a new case, `PoolTimeout`, so an exhaustive `match` on it needs one more arm.
 - `PgError` is `Sendable`, and so are `ServerError`, `ConnectError`, `ConnectAttempt`, `ProtocolError` and
   `ErrorFields`, so an error can cross isolates (a `Channel<PgError>`, or a `Sendable` type that holds one).
 

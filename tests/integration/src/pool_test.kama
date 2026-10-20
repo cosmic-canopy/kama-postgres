@@ -1,0 +1,161 @@
+// postgres::pool against the live server: a connection comes back to the pool reset (its settings, temporary tables,
+// advisory locks, LISTENs and prepared statements gone), an open transaction is rolled back rather than committed, and
+// isolates sharing a pool never hold more than maxSize connections between them, as pg_stat_activity counts them.
+import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
+         std::concurrent::SendResult, std::concurrent::Isolate, std::fmt::parse, std::fmt::ParseError, std::random::Rng,
+         postgres::Config, postgres::Environment, postgres::PgError, postgres::TransactionStatus, postgres::pool::Pool, postgres::pool::PoolOptions, postgres::pool::PoolShare,
+         postgres::pool::Lease,
+         postgres_integration_tests::check, postgres_integration_tests::conninfoFor,
+         postgres_integration_tests::quietEnvironment, postgres_integration_tests::configWith, postgres_integration_tests::scalar };
+export { poolTests };
+
+// A pool of `size` connections as `kp_trust`, named `name` (application_name), over this run's sslmode.
+unsafe fn Result<Pool, PgError> livePool(const ref string name, isize size) {
+    string conninfo = conninfoFor(user: "kp_trust").concat(other: " application_name=").concat(other: name);
+    Environment env = quietEnvironment();
+    Result<Config, PgError> c = configWith(conninfo: conninfo, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    PoolOptions options = PoolOptions.defaults();
+    options.maxSize = size;
+    return Pool.make(config: config, options: options);
+}
+
+// A name no other run's sessions have, for counting this run's in pg_stat_activity.
+unsafe fn string uniqueName(const ref string stem) {
+    Rng g = Rng.fromEntropy();
+    uint64 n = g.next() % 1000000000ui64;
+    return stem.concat(other: "_${n}");
+}
+
+unsafe fn int32 resetOnRelease() {
+    int32 f = 0;
+    string name = uniqueName(stem: "kp_pool");
+    Result<Pool, PgError> made = livePool(name: name, size: 2);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make (".concat(other: e.message()).concat(other: ")")); } };
+    string firstPid = "";
+    string dirtied = "";
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        Lease l = match (give a) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pool: acquire (".concat(other: e.message()).concat(other: ")")); } };
+        firstPid = scalar(c: l.conn(), sql: "SELECT pg_backend_pid()");
+        string set = scalar(c: l.conn(), sql: "SET application_name = 'kp_pool_dirty'");
+        string temp = scalar(c: l.conn(), sql: "CREATE TEMP TABLE kp_pool_temp (x int)");
+        string lock = scalar(c: l.conn(), sql: "SELECT pg_advisory_lock(4242)");
+        string listen = scalar(c: l.conn(), sql: "LISTEN kp_pool_channel");
+        string prepare = scalar(c: l.conn(), sql: "PREPARE kp_pool_stmt AS SELECT 1");
+        dirtied = scalar(c: l.conn(), sql: "SELECT current_setting('application_name')");
+    }
+    Result<Lease, PgError> b = pool.acquire();
+    Lease l = match (give b) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pool: acquire again (".concat(other: e.message()).concat(other: ")")); } };
+    string pid = scalar(c: l.conn(), sql: "SELECT pg_backend_pid()");
+    string app = scalar(c: l.conn(), sql: "SHOW application_name");
+    string temp = scalar(c: l.conn(), sql: "SELECT count(*) FROM pg_class WHERE relname = 'kp_pool_temp' AND relpersistence = 't'");
+    string locks = scalar(c: l.conn(), sql: "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()");
+    string listens = scalar(c: l.conn(), sql: "SELECT count(*) FROM pg_listening_channels()");
+    string prepared = scalar(c: l.conn(), sql: "SELECT count(*) FROM pg_prepared_statements");
+    f = f + check(ok: dirtied.equals(other: "kp_pool_dirty") && pid.equals(other: firstPid),
+                  what: "pool: the next acquire gets the same backend (".concat(other: firstPid).concat(other: ", then ").concat(other: pid).concat(other: "; ").concat(other: dirtied).concat(other: ")"));
+    f = f + check(ok: app.equals(other: name) && temp.equals(other: "0") && locks.equals(other: "0") && listens.equals(other: "0") && prepared.equals(other: "0"),
+                  what: "pool: a released connection comes back reset (application_name ".concat(other: app).concat(other: ", temp ").concat(other: temp)
+                        .concat(other: ", advisory locks ").concat(other: locks).concat(other: ", listens ").concat(other: listens).concat(other: ", prepared ").concat(other: prepared).concat(other: ")"));
+    return f;
+}
+
+unsafe fn int32 rollbackOnRelease() {
+    string name = uniqueName(stem: "kp_pool");
+    Result<Pool, PgError> made = livePool(name: name, size: 1);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, rollback (".concat(other: e.message()).concat(other: ")")); } };
+    string xid = "";
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        Lease l = match (give a) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pool: acquire, rollback"); } };
+        string begun = scalar(c: l.conn(), sql: "BEGIN");
+        xid = scalar(c: l.conn(), sql: "SELECT pg_current_xact_id()");
+    }
+    Result<Lease, PgError> b = pool.acquire();
+    Lease l = match (give b) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pool: acquire, rollback again"); } };
+    bool idle = l.conn().transactionStatus() == TransactionStatus::Idle;
+    string status = scalar(c: l.conn(), sql: "SELECT pg_xact_status('".concat(other: xid).concat(other: "'::xid8)"));
+    return check(ok: idle && status.equals(other: "aborted"),
+                 what: "pool: a transaction left open on release is rolled back (transaction ".concat(other: xid).concat(other: " is ").concat(other: status).concat(other: ")"));
+}
+
+// ---- isolates sharing a pool ----
+
+// Takes a connection `rounds` times, counting this pool's sessions each time, and reports the most it saw (or the
+// first error).
+type resource Worker implements Sendable {
+    PoolShare share;
+    Sender<string> report;
+    string counting;
+    public ctor make(PoolShare share, Sender<string> report, string counting) {
+        this.share = give share; this.report = give report; this.counting = give counting;
+    }
+    public unsafe fn void run() {
+        Pool pool = Pool.join(share: this.share);
+        int32 most = 0;
+        string failed = "";
+        isize round = 0;
+        while (round < 5 && failed.length() == 0) {
+            Result<Lease, PgError> got = pool.acquire();
+            match (give got) {
+                case Ok(value: lease): {
+                    Lease l = give lease;
+                    string n = scalar(c: l.conn(), sql: this.counting);
+                    Result<int32, ParseError> seen = parse::<int32>(s: n);
+                    match (seen) { case Ok(value: v): { if (v > most) { most = v; } } case Err(error: e): { failed = copy n; } };
+                    string slept = scalar(c: l.conn(), sql: "SELECT pg_sleep(0.02)");
+                }
+                case Err(error: e): { failed = e.message(); }
+            };
+            round = round + 1;
+        }
+        string outcome = "most ${most}";
+        if (failed.length() > 0) { outcome = copy failed; }
+        SendResult<string> sent = this.report.send(item: give outcome);
+    }
+}
+
+fn void work(Worker job) { job.run(); }
+
+unsafe fn int32 boundAcrossIsolates() {
+    string name = uniqueName(stem: "kp_pool_bound");
+    Result<Pool, PgError> made = livePool(name: name, size: 2);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, isolates"); } };
+    string counting = "SELECT count(*) FROM pg_stat_activity WHERE application_name = '".concat(other: name).concat(other: "'");
+    Channel<string> results = Channel.bounded(capacity: 8);
+    Receiver<string> rx = results.receiver();
+    isize workers = 4;
+    {
+        DynamicArray<Isolate> running = DynamicArray.empty();
+        isize i = 0;
+        while (i < workers) {
+            Result<PoolShare, PgError> sh = pool.share();
+            PoolShare share = match (give sh) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pool: share, isolates"); } };
+            Worker job = Worker.make(share: give share, report: results.sender(), counting: copy counting);
+            Isolate w = spawn work(job: give job);
+            running.add(item: give w);
+            i = i + 1;
+        }
+    }
+    string seen = "";
+    bool bounded = true;
+    isize k = 0;
+    while (k < workers) {
+        Optional<string> r = rx.recv();
+        string got = match (r) { case Some(value: v): copy v; case None: "(no report)"; };
+        bounded = bounded && (got.equals(other: "most 1") || got.equals(other: "most 2"));
+        if (seen.length() > 0) { seen = seen.concat(other: ", "); }
+        seen = seen.concat(other: got);
+        k = k + 1;
+    }
+    return check(ok: bounded, what: "pool: isolates sharing a pool never hold more than maxSize (2) connections (".concat(other: seen).concat(other: ")"));
+}
+
+unsafe fn int32 poolTests() {
+    int32 f = 0;
+    f = f + resetOnRelease();
+    f = f + rollbackOnRelease();
+    f = f + boundAcrossIsolates();
+    return f;
+}

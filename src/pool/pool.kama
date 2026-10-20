@@ -1,0 +1,406 @@
+import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
+         std::concurrent::SendResult, std::concurrent::RecvResult, std::concurrent::cpuCount, std::memory::Owned,
+         std::memory::Shared, std::random::Rng, std::random::range, std::time::Duration, std::time::Instant,
+         std::time::monotonicNow, postgres::Config, postgres::Connection, postgres::PgError, postgres::PipelineStatus,
+         postgres::TransactionStatus, Connector };
+export { Pool, PoolOptions, PoolShare, Lease };
+
+// postgres::pool — connections shared by the isolates of a program, as pgxpool, HikariCP and Npgsql share theirs. A
+// Lease holds one connection and gives it back when it is dropped, on every path out of its scope.
+//
+// The pool is two channels, with no lock and no atomic. `slots` holds the idle connections, and `permits` the capacity
+// no connection has used yet, maxSize of it at first. Acquire takes an idle connection if one is waiting, else a permit
+// (and connects), else waits on `slots` until acquireTimeout passes. Capacity freed later (a connection closed, a
+// connect that failed, a connection past its lifetime) goes into `slots` as Empty, never back to `permits`, so that a
+// waiter wakes for it; whoever takes an Empty connects. So the permits left, the slots, the leases and the connects
+// under way always add up to maxSize, and a program that takes one connection at a time keeps using one.
+//
+// A pool belongs to one isolate, and so do its leases. `share()` makes a PoolShare, which is Sendable, and
+// `Pool.join(share:)` in another isolate makes a pool over the same channels, the same maxSize between them. Only the
+// pool that made the channels can share them, since only a channel makes new ends for itself.
+//
+// Release is Npgsql's. A connection that is closed, busy (a result, a stream or a COPY still open), in pipeline mode,
+// or past its lifetime is closed. Then the session is reset (Connection.resetSession, which rolls back an open block
+// first), sent at once, so that a failure is the releaser's and not the next user's; a reset that fails closes the
+// connection. With `reset` off, only an open block is rolled back, as pgx's release does. The pool's query timeout is
+// put back first, so it bounds the reset too, and a notice handler set through the lease is cleared: a pooled
+// connection's notices go to the log.
+
+// How a pool behaves (Pool.make). The defaults are pgxpool's, with HikariCP's spread of lifetimes and the acquire
+// timeout of sqlx and HikariCP.
+type value PoolOptions implements Sendable {
+    // The most connections open at once, leased and idle together, across every isolate the pool is shared with.
+    // Default max(4, the CPUs online), pgxpool's.
+    public isize maxSize;
+    // How long a connection is kept, from its connect; None for no limit. One past it is closed when it is next
+    // released or acquired. Default one hour, pgxpool's.
+    public Optional<Duration> lifetime;
+    // Up to this much more, chosen at random for each connection, so that connections made together do not all reach
+    // their lifetime together. Default 90 seconds, HikariCP's 2.5% of the hour.
+    public Duration lifetimeJitter;
+    // How long acquire() waits while every connection is leased; then it fails with PgError::PoolTimeout. Default 30
+    // seconds, as sqlx and HikariCP wait. A connect it makes is bounded by the Config's connect_timeout, as libpq's is.
+    public Duration acquireTimeout;
+    // Whether release resets the session (Connection.resetSession). Default true, as Npgsql and asyncpg reset. Off,
+    // release only rolls back an open transaction block, as pgx's does.
+    public bool reset;
+    // Each connection's query timeout and its grace (Connection.setQueryTimeout), set when it connects and put back
+    // when it is released. Default None and 2 seconds, a connection's own defaults.
+    public Optional<Duration> queryTimeout;
+    public Duration queryGrace;
+
+    public ctor defaults() {
+        isize cpus = cast<isize>(cpuCount());
+        this.maxSize = cpus;
+        if (cpus < 4) { this.maxSize = 4; }
+        this.lifetime = Optional::Some(value: Duration.fromSecs(s: 3600i64));
+        this.lifetimeJitter = Duration.fromSecs(s: 90i64);
+        this.acquireTimeout = Duration.fromSecs(s: 30i64);
+        this.reset = true;
+        this.queryTimeout = Optional::None;
+        this.queryGrace = Duration.fromSecs(s: 2i64);
+    }
+}
+
+// Why `options` cannot make a pool, or None.
+fn Optional<string> invalid(const ref PoolOptions options) {
+    if (options.maxSize < 1) {
+        isize n = options.maxSize;
+        return Optional::Some(value: "pool maxSize must be at least 1, not ${n}");
+    }
+    bool lifeOk = match (options.lifetime) { case Some(value: d): !d.isNegative() && d.asNanos() > 0i64; case None: true; };
+    if (!lifeOk) { return Optional::Some(value: "pool lifetime must be more than 0 (or None, for no limit)"); }
+    bool timeoutOk = match (options.queryTimeout) { case Some(value: d): !d.isNegative(); case None: true; };
+    if (options.lifetimeJitter.isNegative() || options.acquireTimeout.isNegative() || options.queryGrace.isNegative() || !timeoutOk) {
+        return Optional::Some(value: "pool durations must not be negative");
+    }
+    return Optional::None;
+}
+
+// What the pool's channels carry. A slot is an idle connection, with when its lifetime ends, or Empty: capacity a
+// connection gave up, which whoever takes it fills by connecting. A permit is capacity no connection has used yet.
+type enum Slot implements Sendable { Idle(Connection conn, Optional<Instant> expires), Empty }
+type enum Permit implements Sendable { One }
+
+// This isolate's ends of the pool's two channels. Every channel call the pool makes is here.
+type resource Ends implements Sendable {
+    Sender<Slot> slotsIn;
+    Receiver<Slot> slotsOut;
+    Receiver<Permit> permitsOut;
+
+    ctor make(Sender<Slot> slotsIn, Receiver<Slot> slotsOut, Receiver<Permit> permitsOut) {
+        this.slotsIn = give slotsIn; this.slotsOut = give slotsOut; this.permitsOut = give permitsOut;
+    }
+    friend Factories[make];
+
+    // Give a slot back. With no receiver left (every pool over the channel gone) it is dropped, and with it its
+    // connection, which closes.
+    unsafe fn void put(Slot slot) { SendResult<Slot> sent = this.slotsIn.send(item: give slot); }
+
+    // A slot waiting now, if there is one.
+    fn Optional<Slot> take() {
+        RecvResult<Slot> r = this.slotsOut.tryRecv();
+        match (give r) { case Received(item: s): { return Optional::Some(value: give s); } case _: { } };
+        return Optional::None;
+    }
+
+    // A slot, waiting for one until `deadline`.
+    unsafe fn Optional<Slot> takeBy(Instant deadline) {
+        Instant now = monotonicNow();
+        RecvResult<Slot> r = this.slotsOut.recvTimeout(timeout: deadline.since(earlier: now));
+        match (give r) { case Received(item: s): { return Optional::Some(value: give s); } case _: { } };
+        return Optional::None;
+    }
+
+    // Whether a permit was waiting; it is taken.
+    fn bool permit() {
+        RecvResult<Permit> r = this.permitsOut.tryRecv();
+        return match (r) { case Received(item: p): true; case _: false; };
+    }
+
+    friend PoolCore[put, take, takeBy, permit];
+}
+
+// The two channels themselves, which the pool that made them keeps: only a channel makes new ends, which share() needs.
+type resource Factories {
+    Channel<Slot> slots;
+    Channel<Permit> permits;
+
+    // Room for `size` connections: as many permits, and as many slots, since no more can ever be given back.
+    unsafe ctor make(isize size) {
+        usize room = cast<usize>(size);
+        this.slots = Channel.bounded(capacity: room);
+        this.permits = Channel.bounded(capacity: room);
+        Sender<Permit> fill = this.permits.sender();
+        usize i = 0;
+        while (i < room) { SendResult<Permit> sent = fill.send(item: Permit::One); i = i + 1; }
+    }
+
+    unsafe fn Ends mint() {
+        return Ends.make(slotsIn: this.slots.sender(), slotsOut: this.slots.receiver(), permitsOut: this.permits.receiver());
+    }
+
+    friend Pool[make, mint];
+}
+
+// Pool.make's connector: Connection.connect.
+type resource DirectConnector implements Connector, Sendable {
+    bool unused = false;
+    ctor make() { this.unused = false; }
+    friend Pool[make];
+    public unsafe fn Result<Connection, PgError> open(const ref Config config) { return Connection.connect(config: config); }
+    public fn Owned<Connector> fork() {
+        Owned<Connector> next = new DirectConnector.make();
+        return give next;
+    }
+}
+
+// Everything a pool is in one isolate: its ends of the channels, its settings, and its connector. Sendable, so that a
+// PoolShare can carry one to another isolate.
+type resource PoolCore implements Sendable {
+    Ends ends;
+    Config config;
+    PoolOptions settings;
+    Owned<Connector> connector;
+    Rng rng;   // the lifetimes' spread
+
+    unsafe ctor make(Ends ends, Config config, PoolOptions settings, Owned<Connector> connector) {
+        this.ends = give ends; this.config = give config; this.settings = settings; this.connector = give connector;
+        this.rng = Rng.fromEntropy();
+    }
+
+    // The same pool, over new ends of its channels, for another isolate.
+    unsafe fn PoolCore fork(Ends ends) {
+        Config c = copy this.config;
+        Owned<Connector> next = this.connector.fork();
+        return PoolCore.make(ends: give ends, config: give c, settings: this.settings, connector: give next);
+    }
+
+    const fn Duration acquireTimeout() { return this.settings.acquireTimeout; }
+
+    // A connection to lease, by `deadline`: an idle one, or a new one on capacity that is free. Always an Idle slot.
+    unsafe fn Result<Slot, PgError> checkout(Instant deadline) {
+        Optional<Slot> got = this.ends.take();
+        bool waiting = match (got) { case Some(value: s): false; case None: true; };
+        if (waiting) {
+            if (this.ends.permit()) { return this.dial(); }
+            got = this.ends.takeBy(deadline: deadline);
+        }
+        match (give got) {
+            case Some(value: s): {
+                match (give s) {
+                    case Idle(conn: c, expires: until): {
+                        if (!past(expires: until)) { return Result::Ok(value: Slot::Idle(conn: give c, expires: until)); }
+                        Connection old = give c;
+                        old.close();
+                        return this.dial();
+                    }
+                    case Empty: { return this.dial(); }
+                };
+            }
+            case None: { }
+        };
+        return Result::Err(error: PgError::PoolTimeout);
+    }
+
+    // A new connection on capacity the caller holds. If it cannot be made, the capacity goes back, as Empty.
+    unsafe fn Result<Slot, PgError> dial() {
+        Result<Connection, PgError> made = this.connector.open(config: this.config);
+        match (give made) {
+            case Ok(value: c): {
+                Connection conn = give c;
+                conn.setQueryTimeout(timeout: this.settings.queryTimeout, grace: this.settings.queryGrace);
+                Optional<Instant> lifeEnds = this.expiry();
+                return Result::Ok(value: Slot::Idle(conn: give conn, expires: lifeEnds));
+            }
+            case Err(error: e): {
+                this.ends.put(slot: Slot::Empty);
+                return Result::Err(error: give e);
+            }
+        };
+        return Result::Err(error: PgError::Closed);
+    }
+
+    // When a connection made now reaches its lifetime: the lifetime and a random part of the jitter from now.
+    unsafe fn Optional<Instant> expiry() {
+        match (this.settings.lifetime) {
+            case Some(value: life): {
+                int64 most = this.settings.lifetimeJitter.asMillis();
+                int64 spread = 0;
+                if (most > 0i64) {
+                    int64 lo = 0;
+                    int64 hi = most + 1;
+                    spread = range(rng: ref this.rng, lo: lo, hi: hi);
+                }
+                Instant now = monotonicNow();
+                return Optional::Some(value: now + life + Duration.fromMillis(ms: spread));
+            }
+            case None: { }
+        };
+        return Optional::None;
+    }
+
+    // Take back a leased connection (Lease's destructor), as the header says.
+    unsafe fn void release(Connection conn, Optional<Instant> expires) {
+        bool keep = !conn.isClosed();
+        if (keep && (conn.pipelineStatus() != PipelineStatus::Off || conn.transactionStatus() == TransactionStatus::Active)) {
+            keep = false;
+        }
+        if (keep && past(expires: expires)) { keep = false; }
+        if (keep) {
+            conn.setQueryTimeout(timeout: this.settings.queryTimeout, grace: this.settings.queryGrace);
+            conn.clearNoticeHandler();
+            if (this.settings.reset) {
+                Result<Unit, PgError> r = conn.resetSession();
+                keep = match (r) { case Ok(value: u): true; case Err(error: e): false; };
+            } else if (conn.transactionStatus() != TransactionStatus::Idle) {
+                conn.settle();
+            }
+            keep = keep && !conn.isClosed();
+        }
+        if (keep) {
+            this.ends.put(slot: Slot::Idle(conn: give conn, expires: expires));
+            return;
+        }
+        Connection gone = give conn;
+        gone.close();
+        this.ends.put(slot: Slot::Empty);
+    }
+
+    friend Pool[make, fork, acquireTimeout, checkout];
+    friend Lease[release];
+}
+
+// Whether a connection whose lifetime ends at `expires` is past it.
+unsafe fn bool past(Optional<Instant> expires) {
+    Instant now = monotonicNow();
+    return match (expires) { case Some(value: at): now >= at; case None: false; };
+}
+
+// A pool's state in its isolate, which the Pool and its leases share: a lease gives its connection back through it.
+type resource Home {
+    PoolCore state;
+    ctor make(PoolCore state) { this.state = give state; }
+    fn ref PoolCore core() { return this.state; }
+    friend Pool[make, core];
+    friend Lease[core];
+}
+
+// A pool to join from another isolate (Pool.join), made by Pool.share(). Sendable. It can be joined once.
+type resource PoolShare implements Sendable {
+    DynamicArray<PoolCore> part;   // zero or one: joining takes it
+
+    ctor make(PoolCore core) { this.part = DynamicArray.empty(); this.part.add(item: give core); }
+
+    fn PoolCore claim() {
+        Optional<PoolCore> c = this.part.pop();
+        match (give c) { case Some(value: core): { return give core; } case None: { } };
+        panic(msg: "this PoolShare was joined already: share() makes one per pool to join");
+    }
+
+    friend Pool[make, claim];
+}
+
+// A connection pool (see the header). It belongs to the isolate that made it; share() hands it to another.
+type resource Pool {
+    Shared<Home> home;
+    Optional<Factories> made;   // the channels, kept by the pool that made them
+
+    // A pool of connections made with `config`, as Connection.connect makes them. None is made until one is
+    // acquired, as pgxpool makes none. Options that cannot make a pool are refused (PgError::Usage).
+    public unsafe ctor Result<Pool, PgError> make(const ref Config config, PoolOptions options) {
+        Owned<Connector> direct = new DirectConnector.make();
+        return Pool.makeWith(connector: give direct, config: config, options: options);
+    }
+
+    // A pool whose connections `connector` makes.
+    public unsafe ctor Result<Pool, PgError> makeWith(Owned<Connector> connector, const ref Config config, PoolOptions options) {
+        Optional<string> wrong = invalid(options: options);
+        match (wrong) { case Some(value: why): { return Result::Err(error: PgError::Usage(detail: copy why)); } case None: { } };
+        Pool p = Pool.over(connector: give connector, config: config, options: options);
+        return Result::Ok(value: give p);
+    }
+
+    unsafe ctor over(Owned<Connector> connector, const ref Config config, PoolOptions options) {
+        Factories f = Factories.make(size: options.maxSize);
+        Ends mine = f.mint();
+        Config c = copy config;
+        PoolCore core = PoolCore.make(ends: give mine, config: give c, settings: options, connector: give connector);
+        Shared<Home> h = new Home.make(state: give core);
+        this.home = give h;
+        this.made = Optional::Some(value: give f);
+    }
+
+    // The pool `share` was made from, in this isolate. A share joins once; joining it again panics.
+    public unsafe ctor join(ref PoolShare share) {
+        PoolCore core = share.claim();
+        Shared<Home> h = new Home.make(state: give core);
+        this.home = give h;
+        this.made = Optional::None;
+    }
+
+    // This pool, for another isolate to join (Pool.join). Refused for a pool that was itself joined from a share,
+    // since only the pool that made the channels can make new ends for them.
+    public unsafe fn Result<PoolShare, PgError> share() {
+        match (this.made) {
+            case Some(value: f): {
+                Ends theirs = f.mint();
+                PoolCore core = this.home.core().fork(ends: give theirs);
+                PoolShare s = PoolShare.make(core: give core);
+                return Result::Ok(value: give s);
+            }
+            case None: { }
+        };
+        return Result::Err(error: PgError::Usage(detail: "a pool joined from a PoolShare cannot be shared again: share the pool that made it"));
+    }
+
+    // A connection: an idle one, or a new one while fewer than maxSize are open, or else the first given back within
+    // acquireTimeout (PgError::PoolTimeout after it). A connect's error is returned as it is.
+    public unsafe fn Result<Lease, PgError> acquire() {
+        Instant start = monotonicNow();
+        Instant deadline = start + this.home.core().acquireTimeout();
+        Result<Slot, PgError> got = this.home.core().checkout(deadline: deadline);
+        match (give got) {
+            case Ok(value: s): {
+                match (give s) {
+                    case Idle(conn: c, expires: until): {
+                        Shared<Home> back = this.home;
+                        Lease lease = Lease.make(conn: give c, expires: until, home: give back);
+                        return Result::Ok(value: give lease);
+                    }
+                    case Empty: { }
+                };
+            }
+            case Err(error: e): { return Result::Err(error: give e); }
+        };
+        return Result::Err(error: PgError::Closed);   // checkout yields only Idle
+    }
+}
+
+// One connection from a pool (Pool.acquire), given back when the lease is dropped. It belongs to the isolate whose
+// pool made it.
+type resource Lease {
+    DynamicArray<Connection> held;   // zero or one: a destructor can pop() a field but not give it
+    Optional<Instant> expires;
+    Shared<Home> home;
+
+    ctor make(Connection conn, Optional<Instant> expires, Shared<Home> home) {
+        this.held = DynamicArray.empty();
+        this.held.add(item: give conn);
+        this.expires = expires;
+        this.home = give home;
+    }
+    friend Pool[make];
+
+    // The connection, which stays the lease's: `lease.conn().query(q: …)`, `borrow lease.conn().transaction() as tx`.
+    // Closing it (`lease.conn().close()`) gives its place in the pool back.
+    public fn ref Connection conn() { return this.held[0]; }
+
+    unsafe ~Lease() {
+        Optional<Connection> c = this.held.pop();
+        match (give c) {
+            case Some(value: conn): { this.home.core().release(conn: give conn, expires: this.expires); }
+            case None: { }
+        };
+    }
+}

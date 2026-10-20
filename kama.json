@@ -22,6 +22,7 @@
     "conninfo": { "visibility": "public" },
     "sqlstate": { "visibility": "public" },
     "types":    { "visibility": "public" },
+    "pool":     { "visibility": "public" },
     "wire":     { "visibility": "internal" },
     "secure":   { "visibility": "internal" },
     "session":  { "visibility": "internal" },

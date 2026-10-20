@@ -1,0 +1,14 @@
+import { std::memory::Owned, postgres::Config, postgres::Connection, postgres::PgError };
+export { Connector };
+
+// Where a pool's connections come from (Pool.makeWith): connections through a tunnel or a proxy (Connection.connectWith
+// and a Dialer), a test's scripted server, or a session set up in a way a Config cannot say. Pool.make's connects as
+// Connection.connect does.
+
+type contract Connector for resource implements Sendable {
+    // A new connection, made with the pool's Config. Any error is acquire's.
+    fn Result<Connection, PgError> open(const ref Config config);
+    // The connector of a pool joined in another isolate (Pool.share). Each isolate's pool has its own, since a
+    // connector is a resource and belongs to one.
+    fn Owned<Connector> fork();
+}

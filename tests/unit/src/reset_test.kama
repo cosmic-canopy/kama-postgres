@@ -13,7 +13,7 @@ import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire,
          postgres_unit_tests::resetRollback, postgres_unit_tests::resetDiscardAll, postgres_unit_tests::resetServerVersion,
          postgres_unit_tests::resetVersionNumber, postgres_unit_tests::resetLongForm, postgres_unit_tests::resetShortForm };
-export { resetTests };
+export { resetTests, opening, openingAt, queried, completes, resets, sentinel, said, quiet, answer, description, ints };
 
 comptime uint8 IDLE = 73ui8;     // 'I'
 comptime uint8 INTX = 84ui8;     // 'T'

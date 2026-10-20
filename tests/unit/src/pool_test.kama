@@ -1,0 +1,650 @@
+// postgres::pool against scripted servers: each connection the pool makes runs the next script (ScriptConnector), so
+// every message a release sends is checked, and a connection the pool should have closed is seen to be replaced by a
+// new one. The bound, a waiter woken from another isolate, a timeout, what release closes, resets and rolls back, the
+// settings it puts back, lifetimes, and the options a pool refuses.
+//
+// A script's steps are the conversation that connection must have. A message the script does not expect is answered
+// FATAL, and the pool then replaces the connection, so "it connected once" and "the sentinel ran" together say that
+// nothing else was sent.
+import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
+         std::concurrent::SendResult, std::concurrent::RecvResult, std::concurrent::Isolate, std::concurrent::cpuCount, std::io::IoError,
+         std::io::IoErrorKind, std::fmt::parse, std::fmt::ParseError, std::memory::Owned, std::time::Duration, std::time::Instant, std::time::monotonicNow,
+         std::time::sleep,
+         postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
+         postgres::Transport, postgres::TransactionStatus, postgres::PipelineStatus, postgres::CacheMode,
+         postgres::CopyInfo, postgres::NoticeHandler, postgres::ServerError,
+         postgres::pool::Pool, postgres::pool::PoolOptions, postgres::pool::PoolShare, postgres::pool::Lease,
+         postgres::pool::Connector,
+         postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
+         postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire,
+         postgres_unit_tests::resetDiscardAll, postgres_unit_tests::opening, postgres_unit_tests::openingAt,
+         postgres_unit_tests::queried, postgres_unit_tests::completes, postgres_unit_tests::resets,
+         postgres_unit_tests::sentinel, postgres_unit_tests::quiet, postgres_unit_tests::answer,
+         postgres_unit_tests::description, postgres_unit_tests::ints };
+export { poolTests };
+
+comptime uint8 IDLE = 73ui8;     // 'I'
+comptime uint8 INTX = 84ui8;     // 'T'
+comptime uint8 PARSE = 80ui8;    // 'P'
+comptime uint8 BIND = 66ui8;     // 'B'
+comptime uint8 DESCRIBE = 68ui8; // 'D'
+comptime uint8 EXECUTE = 69ui8;  // 'E'
+comptime uint8 SYNC = 83ui8;     // 'S'
+
+// ---- the connector ----
+
+// Opens each of the pool's connections over the next script, through a FakeServer, and tells `channel` of each:
+// "connect", then every message the client sends after its startup, as PQtrace prints it ("F\t16\tQuery\t…"). With
+// no script left a connect is refused. A fork opens nothing: the tests that share a pool lease the connections the
+// first pool made.
+type resource ScriptConnector implements Connector, Sendable {
+    DynamicArray<DynamicArray<Step>> scripts;
+    DynamicArray<Channel<string>> channel;   // zero or one
+
+    public ctor make(DynamicArray<DynamicArray<Step>> scripts, Channel<string> channel) {
+        this.scripts = give scripts;
+        this.channel = DynamicArray.empty();
+        this.channel.add(item: give channel);
+    }
+    ctor none() { this.scripts = DynamicArray.empty(); this.channel = DynamicArray.empty(); }
+
+    public unsafe fn Result<Connection, PgError> open(const ref Config config) {
+        if (this.channel.length() == 0 || this.scripts.length() == 0) {
+            return Result::Err(error: PgError::Io(error: IoError.of(kind: IoErrorKind::ConnectionRefused)));
+        }
+        Sender<string> log = this.channel[0].sender();
+        SendResult<string> sent = log.send(item: "connect");
+        DynamicArray<Step> s = this.scripts.remove(index: 0);
+        Owned<Transport> fake = new FakeServer.traced(steps: give s, chunk: 1, writeLimit: 3, tracer: this.channel[0].sender());
+        return Connection.connectOver(transport: give fake, config: config);
+    }
+
+    public fn Owned<Connector> fork() {
+        Owned<Connector> next = new ScriptConnector.none();
+        return give next;
+    }
+}
+
+// Everything `log` was told since it was last read.
+fn DynamicArray<string> drained(ref Receiver<string> log) {
+    DynamicArray<string> lines = DynamicArray.empty();
+    bool more = true;
+    while (more) {
+        RecvResult<string> r = log.tryRecv();
+        match (give r) { case Received(item: line): { lines.add(item: give line); } case _: { more = false; } };
+    }
+    return lines;
+}
+
+// How many connects `lines` report.
+fn isize connectsIn(const ref DynamicArray<string> lines) {
+    isize n = 0;
+    foreach (string line in lines) { if (line.equals(other: "connect")) { n = n + 1; } }
+    return n;
+}
+
+// How many connects `log` reported since it was last read.
+fn isize connects(ref Receiver<string> log) {
+    DynamicArray<string> lines = drained(log: ref log);
+    return connectsIn(lines: lines);
+}
+
+// Whether the first connection in `lines` sent a message with `what` in it.
+fn bool firstSays(const ref DynamicArray<string> lines, const ref string what) {
+    isize seen = 0;
+    foreach (string line in lines) {
+        if (line.equals(other: "connect")) { seen = seen + 1; }
+        else if (seen == 1 && line.contains(substring: what)) { return true; }
+    }
+    return false;
+}
+
+// A pool over `scripts`, with no statement cache (so each reset is DISCARD ALL), reporting its connects on `log`.
+unsafe fn Result<Pool, PgError> poolOver(DynamicArray<DynamicArray<Step>> scripts, PoolOptions options, Channel<string> log) {
+    Environment env = testEnvironment();
+    string none = "";
+    Result<Config, PgError> c = resolveWith(text: none, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    config.setStatementCache(mode: CacheMode::Off, capacity: 0);
+    Owned<Connector> connector = new ScriptConnector.make(scripts: give scripts, channel: give log);
+    return Pool.makeWith(connector: give connector, config: config, options: options);
+}
+
+fn DynamicArray<DynamicArray<Step>> scriptsOf(DynamicArray<Step> a) {
+    DynamicArray<DynamicArray<Step>> all = DynamicArray.empty();
+    all.add(item: give a);
+    return all;
+}
+
+fn DynamicArray<DynamicArray<Step>> twoScripts(DynamicArray<Step> a, DynamicArray<Step> b) {
+    DynamicArray<DynamicArray<Step>> all = DynamicArray.empty();
+    all.add(item: give a);
+    all.add(item: give b);
+    return all;
+}
+
+// The options the tests start from: `size` connections, a short wait, no lifetime.
+fn PoolOptions sized(isize size) {
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = size;
+    o.acquireTimeout = Duration.fromMillis(ms: 200i64);
+    o.lifetime = Optional::None;
+    o.lifetimeJitter = Duration.zero();
+    return o;
+}
+
+fn string said(const ref Result<Lease, PgError> r) { return match (r) { case Ok(value: l): "ok"; case Err(error: e): e.message(); }; }
+
+// SELECT 1 runs on `c`, which stays open.
+unsafe fn bool selectsOne(ref Connection c) {
+    Result<DynamicArray<Rows>, PgError> r = c.simpleQuery(sql: "SELECT 1");
+    bool ran = match (r) { case Ok(value: rows): true; case Err(error: e): false; };
+    return ran && !c.isClosed();
+}
+
+// A script that opens, and whose connection then answers the sentinel.
+unsafe fn DynamicArray<Step> answersSentinel() {
+    DynamicArray<Step> s = opening();
+    s.add(item: sentinel());
+    return s;
+}
+
+// ---- the bound ----
+
+unsafe fn int32 sequentialKeepsOne() {
+    DynamicArray<Step> s = opening();
+    isize i = 0;
+    while (i < 3) { s.add(item: sentinel()); s.add(item: resets(sql: resetDiscardAll())); i = i + 1; }
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    Result<Pool, PgError> made = poolOver(scripts: scriptsOf(a: give s), options: sized(size: 4), log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, sequential"); } };
+    bool ran = true;
+    i = 0;
+    while (i < 3) {
+        Result<Lease, PgError> a = pool.acquire();
+        match (give a) {
+            case Ok(value: lease): { Lease l = give lease; ran = ran && selectsOne(c: l.conn()); }
+            case Err(error: e): { ran = false; }
+        };
+        i = i + 1;
+    }
+    isize n = connects(log: ref log);
+    return check(ok: ran && n == 1, what: "pool: one lease at a time keeps using one connection, reset after each (connects ${n})");
+}
+
+unsafe fn int32 boundedAndTimesOut() {
+    int32 f = 0;
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    Result<Pool, PgError> made = poolOver(scripts: twoScripts(a: opening(), b: opening()), options: sized(size: 2), log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, bounded"); } };
+    Result<Lease, PgError> a = pool.acquire();
+    Result<Lease, PgError> b = pool.acquire();
+    Instant start = monotonicNow();
+    Result<Lease, PgError> c = pool.acquire();
+    int64 waited = start.elapsed().asMillis();
+    string first = said(r: a);
+    string second = said(r: b);
+    string third = said(r: c);
+    bool timedOut = match (c) { case Ok(value: l): false; case Err(error: e): match (e) { case PoolTimeout: true; case _: false; }; };
+    isize n = connects(log: ref log);
+    f = f + check(ok: first.equals(other: "ok") && second.equals(other: "ok") && n == 2,
+                  what: "pool: maxSize connections are made (connects ${n}: ${first}, ${second})");
+    f = f + check(ok: timedOut && third.equals(other: "pool timed out while waiting for an open connection") && waited >= 190i64 && waited < 5000i64,
+                  what: "pool: one more waits acquireTimeout, then PoolTimeout (${third}, waited ${waited} ms)");
+    return f;
+}
+
+// ---- a waiter in another isolate ----
+
+type resource Waiter implements Sendable {
+    PoolShare share;
+    Sender<string> report;
+    public ctor make(PoolShare share, Sender<string> report) { this.share = give share; this.report = give report; }
+    public unsafe fn void run() {
+        Pool pool = Pool.join(share: this.share);
+        Instant start = monotonicNow();
+        Result<Lease, PgError> got = pool.acquire();
+        int64 waited = start.elapsed().asMillis();
+        string outcome = said(r: got);
+        match (give got) {
+            case Ok(value: lease): {
+                Lease l = give lease;
+                if (!selectsOne(c: l.conn())) { outcome = "SELECT 1 failed"; }
+            }
+            case Err(error: e): { }
+        };
+        SendResult<string> sent = this.report.send(item: give outcome);
+        SendResult<string> took = this.report.send(item: "${waited}");
+    }
+}
+
+fn void waitInIsolate(Waiter job) { job.run(); }
+
+unsafe fn int32 waiterWokenAcrossIsolates() {
+    DynamicArray<Step> s = opening();
+    s.add(item: resets(sql: resetDiscardAll()));   // this isolate's release
+    s.add(item: sentinel());                        // the waiter's query
+    s.add(item: resets(sql: resetDiscardAll()));   // the waiter's release
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = sized(size: 1);
+    o.acquireTimeout = Duration.fromSecs(s: 10i64);
+    Result<Pool, PgError> made = poolOver(scripts: scriptsOf(a: give s), options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, waiter"); } };
+    Channel<string> results = Channel.bounded(capacity: 4);
+    Receiver<string> rx = results.receiver();
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        Lease held = match (give a) { case Ok(value: l): give l; case Err(error: e): { return check(ok: false, what: "pool: acquire, waiter"); } };
+        Result<PoolShare, PgError> sh = pool.share();
+        PoolShare share = match (give sh) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pool: share, waiter"); } };
+        Waiter job = Waiter.make(share: give share, report: results.sender());
+        Isolate worker = spawn waitInIsolate(job: give job);
+        sleep(d: Duration.fromMillis(ms: 300i64));
+        Lease released = give held;
+    }
+    Optional<string> outcome = rx.recv();
+    Optional<string> took = rx.recv();
+    string got = match (outcome) { case Some(value: v): copy v; case None: "(no report)"; };
+    string waited = match (took) { case Some(value: v): copy v; case None: "0"; };
+    Result<int64, ParseError> ms = parse::<int64>(s: waited);
+    bool waitedLong = match (ms) { case Ok(value: v): v >= 150i64; case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    return check(ok: got.equals(other: "ok") && waitedLong && n == 1,
+                 what: "pool: a waiter in another isolate gets the connection released, with no new connect (${got}, waited ${waited} ms, connects ${n})");
+}
+
+// ---- what release closes ----
+
+unsafe fn int32 closedIsReplaced() {
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    Result<Pool, PgError> made = poolOver(scripts: twoScripts(a: opening(), b: answersSentinel()), options: sized(size: 1), log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, closed"); } };
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        match (give a) { case Ok(value: lease): { Lease l = give lease; l.conn().close(); } case Err(error: e): { } };
+    }
+    Result<Lease, PgError> b = pool.acquire();
+    bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    return check(ok: ran && n == 2, what: "pool: a connection closed under its lease gives its place back, and the next acquire connects anew (connects ${n})");
+}
+
+// A release that must close the connection, with the reset off (with it on, the reset is refused and closes it too):
+// the next acquire connects anew and its connection answers the sentinel.
+unsafe fn int32 closesBusy(DynamicArray<Step> first, int32 how, const ref string what) {
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = sized(size: 1);
+    o.reset = false;
+    Result<Pool, PgError> made = poolOver(scripts: twoScripts(a: give first, b: answersSentinel()), options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, ".concat(other: what)); } };
+    bool busy = false;
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        match (give a) {
+            case Ok(value: lease): {
+                Lease l = give lease;
+                if (how == 0) {
+                    Query q = Query.make(sql: "select $1 + 1");
+                    q.add(value: 7);
+                    Result<Unit, PgError> started = l.conn().startRows(q: q);
+                    Result<Rows, PgError> chunk = l.conn().nextRows(maxRows: 1);
+                    busy = l.conn().transactionStatus() == TransactionStatus::Active;
+                } else if (how == 1) {
+                    Result<CopyInfo, PgError> started = l.conn().startCopyIn(sql: "COPY t FROM STDIN");
+                    busy = l.conn().transactionStatus() == TransactionStatus::Active;
+                } else {
+                    Result<Unit, PgError> entered = l.conn().enterPipelineMode();
+                    busy = l.conn().pipelineStatus() == PipelineStatus::On;
+                }
+            }
+            case Err(error: e): { }
+        };
+    }
+    Result<Lease, PgError> b = pool.acquire();
+    bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    return check(ok: busy && ran && n == 2, what: "pool: ".concat(other: what).concat(other: " is closed on release, not kept (connects ${n})"));
+}
+
+unsafe fn int32 busyTests() {
+    int32 f = 0;
+    Wire rows = Wire.make(); rows.bindComplete();
+    int32 i = 1;
+    while (i <= 3) { rows.intRow(values: ints(a: i)); i = i + 1; }
+    rows.complete(tag: "SELECT 3"); rows.ready(status: IDLE);
+    DynamicArray<Step> stream = opening();
+    stream.add(item: quiet(tag: PARSE, body: ""));
+    stream.add(item: quiet(tag: DESCRIBE, body: ""));
+    stream.add(item: answer(tag: SYNC, reply: description()));
+    stream.add(item: quiet(tag: BIND, body: ""));
+    stream.add(item: quiet(tag: EXECUTE, body: ""));
+    stream.add(item: answer(tag: SYNC, reply: give rows));
+    stream.add(item: completes(sql: "ROLLBACK", tag: "ROLLBACK", status: IDLE));   // what settle() would send, kept or not
+    f = f + closesBusy(first: give stream, how: 0, what: "a result still being read");
+    Wire g = Wire.make(); g.copyResponse(tag: 71ui8);
+    DynamicArray<Step> copying = opening();
+    copying.add(item: queried(sql: "COPY t FROM STDIN", reply: give g));
+    f = f + closesBusy(first: give copying, how: 1, what: "a COPY in progress");
+    f = f + closesBusy(first: opening(), how: 2, what: "a connection in pipeline mode");
+    return f;
+}
+
+// ---- what release resets ----
+
+unsafe fn int32 blockRolledBackAndReset() {
+    DynamicArray<Step> s = opening();
+    s.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: INTX));
+    s.add(item: completes(sql: "ROLLBACK", tag: "ROLLBACK", status: IDLE));
+    s.add(item: resets(sql: resetDiscardAll()));
+    s.add(item: sentinel());
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    Result<Pool, PgError> made = poolOver(scripts: scriptsOf(a: give s), options: sized(size: 1), log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, block"); } };
+    bool inBlock = false;
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        match (give a) {
+            case Ok(value: lease): {
+                Lease l = give lease;
+                Result<DynamicArray<Rows>, PgError> begun = l.conn().simpleQuery(sql: "BEGIN");
+                inBlock = l.conn().transactionStatus() == TransactionStatus::InTransaction;
+            }
+            case Err(error: e): { }
+        };
+    }
+    Result<Lease, PgError> b = pool.acquire();
+    bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    return check(ok: inBlock && ran && n == 1,
+                 what: "pool: release in a block sends ROLLBACK, then DISCARD ALL, and keeps the connection (connects ${n})");
+}
+
+unsafe fn int32 resetOffSendsNothing() {
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = sized(size: 1);
+    o.reset = false;
+    Result<Pool, PgError> made = poolOver(scripts: scriptsOf(a: answersSentinel()), options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, reset off"); } };
+    { Result<Lease, PgError> a = pool.acquire(); }
+    Result<Lease, PgError> b = pool.acquire();
+    bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    return check(ok: ran && n == 1, what: "pool: with the reset off, an idle connection is sent nothing on release (connects ${n})");
+}
+
+unsafe fn int32 resetOffRollsBack() {
+    DynamicArray<Step> s = opening();
+    s.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: INTX));
+    s.add(item: completes(sql: "ROLLBACK", tag: "ROLLBACK", status: IDLE));
+    s.add(item: sentinel());
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = sized(size: 1);
+    o.reset = false;
+    Result<Pool, PgError> made = poolOver(scripts: scriptsOf(a: give s), options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, reset off, block"); } };
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        match (give a) {
+            case Ok(value: lease): { Lease l = give lease; Result<DynamicArray<Rows>, PgError> begun = l.conn().simpleQuery(sql: "BEGIN"); }
+            case Err(error: e): { }
+        };
+    }
+    Result<Lease, PgError> b = pool.acquire();
+    bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    return check(ok: ran && n == 1, what: "pool: with the reset off, a block is rolled back on release, and nothing else is sent (connects ${n})");
+}
+
+unsafe fn int32 resetOffFailedRollbackDropped() {
+    Wire refused = Wire.make();
+    refused.report(tag: 69ui8, severity: "ERROR", code: "XX000", message: "no rollback today");
+    refused.ready(status: INTX);
+    DynamicArray<Step> s = opening();
+    s.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: INTX));
+    s.add(item: queried(sql: "ROLLBACK", reply: give refused));
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = sized(size: 1);
+    o.reset = false;
+    Result<Pool, PgError> made = poolOver(scripts: twoScripts(a: give s, b: answersSentinel()), options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, reset off, failed rollback"); } };
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        match (give a) {
+            case Ok(value: lease): { Lease l = give lease; Result<DynamicArray<Rows>, PgError> begun = l.conn().simpleQuery(sql: "BEGIN"); }
+            case Err(error: e): { }
+        };
+    }
+    Result<Lease, PgError> b = pool.acquire();
+    bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    return check(ok: ran && n == 2, what: "pool: with the reset off, a rollback that fails closes the connection, and its place is given back (connects ${n})");
+}
+
+unsafe fn int32 failedResetDropped() {
+    int32 f = 0;
+    // The server refuses the reset.
+    Wire refused = Wire.make();
+    refused.report(tag: 69ui8, severity: "ERROR", code: "XX000", message: "no reset today");
+    refused.ready(status: IDLE);
+    DynamicArray<Step> s = opening();
+    s.add(item: queried(sql: resetDiscardAll(), reply: give refused));
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    Result<Pool, PgError> made = poolOver(scripts: twoScripts(a: give s, b: answersSentinel()), options: sized(size: 1), log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, failed reset"); } };
+    { Result<Lease, PgError> a = pool.acquire(); }
+    Result<Lease, PgError> b = pool.acquire();
+    bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    f = f + check(ok: ran && n == 2, what: "pool: a reset the server refuses closes the connection, and its place is given back (connects ${n})");
+    // A server that reported no server_version: the reset is refused before anything is sent, and the connection is not
+    // kept unreset.
+    Channel<string> ch2 = Channel.bounded(capacity: 256);
+    Receiver<string> log2 = ch2.receiver();
+    Result<Pool, PgError> made2 = poolOver(scripts: twoScripts(a: openingAt(version: ""), b: answersSentinel()), options: sized(size: 1), log: give ch2);
+    Pool pool2 = match (give made2) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, no server_version"); } };
+    { Result<Lease, PgError> a = pool2.acquire(); }
+    Result<Lease, PgError> c = pool2.acquire();
+    bool ran2 = match (give c) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n2 = connects(log: ref log2);
+    f = f + check(ok: ran2 && n2 == 2, what: "pool: a reset refused for want of server_version closes the connection (connects ${n2})");
+    return f;
+}
+
+// ---- connects that fail ----
+
+unsafe fn int32 failedConnectGivesBack() {
+    Wire w = Wire.make();
+    w.report(tag: 69ui8, severity: "FATAL", code: "53300", message: "sorry, too many clients already");
+    DynamicArray<Step> refused = DynamicArray.empty();
+    refused.add(item: Step::Send(bytes: w.bytes()));
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    Result<Pool, PgError> made = poolOver(scripts: twoScripts(a: give refused, b: answersSentinel()), options: sized(size: 1), log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, failed connect"); } };
+    Result<Lease, PgError> a = pool.acquire();
+    string first = said(r: a);
+    Result<Lease, PgError> b = pool.acquire();
+    bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    return check(ok: first.contains(substring: "sorry, too many clients already") && ran && n == 2,
+                 what: "pool: a connect that fails is acquire's error, and its place is given back (".concat(other: first).concat(other: ", connects ${n})"));
+}
+
+// ---- lifetimes ----
+
+unsafe fn int32 lifetimeTests() {
+    int32 f = 0;
+    // Past its lifetime when released: closed, not reset. The script would answer a reset, so one sent would be seen.
+    DynamicArray<Step> first = opening();
+    first.add(item: resets(sql: resetDiscardAll()));
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = sized(size: 1);
+    o.lifetime = Optional::Some(value: Duration.fromMillis(ms: 50i64));
+    Result<Pool, PgError> made = poolOver(scripts: twoScripts(a: give first, b: answersSentinel()), options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, lifetime"); } };
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        sleep(d: Duration.fromMillis(ms: 100i64));
+    }
+    Result<Lease, PgError> b = pool.acquire();
+    bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    DynamicArray<string> told = drained(log: ref log);
+    bool reset = firstSays(lines: told, what: "DISCARD ALL");
+    isize n = connectsIn(lines: told);
+    f = f + check(ok: ran && n == 2 && !reset, what: "pool: a connection past its lifetime is closed on release, not reset (connects ${n})");
+    // Past it while idle: closed when next acquired.
+    DynamicArray<Step> s = opening();
+    s.add(item: resets(sql: resetDiscardAll()));
+    Channel<string> ch2 = Channel.bounded(capacity: 256);
+    Receiver<string> log2 = ch2.receiver();
+    Result<Pool, PgError> made2 = poolOver(scripts: twoScripts(a: give s, b: answersSentinel()), options: o, log: give ch2);
+    Pool pool2 = match (give made2) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, idle lifetime"); } };
+    { Result<Lease, PgError> a = pool2.acquire(); }
+    sleep(d: Duration.fromMillis(ms: 100i64));
+    Result<Lease, PgError> c = pool2.acquire();
+    bool ran2 = match (give c) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n2 = connects(log: ref log2);
+    f = f + check(ok: ran2 && n2 == 2, what: "pool: an idle connection past its lifetime is closed when acquired, and a new one made (connects ${n2})");
+    return f;
+}
+
+// ---- what release puts back ----
+
+// Counts the notices it is given.
+type resource Counting implements NoticeHandler, Sendable {
+    Sender<string> seen;
+    public ctor make(Sender<string> seen) { this.seen = give seen; }
+    public fn void notice(const ref ServerError notice) { SendResult<string> sent = this.seen.send(item: notice.primary()); }
+}
+
+unsafe fn int32 settingsPutBack() {
+    int32 f = 0;
+    Wire noticed = Wire.make();
+    noticed.columns(names: columnNamed(a: "x"));
+    noticed.report(tag: 78ui8, severity: "NOTICE", code: "00000", message: "for whoever listens");
+    noticed.complete(tag: "SELECT 0");
+    noticed.ready(status: IDLE);
+    DynamicArray<Step> s = opening();
+    s.add(item: resets(sql: resetDiscardAll()));
+    s.add(item: queried(sql: "SELECT 1", reply: give noticed));
+    s.add(item: resets(sql: resetDiscardAll()));
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = sized(size: 1);
+    o.queryTimeout = Optional::Some(value: Duration.fromSecs(s: 5i64));
+    Result<Pool, PgError> made = poolOver(scripts: scriptsOf(a: give s), options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, settings"); } };
+    Channel<string> notices = Channel.bounded(capacity: 8);
+    Receiver<string> heard = notices.receiver();
+    int64 firstMs = -1;
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        match (give a) {
+            case Ok(value: lease): {
+                Lease l = give lease;
+                firstMs = msOf(t: l.conn().queryTimeout());
+                l.conn().setQueryTimeout(timeout: Optional::Some(value: Duration.fromMillis(ms: 1i64)), grace: Duration.fromMillis(ms: 1i64));
+                Owned<NoticeHandler> h = new Counting.make(seen: notices.sender());
+                l.conn().setNoticeHandler(handler: give h);
+            }
+            case Err(error: e): { }
+        };
+    }
+    int64 againMs = -1;
+    bool ran = false;
+    {
+        Result<Lease, PgError> b = pool.acquire();
+        match (give b) {
+            case Ok(value: lease): {
+                Lease l = give lease;
+                againMs = msOf(t: l.conn().queryTimeout());
+                Result<DynamicArray<Rows>, PgError> r = l.conn().simpleQuery(sql: "SELECT 1");
+                ran = match (r) { case Ok(value: rows): true; case Err(error: e): false; };
+            }
+            case Err(error: e): { }
+        };
+    }
+    RecvResult<string> got = heard.tryRecv();
+    bool handled = match (got) { case Received(item: m): true; case _: false; };
+    f = f + check(ok: firstMs == 5000i64 && againMs == 5000i64,
+                  what: "pool: each connection has the pool's query timeout, put back on release (${firstMs}, then ${againMs} ms)");
+    f = f + check(ok: ran && !handled, what: "pool: a notice handler set through a lease is cleared on release");
+    return f;
+}
+
+fn int64 msOf(Optional<Duration> t) { return match (t) { case Some(value: d): d.asMillis(); case None: -1i64; }; }
+
+fn DynamicArray<string> columnNamed(const ref string a) { DynamicArray<string> v = DynamicArray.empty(); v.add(item: copy a); return v; }
+
+// ---- making and sharing ----
+
+unsafe fn int32 refusals() {
+    int32 f = 0;
+    DynamicArray<DynamicArray<Step>> none = DynamicArray.empty();
+    Result<Pool, PgError> zero = poolOver(scripts: give none, options: sized(size: 0), log: Channel.bounded(capacity: 1));
+    string z = match (zero) { case Ok(value: p): "made"; case Err(error: e): e.message(); };
+    f = f + check(ok: z.equals(other: "pool maxSize must be at least 1, not 0"), what: "pool: maxSize 0 is refused (".concat(other: z).concat(other: ")"));
+    PoolOptions o = sized(size: 1);
+    o.acquireTimeout = Duration.fromMillis(ms: -1i64);
+    DynamicArray<DynamicArray<Step>> none2 = DynamicArray.empty();
+    Result<Pool, PgError> negative = poolOver(scripts: give none2, options: o, log: Channel.bounded(capacity: 1));
+    string neg = match (negative) { case Ok(value: p): "made"; case Err(error: e): e.message(); };
+    f = f + check(ok: neg.equals(other: "pool durations must not be negative"), what: "pool: a negative duration is refused (".concat(other: neg).concat(other: ")"));
+    PoolOptions o2 = sized(size: 1);
+    o2.lifetime = Optional::Some(value: Duration.zero());
+    DynamicArray<DynamicArray<Step>> none3 = DynamicArray.empty();
+    Result<Pool, PgError> noLife = poolOver(scripts: give none3, options: o2, log: Channel.bounded(capacity: 1));
+    string nl = match (noLife) { case Ok(value: p): "made"; case Err(error: e): e.message(); };
+    f = f + check(ok: nl.equals(other: "pool lifetime must be more than 0 (or None, for no limit)"), what: "pool: a lifetime of 0 is refused (".concat(other: nl).concat(other: ")"));
+
+    DynamicArray<DynamicArray<Step>> none4 = DynamicArray.empty();
+    Result<Pool, PgError> made = poolOver(scripts: give none4, options: sized(size: 1), log: Channel.bounded(capacity: 1));
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return f + check(ok: false, what: "pool: make, share"); } };
+    Result<PoolShare, PgError> sh = pool.share();
+    PoolShare share = match (give sh) { case Ok(value: x): give x; case Err(error: e): { return f + check(ok: false, what: "pool: share"); } };
+    Pool joined = Pool.join(share: share);
+    Result<PoolShare, PgError> again = joined.share();
+    string a = match (again) { case Ok(value: x): "shared"; case Err(error: e): e.message(); };
+    f = f + check(ok: a.equals(other: "a pool joined from a PoolShare cannot be shared again: share the pool that made it"),
+                  what: "pool: a joined pool cannot share (".concat(other: a).concat(other: ")"));
+
+    PoolOptions d = PoolOptions.defaults();
+    isize cpus = cast<isize>(cpuCount());
+    isize most = cpus;
+    if (cpus < 4) { most = 4; }
+    bool lifeHour = match (d.lifetime) { case Some(value: t): t.asSecs() == 3600i64; case None: false; };
+    f = f + check(ok: d.maxSize == most && lifeHour && d.lifetimeJitter.asSecs() == 90i64 && d.acquireTimeout.asSecs() == 30i64
+                      && d.reset && msOf(t: d.queryTimeout) == -1i64 && d.queryGrace.asSecs() == 2i64,
+                  what: "pool: the defaults are max(4, CPUs), an hour and 90 s, 30 s, reset on, no query timeout and 2 s of grace");
+    return f;
+}
+
+unsafe fn int32 poolTests() {
+    int32 f = 0;
+    f = f + sequentialKeepsOne();
+    f = f + boundedAndTimesOut();
+    f = f + waiterWokenAcrossIsolates();
+    f = f + closedIsReplaced();
+    f = f + busyTests();
+    f = f + blockRolledBackAndReset();
+    f = f + resetOffSendsNothing();
+    f = f + resetOffRollsBack();
+    f = f + resetOffFailedRollbackDropped();
+    f = f + failedResetDropped();
+    f = f + failedConnectGivesBack();
+    f = f + lifetimeTests();
+    f = f + settingsPutBack();
+    f = f + refusals();
+    return f;
+}

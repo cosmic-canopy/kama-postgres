@@ -56,7 +56,10 @@ type enum PgError implements Error, Sendable {
     // A bound of Config.setLimits was reached. The detail names the bound, its value and what was given up. Past
     // `readBuffer` or `parameters` the session is over (isClosed()); past `resultBytes` the command ran, its rows were
     // read and dropped, and the session goes on.
-    Limit(string detail);
+    Limit(string detail),
+    // A pool's acquireTimeout passed while every connection it may open was leased (postgres::pool), as sqlx's
+    // PoolTimedOut. Nothing was given up: the pool is as it was.
+    PoolTimeout;
 
     public const fn string message() {
         return match (this) {
@@ -76,6 +79,7 @@ type enum PgError implements Error, Sendable {
             case RolledBack: "commit unexpectedly resulted in rollback";
             case Target(detail: d): copy d;
             case Limit(detail: d): copy d;
+            case PoolTimeout: "pool timed out while waiting for an open connection";
         };
     }
 

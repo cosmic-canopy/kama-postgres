@@ -6,7 +6,7 @@ import { core::env as getenv, std::collections::DynamicArray, std::concurrent::S
          postgres::NoticeHandler, postgres::ServerError, postgres::conninfo::ConnInfo,
          postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
          postgres_integration_tests::setting };
-export { conninfoFor, plainConninfoFor, passwordFor, quietEnvironment, openWith, open, scalar, writePrivate, writeShared, capture,
+export { conninfoFor, plainConninfoFor, passwordFor, quietEnvironment, configWith, openWith, open, scalar, writePrivate, writeShared, capture,
          warningsLogged, infosLogged, NoticeCollector, scratchDir };
 
 // The connection string for `user` on the test server, with the sslmode of this run: PGTEST_SSLMODE, which
@@ -54,10 +54,14 @@ unsafe fn Environment quietEnvironment() {
     return env;
 }
 
-unsafe fn Result<Connection, PgError> openWith(const ref string conninfo, const ref Environment env) {
+unsafe fn Result<Config, PgError> configWith(const ref string conninfo, const ref Environment env) {
     Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: conninfo);
     ConnInfo info = match (give parsed) { case Ok(value: i): give i; case Err(error: e): { return Result::Err(error: PgError::Config(detail: e.message())); } };
-    Result<Config, PgError> c = Config.resolve(info: give info, environment: env);
+    return Config.resolve(info: give info, environment: env);
+}
+
+unsafe fn Result<Connection, PgError> openWith(const ref string conninfo, const ref Environment env) {
+    Result<Config, PgError> c = configWith(conninfo: conninfo, env: env);
     Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
     return Connection.connect(config: config);
 }

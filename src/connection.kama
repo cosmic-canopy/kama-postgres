@@ -916,6 +916,7 @@ type resource Connection implements Sendable, Transactional {
     }
 
     friend postgres::Transaction[unbegunError, blocksEnded, endWindow, command, settleWindow];
+    friend postgres::pool::PoolCore[settle];   // release with the reset off
 
     // A statement run for its effect alone.
     unsafe fn Result<Unit, PgError> command(const ref string sql) {

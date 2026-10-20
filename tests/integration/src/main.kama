@@ -6,7 +6,7 @@ import { core::println, core::env, std::log::setLogSink, postgres_integration_te
          postgres_integration_tests::sessionTests, postgres_integration_tests::socketTests,
          postgres_integration_tests::extendedTests, postgres_integration_tests::typesTests, postgres_integration_tests::tlsTests,
          postgres_integration_tests::tlsLibpqTests, postgres_integration_tests::cancelTests, postgres_integration_tests::notifyTests, postgres_integration_tests::transactionTests, postgres_integration_tests::copyTests, postgres_integration_tests::cacheTests, postgres_integration_tests::pipelineTests, postgres_integration_tests::batchTests, postgres_integration_tests::tsaTests, postgres_integration_tests::lbTests,
-         postgres_integration_tests::resetTests, postgres_integration_tests::limitsTests,
+         postgres_integration_tests::resetTests, postgres_integration_tests::limitsTests, postgres_integration_tests::poolTests,
          postgres_integration_tests::restartTests };
 export { check, setting };
 
@@ -58,6 +58,7 @@ fn int32 main() {
     failed = failed + lbTests();
     failed = failed + resetTests();
     failed = failed + limitsTests();
+    failed = failed + poolTests();
     if (failed != 0) { println(s: "postgres integration tests: ${failed} failed"); return 1; }
     println(s: "postgres integration tests: OK");
     return 0;

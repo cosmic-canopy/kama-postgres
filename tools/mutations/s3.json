@@ -1,0 +1,219 @@
+[
+ {
+  "id": "P2",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (keep && (conn.pipelineStatus() != PipelineStatus::Off || conn.transactionStatus() == TransactionStatus::Active)) {",
+  "new": "if (keep && (conn.pipelineStatus() != PipelineStatus::Off)) {",
+  "expect": "pool: a result still being read is closed on release"
+ },
+ {
+  "id": "P3",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (keep && (conn.pipelineStatus() != PipelineStatus::Off || conn.transactionStatus() == TransactionStatus::Active)) {",
+  "new": "if (keep && (conn.transactionStatus() == TransactionStatus::Active)) {",
+  "expect": "pool: a connection in pipeline mode is closed on release"
+ },
+ {
+  "id": "P4",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "gone.close();\n        this.ends.put(slot: Slot::Empty);",
+  "new": "gone.close();",
+  "expect": "pool: a connection closed under its lease gives its place back"
+ },
+ {
+  "id": "P5",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (this.ends.permit()) { return this.dial(); }",
+  "new": "return this.dial();",
+  "expect": "pool: one more waits acquireTimeout",
+  "timeout": 120
+ },
+ {
+  "id": "P6",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (this.settings.reset) {",
+  "new": "if (false) {",
+  "expect": "pool: release in a block sends ROLLBACK, then DISCARD ALL"
+ },
+ {
+  "id": "P7",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "conn.clearNoticeHandler();",
+  "new": "",
+  "expect": "pool: a notice handler set through a lease is cleared on release"
+ },
+ {
+  "id": "P8",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "conn.setQueryTimeout(timeout: this.settings.queryTimeout, grace: this.settings.queryGrace);\n            conn.clearNoticeHandler();",
+  "new": "conn.clearNoticeHandler();",
+  "expect": "pool: each connection has the pool's query timeout"
+ },
+ {
+  "id": "P9",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "Connection conn = give c;\n                conn.setQueryTimeout(timeout: this.settings.queryTimeout, grace: this.settings.queryGrace);",
+  "new": "Connection conn = give c;",
+  "expect": "pool: each connection has the pool's query timeout"
+ },
+ {
+  "id": "P10",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (keep && past(expires: expires)) { keep = false; }",
+  "new": "",
+  "expect": "pool: a connection past its lifetime is closed on release"
+ },
+ {
+  "id": "P11",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (!past(expires: until)) {",
+  "new": "if (true) {",
+  "expect": "pool: an idle connection past its lifetime is closed when acquired"
+ },
+ {
+  "id": "P12",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.ends.put(slot: Slot::Empty);\n                return Result::Err(error: give e);",
+  "new": "return Result::Err(error: give e);",
+  "expect": "pool: a connect that fails is acquire's error, and its place is given back"
+ },
+ {
+  "id": "P13",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "keep = match (r) { case Ok(value: u): true; case Err(error: e): false; };",
+  "new": "",
+  "expect": "pool: a reset refused for want of server_version closes the connection"
+ },
+ {
+  "id": "P14",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "keep = keep && !conn.isClosed();",
+  "new": "",
+  "expect": "pool: with the reset off, a rollback that fails closes the connection"
+ },
+ {
+  "id": "P15",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "conn.settle();",
+  "new": "",
+  "expect": "pool: with the reset off, a block is rolled back on release"
+ },
+ {
+  "id": "P16",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "} else if (conn.transactionStatus() != TransactionStatus::Idle) {",
+  "new": "} else {",
+  "expect": "pool: with the reset off, an idle connection is sent nothing on release"
+ },
+ {
+  "id": "P17",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "case Some(value: conn): { this.home.core().release(conn: give conn, expires: this.expires); }",
+  "new": "case Some(value: conn): { Connection dropped = give conn; }",
+  "expect": "pool: one lease at a time keeps using one connection"
+ },
+ {
+  "id": "P18",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (options.maxSize < 1) {",
+  "new": "if (options.maxSize < 0) {",
+  "expect": "pool: maxSize 0 is refused"
+ },
+ {
+  "id": "P19",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "options.lifetimeJitter.isNegative() || options.acquireTimeout.isNegative() ||",
+  "new": "options.lifetimeJitter.isNegative() ||",
+  "expect": "pool: a negative duration is refused"
+ },
+ {
+  "id": "P20",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "!d.isNegative() && d.asNanos() > 0i64",
+  "new": "!d.isNegative()",
+  "expect": "pool: a lifetime of 0 is refused"
+ },
+ {
+  "id": "P21",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.lifetimeJitter = Duration.fromSecs(s: 90i64);",
+  "new": "this.lifetimeJitter = Duration.fromSecs(s: 0i64);",
+  "expect": "pool: the defaults are"
+ },
+ {
+  "id": "P22",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "RecvResult<Slot> r = this.slotsOut.recvTimeout(timeout: deadline.since(earlier: now));",
+  "new": "RecvResult<Slot> r = this.slotsOut.tryRecv();",
+  "expect": "pool: a waiter in another isolate gets the connection released"
+ },
+ {
+  "id": "P23",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "return Optional::Some(value: now + life + Duration.fromMillis(ms: spread));",
+  "new": "return Optional::None;",
+  "expect": "pool: a connection past its lifetime is closed on release"
+ },
+ {
+  "id": "P24",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.maxSize = cpus;",
+  "new": "this.maxSize = 4;",
+  "expect": "pool: the defaults are"
+ },
+ {
+  "id": "IP1",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "if (this.settings.reset) {",
+  "new": "if (false) {",
+  "expect": "pool: a released connection comes back reset"
+ },
+ {
+  "id": "IP2",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "Result<Unit, PgError> r = conn.resetSession();",
+  "new": "Result<Unit, PgError> r = conn.ping();",
+  "expect": "pool: a transaction left open on release is rolled back"
+ },
+ {
+  "id": "IP3",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "usize room = cast<usize>(size);",
+  "new": "usize room = cast<usize>(size + 2);",
+  "expect": "pool: isolates sharing a pool never hold more than maxSize"
+ },
+ {
+  "id": "IP4",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "public unsafe fn Result<Connection, PgError> open(const ref Config config) { return Connection.connect(config: config); }",
+  "new": "public unsafe fn Result<Connection, PgError> open(const ref Config config) { return Result::Err(error: PgError::Closed); }",
+  "expect": "pool: acquire"
+ }
+]

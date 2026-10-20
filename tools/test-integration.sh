@@ -46,9 +46,8 @@ for v in $VERSIONS; do
     echo "== PostgreSQL $v (--release, sslmode=require)"
     if ( set -a; . "$ROOT/out/pgtest-$v.env"; set +a; PGTEST_SSLMODE=require PGTEST_TMP="$work" PGTEST_SOCKDIR="$sockets" "$tmp/integration--release" ); then :; else failed="$failed $v-tls"; fi
     work="$tmp/work-$v-restart"; mkdir -p "$work/home"
-    # The debug build: a release build leaves the restart group out until KPG-41 is fixed (restart_release.kama).
-    echo "== PostgreSQL $v (--debug, restarts)"
-    if ( set -a; . "$ROOT/out/pgtest-$v.env"; set +a; PGTEST_RESTART=1 PGTEST_PGSH="$ROOT/tools/pg.sh" PGTEST_TMP="$work" PGTEST_SOCKDIR="$sockets" "$tmp/integration--debug" ); then :; else failed="$failed $v-restart"; fi
+    echo "== PostgreSQL $v (--release, restarts)"
+    if ( set -a; . "$ROOT/out/pgtest-$v.env"; set +a; PGTEST_RESTART=1 PGTEST_PGSH="$ROOT/tools/pg.sh" PGTEST_TMP="$work" PGTEST_SOCKDIR="$sockets" "$tmp/integration--release" ); then :; else failed="$failed $v-restart"; fi
     # The leg leaves the server running; this makes sure, with its standby back in recovery.
     "$ROOT/tools/pg.sh" up --version "$v" >/dev/null
     [ "$DOWN" = 1 ] && "$ROOT/tools/pg.sh" down --version "$v" >/dev/null

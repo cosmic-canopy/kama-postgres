@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-20: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2 and S3 are done, and the port to kama 0.9.673). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-20: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2 and S3 are done, and the ports to kama 0.9.673 and 0.9.690). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -36,8 +36,8 @@ of libpq's `libpq_pipeline` message for message and the cases of `001_stream_rep
 and ask the container's libpq about each `target_session_attrs` case against a primary and its standby. On kama 0.9.667,
 KPG-33 to KPG-38 are fixed. KPG-39 (std's JSON beside this package) and KPG-40 (nesting through `tx.conn()` is intended,
 and the freeze it relies on is fixed) were verified on the 0.9.673 release, which the package now needs. KPG-41 (on
-macOS, a release build with `std::process` beside `std::concurrent` fails in clang) is open, found in S2c, with a
-workaround in the integration tests only. Phase 8 is under way: its plan is below.
+macOS, a release build with `std::process` beside `std::concurrent` failed in clang), found in S2c, is fixed in 0.9.679,
+and the package now needs 0.9.690. No gap is open. Phase 8 is under way: its plan is below.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -52,7 +52,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2 and S3 done; S4 next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3 and the port to 0.9.690 done; S4 next |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -202,6 +202,14 @@ it fail.
       tables, advisory locks, LISTEN, prepared statements), a transaction left open seen aborted (`pg_xact_status`),
       and four isolates sharing a pool of 2, each seeing at most 2 sessions in `pg_stat_activity`.
     - Mutations: `tools/mutations/s3.json`.
+- **The port to kama 0.9.690, done (2026-10-20).** v0.9.679 was the first release with KPG-41's fix, and v0.9.690
+  came out an hour later with KR-214. The floor is `>=0.9.690`, since code written against KR-214's channels does not
+  build on 0.9.679 (the maintainer approved raising it to the release with KPG-41's fix).
+  - KPG-41's repro ran as filed on 0.9.679 and, with `fn uint8 main()`, on 0.9.690; the entry moved to FIXED. Its
+    workaround is gone: the restart group builds in release, and the restart leg runs the release build.
+  - KR-214: `send` is `_ = tx.send(item: …);` (the discard drops an undelivered item), and `tryRecv`/`recvTimeout`
+    are `Result<T, RecvError>`. Nothing else was a discarded `Result`: this code base binds every one.
+  - `main` is `fn uint8 main()` in both test programs and the README.
 - **S4, maintenance.** One isolate per pool, stopped when the pool drops. It closes idle and expired connections, pings
     the rest, and keeps min idle. Acquire also pings a connection that has been idle for more than 1 s.
 - **S5, pool tests.**
@@ -227,32 +235,15 @@ it fail.
 - **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
   for changes.
 
-**What the next session needs to know** (written 2026-10-20, after S3):
-- **Where it stands.** S0, S0b, S1, S2 and S3 are done, and so is the port to kama 0.9.673. Nothing is pushed: pushing
-  waits for the maintainer.
-- **First: the next kama release, which is a port, not just a version.** cstar's tree (0.9.690 on 2026-10-20) carries:
-  - KPG-41's fix (`fce00971`, 0.9.677);
-  - KR-214 (0.9.680): a `Result` in statement position is refused, `_ = expr;` is the one explicit discard, and
-    channels return `Result` (`send` → `Result<Unit, Undelivered<T>>`, `tryRecv`/`recvTimeout` →
-    `Result<T, RecvError>`; `SendResult` and `RecvResult` are gone);
-  - `main` returns the platform's exit status (0.9.681, 0.9.684): `fn int32 main()` is refused, `fn uint8 main()` it is;
-  - a value a statement discards is dropped at the statement's end (0.9.676).
-
-  Checked against that tree before the release, the package had 10 errors, the unit tests 16 and the integration tests
-  13 at the first stage (the channel types and `main`), and more may follow once those clear. The maintainer approved
-  raising the floor to the first release with KPG-41's fix (2026-10-19). The port is one commit:
-  - run KPG-41's repro (`c3.kama`) with `--release` and move the entry to FIXED;
-  - delete the workaround: `restart_test.kama`'s `file @compileFor(!RELEASE)`, `restart_release.kama`, and the
-    debug-only restart leg in `tools/test-integration.sh`;
-  - port the channel calls: the pool's are all in `Ends` (`src/pool/pool.kama`); the tests' are spread across
-    `tests/*/src`;
-  - raise `"kama"` in the three manifests, `KAMA_VERSION` in ci.yml, and the floor in AGENTS.postgres.md and the
-    README, whose examples' `main` also changes;
-  - the whole gate, with every mutation file (s0b, s1, s2, s3), since 0.9.676 changes when values drop.
+**What the next session needs to know** (written 2026-10-20, after S3 and the port to 0.9.690):
+- **Where it stands.** S0, S0b, S1, S2 and S3 are done, and so are the ports to kama 0.9.673 and 0.9.690. No gap is
+  open. Nothing is pushed: pushing waits for the maintainer.
 - **Next: S4, maintenance**, as its bullet above says. What S3 leaves for it:
   - `PoolOptions` gets `minIdle`, `idleTimeout` (30 min) and `healthCheck` (1 min) then, and `Slot::Idle` gets a
     `since`.
-  - The maintenance isolate needs its own ends of the channels: `Factories.mint()`, as `share()` does.
+  - The maintenance isolate needs its own ends of the channels: `Factories.mint()`, as `share()` does. It is the first
+    `Isolate` the package itself holds: put it in a field declared before the stop channel's `Sender`, so the sender
+    drops first (fields drop in reverse order) and the isolate's join then finds it stopping.
   - It must keep the slot count. A path that puts one slot too many deadlocks a release in `send` on a full channel.
   - It stops when the pool drops. No `select` exists, so a stop channel it polls with `recvTimeout` (the health
     check's period) is the shape: `Empty` (timed out) means do a round, `Closed` means stop.
@@ -264,19 +255,19 @@ it fail.
   - `tools/test-integration.sh`, on 14–19 in debug, release and TLS, then the restart leg;
   - **`tools/mutate.sh tools/mutations/<step>.json --version 18`**. This runs each mutation in a copy of the tree and
     exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json`, S1's 35 in `s1.json`, S2's 47
-    in `s2.json` and S3's 27 in `s3.json`. Write a file per step, and re-run older files when their code changes. A
-    `BAD-PATTERN` means the source moved on, so update the mutation. PANICKED is a run that died before any case
-    failed; an entry may expect it, and may set `"env"` (the restart mutations set `PGTEST_RESTART=1`) and `"timeout"`.
-    A run that times out is judged by what it printed first, since a pool mutant can fail its case and then deadlock
-    (S3's P5).
+    in `s2.json` and S3's 27 in `s3.json`; all of them were run again on 0.9.690. Write a file per step, and re-run
+    older files when their code changes. A `BAD-PATTERN` means the source moved on, so update the mutation. PANICKED is
+    a run that died before any case failed; an entry may expect it, and may set `"env"` (the restart mutations set
+    `PGTEST_RESTART=1`) and `"timeout"`. A run that times out is judged by what it printed first, since a pool mutant
+    can fail its case and then deadlock (S3's P5).
   - A mutation whose code another line already guarantees is equivalent: rewrite the code or drop the mutation, and do
     not keep one that cannot fail. S3 dropped a check of `isClosed()` that the final check made redundant.
   - Run the integration mutations after the matrix, not beside it: both use the same servers.
   - A generator's output is committed: re-run it, and `git diff` must be empty (`tools/gen-reset-vectors.sh` for S1,
     `tools/gen-libpq-tables.sh` for S2a).
   - Never edit a script while it runs: `sh` reads it as it goes.
-- **The compiler.** Build with the v0.9.673 release, as CI does, until the port above. The dev tree (`../cstar/out`) is
-  past the release, and `~/.kama/bin/kama` is an old 0.9.440.
+- **The compiler.** Build with the v0.9.690 release, as CI does. The dev tree (`../cstar/out`) may be past the release,
+  and `~/.kama/bin/kama` is an old 0.9.440.
   - To get one: `kama-macos-universal-vX.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its
     `.sha256` and unpacked anywhere (it holds `kama-macos-universal-vX/bin/kama`). A session's scratchpad does not
     outlive it, so download it again each session.

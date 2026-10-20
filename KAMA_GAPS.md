@@ -6,9 +6,9 @@ it. Every entry with a repro was **run** on the version named. Nothing is inferr
 spec. An entry that is an absence cites the cstar files that show it instead. This file is excluded from
 the published package, as it is in `@kama/sodium`.
 
-**Current compiler:** `kama 0.9.673`, the release (`v0.9.673`, from GitHub, checksum verified). KPG-39 and KPG-40 were
-re-run on it, with the repros as filed, before they moved to FIXED. KPG-41 was filed on it, and still fails on
-`v0.9.675` (checked the same day). Earlier rounds: `0.9.667` (KPG-33 to KPG-38
+**Current compiler:** `kama 0.9.690`, the release (`v0.9.690`, from GitHub, checksum verified). KPG-41 was re-run on it
+and on `v0.9.679`, the first release with its fix, with the repro as filed, before it moved to FIXED. Earlier rounds:
+`0.9.673` (KPG-39 and KPG-40 verified, KPG-41 filed; still failing on `0.9.675`), `0.9.667` (KPG-33 to KPG-38
 verified, KPG-39 and KPG-40 filed), `0.9.523` (KPG-31 and KPG-32
 verified, KPG-33 to KPG-38 filed), `0.9.519` (KPG-23 to KPG-30 verified), `0.9.506` (KPG-11 to KPG-22 verified, KPG-23
 to KPG-30 filed), `0.9.490` (KPG-15 to KPG-22 filed), `0.9.486` (KPG-11 to KPG-14 filed), `0.9.477` (KPG-1 also on
@@ -18,7 +18,7 @@ Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.47
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** KPG-41 (HIGH). Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** none. Every gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -29,7 +29,27 @@ changes the right design here, say so and we will follow it.
 
 ## OPEN
 
-### KPG-41 · HIGH · On macOS, a release build that uses `std::process::Command` beside `std::concurrent` fails in the C compiler
+None.
+
+## FIXED — kept for the record
+
+KPG-41 was verified on 0.9.679 and 0.9.690. KPG-39 and KPG-40 were verified on 0.9.673. KPG-33 to KPG-38 were verified on 0.9.667. KPG-31 and KPG-32 were verified on 0.9.523, the first release with their fixes. KPG-23 to KPG-30 were verified on 0.9.519, KPG-11 to KPG-22 on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
+same repro as the original report.
+
+### KPG-41 · HIGH · On macOS, a release build that uses `std::process::Command` beside `std::concurrent` fails in the C compiler — FIXED in 0.9.679
+
+Fixed in cstar's 0.9.677 (`fce00971`), first released in v0.9.679: `kama_os.h`'s `read`, `write` and `close` carry
+macOS's asm label, as `pread`/`pwrite` already did, so `<unistd.h>` may follow it. Verified with the repro below (checksums
+checked):
+- on v0.9.679, as filed: `kama build c3.kama --release` builds, and the program prints `made`;
+- on v0.9.690, with `fn uint8 main()` (0.9.684 refuses `fn int32 main()`): the same, and so does the `Channel` variant
+  (a channel made and its sender taken, beside the `Command`), in release and in debug.
+
+The workaround is deleted: `restart_test.kama` is no longer `@compileFor(!RELEASE)`, `restart_release.kama` is gone,
+and `tools/test-integration.sh` runs the restart leg in release. The pool (`postgres::pool`, on `std::concurrent`) and
+`std::process` now build together for release on macOS.
+
+The report as filed:
 
 Found in phase 8 (S2c), when the integration test program began to restart its server through `std::process::Command`
 (it already spawns isolates). The debug build is fine; the release build stops in clang:
@@ -78,15 +98,10 @@ server that runs a helper and keeps a pool of workers is that program. This pack
 built on `std::concurrent`'s `Channel` and a maintenance isolate, so once it lands, an application on macOS that uses the
 pool and starts a process will not build for release, through no fault of its own.
 
-**Workaround here, to delete when this is fixed:** `tests/integration/src/restart_test.kama` is
+**The workaround, deleted on 0.9.690:** `tests/integration/src/restart_test.kama` is
 `file @compileFor(!RELEASE);`, and `main` runs it through a `@compileFor(!RELEASE)` function (its release twin says the
 group needs a debug build). `tools/test-integration.sh` runs the restart leg with the debug build. Once fixed: drop the
 gate and the twin, and run the leg in release like the TLS one.
-
-## FIXED — kept for the record
-
-KPG-39 and KPG-40 were verified on 0.9.673. KPG-33 to KPG-38 were verified on 0.9.667. KPG-31 and KPG-32 were verified on 0.9.523, the first release with their fixes. KPG-23 to KPG-30 were verified on 0.9.519, KPG-11 to KPG-22 on 0.9.506, KPG-4 and KPG-6 on 0.9.486. The rest were re-run on 0.9.477 with the
-same repro as the original report.
 
 ### KPG-40 · LOW · Is a window inside a window, through a view's `ref` accessor, intended? — ANSWERED: yes; its defect FIXED in 0.9.673
 

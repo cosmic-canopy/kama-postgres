@@ -3,7 +3,7 @@
 // here; over TLS (libpq 17's encrypted cancel) in the suite's TLS pass, PGTEST_SSLMODE=require; and with protocol
 // 3.2's longer keys where the server has them (18 and later).
 import { std::collections::DynamicArray, std::concurrent::Isolate, std::concurrent::Channel, std::concurrent::Sender,
-         std::concurrent::Receiver, std::concurrent::SendResult, std::time::Duration, std::time::sleep,
+         std::concurrent::Receiver, std::time::Duration, std::time::sleep,
          std::time::monotonicNow, std::time::Instant,
          postgres::Connection, postgres::CancelToken, postgres::PgError, postgres::Rows, postgres::Query,
          postgres::protocol::PROTOCOL_3_2, postgres::sqlstate::QUERY_CANCELED,
@@ -20,7 +20,7 @@ type resource Canceller implements Sendable {
         sleep(d: Duration.fromMillis(ms: 300i64));
         Result<Unit, PgError> r = this.token.cancel();
         string outcome = match (r) { case Ok(value: u): "sent"; case Err(error: e): e.message(); };
-        SendResult<string> s = this.report.send(item: give outcome);
+        _ = this.report.send(item: give outcome);
     }
 }
 

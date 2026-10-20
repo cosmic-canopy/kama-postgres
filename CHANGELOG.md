@@ -78,10 +78,13 @@ All notable changes to this package are recorded here. The format follows
   end the session after a protocol error. `PGTEST_GARBLE_SEEDS` runs more seeds; 500 (a million cases) find nothing.
 
 ### Changed
-- **Needs kama ≥ 0.9.673.** It is the first release in which:
+- **Needs kama ≥ 0.9.690.** It has, of what this package relies on:
+  - channels that return `Result` (`Undelivered<T>`, `RecvError`), which the pool is written against, first in 0.9.690;
+  - a release build on macOS with `std::process` beside `std::concurrent` (KPG-41), first in 0.9.679: an application
+    that uses the pool and starts a process;
   - a window opened through an enclosing window's alias freezes that alias, so `tx` cannot be used inside
-    `borrow tx.conn().transaction() as inner` (KPG-40);
-  - std's JSON can be imported beside this package (KPG-39).
+    `borrow tx.conn().transaction() as inner` (KPG-40), first in 0.9.673;
+  - std's JSON can be imported beside this package (KPG-39), first in 0.9.673.
 - **Breaking: `transaction()` is a borrow window**, `borrow conn.transaction() as tx { … }`, which kama 0.9.658 made
   possible: a view's destructor runs when its window closes (KPG-35).
   - The window sends BEGIN, or SAVEPOINT inside a transaction block, so a window inside a window nests.

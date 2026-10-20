@@ -1,7 +1,7 @@
 // A session's life against a real server: the protocol version it settles on, the server ending it, a server
 // that is not there or does not answer, a connection moved to another isolate, and closing.
 import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender,
-         std::concurrent::Receiver, std::concurrent::SendResult, std::io::IoError, std::net::TcpListener,
+         std::concurrent::Receiver, std::io::IoError, std::net::TcpListener,
          std::time::monotonicNow, std::time::Instant, std::time::Duration,
          postgres::Connection, postgres::PgError, postgres::Rows, postgres::Environment,
          postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
@@ -114,7 +114,7 @@ type resource Job implements Sendable {
     public unsafe fn void run() {
         string v = scalar(c: this.conn, sql: "select 'from the other isolate'");
         this.conn.close();
-        SendResult<string> r = this.report.send(item: give v);
+        _ = this.report.send(item: give v);
     }
 }
 

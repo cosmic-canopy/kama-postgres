@@ -13,7 +13,7 @@
 // than 17 does.
 import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView,
          std::collections::FixedArray, std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready,
-         std::net::ReliableStream, std::concurrent::Sender, std::concurrent::SendResult,
+         std::net::ReliableStream, std::concurrent::Sender,
          tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress,
          std::encoding::base64::encode as b64encode, std::encoding::base64::decode as b64decode,
          std::encoding::base64::DecodeError, std::encoding::utf8::decode as utf8Decode,
@@ -438,7 +438,7 @@ type resource FakeServer implements Transport, Sendable {
 
     unsafe fn void event(const ref string name) {
         if (this.events.length() == 0) { return; }
-        SendResult<string> r = this.events[0].send(item: copy name);
+        _ = this.events[0].send(item: copy name);
     }
 
     // As the backend errors out when an injection point fires: an ErrorResponse (or protocol 2's error text) to
@@ -656,7 +656,7 @@ type resource FakeServer implements Transport, Sendable {
             }
             bool first = !this.startupSeen;
             this.startupSeen = true;
-            if (!first && this.tracer.length() > 0) { SendResult<string> traced = this.tracer[0].send(item: traceFrontend(tag: tag, body: body)); }
+            if (!first && this.tracer.length() > 0) { _ = this.tracer[0].send(item: traceFrontend(tag: tag, body: body)); }
             // In policy mode the startup packet decides everything; what follows it (Terminate) gets no answer.
             if (this.policy) { if (first) { this.policyStartup(body: body); } if (this.hungUp) { return; } continue; }
             this.answer(tag: tag, body: body);
@@ -892,7 +892,7 @@ type resource FakeServer implements Transport, Sendable {
             DynamicArray<uint8> unit = DynamicArray.empty();
             isize i = at;
             while (i < end) { unit.add(item: b[i]); i = i + 1; }
-            if (this.replyCount.length() > 0) { SendResult<isize> counted = this.replyCount[0].send(item: this.replies); }
+            if (this.replyCount.length() > 0) { _ = this.replyCount[0].send(item: this.replies); }
             if (this.replies == this.garble.targetOf()) { unit = this.damaged(unit: give unit); }
             this.replies = this.replies + 1;
             foreach (uint8 x in unit) { result.add(item: x); }

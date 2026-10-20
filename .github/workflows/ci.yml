@@ -6,7 +6,7 @@
 #     runners have no container runtime). `tools/pg.sh smoke` first, one login per auth method with the
 #     server's own psql, so a misconfigured server fails apart from a wrong client; then
 #     tools/test-integration.sh: the integration suite, debug and release, once more over TLS, and then the restart
-#     leg, which stops, starts and restarts the server through tools/pg.sh (in the debug build until KPG-41 is fixed).
+#     leg, which stops, starts and restarts the server through tools/pg.sh.
 #     19 is a beta, so it may fail without failing the run.
 # @kama/tls comes from the registry, pinned by kama.lock. The test PKI needs OpenSSL 3, which the Linux image
 # has and macOS has through Homebrew rather than as /usr/bin/openssl.
@@ -41,7 +41,7 @@ jobs:
       # Raise it deliberately, in the same commit that raises the manifests' "kama" floor.
       - name: Install kama
         env:
-          KAMA_VERSION: v0.9.673
+          KAMA_VERSION: v0.9.690
         run: |
           curl -fsSL https://kama-lang.org/install.sh | sh
           echo "$HOME/.kama/bin" >> "$GITHUB_PATH"
@@ -75,7 +75,7 @@ jobs:
 
       - name: Install kama
         env:
-          KAMA_VERSION: v0.9.673
+          KAMA_VERSION: v0.9.690
         run: |
           curl -fsSL https://kama-lang.org/install.sh | sh
           echo "$HOME/.kama/bin" >> "$GITHUB_PATH"

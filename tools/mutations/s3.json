@@ -164,8 +164,8 @@
   "id": "P22",
   "suite": "unit",
   "file": "src/pool/pool.kama",
-  "old": "RecvResult<Slot> r = this.slotsOut.recvTimeout(timeout: deadline.since(earlier: now));",
-  "new": "RecvResult<Slot> r = this.slotsOut.tryRecv();",
+  "old": "Result<Slot, RecvError> r = this.slotsOut.recvTimeout(timeout: deadline.since(earlier: now));",
+  "new": "Result<Slot, RecvError> r = this.slotsOut.tryRecv();",
   "expect": "pool: a waiter in another isolate gets the connection released"
  },
  {

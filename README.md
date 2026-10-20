@@ -8,7 +8,7 @@ install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls)
 kama pkg add kama.json @kama/postgres --version ^0.2.0     # from the official registry, registry.kama-lang.org
 ```
 
-Needs **kama ≥ 0.9.673**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
+Needs **kama ≥ 0.9.690**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
 release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta.
 
 > **Status: early.** It connects, authenticates and runs queries, with typed parameters and typed rows, over TCP, a
@@ -23,7 +23,7 @@ import { core::println, std::collections::DynamicArray,
          postgres::Config, postgres::Connection, postgres::PgError, postgres::Rows, postgres::column,
          postgres::columnOpt };
 
-fn int32 main() {
+fn uint8 main() {
     // A libpq connection string; the service file, PG* variables and ~/.pgpass apply as they do for psql.
     Result<Config, PgError> parsed = Config.parse(text: "postgresql://app@db.internal/inventory?connect_timeout=5");
     Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };

@@ -4,7 +4,7 @@
 import { std::collections::DynamicArray, std::collections::FixedArray, std::collections::View,
          std::collections::ConstView, std::io::IoError, std::net::UnixListener, std::net::UnixStream,
          std::net::TcpStream, std::net::Poller, std::net::Interest, std::net::Ready,
-         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::SendResult,
+         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
          std::process::currentUser, std::process::UserId,
          postgres::Connection, postgres::PgError, postgres::Environment,
          postgres_integration_tests::check, postgres_integration_tests::setting,
@@ -76,7 +76,7 @@ type resource Relay implements Sendable {
     public unsafe fn void run() {
         Result<Unit, IoError> nb = this.listener.setNonBlocking(on: true);
         Result<Poller, IoError> made = Poller.create();
-        Poller p = match (give made) { case Ok(value: x): give x; case Err(error: e): { SendResult<int32> r = this.done.send(item: -1); return; } };
+        Poller p = match (give made) { case Ok(value: x): give x; case Err(error: e): { _ = this.done.send(item: -1); return; } };
         p.add(fd: this.listener.rawHandle(), interest: Interest::Read);
         int32 served = 0;
         bool waiting = true;
@@ -97,7 +97,7 @@ type resource Relay implements Sendable {
                 case Err(error: e): { }
             };
         }
-        SendResult<int32> r = this.done.send(item: served);
+        _ = this.done.send(item: served);
     }
 }
 

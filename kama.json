@@ -6,7 +6,7 @@
   "repository": "https://github.com/cosmic-canopy/kama-postgres",
   "keywords": ["postgresql", "database", "sql", "libpq", "client"],
   "kind": "library",
-  "kama": ">=0.9.673",
+  "kama": ">=0.9.690",
   "dependencies": {
     "@kama/tls": { "version": "^0.1.3" }
   },

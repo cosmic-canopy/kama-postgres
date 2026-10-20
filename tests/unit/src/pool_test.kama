@@ -7,7 +7,7 @@
 // FATAL, and the pool then replaces the connection, so "it connected once" and "the sentinel ran" together say that
 // nothing else was sent.
 import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
-         std::concurrent::SendResult, std::concurrent::RecvResult, std::concurrent::Isolate, std::concurrent::cpuCount, std::io::IoError,
+         std::concurrent::RecvError, std::concurrent::Isolate, std::concurrent::cpuCount, std::io::IoError,
          std::io::IoErrorKind, std::fmt::parse, std::fmt::ParseError, std::memory::Owned, std::time::Duration, std::time::Instant, std::time::monotonicNow,
          std::time::sleep,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
@@ -53,7 +53,7 @@ type resource ScriptConnector implements Connector, Sendable {
             return Result::Err(error: PgError::Io(error: IoError.of(kind: IoErrorKind::ConnectionRefused)));
         }
         Sender<string> log = this.channel[0].sender();
-        SendResult<string> sent = log.send(item: "connect");
+        _ = log.send(item: "connect");
         DynamicArray<Step> s = this.scripts.remove(index: 0);
         Owned<Transport> fake = new FakeServer.traced(steps: give s, chunk: 1, writeLimit: 3, tracer: this.channel[0].sender());
         return Connection.connectOver(transport: give fake, config: config);
@@ -70,8 +70,8 @@ fn DynamicArray<string> drained(ref Receiver<string> log) {
     DynamicArray<string> lines = DynamicArray.empty();
     bool more = true;
     while (more) {
-        RecvResult<string> r = log.tryRecv();
-        match (give r) { case Received(item: line): { lines.add(item: give line); } case _: { more = false; } };
+        Result<string, RecvError> r = log.tryRecv();
+        match (give r) { case Ok(value: line): { lines.add(item: give line); } case _: { more = false; } };
     }
     return lines;
 }
@@ -215,8 +215,8 @@ type resource Waiter implements Sendable {
             }
             case Err(error: e): { }
         };
-        SendResult<string> sent = this.report.send(item: give outcome);
-        SendResult<string> took = this.report.send(item: "${waited}");
+        _ = this.report.send(item: give outcome);
+        _ = this.report.send(item: "${waited}");
     }
 }
 
@@ -525,7 +525,7 @@ unsafe fn int32 lifetimeTests() {
 type resource Counting implements NoticeHandler, Sendable {
     Sender<string> seen;
     public ctor make(Sender<string> seen) { this.seen = give seen; }
-    public fn void notice(const ref ServerError notice) { SendResult<string> sent = this.seen.send(item: notice.primary()); }
+    public fn void notice(const ref ServerError notice) { _ = this.seen.send(item: notice.primary()); }
 }
 
 unsafe fn int32 settingsPutBack() {
@@ -575,8 +575,8 @@ unsafe fn int32 settingsPutBack() {
             case Err(error: e): { }
         };
     }
-    RecvResult<string> got = heard.tryRecv();
-    bool handled = match (got) { case Received(item: m): true; case _: false; };
+    Result<string, RecvError> got = heard.tryRecv();
+    bool handled = match (got) { case Ok(value: m): true; case _: false; };
     f = f + check(ok: firstMs == 5000i64 && againMs == 5000i64,
                   what: "pool: each connection has the pool's query timeout, put back on release (${firstMs}, then ${againMs} ms)");
     f = f + check(ok: ran && !handled, what: "pool: a notice handler set through a lease is cleared on release");

@@ -30,7 +30,7 @@ unsafe fn bool restarting() {
     return match (v) { case Some(value: s): s.equals(other: "1"); case None: false; };
 }
 
-fn int32 main() {
+fn uint8 main() {
     setLogSink(s: capture);
     if (restarting()) {
         int32 r = restartTests();

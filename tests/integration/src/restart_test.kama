@@ -1,4 +1,3 @@
-file @compileFor(!RELEASE);   // KPG-41: std::process beside std::concurrent fails a release build on macOS
 // A server restart, against a real server: what each session open across it reports, a connect while the server is
 // down and while it starts, and the sessions after it. This group restarts the server, so it runs alone, as its own
 // leg of tools/test-integration.sh (PGTEST_RESTART=1), and drives tools/pg.sh (PGTEST_PGSH) through std::process.

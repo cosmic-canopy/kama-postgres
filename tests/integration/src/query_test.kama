@@ -1,7 +1,7 @@
 // The simple query protocol against a real server: results, command tags, errors and their fields, notices,
 // parameters, transactions, notifications, and what simpleQuery refuses.
 import { std::collections::DynamicArray, std::encoding::utf8::decode, std::encoding::utf8::Utf8Error, std::concurrent::Channel, std::concurrent::Receiver,
-         std::concurrent::RecvResult, std::memory::Owned,
+         std::concurrent::RecvError, std::memory::Owned,
          postgres::Connection, postgres::PgError, postgres::Rows, postgres::columnOpt, postgres::ServerError,
          postgres::TransactionStatus, postgres::NoticeHandler, postgres::Notification,
          postgres::sqlstate::SYNTAX_ERROR, postgres::sqlstate::DIVISION_BY_ZERO,
@@ -192,9 +192,9 @@ fn string drain(ref Receiver<string> rx) {
     string got = "";
     bool more = true;
     while (more) {
-        RecvResult<string> r = rx.tryRecv();
+        Result<string, RecvError> r = rx.tryRecv();
         match (give r) {
-            case Received(item: s): { got = got.concat(other: s).concat(other: ";"); }
+            case Ok(value: s): { got = got.concat(other: s).concat(other: ";"); }
             case _: { more = false; }
         };
     }

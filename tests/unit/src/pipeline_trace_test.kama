@@ -9,7 +9,7 @@
 // them and a cursor's portal by name (PQsendDescribePrepared, PQsendClosePortal), and bind with binary results; this
 // client names the statements it prepares, describes them as it prepares them, and has no portal by name in a pipeline.
 import { std::collections::DynamicArray, std::encoding::hex::decode as hexDecode, std::encoding::hex::DecodeError,
-         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::RecvResult,
+         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::RecvError,
          std::memory::Owned,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
          postgres::Transport, postgres::PipelineStatus, postgres::PipelineResult, postgres::CacheMode, postgres::columnOpt,
@@ -268,8 +268,8 @@ unsafe fn int32 pipelineTraceTests() {
         c.close();
         DynamicArray<string> sent = DynamicArray.empty();
         while (true) {
-            RecvResult<string> got = rx.tryRecv();
-            match (give got) { case Received(item: s): { sent.add(item: give s); } case _: { break; } };
+            Result<string, RecvError> got = rx.tryRecv();
+            match (give got) { case Ok(value: s): { sent.add(item: give s); } case _: { break; } };
         }
         DynamicArray<string> expected = DynamicArray.empty();
         foreach (string line in lines) { if (line.startsWith(prefix: "F\t")) { expected.add(item: copy line); } }

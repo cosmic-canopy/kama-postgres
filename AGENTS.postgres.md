@@ -12,7 +12,7 @@ edit.
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.673**, declared as `"kama"` in every manifest here, and pinned in CI. That is the
+**The package needs kama ≥ 0.9.690**, declared as `"kama"` in every manifest here, and pinned in CI. That is the
 release it is built and tested with, and the first with everything this package relies on:
 - a non-fatal write to a closed socket;
 - a `Sendable` `TcpStream`;
@@ -35,7 +35,11 @@ release it is built and tested with, and the first with everything this package 
 - one copy of an adapter's vtable in a release build (KPG-38, 0.9.543);
 - a view's `~dtor`, run when its borrow window closes (KPG-35, 0.9.658);
 - a window opened through an enclosing window's alias freezes that alias (KPG-40), and std's JSON imports beside
-  this package (KPG-39), both first released in 0.9.673.
+  this package (KPG-39), both first released in 0.9.673;
+- a release build with `std::process` beside `std::concurrent` on macOS (KPG-41, 0.9.679), which the pool and the
+  restart tests need;
+- channels that return `Result` (`Undelivered<T>`, `RecvError`), a `Result` that cannot be dropped unnoticed
+  (`_ = expr;` is the explicit discard), and `fn uint8 main()` (KR-214 and the exit status, both 0.9.690).
 
 ## What is true here and nowhere else
 
@@ -61,9 +65,8 @@ release it is built and tested with, and the first with everything this package 
   - `tests/integration` needs a live server. `tools/test-integration.sh` starts each version itself (all of
     14–19 by default, `--version N` for one) and runs the suite debug and release. A last leg per version
     (`PGTEST_RESTART=1`) runs only `restart_test.kama`, which stops, starts and restarts the server through
-    `tools/pg.sh` (`PGTEST_PGSH`) with `std::process`. It runs the debug build: until KPG-41 is fixed, the group is
-    `file @compileFor(!RELEASE)`, with `restart_release.kama` as its release twin. Never run it beside anything else
-    that uses the same server. `types_test.kama` reads every
+    `tools/pg.sh` (`PGTEST_PGSH`) with `std::process`, in the release build. Never run it beside anything else that
+    uses the same server. `types_test.kama` reads every
     codec vector on each version: its binary bytes, its text both ways, and its kama value sent back.
   - `tools/mutate.sh <file> [--version N]` tests the tests. Each mutation in `tools/mutations/*.json` changes the
     source in a copy of the tree and must make the case it names fail. A test is not called good until one does.
@@ -222,7 +225,8 @@ release it is built and tested with, and the first with everything this package 
   - Every path keeps permits + slots + leases + connects under way equal to `maxSize`. A path that puts one slot too
     many deadlocks a release in `send` on a full channel (a mutation showed it), so a change to acquire or release must
     keep the count.
-  - Every channel call is in `Ends`, the one place KR-214 (channels returning `Result`) changes.
+  - Every channel call is in `Ends`. A `send` whose item may come back undelivered is `_ = tx.send(item: …);`: the
+    discard drops the item (a connection then closes).
   - Only a `Channel` makes new ends for itself, so the pool that made the channels keeps them (`Factories`), and only
     that pool can `share()`. Claim `sender()` and `receiver()` before a `Channel` drops: dropping it closes any side
     nobody claimed.
@@ -257,6 +261,11 @@ release it is built and tested with, and the first with everything this package 
   - A row a loop drops must still be moved: `else { RowValues dropped = give r; }`.
   - `float` is reserved, as every C keyword is; so is `out`.
   - A resource that implements `Copyable<This>` must say its bare hand-off: `Copyable<This>(bare: give)`.
+  - A `Result` in statement position is refused: bind it, or discard it with `_ = expr;` (which drops it, and an
+    `Undelivered` item with it).
+  - `main` is `fn uint8 main()`, the exit status as macOS and Linux keep it.
+  - A channel's `tryRecv` and `recvTimeout` are `Result<T, RecvError>`: `Ok(value:)`, or `Err` with `Empty` (none yet)
+    or `Closed` (no sender left).
   - Nothing moves a field out of a resource, not even out of a by-value parameter. A type whose contents must be
     handed on keeps them in a zero-or-one `DynamicArray` and `pop()`s them (`PoolShare`).
   - `when` is reserved, as a name too.

@@ -2,7 +2,7 @@
 // advisory locks, LISTENs and prepared statements gone), an open transaction is rolled back rather than committed, and
 // isolates sharing a pool never hold more than maxSize connections between them, as pg_stat_activity counts them.
 import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
-         std::concurrent::SendResult, std::concurrent::Isolate, std::fmt::parse, std::fmt::ParseError, std::random::Rng,
+         std::concurrent::Isolate, std::fmt::parse, std::fmt::ParseError, std::random::Rng,
          postgres::Config, postgres::Environment, postgres::PgError, postgres::TransactionStatus, postgres::pool::Pool, postgres::pool::PoolOptions, postgres::pool::PoolShare,
          postgres::pool::Lease,
          postgres_integration_tests::check, postgres_integration_tests::conninfoFor,
@@ -112,7 +112,7 @@ type resource Worker implements Sendable {
         }
         string outcome = "most ${most}";
         if (failed.length() > 0) { outcome = copy failed; }
-        SendResult<string> sent = this.report.send(item: give outcome);
+        _ = this.report.send(item: give outcome);
     }
 }
 

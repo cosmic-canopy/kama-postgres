@@ -1,6 +1,6 @@
 // What every live test shares: connection strings for the test server, a hermetic environment, a log sink that
 // counts what the client logs, and a notice handler that hands notices back to the test.
-import { core::env as getenv, std::collections::DynamicArray, std::concurrent::Sender, std::concurrent::SendResult, std::fs::writeText,
+import { core::env as getenv, std::collections::DynamicArray, std::concurrent::Sender, std::fs::writeText,
          std::fs::setPermissions, std::fs::Permissions, std::io::IoError,
          postgres::Config, postgres::Connection, postgres::PgError, postgres::Environment, postgres::Rows, postgres::columnOpt,
          postgres::NoticeHandler, postgres::ServerError, postgres::conninfo::ConnInfo,
@@ -117,5 +117,5 @@ fn int32 infosLogged() { return infos; }
 type resource NoticeCollector implements NoticeHandler, Sendable {
     Sender<string> sink;
     public ctor make(Sender<string> sink) { this.sink = give sink; }
-    public unsafe fn void notice(const ref ServerError notice) { SendResult<string> r = this.sink.send(item: notice.primary()); }
+    public unsafe fn void notice(const ref ServerError notice) { _ = this.sink.send(item: notice.primary()); }
 }

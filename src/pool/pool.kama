@@ -1,8 +1,7 @@
 import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
-         std::concurrent::SendResult, std::concurrent::RecvResult, std::concurrent::cpuCount, std::memory::Owned,
-         std::memory::Shared, std::random::Rng, std::random::range, std::time::Duration, std::time::Instant,
-         std::time::monotonicNow, postgres::Config, postgres::Connection, postgres::PgError, postgres::PipelineStatus,
-         postgres::TransactionStatus, Connector };
+         std::concurrent::RecvError, std::concurrent::cpuCount, std::memory::Owned, std::memory::Shared, std::random::Rng,
+         std::random::range, std::time::Duration, std::time::Instant, std::time::monotonicNow, postgres::Config,
+         postgres::Connection, postgres::PgError, postgres::PipelineStatus, postgres::TransactionStatus, Connector };
 export { Pool, PoolOptions, PoolShare, Lease };
 
 // postgres::pool — connections shared by the isolates of a program, as pgxpool, HikariCP and Npgsql share theirs. A
@@ -95,27 +94,27 @@ type resource Ends implements Sendable {
 
     // Give a slot back. With no receiver left (every pool over the channel gone) it is dropped, and with it its
     // connection, which closes.
-    unsafe fn void put(Slot slot) { SendResult<Slot> sent = this.slotsIn.send(item: give slot); }
+    unsafe fn void put(Slot slot) { _ = this.slotsIn.send(item: give slot); }
 
     // A slot waiting now, if there is one.
     fn Optional<Slot> take() {
-        RecvResult<Slot> r = this.slotsOut.tryRecv();
-        match (give r) { case Received(item: s): { return Optional::Some(value: give s); } case _: { } };
+        Result<Slot, RecvError> r = this.slotsOut.tryRecv();
+        match (give r) { case Ok(value: s): { return Optional::Some(value: give s); } case _: { } };
         return Optional::None;
     }
 
     // A slot, waiting for one until `deadline`.
     unsafe fn Optional<Slot> takeBy(Instant deadline) {
         Instant now = monotonicNow();
-        RecvResult<Slot> r = this.slotsOut.recvTimeout(timeout: deadline.since(earlier: now));
-        match (give r) { case Received(item: s): { return Optional::Some(value: give s); } case _: { } };
+        Result<Slot, RecvError> r = this.slotsOut.recvTimeout(timeout: deadline.since(earlier: now));
+        match (give r) { case Ok(value: s): { return Optional::Some(value: give s); } case _: { } };
         return Optional::None;
     }
 
     // Whether a permit was waiting; it is taken.
     fn bool permit() {
-        RecvResult<Permit> r = this.permitsOut.tryRecv();
-        return match (r) { case Received(item: p): true; case _: false; };
+        Result<Permit, RecvError> r = this.permitsOut.tryRecv();
+        return match (r) { case Ok(value: p): true; case _: false; };
     }
 
     friend PoolCore[put, take, takeBy, permit];
@@ -133,7 +132,7 @@ type resource Factories {
         this.permits = Channel.bounded(capacity: room);
         Sender<Permit> fill = this.permits.sender();
         usize i = 0;
-        while (i < room) { SendResult<Permit> sent = fill.send(item: Permit::One); i = i + 1; }
+        while (i < room) { _ = fill.send(item: Permit::One); i = i + 1; }
     }
 
     unsafe fn Ends mint() {

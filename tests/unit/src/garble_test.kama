@@ -12,7 +12,7 @@
 // names the one a panic ended.
 import { core::env, core::println, std::collections::DynamicArray, std::memory::Owned, std::time::Duration,
          std::fmt::parse as parseNumber, std::fmt::ParseError,
-         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::RecvResult,
+         std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver, std::concurrent::RecvError,
          tls::TlsConfig,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Query,
          postgres::Portal, postgres::Transport, postgres::CacheMode, postgres::CopyInfo, postgres::CopyChunk,
@@ -476,8 +476,8 @@ unsafe fn isize repliesOf(isize e, ref string broken) {
     isize n = 0;
     bool more = true;
     while (more) {
-        RecvResult<isize> r = rx.tryRecv();
-        more = match (r) { case Received(item: i): true; case _: false; };
+        Result<isize, RecvError> r = rx.tryRecv();
+        more = match (r) { case Ok(value: i): true; case _: false; };
         if (more) { n = n + 1; }
     }
     return n;

@@ -14,7 +14,7 @@ fn int32 check(bool ok, string what) {
     return 0;
 }
 
-fn int32 main() {
+fn uint8 main() {
     setLogSink(s: captureLog);
     int32 failed = 0;
     failed = failed + protocolTests();

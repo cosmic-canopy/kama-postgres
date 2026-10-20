@@ -76,8 +76,8 @@
   "id": "P11",
   "suite": "unit",
   "file": "src/pool/pool.kama",
-  "old": "if (!past(expires: until)) {",
-  "new": "if (true) {",
+  "old": "if (past(expires: expires)) { return false; }",
+  "new": "",
   "expect": "pool: an idle connection past its lifetime is closed when acquired"
  },
  {

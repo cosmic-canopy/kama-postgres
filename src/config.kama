@@ -627,6 +627,10 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
     public const fn int32 maxProtocolVersion() { return this.maxProtocol; }
     // connect_timeout in seconds, applied to each address tried; 0 for no limit.
     public const fn int32 connectTimeout() { return this.timeoutSeconds; }
+    // A connect_timeout of `seconds` where there is none, for a pool's maintenance: its connects must end, since the
+    // pool's drop waits for them.
+    fn void boundConnects(int32 seconds) { if (this.timeoutSeconds == 0) { this.timeoutSeconds = seconds; } }
+    friend postgres::pool::PoolCore[boundConnects];
     public const fn bool keepalives() { return this.keepalivesOn; }
     // keepalives_idle, keepalives_interval and keepalives_count; -1 when not set.
     public const fn int32 keepalivesIdle() { return this.idleSeconds; }

@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-20: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2 and S3 are done, and the ports to kama 0.9.673 and 0.9.690). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-20: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2, S3 and S4 are done, and the ports to kama 0.9.673 and 0.9.690). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -52,7 +52,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3 and the port to 0.9.690 done; S4 next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690 and S4 done; S5 next |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -210,8 +210,59 @@ it fail.
   - KR-214: `send` is `_ = tx.send(item: …);` (the discard drops an undelivered item), and `tryRecv`/`recvTimeout`
     are `Result<T, RecvError>`. Nothing else was a discarded `Result`: this code base binds every one.
   - `main` is `fn uint8 main()` in both test programs and the README.
-- **S4, maintenance.** One isolate per pool, stopped when the pool drops. It closes idle and expired connections, pings
-    the rest, and keeps min idle. Acquire also pings a connection that has been idle for more than 1 s.
+- **S4, done: maintenance** (`src/pool/pool.kama`, planned with the maintainer on 2026-10-20).
+  - **Options:**
+    - `minIdle`: 0, pgxpool's; at most maxSize.
+    - `idleTimeout`: 30 minutes; at least healthCheck, as Npgsql requires; None never prunes.
+    - `healthCheck`: 1 minute, pgxpool's.
+    - `pingTimeout`: 5 seconds, HikariCP's validationTimeout.
+  - **The isolate.** One per pool that made the channels (`PoolCore.keepUp`), stopped and joined when that pool drops:
+    `Maintenance { Isolate worker; Sender<Stop> stop; }`, with the stop sender dropped first. It connects to minIdle at
+    once. Then, every healthCheck, a round:
+    - takes every slot with nothing sent, and counts the idle ones;
+    - closes those past their lifetime and those pruned, after putting the kept ones back, then the Empties;
+    - pings, one at a time, each connection last known to be alive (`Slot::Idle`'s `checked`) more than 1 s ago,
+      taking slots only while the sweep counted one that may need it;
+    - connects until minIdle are idle.
+
+    It never waits on a channel, holds at most one connection while it sends anything, and checks for the stop before
+    each ping, close and connect. Its connects are bounded by connect_timeout, or by acquireTimeout when there is none
+    (`Config.boundConnects`), so a drop never waits forever.
+  - **Pruning is Npgsql's, not pgxpool's** (decided with the maintainer): `slots` is FIFO, as Npgsql's idle channel is,
+    so connections are leased in turn. pgxpool's idle time per connection (made for LIFO reuse) would never shrink a
+    pool while any traffic goes on, and almost every acquire would ping.
+    - Each round records the idle count. Once ceil(idleTimeout / healthCheck) rounds are recorded, the sorted counts'
+      element at ceil(window / 2) − 1 is closed, from the longest idle, and the window starts again.
+    - Each connection retired counts toward it, as in Npgsql's loop, and minIdle is the floor.
+    - Ported from Npgsql v10.0.3 (commit `d3768398c178`), `src/Npgsql/PoolingDataSource.cs` (`c4b07159…6049`):
+      `PruneIdleConnectors`, `DivideRoundingUp`, the constructor's sample size, median index and refusal.
+  - **Acquire** pings a connection last known to be alive more than 1 s ago, within pingTimeout (pgxpool's rule).
+    - One that does not answer is closed, and the next idle connection is taken, as pgxpool and HikariCP retry.
+    - Past the acquire's deadline, it connects on the freed place instead.
+    - An acquire that takes an `Empty` leases an idle connection waiting behind it, if there is one, rather than
+      connecting. Without that, the FIFO channel undid a prune at once (found while writing the trickle test).
+  - **Tests.**
+    - Unit (`tests/unit/src/pool_test.kama`, "maintenance"): minIdle at the start and after a loss; pruning (its window,
+      its floor, a burst pruned under a trickle, and the median, with counts 0, 0, 2 and 0, 2, 2); lifetime; the
+      maintenance's pings, and a dropped connection it replaces; acquire's ping, a failed one passed over, and its bound
+      and deadline; a freed place behind an idle connection; the drop's promptness, mid-wait, mid-ping and mid-connect,
+      with and without connect_timeout; the bound after rounds of churn; refusals and defaults.
+    - The FakeServer gained `pinged` (it answers a ping whenever it comes) and `Stall` (every later wait takes its
+      timeout). `ScriptConnector`'s forks share its scripts, so the maintenance connects over them. A stray reset of the
+      tracer and garbling after a `Late` reply (mechanical edits in 1f30846 and cfebc8d) is gone.
+    - Integration (`tests/integration/src/pool_test.kama`), plaintext and TLS: minIdle sessions before any acquire,
+      pruning down to minIdle, and a backend ended with `pg_terminate_backend` replaced by acquire's ping and by the
+      maintenance.
+    - Mutations: `tools/mutations/s4.json` (40 unit, 4 integration). S3's P11 follows the lifetime check into `usable`.
+    - Four lines have no mutation:
+      - the stop check before a retired connection's close, and the one before a fill's connect, since no scripted
+        server is slow to close, or slow to connect without failing;
+      - the ping pass's gate on its count of stale connections, and the round putting its kept connections back
+        before its Empties. Each only narrows a race that no deterministic test can hit (a mutation of the order
+        survived).
+
+      Both came from a flaky trickle test: while the maintenance holds an idle connection for nothing, an acquire can
+      find only an Empty and connect needlessly.
 - **S5, pool tests.**
   - Unit, through `ScriptConnector` (S3's): what S3's cases leave, and reaping.
   - Integration: S3 has N isolates under the bound and TLS; S5 adds a server restart, in the restart leg.
@@ -231,32 +282,39 @@ it fail.
   after that command had been sent and possibly run. Sent at once, a failure is the releaser's, and the pool closes the
   connection. asyncpg, and pgbouncer's `server_reset_query`, also reset before the connection is used again.
 - **A maintenance isolate.** pgxpool, HikariCP, Npgsql, sqlx and bb8 all have one.
+- **Every ping the pool sends is bounded by `pingTimeout`** (5 s, HikariCP's validationTimeout; decided 2026-10-20, in
+  S4). A ping to a half-open connection would otherwise wait for TCP's retransmissions, past acquireTimeout, and stall
+  the maintenance and the pool's drop with it.
+- **idleTimeout prunes as Npgsql does, by the median of sampled idle counts** (decided 2026-10-20, in S4). The pool's
+  idle queue is a FIFO channel, as Npgsql's is, and pgxpool's idle time per connection would never shrink it while any
+  traffic goes on.
 - **Windows is phase 9.**
 - **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
   for changes.
 
-**What the next session needs to know** (written 2026-10-20, after S3 and the port to 0.9.690):
-- **Where it stands.** S0, S0b, S1, S2 and S3 are done, and so are the ports to kama 0.9.673 and 0.9.690. No gap is
+**What the next session needs to know** (written 2026-10-20, after S4):
+- **Where it stands.** S0, S0b, S1, S2, S3 and S4 are done, and so are the ports to kama 0.9.673 and 0.9.690. No gap is
   open. Nothing is pushed: pushing waits for the maintainer.
-- **Next: S4, maintenance**, as its bullet above says. What S3 leaves for it:
-  - `PoolOptions` gets `minIdle`, `idleTimeout` (30 min) and `healthCheck` (1 min) then, and `Slot::Idle` gets a
-    `since`.
-  - The maintenance isolate needs its own ends of the channels: `Factories.mint()`, as `share()` does. It is the first
-    `Isolate` the package itself holds: put it in a field declared before the stop channel's `Sender`, so the sender
-    drops first (fields drop in reverse order) and the isolate's join then finds it stopping.
-  - It must keep the slot count. A path that puts one slot too many deadlocks a release in `send` on a full channel.
-  - It stops when the pool drops. No `select` exists, so a stop channel it polls with `recvTimeout` (the health
-    check's period) is the shape: `Empty` (timed out) means do a round, `Closed` means stop.
-- **S5's unit tests** go through `ScriptConnector` (`tests/unit/src/pool_test.kama`), which traces every connection's
-  messages into the test's log. The pool's live restart cases go in the restart leg (`restart_test.kama`,
-  `PGTEST_RESTART=1`).
+- **Next: S5, pool tests.** S4 brought its own unit and live cases (its bullet above), so S5 is what is left:
+  - **The pool across a server restart**, in the restart leg (`restart_test.kama`, `PGTEST_RESTART=1`, release):
+    - idle connections a restart ended are passed over by acquire's ping, then replaced by the maintenance;
+    - a lease held across the restart fails in libpq's words, and its place comes back on release;
+    - acquires while the server is down fail with the connect's error, and keep the bound;
+    - minIdle is refilled once the server is back.
+  - **Unit:** what S3's and S4's cases leave. Read both sections of `tests/unit/src/pool_test.kama` first.
+    `ScriptConnector.pinging` scripts are for pools whose maintenance pings; a strict script answers an unexpected ping
+    with FATAL. A connection's trace goes to the test's log (channel capacity 4096, which is plenty), and
+    `awaitLines` waits for lines in it.
+  - **Timing.** The maintenance cases are timed with margins of 200 ms or more: a round every 100 ms (400 ms for the
+    median), and waits of 1.1 s for the 1 s ping rule. Ten debug and release runs, some beside the integration suite,
+    passed. If a case flakes in CI, widen its margin rather than retrying it.
 - **The gate, per step:**
   - `tools/test.sh`, which runs the unit suite in debug and release;
   - `tools/test-integration.sh`, on 14–19 in debug, release and TLS, then the restart leg;
   - **`tools/mutate.sh tools/mutations/<step>.json --version 18`**. This runs each mutation in a copy of the tree and
     exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json`, S1's 35 in `s1.json`, S2's 47
-    in `s2.json` and S3's 27 in `s3.json`; all of them were run again on 0.9.690. Write a file per step, and re-run
-    older files when their code changes. A `BAD-PATTERN` means the source moved on, so update the mutation. PANICKED is
+    in `s2.json`, S3's 27 in `s3.json` and S4's 44 in `s4.json`. All were run on 0.9.690, and S3's again on S4's code.
+    Write a file per step, and re-run older files when their code changes. A `BAD-PATTERN` means the source moved on, so update the mutation. PANICKED is
     a run that died before any case failed; an entry may expect it, and may set `"env"` (the restart mutations set
     `PGTEST_RESTART=1`) and `"timeout"`. A run that times out is judged by what it printed first, since a pool mutant
     can fail its case and then deadlock (S3's P5).

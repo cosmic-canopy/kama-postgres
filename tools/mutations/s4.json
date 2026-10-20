@@ -1,0 +1,356 @@
+[
+ {
+  "id": "K1",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        this.fill(wanted: this.settings.minIdle);\n        while",
+  "new": "        while",
+  "expect": "maintenance: minIdle (2) connections are made at once"
+ },
+ {
+  "id": "K2",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.fill(wanted: this.settings.minIdle - count);",
+  "new": "",
+  "expect": "maintenance: a connection closed under its lease is replaced by the maintenance"
+ },
+ {
+  "id": "K3",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (this.ends.permit()) { return true; }",
+  "new": "",
+  "expect": "maintenance: minIdle (2) connections are made at once"
+ },
+ {
+  "id": "K4",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "case Empty: { return true; }",
+  "new": "case Empty: { this.ends.put(slot: Slot::Empty); }",
+  "expect": "maintenance: a connection closed under its lease is replaced by the maintenance"
+ },
+ {
+  "id": "K5",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "{ this.round(); }",
+  "new": "{ }",
+  "expect": "maintenance: connections not needed for idleTimeout are closed"
+ },
+ {
+  "id": "K6",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.halt[0].recvTimeout(timeout: period);\n        return match (r) { case Ok(value: s): true; case Err(error: e): match (e) { case Closed: true;",
+  "new": "this.halt[0].recvTimeout(timeout: period);\n        return match (r) { case Ok(value: s): true; case Err(error: e): match (e) { case Closed: false;",
+  "expect": "(timed out)",
+  "timeout": 180
+ },
+ {
+  "id": "K7",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "bool expired = past(expires: until);",
+  "new": "bool expired = false;",
+  "expect": "maintenance: an idle connection past its lifetime is closed by the maintenance"
+ },
+ {
+  "id": "K8",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (expired || (prune > 0 && count > this.settings.minIdle)) {",
+  "new": "if (expired || prune > 0) {",
+  "expect": "maintenance: pruning leaves minIdle (1) connections idle"
+ },
+ {
+  "id": "K9",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "isize prune = this.sample(idleCount: count);",
+  "new": "isize prune = 0;",
+  "expect": "maintenance: connections not needed for idleTimeout are closed"
+ },
+ {
+  "id": "K10",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "isize median = this.samples[(window - 1) / 2];",
+  "new": "isize median = this.samples[window - 1];",
+  "expect": "(0, 0, 2: none"
+ },
+ {
+  "id": "K11",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "isize median = this.samples[(window - 1) / 2];",
+  "new": "isize median = this.samples[0];",
+  "expect": "(0, 2, 2: both"
+ },
+ {
+  "id": "K12",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.samples.clear();",
+  "new": "",
+  "expect": "each window of idle counts starts afresh"
+ },
+ {
+  "id": "K13",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "int64 rounds = 1i64 + (span.asNanos() - 1i64) / period.asNanos();",
+  "new": "int64 rounds = 1i64;",
+  "expect": "and not before"
+ },
+ {
+  "id": "K14",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                                keep = this.alive(conn: ref conn);\n",
+  "new": "",
+  "expect": "found by the maintenance's ping"
+ },
+ {
+  "id": "K15",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                                stamp = monotonicNow();\n",
+  "new": "",
+  "expect": "and not again in the second after"
+ },
+ {
+  "id": "K16",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "fn Duration pingAfter() { return Duration.fromSecs(s: 1i64); }",
+  "new": "fn Duration pingAfter() { return Duration.fromSecs(s: 0i64); }",
+  "expect": "known to be alive less than a second ago is not pinged"
+ },
+ {
+  "id": "K17",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (checked.elapsed() <= pingAfter()) { return true; }\n        return this.alive(conn: ref conn);",
+  "new": "return true;",
+  "expect": "acquire pings a connection idle for more than a second"
+ },
+ {
+  "id": "K18",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "conn.setQueryTimeout(timeout: Optional::Some(value: this.settings.pingTimeout), grace: Duration.zero());\n",
+  "new": "",
+  "expect": "a ping is bounded by pingTimeout"
+ },
+ {
+  "id": "K19",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "Result<Unit, PgError> r = conn.ping();\n        conn.setQueryTimeout(timeout: this.settings.queryTimeout, grace: this.settings.queryGrace);",
+  "new": "Result<Unit, PgError> r = conn.ping();",
+  "expect": "after acquire's ping the connection has the pool's query timeout again"
+ },
+ {
+  "id": "K20",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (past(expires: Optional::Some(value: deadline))) { return this.dial(); }",
+  "new": "",
+  "expect": "past acquireTimeout acquire connects rather than ping another"
+ },
+ {
+  "id": "K21",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (past(expires: Optional::Some(value: deadline))) { return this.dial(); }\n                    Optional<Slot> other = this.idleWaiting();",
+  "new": "if (past(expires: Optional::Some(value: deadline))) { return this.dial(); }\n                    Optional<Slot> other = Optional::None;",
+  "expect": "passed over for the next idle one"
+ },
+ {
+  "id": "K22",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "case Some(value: o): { this.ends.put(slot: Slot::Empty); next.add(item: give o); }\n                        case None: { return this.dial(); }\n                    };\n                }\n                case Empty: {",
+  "new": "case Some(value: o): { next.add(item: give o); }\n                        case None: { return this.dial(); }\n                    };\n                }\n                case Empty: {",
+  "expect": "the place of a connection acquire passed over stays the pool's"
+ },
+ {
+  "id": "K23",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "// place is not filled while another sits idle.\n                    Optional<Slot> other = this.idleWaiting();",
+  "new": "// place is not filled while another sits idle.\n                    Optional<Slot> other = Optional::None;",
+  "expect": "leases the idle connection behind it"
+ },
+ {
+  "id": "K24",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "// place is not filled while another sits idle.\n                    Optional<Slot> other = this.idleWaiting();\n                    match (give other) {\n                        case Some(value: o): { this.ends.put(slot: Slot::Empty); next.add(item: give o); }",
+  "new": "// place is not filled while another sits idle.\n                    Optional<Slot> other = this.idleWaiting();\n                    match (give other) {\n                        case Some(value: o): { next.add(item: give o); }",
+  "expect": "the place stays for the next acquire"
+ },
+ {
+  "id": "K25",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "while (empties > 0) { this.ends.put(slot: Slot::Empty); empties = empties - 1; }",
+  "new": "",
+  "expect": "maintenance: a connection closed under its lease is replaced by the maintenance"
+ },
+ {
+  "id": "K26",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "case Empty: { }\n                };\n                this.ends.put(slot: Slot::Empty);",
+  "new": "case Empty: { }\n                };",
+  "expect": "after rounds of closes and connects, maxSize (2) leases can be held"
+ },
+ {
+  "id": "K27",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "gone.close();\n                                this.ends.put(slot: Slot::Empty);\n                                count = count - 1;",
+  "new": "gone.close();\n                                count = count - 1;",
+  "expect": "found by the maintenance's ping, and replaced"
+ },
+ {
+  "id": "K29",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "            if (this.ends.stopped()) { return; }\n            Optional<Slot> s = this.ends.take();",
+  "new": "            Optional<Slot> s = this.ends.take();",
+  "expect": "after the ping under way, not the rest"
+ },
+ {
+  "id": "K30",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "kept.boundConnects();",
+  "new": "",
+  "expect": "its connects end within acquireTimeout when there is no connect_timeout",
+  "timeout": 300
+ },
+ {
+  "id": "K31",
+  "suite": "unit",
+  "file": "src/config.kama",
+  "old": "if (this.timeoutSeconds == 0) { this.timeoutSeconds = seconds; }",
+  "new": "this.timeoutSeconds = seconds;",
+  "expect": "its connects keep the connect_timeout the Config has"
+ },
+ {
+  "id": "K32",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (options.minIdle < 0 || options.minIdle > options.maxSize) {",
+  "new": "if (options.minIdle > options.maxSize) {",
+  "expect": "pool: a negative minIdle is refused"
+ },
+ {
+  "id": "K33",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (options.minIdle < 0 || options.minIdle > options.maxSize) {",
+  "new": "if (options.minIdle < 0) {",
+  "expect": "pool: minIdle over maxSize is refused"
+ },
+ {
+  "id": "K34",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (options.healthCheck.asNanos() <= 0i64) {",
+  "new": "if (false) {",
+  "expect": "pool: a healthCheck of 0 is refused"
+ },
+ {
+  "id": "K35",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (options.pingTimeout.asNanos() <= 0i64) {",
+  "new": "if (false) {",
+  "expect": "pool: a pingTimeout of 0 is refused"
+ },
+ {
+  "id": "K36",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "case Some(value: d): d >= options.healthCheck;",
+  "new": "case Some(value: d): true;",
+  "expect": "pool: an idleTimeout under healthCheck is refused"
+ },
+ {
+  "id": "K37",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "case Some(value: d): d >= options.healthCheck;",
+  "new": "case Some(value: d): d > options.healthCheck;",
+  "expect": "pool: an idleTimeout equal to healthCheck is taken"
+ },
+ {
+  "id": "K38",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.minIdle = 0;",
+  "new": "this.minIdle = 1;",
+  "expect": "the maintenance's defaults"
+ },
+ {
+  "id": "K39",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.idleTimeout = Optional::Some(value: Duration.fromSecs(s: 1800i64));",
+  "new": "this.idleTimeout = Optional::Some(value: Duration.fromSecs(s: 1799i64));",
+  "expect": "the maintenance's defaults"
+ },
+ {
+  "id": "K40",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.healthCheck = Duration.fromSecs(s: 60i64);",
+  "new": "this.healthCheck = Duration.fromSecs(s: 59i64);",
+  "expect": "the maintenance's defaults"
+ },
+ {
+  "id": "K41",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.pingTimeout = Duration.fromSecs(s: 5i64);",
+  "new": "this.pingTimeout = Duration.fromSecs(s: 4i64);",
+  "expect": "the maintenance's defaults"
+ },
+ {
+  "id": "KI1",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "        this.fill(wanted: this.settings.minIdle);\n        while",
+  "new": "        while",
+  "expect": "maintenance: minIdle (2) sessions are opened before any acquire"
+ },
+ {
+  "id": "KI2",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "isize prune = this.sample(idleCount: count);",
+  "new": "isize prune = 0;",
+  "expect": "maintenance: sessions a pool has not needed for idleTimeout are closed"
+ },
+ {
+  "id": "KI3",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "if (checked.elapsed() <= pingAfter()) { return true; }\n        return this.alive(conn: ref conn);",
+  "new": "return true;",
+  "expect": "is passed over by acquire's ping"
+ },
+ {
+  "id": "KI4",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "                                keep = this.alive(conn: ref conn);\n",
+  "new": "",
+  "expect": "maintenance: a session the server ended is replaced by the maintenance"
+ }
+]

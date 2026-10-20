@@ -1,7 +1,8 @@
-import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
-         std::concurrent::RecvError, std::concurrent::cpuCount, std::memory::Owned, std::memory::Shared, std::random::Rng,
-         std::random::range, std::time::Duration, std::time::Instant, std::time::monotonicNow, postgres::Config,
-         postgres::Connection, postgres::PgError, postgres::PipelineStatus, postgres::TransactionStatus, Connector };
+import { std::collections::DynamicArray, std::collections::sortUnstable, std::concurrent::Channel, std::concurrent::Sender,
+         std::concurrent::Receiver, std::concurrent::RecvError, std::concurrent::Isolate, std::concurrent::cpuCount,
+         std::log::logWarn, std::memory::Owned, std::memory::Shared, std::random::Rng, std::random::range,
+         std::time::Duration, std::time::Instant, std::time::monotonicNow, postgres::Config, postgres::Connection,
+         postgres::PgError, postgres::PipelineStatus, postgres::TransactionStatus, Connector };
 export { Pool, PoolOptions, PoolShare, Lease };
 
 // postgres::pool — connections shared by the isolates of a program, as pgxpool, HikariCP and Npgsql share theirs. A
@@ -11,12 +12,36 @@ export { Pool, PoolOptions, PoolShare, Lease };
 // no connection has used yet, maxSize of it at first. Acquire takes an idle connection if one is waiting, else a permit
 // (and connects), else waits on `slots` until acquireTimeout passes. Capacity freed later (a connection closed, a
 // connect that failed, a connection past its lifetime) goes into `slots` as Empty, never back to `permits`, so that a
-// waiter wakes for it; whoever takes an Empty connects. So the permits left, the slots, the leases and the connects
-// under way always add up to maxSize, and a program that takes one connection at a time keeps using one.
+// waiter wakes for it. Whoever takes an Empty connects, unless an idle connection is waiting behind it. So the permits
+// left, the slots, the leases, the connects under way and what the maintenance holds always add up to maxSize, and a
+// program that takes one connection at a time keeps using one.
+//
+// An idle connection last known to be alive more than a second ago is pinged before it is leased, as pgxpool pings
+// one, within pingTimeout. One that does not answer is closed, and acquire takes the next idle connection, or, with
+// none waiting or its time up, connects on the place the closed one left.
 //
 // A pool belongs to one isolate, and so do its leases. `share()` makes a PoolShare, which is Sendable, and
 // `Pool.join(share:)` in another isolate makes a pool over the same channels, the same maxSize between them. Only the
 // pool that made the channels can share them, since only a channel makes new ends for itself.
+//
+// Maintenance. The pool that made the channels runs an isolate that keeps them, stopped and joined when that pool
+// drops; a joined pool's connections are kept only while it lives. It connects until minIdle connections are idle,
+// then every healthCheck runs a round:
+//   - it takes every slot waiting, sending nothing, and counts the idle connections;
+//   - it closes those past their lifetime, and those pruned;
+//   - one at a time, it pings each idle connection not known to be alive for more than a second, and closes one that
+//     does not answer;
+//   - it connects again until minIdle are idle.
+// It never waits on a channel, since the isolate dropping the pool may hold leases while it joins the maintenance, and
+// it holds at most one connection while it sends anything. An acquire that comes while it holds the only idle
+// connection for that moment finds none, and connects, as an acquire during pgxpool's health check does; pruning
+// closes the extra connection later.
+//
+// Pruning is Npgsql's (PoolingDataSource.PruneIdleConnectors, v10.0.3), not pgxpool's idle time per connection.
+// `slots` is first in, first out, as Npgsql's idle channel is, so connections are leased in turn, and none stays idle
+// for long while any traffic goes on. So each round records how many connections are idle. Once idleTimeout's worth
+// of rounds is recorded, the median of those counts is how many are closed, from the longest idle, never leaving
+// fewer than minIdle idle.
 //
 // Release is Npgsql's. A connection that is closed, busy (a result, a stream or a COPY still open), in pipeline mode,
 // or past its lifetime is closed. Then the session is reset (Connection.resetSession, which rolls back an open block
@@ -25,14 +50,14 @@ export { Pool, PoolOptions, PoolShare, Lease };
 // put back first, so it bounds the reset too, and a notice handler set through the lease is cleared: a pooled
 // connection's notices go to the log.
 
-// How a pool behaves (Pool.make). The defaults are pgxpool's, with HikariCP's spread of lifetimes and the acquire
-// timeout of sqlx and HikariCP.
+// How a pool behaves (Pool.make). The defaults are pgxpool's, with HikariCP's spread of lifetimes and ping bound, and
+// the acquire timeout of sqlx and HikariCP.
 type value PoolOptions implements Sendable {
     // The most connections open at once, leased and idle together, across every isolate the pool is shared with.
     // Default max(4, the CPUs online), pgxpool's.
     public isize maxSize;
     // How long a connection is kept, from its connect; None for no limit. One past it is closed when it is next
-    // released or acquired. Default one hour, pgxpool's.
+    // released, acquired or maintained. Default one hour, pgxpool's.
     public Optional<Duration> lifetime;
     // Up to this much more, chosen at random for each connection, so that connections made together do not all reach
     // their lifetime together. Default 90 seconds, HikariCP's 2.5% of the hour.
@@ -47,6 +72,17 @@ type value PoolOptions implements Sendable {
     // when it is released. Default None and 2 seconds, a connection's own defaults.
     public Optional<Duration> queryTimeout;
     public Duration queryGrace;
+    // The fewest idle connections the maintenance keeps open, connecting in the background to keep them. Best effort:
+    // the pool can dip below it for a while after connections close. At most maxSize. Default 0, pgxpool's.
+    public isize minIdle;
+    // How long the maintenance watches the idle connections before it closes the ones the pool has not needed (see the
+    // header); None never closes them. At least healthCheck, as Npgsql requires. Default 30 minutes, pgxpool's.
+    public Optional<Duration> idleTimeout;
+    // How often the maintenance runs. Default one minute, pgxpool's.
+    public Duration healthCheck;
+    // How long a ping the pool sends may take; a connection that has not answered by then is closed. Default 5
+    // seconds, HikariCP's validationTimeout.
+    public Duration pingTimeout;
 
     public ctor defaults() {
         isize cpus = cast<isize>(cpuCount());
@@ -58,6 +94,10 @@ type value PoolOptions implements Sendable {
         this.reset = true;
         this.queryTimeout = Optional::None;
         this.queryGrace = Duration.fromSecs(s: 2i64);
+        this.minIdle = 0;
+        this.idleTimeout = Optional::Some(value: Duration.fromSecs(s: 1800i64));
+        this.healthCheck = Duration.fromSecs(s: 60i64);
+        this.pingTimeout = Duration.fromSecs(s: 5i64);
     }
 }
 
@@ -67,30 +107,49 @@ fn Optional<string> invalid(const ref PoolOptions options) {
         isize n = options.maxSize;
         return Optional::Some(value: "pool maxSize must be at least 1, not ${n}");
     }
+    if (options.minIdle < 0 || options.minIdle > options.maxSize) {
+        isize most = options.maxSize;
+        isize n = options.minIdle;
+        return Optional::Some(value: "pool minIdle must be from 0 to maxSize (${most}), not ${n}");
+    }
     bool lifeOk = match (options.lifetime) { case Some(value: d): !d.isNegative() && d.asNanos() > 0i64; case None: true; };
     if (!lifeOk) { return Optional::Some(value: "pool lifetime must be more than 0 (or None, for no limit)"); }
     bool timeoutOk = match (options.queryTimeout) { case Some(value: d): !d.isNegative(); case None: true; };
     if (options.lifetimeJitter.isNegative() || options.acquireTimeout.isNegative() || options.queryGrace.isNegative() || !timeoutOk) {
         return Optional::Some(value: "pool durations must not be negative");
     }
+    if (options.healthCheck.asNanos() <= 0i64) { return Optional::Some(value: "pool healthCheck must be more than 0"); }
+    if (options.pingTimeout.asNanos() <= 0i64) { return Optional::Some(value: "pool pingTimeout must be more than 0"); }
+    bool idleOk = match (options.idleTimeout) { case Some(value: d): d >= options.healthCheck; case None: true; };
+    if (!idleOk) { return Optional::Some(value: "pool idleTimeout must be at least healthCheck (or None, for no limit)"); }
     return Optional::None;
 }
 
-// What the pool's channels carry. A slot is an idle connection, with when its lifetime ends, or Empty: capacity a
-// connection gave up, which whoever takes it fills by connecting. A permit is capacity no connection has used yet.
-type enum Slot implements Sendable { Idle(Connection conn, Optional<Instant> expires), Empty }
+// What the pool's channels carry. A slot is an idle connection, with when its lifetime ends and when it was last known
+// to be alive (connected, released or answering a ping), or Empty: capacity a connection gave up, which whoever takes
+// it fills by connecting. A permit is capacity no connection has used yet.
+type enum Slot implements Sendable { Idle(Connection conn, Optional<Instant> expires, Instant checked), Empty }
 type enum Permit implements Sendable { One }
+// What the maintenance's stop channel would carry. Nothing is sent: the pool drops its sender, which closes it.
+type enum Stop implements Sendable { Now }
 
-// This isolate's ends of the pool's two channels. Every channel call the pool makes is here.
+// This isolate's ends of the pool's two channels, and, for the maintenance, the end of its stop channel. Every channel
+// call the pool makes is here.
 type resource Ends implements Sendable {
     Sender<Slot> slotsIn;
     Receiver<Slot> slotsOut;
     Receiver<Permit> permitsOut;
+    DynamicArray<Receiver<Stop>> halt;   // zero or one: the maintenance's, closed when the pool that started it drops
 
     ctor make(Sender<Slot> slotsIn, Receiver<Slot> slotsOut, Receiver<Permit> permitsOut) {
         this.slotsIn = give slotsIn; this.slotsOut = give slotsOut; this.permitsOut = give permitsOut;
+        this.halt = DynamicArray.empty();
     }
     friend Factories[make];
+
+    // These ends are the maintenance's: `stop` closes when the pool drops.
+    fn void heed(Receiver<Stop> stop) { this.halt.add(item: give stop); }
+    friend Pool[heed];
 
     // Give a slot back. With no receiver left (every pool over the channel gone) it is dropped, and with it its
     // connection, which closes.
@@ -117,7 +176,21 @@ type resource Ends implements Sendable {
         return match (r) { case Ok(value: p): true; case _: false; };
     }
 
-    friend PoolCore[put, take, takeBy, permit];
+    // Whether the pool that started the maintenance has dropped. Ends with no stop channel never stop.
+    fn bool stopped() {
+        if (this.halt.length() == 0) { return false; }
+        Result<Stop, RecvError> r = this.halt[0].tryRecv();
+        return match (r) { case Ok(value: s): true; case Err(error: e): match (e) { case Closed: true; case _: false; }; };
+    }
+
+    // Wait up to `period` for the pool that started the maintenance to drop; whether it did.
+    fn bool stopsWithin(Duration period) {
+        if (this.halt.length() == 0) { return true; }
+        Result<Stop, RecvError> r = this.halt[0].recvTimeout(timeout: period);
+        return match (r) { case Ok(value: s): true; case Err(error: e): match (e) { case Closed: true; case _: false; }; };
+    }
+
+    friend PoolCore[put, take, takeBy, permit, stopped, stopsWithin];
 }
 
 // The two channels themselves, which the pool that made them keeps: only a channel makes new ends, which share() needs.
@@ -155,17 +228,19 @@ type resource DirectConnector implements Connector, Sendable {
 }
 
 // Everything a pool is in one isolate: its ends of the channels, its settings, and its connector. Sendable, so that a
-// PoolShare can carry one to another isolate.
+// PoolShare can carry one to another isolate, and the maintenance one to its own.
 type resource PoolCore implements Sendable {
     Ends ends;
     Config config;
     PoolOptions settings;
     Owned<Connector> connector;
-    Rng rng;   // the lifetimes' spread
+    Rng rng;                        // the lifetimes' spread
+    DynamicArray<isize> samples;    // the maintenance's: the idle counts of this window's rounds
 
     unsafe ctor make(Ends ends, Config config, PoolOptions settings, Owned<Connector> connector) {
         this.ends = give ends; this.config = give config; this.settings = settings; this.connector = give connector;
         this.rng = Rng.fromEntropy();
+        this.samples = DynamicArray.empty();
     }
 
     // The same pool, over new ends of its channels, for another isolate.
@@ -177,29 +252,97 @@ type resource PoolCore implements Sendable {
 
     const fn Duration acquireTimeout() { return this.settings.acquireTimeout; }
 
+    // The maintenance's connects end, and with them the drop of the pool waiting to join it: within connect_timeout,
+    // or, where there is none, within acquireTimeout rounded up to a second, since no acquire waits longer than that.
+    fn void boundConnects() {
+        int64 ms = this.settings.acquireTimeout.asMillis();
+        int64 secs = (ms + 999i64) / 1000i64;
+        if (secs < 1i64) { secs = 1i64; }
+        if (secs > 2147483647i64) { secs = 2147483647i64; }
+        this.config.boundConnects(seconds: cast<int32>(secs));
+    }
+
     // A connection to lease, by `deadline`: an idle one, or a new one on capacity that is free. Always an Idle slot.
     unsafe fn Result<Slot, PgError> checkout(Instant deadline) {
+        DynamicArray<Slot> next = DynamicArray.empty();   // zero or one: the slot to look at
         Optional<Slot> got = this.ends.take();
-        bool waiting = match (got) { case Some(value: s): false; case None: true; };
-        if (waiting) {
-            if (this.ends.permit()) { return this.dial(); }
-            got = this.ends.takeBy(deadline: deadline);
-        }
         match (give got) {
-            case Some(value: s): {
-                match (give s) {
-                    case Idle(conn: c, expires: until): {
-                        if (!past(expires: until)) { return Result::Ok(value: Slot::Idle(conn: give c, expires: until)); }
-                        Connection old = give c;
-                        old.close();
-                        return this.dial();
-                    }
-                    case Empty: { return this.dial(); }
+            case Some(value: s): { next.add(item: give s); }
+            case None: {
+                if (this.ends.permit()) { return this.dial(); }
+                Optional<Slot> waited = this.ends.takeBy(deadline: deadline);
+                match (give waited) {
+                    case Some(value: s): { next.add(item: give s); }
+                    case None: { return Result::Err(error: PgError::PoolTimeout); }
                 };
             }
-            case None: { }
         };
+        while (next.length() > 0) {
+            Slot s = next.remove(index: 0);
+            match (give s) {
+                case Idle(conn: c, expires: until, checked: at): {
+                    Connection conn = give c;
+                    if (this.usable(conn: ref conn, expires: until, checked: at)) {
+                        return Result::Ok(value: Slot::Idle(conn: give conn, expires: until, checked: at));
+                    }
+                    Connection gone = give conn;
+                    gone.close();
+                    // Its place: the next idle connection, while there is time and one is waiting, else a new one.
+                    if (past(expires: Optional::Some(value: deadline))) { return this.dial(); }
+                    Optional<Slot> other = this.idleWaiting();
+                    match (give other) {
+                        case Some(value: o): { this.ends.put(slot: Slot::Empty); next.add(item: give o); }
+                        case None: { return this.dial(); }
+                    };
+                }
+                case Empty: {
+                    // Capacity: an idle connection waiting behind it is leased first, so that a closed connection's
+                    // place is not filled while another sits idle.
+                    Optional<Slot> other = this.idleWaiting();
+                    match (give other) {
+                        case Some(value: o): { this.ends.put(slot: Slot::Empty); next.add(item: give o); }
+                        case None: { return this.dial(); }
+                    };
+                }
+            };
+        }
         return Result::Err(error: PgError::PoolTimeout);
+    }
+
+    // An idle connection waiting, looked for without waiting among maxSize slots; the Empty ones passed over go back.
+    unsafe fn Optional<Slot> idleWaiting() {
+        isize i = 0;
+        while (i < this.settings.maxSize) {
+            Optional<Slot> s = this.ends.take();
+            match (give s) {
+                case Some(value: x): {
+                    match (give x) {
+                        case Idle(conn: c, expires: until, checked: at): { return Optional::Some(value: Slot::Idle(conn: give c, expires: until, checked: at)); }
+                        case Empty: { this.ends.put(slot: Slot::Empty); }
+                    };
+                }
+                case None: { return Optional::None; }
+            };
+            i = i + 1;
+        }
+        return Optional::None;
+    }
+
+    // Whether an idle connection may be leased: within its lifetime, and answering a ping if it was last known to be
+    // alive more than a second ago.
+    unsafe fn bool usable(ref Connection conn, Optional<Instant> expires, Instant checked) {
+        if (past(expires: expires)) { return false; }
+        if (checked.elapsed() <= pingAfter()) { return true; }
+        return this.alive(conn: ref conn);
+    }
+
+    // Whether `conn` answers a ping within pingTimeout, with no grace for a cancel: a connection that does not is the
+    // caller's to close. The pool's query timeout is put back.
+    unsafe fn bool alive(ref Connection conn) {
+        conn.setQueryTimeout(timeout: Optional::Some(value: this.settings.pingTimeout), grace: Duration.zero());
+        Result<Unit, PgError> r = conn.ping();
+        conn.setQueryTimeout(timeout: this.settings.queryTimeout, grace: this.settings.queryGrace);
+        return match (r) { case Ok(value: u): true; case Err(error: e): false; };
     }
 
     // A new connection on capacity the caller holds. If it cannot be made, the capacity goes back, as Empty.
@@ -210,7 +353,8 @@ type resource PoolCore implements Sendable {
                 Connection conn = give c;
                 conn.setQueryTimeout(timeout: this.settings.queryTimeout, grace: this.settings.queryGrace);
                 Optional<Instant> lifeEnds = this.expiry();
-                return Result::Ok(value: Slot::Idle(conn: give conn, expires: lifeEnds));
+                Instant now = monotonicNow();
+                return Result::Ok(value: Slot::Idle(conn: give conn, expires: lifeEnds, checked: now));
             }
             case Err(error: e): {
                 this.ends.put(slot: Slot::Empty);
@@ -258,7 +402,8 @@ type resource PoolCore implements Sendable {
             keep = keep && !conn.isClosed();
         }
         if (keep) {
-            this.ends.put(slot: Slot::Idle(conn: give conn, expires: expires));
+            Instant now = monotonicNow();
+            this.ends.put(slot: Slot::Idle(conn: give conn, expires: expires, checked: now));
             return;
         }
         Connection gone = give conn;
@@ -266,14 +411,213 @@ type resource PoolCore implements Sendable {
         this.ends.put(slot: Slot::Empty);
     }
 
-    friend Pool[make, fork, acquireTimeout, checkout];
+    // ---- maintenance (see the header) ----
+
+    // The maintenance isolate's work: connect until minIdle are idle, then a round every healthCheck, until the pool
+    // that started it drops.
+    unsafe fn void keepUp() {
+        this.fill(wanted: this.settings.minIdle);
+        while (!this.ends.stopsWithin(period: this.settings.healthCheck)) { this.round(); }
+    }
+
+    // One round. It never waits on a channel, holds at most one connection while it sends anything, and stops between
+    // connections once the pool has dropped.
+    unsafe fn void round() {
+        // The sweep: every slot waiting, taken with nothing sent, so the idle connections can be counted.
+        DynamicArray<Slot> idle = DynamicArray.empty();
+        isize empties = 0;
+        isize i = 0;
+        bool more = true;
+        while (more && i < this.settings.maxSize) {
+            Optional<Slot> s = this.ends.take();
+            match (give s) {
+                case Some(value: x): {
+                    match (give x) {
+                        case Idle(conn: c, expires: until, checked: at): { idle.add(item: Slot::Idle(conn: give c, expires: until, checked: at)); }
+                        case Empty: { empties = empties + 1; }
+                    };
+                }
+                case None: { more = false; }
+            };
+            i = i + 1;
+        }
+
+        // Retire, longest idle first: those past their lifetime, and the pruned, while more than minIdle stay idle.
+        // Each one retired counts toward the pruned, as in Npgsql's loop. The rest go back before anything is sent,
+        // and before the Empty slots, so that an acquire the sweep left waiting wakes for a connection, not to connect.
+        isize count = idle.length();
+        isize prune = this.sample(idleCount: count);
+        isize stale = 0;   // the kept connections last known to be alive more than a second ago, for the ping pass
+        DynamicArray<Slot> retired = DynamicArray.empty();
+        while (idle.length() > 0) {
+            Slot s = idle.remove(index: 0);
+            match (give s) {
+                case Idle(conn: c, expires: until, checked: at): {
+                    bool expired = past(expires: until);
+                    if (expired || (prune > 0 && count > this.settings.minIdle)) {
+                        retired.add(item: Slot::Idle(conn: give c, expires: until, checked: at));
+                        count = count - 1;
+                        if (prune > 0) { prune = prune - 1; }
+                    } else {
+                        if (at.elapsed() > pingAfter()) { stale = stale + 1; }
+                        this.ends.put(slot: Slot::Idle(conn: give c, expires: until, checked: at));
+                    }
+                }
+                case Empty: { this.ends.put(slot: Slot::Empty); }
+            };
+        }
+        while (empties > 0) { this.ends.put(slot: Slot::Empty); empties = empties - 1; }
+        bool halted = false;
+        while (retired.length() > 0) {
+            Slot s = retired.remove(index: 0);
+            if (!halted) { halted = this.ends.stopped(); }
+            if (halted) { this.ends.put(slot: give s); }
+            else {
+                match (give s) {
+                    case Idle(conn: c, expires: until, checked: at): { Connection gone = give c; gone.close(); }
+                    case Empty: { }
+                };
+                this.ends.put(slot: Slot::Empty);
+            }
+        }
+        if (halted) { return; }
+
+        // Ping, one connection at a time, each last known to be alive more than a second ago (so none twice: a ping
+        // stamps it). Every slot waiting now is reached in maxSize takes, unless an acquire takes it first. With none
+        // to ping, no slot is taken: one held for nothing can send an acquire that finds only an Empty to connect.
+        i = 0;
+        more = true;
+        while (more && stale > 0 && i < this.settings.maxSize) {
+            if (this.ends.stopped()) { return; }
+            Optional<Slot> s = this.ends.take();
+            match (give s) {
+                case Some(value: x): {
+                    match (give x) {
+                        case Idle(conn: c, expires: until, checked: at): {
+                            Connection conn = give c;
+                            bool keep = true;
+                            Instant stamp = at;
+                            if (at.elapsed() > pingAfter()) {
+                                stale = stale - 1;
+                                keep = this.alive(conn: ref conn);
+                                stamp = monotonicNow();
+                            }
+                            if (keep) { this.ends.put(slot: Slot::Idle(conn: give conn, expires: until, checked: stamp)); }
+                            else {
+                                Connection gone = give conn;
+                                gone.close();
+                                this.ends.put(slot: Slot::Empty);
+                                count = count - 1;
+                            }
+                        }
+                        case Empty: { this.ends.put(slot: Slot::Empty); }
+                    };
+                }
+                case None: { more = false; }
+            };
+            i = i + 1;
+        }
+        this.fill(wanted: this.settings.minIdle - count);
+    }
+
+    // Connect `wanted` more idle connections (minIdle's), one at a time, each on capacity no connection holds. A connect
+    // that fails is logged, and the rest wait for the next round.
+    unsafe fn void fill(isize wanted) {
+        isize left = wanted;
+        while (left > 0) {
+            if (this.ends.stopped()) { return; }
+            if (!this.claim()) { return; }
+            Result<Slot, PgError> made = this.dial();   // its capacity goes back as Empty if it fails
+            match (give made) {
+                case Ok(value: s): { this.ends.put(slot: give s); }
+                case Err(error: e): {
+                    logWarn(tag: "postgres", msg: "pool: could not open a connection to keep minIdle: ".concat(other: e.message()));
+                    return;
+                }
+            };
+            left = left - 1;
+        }
+    }
+
+    // Take capacity no connection holds, without waiting: a permit, else an Empty slot among those waiting (the idle
+    // connections passed over go back). Whether there was any.
+    unsafe fn bool claim() {
+        if (this.ends.permit()) { return true; }
+        isize i = 0;
+        while (i < this.settings.maxSize) {
+            Optional<Slot> s = this.ends.take();
+            match (give s) {
+                case Some(value: x): {
+                    match (give x) {
+                        case Empty: { return true; }
+                        case Idle(conn: c, expires: until, checked: at): { this.ends.put(slot: Slot::Idle(conn: give c, expires: until, checked: at)); }
+                    };
+                }
+                case None: { return false; }
+            };
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // How many idle connections to prune this round, as Npgsql's PruneIdleConnectors decides: the round's idle count is
+    // recorded, and once the window is full (idleTimeout over healthCheck, rounded up) the median of the sorted counts
+    // (at index ceil(window / 2) - 1) is pruned and the window starts again. 0 while it fills, or with no idleTimeout.
+    unsafe fn isize sample(isize idleCount) {
+        match (this.settings.idleTimeout) {
+            case Some(value: life): {
+                isize window = roundsIn(span: life, period: this.settings.healthCheck);
+                this.samples.add(item: idleCount);
+                if (this.samples.length() < window) { return 0; }
+                sortUnstable::<isize>(items: this.samples.viewMut());
+                isize median = this.samples[(window - 1) / 2];
+                this.samples.clear();
+                return median;
+            }
+            case None: { }
+        };
+        return 0;
+    }
+
+    friend Pool[make, fork, acquireTimeout, checkout, boundConnects];
     friend Lease[release];
+    friend Keeper[keepUp];
 }
 
 // Whether a connection whose lifetime ends at `expires` is past it.
 unsafe fn bool past(Optional<Instant> expires) {
     Instant now = monotonicNow();
     return match (expires) { case Some(value: at): now >= at; case None: false; };
+}
+
+// How long a connection may sit idle, since it was last known to be alive, before it is pinged: a second, pgxpool's.
+fn Duration pingAfter() { return Duration.fromSecs(s: 1i64); }
+
+// How many rounds of `period` cover `span`, rounded up: Npgsql's DivideRoundingUp(ConnectionIdleLifetime,
+// ConnectionPruningInterval), 1 + (span - 1) / period.
+fn isize roundsIn(Duration span, Duration period) {
+    int64 rounds = 1i64 + (span.asNanos() - 1i64) / period.asNanos();
+    return cast<isize>(rounds);
+}
+
+// What the maintenance isolate is given: the pool, over ends of its own that also hear the pool drop.
+type resource Keeper implements Sendable {
+    PoolCore core;
+    ctor make(PoolCore core) { this.core = give core; }
+    unsafe fn void run() { this.core.keepUp(); }
+    friend Pool[make];
+    friend keepPool[run];
+}
+
+fn void keepPool(Keeper job) { job.run(); }
+
+// The maintenance isolate, and the end of the channel that stops it. `stop` is declared last, so it drops first: the
+// isolate's wait ends with the channel closed, and the Isolate's drop then joins it.
+type resource Maintenance {
+    Isolate worker;
+    Sender<Stop> stop;
+    ctor make(Isolate worker, Sender<Stop> stop) { this.worker = give worker; this.stop = give stop; }
+    friend Pool[make];
 }
 
 // A pool's state in its isolate, which the Pool and its leases share: a lease gives its connection back through it.
@@ -303,10 +647,12 @@ type resource PoolShare implements Sendable {
 // A connection pool (see the header). It belongs to the isolate that made it; share() hands it to another.
 type resource Pool {
     Shared<Home> home;
-    Optional<Factories> made;   // the channels, kept by the pool that made them
+    Optional<Factories> made;          // the channels, kept by the pool that made them
+    Optional<Maintenance> upkeep;      // that pool's maintenance, declared last so that it stops first; None when joined
 
     // A pool of connections made with `config`, as Connection.connect makes them. None is made until one is
-    // acquired, as pgxpool makes none. Options that cannot make a pool are refused (PgError::Usage).
+    // acquired, as pgxpool makes none, unless minIdle asks for some. Options that cannot make a pool are refused
+    // (PgError::Usage).
     public unsafe ctor Result<Pool, PgError> make(const ref Config config, PoolOptions options) {
         Owned<Connector> direct = new DirectConnector.make();
         return Pool.makeWith(connector: give direct, config: config, options: options);
@@ -325,9 +671,20 @@ type resource Pool {
         Ends mine = f.mint();
         Config c = copy config;
         PoolCore core = PoolCore.make(ends: give mine, config: give c, settings: options, connector: give connector);
+        // The maintenance: the pool again, over ends of its own that hear this pool drop.
+        Channel<Stop> stops = Channel.bounded(capacity: 1);
+        Sender<Stop> stop = stops.sender();
+        Ends theirs = f.mint();
+        theirs.heed(stop: stops.receiver());
+        PoolCore kept = core.fork(ends: give theirs);
+        kept.boundConnects();
+        Keeper k = Keeper.make(core: give kept);
+        Isolate worker = spawn keepPool(job: give k);
+        Maintenance m = Maintenance.make(worker: give worker, stop: give stop);
         Shared<Home> h = new Home.make(state: give core);
         this.home = give h;
         this.made = Optional::Some(value: give f);
+        this.upkeep = Optional::Some(value: give m);
     }
 
     // The pool `share` was made from, in this isolate. A share joins once; joining it again panics.
@@ -336,6 +693,7 @@ type resource Pool {
         Shared<Home> h = new Home.make(state: give core);
         this.home = give h;
         this.made = Optional::None;
+        this.upkeep = Optional::None;
     }
 
     // This pool, for another isolate to join (Pool.join). Refused for a pool that was itself joined from a share,
@@ -354,7 +712,8 @@ type resource Pool {
     }
 
     // A connection: an idle one, or a new one while fewer than maxSize are open, or else the first given back within
-    // acquireTimeout (PgError::PoolTimeout after it). A connect's error is returned as it is.
+    // acquireTimeout (PgError::PoolTimeout after it). An idle connection last known to be alive more than a second ago
+    // is pinged first, and passed over if it does not answer. A connect's error is returned as it is.
     public unsafe fn Result<Lease, PgError> acquire() {
         Instant start = monotonicNow();
         Instant deadline = start + this.home.core().acquireTimeout();
@@ -362,7 +721,7 @@ type resource Pool {
         match (give got) {
             case Ok(value: s): {
                 match (give s) {
-                    case Idle(conn: c, expires: until): {
+                    case Idle(conn: c, expires: until, checked: at): {
                         Shared<Home> back = this.home;
                         Lease lease = Lease.make(conn: give c, expires: until, home: give back);
                         return Result::Ok(value: give lease);

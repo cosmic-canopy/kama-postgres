@@ -219,12 +219,29 @@ release it is built and tested with, and the first with everything this package 
   - Never put a `Shared` in a `Connection`; it is a non-atomic count.
 
 - **The pool is two channels** (`src/pool/pool.kama`, `postgres::pool`), with no lock and no atomic.
-  - `slots` carries `Slot`s, each `Idle(conn, expires)` or `Empty`. `permits` holds the capacity no connection has used
+  - `slots` carries `Slot`s, each `Idle(conn, expires, checked)` or `Empty`. `checked` is when the connection was last
+    known to be alive: connected, released, or answering a ping. `permits` holds the capacity no connection has used
     yet, `maxSize` of it at first. Capacity freed later goes into `slots` as `Empty`, never back to `permits`, so a
     waiter blocked on `slots` wakes for it.
-  - Every path keeps permits + slots + leases + connects under way equal to `maxSize`. A path that puts one slot too
-    many deadlocks a release in `send` on a full channel (a mutation showed it), so a change to acquire or release must
-    keep the count.
+  - An acquire that takes an `Empty` first looks, without waiting, for an idle connection behind it (`idleWaiting`), and
+    connects only if there is none. Otherwise a FIFO channel undoes every prune and close at once.
+  - Every path keeps permits + slots + leases + connects under way (+ what the maintenance holds) equal to `maxSize`. A
+    path that puts one slot too many deadlocks a release in `send` on a full channel (a mutation showed it), so a change
+    to acquire, release or a maintenance round must keep the count.
+  - **The maintenance** (`PoolCore.keepUp`) is an isolate per pool that made the channels:
+    - It gets its own `PoolCore` (a fork over `Factories.mint()`, its `Ends` holding the stop channel's receiver).
+    - `Pool.upkeep` is a `Maintenance { Isolate worker; Sender<Stop> stop; }`. `stop` is declared last, so it drops
+      first, the keeper's `recvTimeout` returns `Closed`, and the `Isolate`'s drop then joins it.
+    - It never waits on a channel: the isolate dropping the pool may hold leases while it joins. It only uses `take()`
+      and `permit()`.
+    - It holds at most one connection while it sends anything.
+    - It checks `stopped()` before each ping, close and dial.
+    - Its connects are bounded: `Config.boundConnects` (a `friend` setter) gives its copy a connect_timeout of
+      acquireTimeout when there is none, or the pool's drop could wait on a connect forever.
+    - A round puts the kept idle connections back before the `Empty`s, so an acquire the sweep left waiting wakes for
+      a connection, not to connect (a flaky trickle test found it).
+    - Pruning is Npgsql's (PoolingDataSource v10.0.3, pinned in the ROADMAP): the median of a window of idle counts,
+      not pgxpool's idle time per connection, because the channel is FIFO and leases connections in turn.
   - Every channel call is in `Ends`. A `send` whose item may come back undelivered is `_ = tx.send(item: …);`: the
     discard drops the item (a connection then closes).
   - Only a `Channel` makes new ends for itself, so the pool that made the channels keeps them (`Factories`), and only
@@ -238,7 +255,9 @@ release it is built and tested with, and the first with everything this package 
     it.
   - `Connection.settle()` is private; `PoolCore` has a `friend` grant for release with the reset off.
   - `Pool.makeWith(connector:)` is the seam: the unit tests' `ScriptConnector` opens each connection over the next
-    script, so every message a release sends is checked.
+    script, so every message a release sends is checked. Its forks (the maintenance's, a joined pool's) draw on the same
+    queue of scripts. `ScriptConnector.pinging` makes `FakeServer.pinged` servers, which answer a ping whenever it
+    comes, since the maintenance pings when it will. A `Stall` step makes every later wait take its timeout.
 
 - **Language habits this code base needs, each learned from a compiler error:**
   - A `resource` field is always private.

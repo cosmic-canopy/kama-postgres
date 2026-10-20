@@ -288,7 +288,8 @@ A pool belongs to the isolate that made it. To use it from another, `pool.share(
 between them all. Only the pool that made the connections' channels can share them.
 
 - **The bound.** At most `maxSize` connections are open at once, leased and idle together, across every isolate. A
-  connection is made only when one is acquired and none is idle. One acquire at a time keeps using one connection.
+  connection is made when one is acquired and none is idle, or by the maintenance to keep `minIdle`. One acquire at a
+  time keeps using one connection.
 - **Waiting.** While every connection is leased, `acquire()` waits for one to come back, up to `acquireTimeout`, and
   then fails with `PgError::PoolTimeout`. A connect that fails is acquire's error, and its place in the pool is given
   back.
@@ -298,11 +299,32 @@ between them all. Only the pool that made the connections' channels can share th
   The pool's query timeout is put back, and a notice handler set through the lease is cleared.
 - **Lifetime.** A connection is closed once it has been open for `lifetime`, plus a random part of `lifetimeJitter`, so
   that connections made together are not all replaced together.
+- **Pings.** Acquire pings an idle connection last known to be alive more than a second ago, within `pingTimeout`. One
+  that does not answer (its server restarted, or ended the session) is closed, and the next idle one is taken.
+- **Maintenance.** The pool that made the connections runs an isolate of its own, every `healthCheck`, and stops it
+  when that pool is dropped. It does four things:
+  - it closes connections past their lifetime;
+  - it pings the idle ones;
+  - it connects until `minIdle` connections are idle;
+  - it closes the connections the pool has not needed, as Npgsql prunes. Each round records how many connections are
+    idle. Once `idleTimeout` has been recorded, the median of those counts is closed, never leaving fewer than
+    `minIdle`. A pool that grew in a burst shrinks to what its traffic uses, even while that traffic goes on.
 
-The defaults are pgxpool's: `maxSize` max(4, the CPUs online), a `lifetime` of one hour. Then a `lifetimeJitter` of 90
-seconds (HikariCP's 2.5%), an `acquireTimeout` of 30 seconds (sqlx's and HikariCP's), and `reset` on (Npgsql's and
-asyncpg's). `Pool.makeWith(connector:, config:, options:)` takes a `Connector` that makes the connections, for a pool
-that connects through a `Dialer` or sets each session up its own way.
+The defaults are pgxpool's where pgxpool has one:
+- `maxSize` max(4, the CPUs online);
+- a `lifetime` of one hour;
+- `minIdle` 0;
+- an `idleTimeout` of 30 minutes;
+- a `healthCheck` of one minute.
+
+The rest come from other pools:
+- a `lifetimeJitter` of 90 seconds (HikariCP's 2.5%);
+- a `pingTimeout` of 5 seconds (HikariCP's validationTimeout);
+- an `acquireTimeout` of 30 seconds (sqlx's and HikariCP's);
+- `reset` on (Npgsql's and asyncpg's).
+
+`Pool.makeWith(connector:, config:, options:)` takes a `Connector` that makes the connections, for a pool that connects
+through a `Dialer` or sets each session up its own way.
 
 ## Notifications
 

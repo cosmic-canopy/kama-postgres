@@ -13,7 +13,7 @@
 // than 17 does.
 import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView,
          std::collections::FixedArray, std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready,
-         std::net::ReliableStream, std::concurrent::Sender,
+         std::net::ReliableStream, std::concurrent::Sender, std::time::Duration, std::time::sleep,
          tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress,
          std::encoding::base64::encode as b64encode, std::encoding::base64::decode as b64decode,
          std::encoding::base64::DecodeError, std::encoding::utf8::decode as utf8Decode,
@@ -44,6 +44,9 @@ type enum Step implements Sendable {
     Hangup,
     // Say nothing.
     Silent,
+    // Say nothing from now on, as a server that has stopped answering: each wait the client makes lasts its timeout,
+    // and one with no timeout never ends.
+    Stall,
     // Answer an SSLRequest with exactly these bytes ('E', a byte that is no answer, 'S' and more, 'N' and more). An
     // answer starting 'S' starts TLS when the server is secure.
     SslAnswer(DynamicArray<uint8> bytes),
@@ -306,6 +309,8 @@ type resource FakeServer implements Transport, Sendable {
     isize backlog = -1;
     DynamicArray<uint8> held;   // a late reply (Step::Late), given to the client after one wait in vain
     DynamicArray<Sender<string>> tracer;   // zero or one: each message after startup, as PQtrace prints it
+    bool pings = false;     // answers every ping (an empty query) without taking a step: `pinged`
+    bool stalled = false;   // past a Stall step
     // A garbled server (garbled, garbledSecure): every reply goes through `garble`, and each message's number in the
     // count goes to `replyCount` when there is one. Once a reply is cut short (`severed`), nothing more is sent.
     bool garbling = false;
@@ -376,6 +381,24 @@ type resource FakeServer implements Transport, Sendable {
         this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
         this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
         this.garbling = false; this.garble = Garble.none(); this.replies = 0; this.severed = false; this.replyCount = DynamicArray.empty(); this.tracer.add(item: give tracer);
+    }
+
+    // `traced`, answering every ping (an empty query) as a server does, whenever it comes, without taking a step: for
+    // a pool's connections, which its maintenance pings when it will.
+    public ctor pinged(DynamicArray<Step> steps, isize chunk, isize writeLimit, Sender<string> tracer) {
+        this.steps = give steps; this.next = 0;
+        this.toClient = DynamicArray.empty(); this.readAt = 0;
+        this.fromClient = DynamicArray.empty(); this.parsedAt = 0;
+        this.startupSeen = false; this.hungUp = false;
+        this.chunk = chunk; this.writeLimit = writeLimit;
+        this.clientFirstBare = ""; this.serverFirst = ""; this.scramPassword = ""; this.gs2Header = "n,,";
+        this.tlsConfig = DynamicArray.empty(); this.engine = DynamicArray.empty();
+        this.tlsMode = false; this.established = false; this.directAccepted = false;
+        this.endPoint = DynamicArray.empty(); this.sniWanted = "";
+        this.policy = false; this.injection = "none"; this.hbaTypes = DynamicArray.empty(); this.hbaUsers = DynamicArray.empty();
+        this.overSocket = false; this.events = DynamicArray.empty(); this.backlog = -1; this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
+        this.garbling = false; this.garble = Garble.none(); this.replies = 0; this.severed = false; this.replyCount = DynamicArray.empty(); this.tracer.add(item: give tracer);
+        this.pings = true;
     }
 
     // `make`, blocked on its own output past `backlog` bytes of unread replies (see `backlog`).
@@ -605,11 +628,16 @@ type resource FakeServer implements Transport, Sendable {
         if (this.held.length() > 0) {
             // This wait ends without the late reply; it is there for the next.
             foreach (uint8 b in this.held) { this.toClient.add(item: b); }
-            this.held = DynamicArray.empty(); this.tracer = DynamicArray.empty();
-        this.garbling = false; this.garble = Garble.none(); this.replies = 0; this.severed = false; this.replyCount = DynamicArray.empty();
+            this.held = DynamicArray.empty();
             return Result::Ok(value: Ready.of(readable: false, writable: !this.blocked()));
         }
         bool readable = this.readAt < this.toClient.length() || this.hungUp;
+        if (!readable && this.stalled && timeoutMs != 0) {
+            // A server that has stopped answering: the wait lasts its whole timeout, and with none, for ever.
+            bool forever = timeoutMs < 0;
+            while (forever) { sleep(d: Duration.fromSecs(s: 60i64)); }
+            sleep(d: Duration.fromMillis(ms: cast<int64>(timeoutMs)));
+        }
         return Result::Ok(value: Ready.of(readable: readable, writable: !this.blocked()));
     }
 
@@ -657,6 +685,12 @@ type resource FakeServer implements Transport, Sendable {
             bool first = !this.startupSeen;
             this.startupSeen = true;
             if (!first && this.tracer.length() > 0) { _ = this.tracer[0].send(item: traceFrontend(tag: tag, body: body)); }
+            // A server made `pinged` answers an empty query (a ping) whenever it comes, taking no step.
+            if (!first && this.pings && !this.stalled && tag == 81ui8 && body.length() == 1 && body[0] == 0ui8) {
+                Wire m = Wire.make(); m.emptyQuery(); m.ready(status: 73ui8);
+                this.queue(b: m.bytes().view());
+                continue;
+            }
             // In policy mode the startup packet decides everything; what follows it (Terminate) gets no answer.
             if (this.policy) { if (first) { this.policyStartup(body: body); } if (this.hungUp) { return; } continue; }
             this.answer(tag: tag, body: body);
@@ -745,6 +779,7 @@ type resource FakeServer implements Transport, Sendable {
             }
             case Hangup: { this.hungUp = true; }
             case Silent: { }
+            case Stall: { this.stalled = true; }
             case SslAnswer(bytes: b): { this.queue(b: b.view()); }
             case ScramFirstBound(password: pw, header: h): {
                 string mechanism = cString(body: body, from: 0);

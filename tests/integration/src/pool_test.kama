@@ -1,22 +1,30 @@
 // postgres::pool against the live server: a connection comes back to the pool reset (its settings, temporary tables,
 // advisory locks, LISTENs and prepared statements gone), an open transaction is rolled back rather than committed, and
-// isolates sharing a pool never hold more than maxSize connections between them, as pg_stat_activity counts them.
+// isolates sharing a pool never hold more than maxSize connections between them, as pg_stat_activity counts them. The
+// maintenance opens minIdle sessions before any acquire, closes the ones a pool has not needed, and replaces a session
+// the server ended, as acquire's ping does too.
 import { std::collections::DynamicArray, std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
-         std::concurrent::Isolate, std::fmt::parse, std::fmt::ParseError, std::random::Rng,
+         std::concurrent::Isolate, std::fmt::parse, std::fmt::ParseError, std::random::Rng, std::time::Duration,
+         std::time::Instant, std::time::monotonicNow, std::time::sleep, postgres::Connection,
          postgres::Config, postgres::Environment, postgres::PgError, postgres::TransactionStatus, postgres::pool::Pool, postgres::pool::PoolOptions, postgres::pool::PoolShare,
          postgres::pool::Lease,
          postgres_integration_tests::check, postgres_integration_tests::conninfoFor,
-         postgres_integration_tests::quietEnvironment, postgres_integration_tests::configWith, postgres_integration_tests::scalar };
+         postgres_integration_tests::quietEnvironment, postgres_integration_tests::configWith, postgres_integration_tests::scalar,
+         postgres_integration_tests::open };
 export { poolTests };
 
 // A pool of `size` connections as `kp_trust`, named `name` (application_name), over this run's sslmode.
 unsafe fn Result<Pool, PgError> livePool(const ref string name, isize size) {
+    PoolOptions options = PoolOptions.defaults();
+    options.maxSize = size;
+    return livePoolWith(name: name, options: options);
+}
+
+unsafe fn Result<Pool, PgError> livePoolWith(const ref string name, PoolOptions options) {
     string conninfo = conninfoFor(user: "kp_trust").concat(other: " application_name=").concat(other: name);
     Environment env = quietEnvironment();
     Result<Config, PgError> c = configWith(conninfo: conninfo, env: env);
     Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
-    PoolOptions options = PoolOptions.defaults();
-    options.maxSize = size;
     return Pool.make(config: config, options: options);
 }
 
@@ -152,10 +160,122 @@ unsafe fn int32 boundAcrossIsolates() {
     return check(ok: bounded, what: "pool: isolates sharing a pool never hold more than maxSize (2) connections (".concat(other: seen).concat(other: ")"));
 }
 
+// ---- maintenance ----
+
+// `sql`'s value on `c` once it is `want`, asked every 100 ms for up to `within`; else the last value.
+unsafe fn string awaitValue(ref Connection c, const ref string sql, const ref string want, Duration within) {
+    Instant until = monotonicNow() + within;
+    string v = scalar(c: c, sql: sql);
+    while (!v.equals(other: want) && monotonicNow() < until) {
+        sleep(d: Duration.fromMillis(ms: 100i64));
+        v = scalar(c: c, sql: sql);
+    }
+    return v;
+}
+
+unsafe fn Result<Connection, PgError> watcher() { return open(conninfo: conninfoFor(user: "kp_trust")); }
+
+fn string sessionsNamed(const ref string name) {
+    return "SELECT count(*) FROM pg_stat_activity WHERE application_name = '".concat(other: name).concat(other: "'");
+}
+
+unsafe fn int32 minIdleLive() {
+    string name = uniqueName(stem: "kp_pool_min");
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = 3;
+    o.minIdle = 2;
+    Result<Pool, PgError> made = livePoolWith(name: name, options: o);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "maintenance: make, minIdle (".concat(other: e.message()).concat(other: ")")); } };
+    Result<Connection, PgError> w = watcher();
+    Connection seer = match (give w) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "maintenance: watcher, minIdle"); } };
+    string counting = sessionsNamed(name: name);
+    string seen = awaitValue(c: seer, sql: counting, want: "2", within: Duration.fromSecs(s: 10i64));
+    sleep(d: Duration.fromMillis(ms: 500i64));
+    string still = scalar(c: seer, sql: counting);
+    return check(ok: seen.equals(other: "2") && still.equals(other: "2"),
+                 what: "maintenance: minIdle (2) sessions are opened before any acquire (".concat(other: seen).concat(other: ", then ").concat(other: still).concat(other: ")"));
+}
+
+unsafe fn int32 pruningLive() {
+    string name = uniqueName(stem: "kp_pool_prune");
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = 3;
+    o.minIdle = 1;
+    o.healthCheck = Duration.fromMillis(ms: 500i64);
+    o.idleTimeout = Optional::Some(value: Duration.fromSecs(s: 2i64));
+    Result<Pool, PgError> made = livePoolWith(name: name, options: o);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "maintenance: make, pruning"); } };
+    Result<Connection, PgError> w = watcher();
+    Connection seer = match (give w) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "maintenance: watcher, pruning"); } };
+    string counting = sessionsNamed(name: name);
+    string grown = "";
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        Result<Lease, PgError> b = pool.acquire();
+        Result<Lease, PgError> c = pool.acquire();
+        grown = scalar(c: seer, sql: counting);
+    }
+    string pruned = awaitValue(c: seer, sql: counting, want: "1", within: Duration.fromSecs(s: 15i64));
+    sleep(d: Duration.fromMillis(ms: 2500i64));
+    string still = scalar(c: seer, sql: counting);
+    return check(ok: grown.equals(other: "3") && pruned.equals(other: "1") && still.equals(other: "1"),
+                 what: "maintenance: sessions a pool has not needed for idleTimeout are closed, down to minIdle (".concat(other: grown).concat(other: ", then ")
+                       .concat(other: pruned).concat(other: ", then ").concat(other: still).concat(other: ")"));
+}
+
+unsafe fn int32 endedReplacedOnAcquire() {
+    string name = uniqueName(stem: "kp_pool_ping");
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = 1;
+    Result<Pool, PgError> made = livePoolWith(name: name, options: o);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, ended session"); } };
+    string before = "";
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        Lease l = match (give a) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pool: acquire, ended session"); } };
+        before = scalar(c: l.conn(), sql: "SELECT pg_backend_pid()");
+    }
+    Result<Connection, PgError> w = watcher();
+    Connection killer = match (give w) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pool: killer, ended session"); } };
+    string done = scalar(c: killer, sql: "select pg_terminate_backend(".concat(other: before).concat(other: ", 5000)"));
+    sleep(d: Duration.fromMillis(ms: 1100i64));
+    Result<Lease, PgError> b = pool.acquire();
+    string after = match (give b) { case Ok(value: x): { Lease l = give x; := scalar(c: l.conn(), sql: "SELECT pg_backend_pid()"); } case Err(error: e): e.message(); };
+    Result<int32, ParseError> pid = parse::<int32>(s: after);
+    bool fresh = match (pid) { case Ok(value: v): !after.equals(other: before); case Err(error: e): false; };
+    return check(ok: done.equals(other: "t") && fresh,
+                 what: "pool: a session the server ended while it sat idle is passed over by acquire's ping (backend ".concat(other: before).concat(other: ", then ").concat(other: after).concat(other: ")"));
+}
+
+unsafe fn int32 endedReplacedByMaintenance() {
+    string name = uniqueName(stem: "kp_pool_keep");
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = 1;
+    o.minIdle = 1;
+    o.healthCheck = Duration.fromMillis(ms: 300i64);
+    Result<Pool, PgError> made = livePoolWith(name: name, options: o);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "maintenance: make, ended session"); } };
+    Result<Connection, PgError> w = watcher();
+    Connection seer = match (give w) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "maintenance: watcher, ended session"); } };
+    string counting = sessionsNamed(name: name);
+    string opened = awaitValue(c: seer, sql: counting, want: "1", within: Duration.fromSecs(s: 10i64));
+    string before = scalar(c: seer, sql: "SELECT pid FROM pg_stat_activity WHERE application_name = '".concat(other: name).concat(other: "'"));
+    string done = scalar(c: seer, sql: "select pg_terminate_backend(".concat(other: before).concat(other: ", 5000)"));
+    string others = "SELECT count(*) FROM pg_stat_activity WHERE application_name = '".concat(other: name).concat(other: "' AND pid <> ").concat(other: before);
+    string replaced = awaitValue(c: seer, sql: others, want: "1", within: Duration.fromSecs(s: 10i64));
+    return check(ok: opened.equals(other: "1") && done.equals(other: "t") && replaced.equals(other: "1"),
+                 what: "maintenance: a session the server ended is replaced by the maintenance, with no acquire (".concat(other: opened).concat(other: ", ")
+                       .concat(other: done).concat(other: ", ").concat(other: replaced).concat(other: ")"));
+}
+
 unsafe fn int32 poolTests() {
     int32 f = 0;
     f = f + resetOnRelease();
     f = f + rollbackOnRelease();
     f = f + boundAcrossIsolates();
+    f = f + minIdleLive();
+    f = f + pruningLive();
+    f = f + endedReplacedOnAcquire();
+    f = f + endedReplacedByMaintenance();
     return f;
 }

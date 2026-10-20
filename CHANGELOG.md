@@ -69,6 +69,22 @@ All notable changes to this package are recorded here. The format follows
   - `PoolOptions.defaults()` are pgxpool's (max(4, CPUs), a one-hour lifetime), with HikariCP's 90 seconds of lifetime
     jitter and a 30-second acquire timeout.
   - `Pool.makeWith(connector:, …)` takes a `Connector` that makes the connections.
+  - **Maintenance:** the pool that made the connections runs an isolate that keeps them. It stops and is joined when
+    that pool drops. Every `healthCheck` (1 minute, pgxpool's) it does four things:
+    - it closes connections past their lifetime;
+    - it closes the ones the pool has not needed: Npgsql's pruning, since the pool hands its idle connections out in
+      turn, as Npgsql's channel does;
+    - it pings, one at a time, each connection last known to be alive more than a second ago;
+    - it connects until `minIdle` (0) are idle.
+  - **Pruning:** each round records how many connections are idle. Once `idleTimeout` (30 minutes) has been recorded,
+    the median of those counts is closed, never leaving fewer than `minIdle`.
+  - **Acquire's ping:** acquire pings a connection last known to be alive more than a second ago, as pgxpool does. One
+    that does not answer is closed, and the next idle one is taken; past the acquire's deadline, it connects instead.
+  - **Ping bound:** every ping the pool sends is bounded by `pingTimeout` (5 seconds, HikariCP's validationTimeout).
+  - **Connect bound:** the maintenance's connects are bounded by connect_timeout, or by acquireTimeout when there is
+    none, so a pool's drop never waits on a connect that cannot end.
+  - **Freed places:** an acquire that takes the place of a closed connection leases an idle connection waiting behind
+    it, rather than connecting, so pruning and closes are not undone at once.
 - **Seeded mutations of every scripted reply** (`tests/unit/src/garble_test.kama`). Eighteen conversations carry every
   backend message this client reads, in each state it can arrive in: startup with each authentication method and a
   protocol downgrade, the simple and extended protocols, the statement cache, a portal, COPY both ways, a pipeline, a

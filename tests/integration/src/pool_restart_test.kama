@@ -1,0 +1,196 @@
+// postgres::pool across a server restart, against a real server. Idle connections the restart ended are passed over
+// by acquire's ping, and the maintenance replaces the ones minIdle keeps. A lease held across it fails in libpq's
+// words, and gives its place back when it is dropped, used or not. While the server is down, each acquire fails with
+// the connect's error and gives its place back, and once it is back the bound holds and minIdle is connected again.
+//
+// It takes the server down (tools/pg.sh restart, then stop and start), so it runs in the restart leg
+// (PGTEST_RESTART=1), after restart_test.kama's group. Its pools connect over plain TCP, so that a refused connect is
+// libpq's refusal word for word, as in stoppedTests.
+import { std::collections::DynamicArray, std::time::Duration, std::time::Instant, std::time::monotonicNow,
+         std::time::sleep, postgres::Config, postgres::Connection, postgres::Environment, postgres::PgError,
+         postgres::Rows, postgres::pool::Pool, postgres::pool::PoolOptions, postgres::pool::Lease,
+         postgres_integration_tests::check, postgres_integration_tests::setting,
+         postgres_integration_tests::plainConninfoFor, postgres_integration_tests::quietEnvironment,
+         postgres_integration_tests::configWith, postgres_integration_tests::scalar, postgres_integration_tests::open,
+         postgres_integration_tests::pgsh, postgres_integration_tests::lostWords,
+         postgres_integration_tests::uniqueName, postgres_integration_tests::awaitValue,
+         postgres_integration_tests::sessionsNamed };
+export { poolRestartTests };
+
+// A pool as `kp_trust` over plain TCP, named `name` (application_name).
+unsafe fn Result<Pool, PgError> plainPool(const ref string name, PoolOptions options) {
+    string conninfo = plainConninfoFor(user: "kp_trust").concat(other: " application_name=").concat(other: name);
+    Environment env = quietEnvironment();
+    Result<Config, PgError> c = configWith(conninfo: conninfo, env: env);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return Result::Err(error: give e); } };
+    return Pool.make(config: config, options: options);
+}
+
+// `size` connections, minIdle `least`, a round every `every`, none pruned, and an acquire that waits a second.
+fn PoolOptions restartOptions(isize size, isize least, Duration every) {
+    PoolOptions o = PoolOptions.defaults();
+    o.maxSize = size;
+    o.minIdle = least;
+    o.healthCheck = every;
+    o.idleTimeout = Optional::None;
+    o.acquireTimeout = Duration.fromSecs(s: 1i64);
+    return o;
+}
+
+fn string outcome(const ref Result<Lease, PgError> r) { return match (r) { case Ok(value: l): "ok"; case Err(error: e): e.message(); }; }
+
+fn string timedOut() { return "pool timed out while waiting for an open connection"; }
+
+// SELECT 1 on an acquired lease: "1", or what failed.
+unsafe fn string selectOne(Result<Lease, PgError> r) {
+    return match (give r) { case Ok(value: x): { Lease l = give x; := scalar(c: l.conn(), sql: "select 1"); } case Err(error: e): e.message(); };
+}
+
+// libpq's refusal while the server is down (as stoppedTests has it).
+unsafe fn string refusedText() {
+    string port = setting(name: "PGTEST_PORT");
+    return "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?");
+}
+
+// Sleep until `ms` after `from`.
+unsafe fn void sleepUntil(Instant from, int64 ms) {
+    Instant at = from + Duration.fromMillis(ms: ms);
+    Instant now = monotonicNow();
+    if (now < at) { sleep(d: at.since(earlier: now)); }
+}
+
+unsafe fn int32 acrossRestart() {
+    int32 f = 0;
+    Duration never = Duration.fromSecs(s: 600i64);   // no round in this group's time
+    // A: two idle connections, for acquire's ping.
+    string nameA = uniqueName(stem: "kp_pool_rs_ping");
+    Result<Pool, PgError> madeA = plainPool(name: nameA, options: restartOptions(size: 2, least: 0, every: never));
+    Pool poolA = match (give madeA) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool restart: make A (".concat(other: e.message()).concat(other: ")")); } };
+    string idleBefore = "";
+    {
+        Result<Lease, PgError> a1 = poolA.acquire();
+        Result<Lease, PgError> a2 = poolA.acquire();
+        idleBefore = outcome(r: a1).concat(other: ", ").concat(other: outcome(r: a2));
+    }
+    Instant released = monotonicNow();
+    // B: minIdle 2, kept by a round every 300 ms.
+    string nameB = uniqueName(stem: "kp_pool_rs_keep");
+    Result<Pool, PgError> madeB = plainPool(name: nameB, options: restartOptions(size: 2, least: 2, every: Duration.fromMillis(ms: 300i64)));
+    Pool poolB = match (give madeB) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool restart: make B"); } };
+    Result<Connection, PgError> w = open(conninfo: plainConninfoFor(user: "kp_trust"));
+    Connection seer = match (give w) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pool restart: watcher"); } };
+    string keptBefore = awaitValue(c: seer, sql: sessionsNamed(name: nameB), want: "2", within: Duration.fromSecs(s: 10i64));
+    // C: two leases held across the restart.
+    string nameC = uniqueName(stem: "kp_pool_rs_lease");
+    Result<Pool, PgError> madeC = plainPool(name: nameC, options: restartOptions(size: 2, least: 0, every: never));
+    Pool poolC = match (give madeC) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool restart: make C"); } };
+    Result<Lease, PgError> c1 = poolC.acquire();
+    Result<Lease, PgError> c2 = poolC.acquire();
+    string leasedBefore = outcome(r: c1).concat(other: ", ").concat(other: outcome(r: c2));
+    f = f + check(ok: idleBefore.equals(other: "ok, ok") && keptBefore.equals(other: "2") && leasedBefore.equals(other: "ok, ok"),
+                  what: "pool restart: the pools are ready before it (".concat(other: idleBefore).concat(other: "; ").concat(other: keptBefore)
+                        .concat(other: "; ").concat(other: leasedBefore).concat(other: ")"));
+
+    f = f + check(ok: pgsh(what: "restart"), what: "pool restart: tools/pg.sh restart");
+
+    // C: the lease used after it fails in libpq's words; dropped, it and the unused one give their places back.
+    string lost = "(no lease)";
+    bool closed = false;
+    {
+        Result<Lease, PgError> used = give c1;
+        match (give used) {
+            case Ok(value: x): {
+                Lease l = give x;
+                Result<DynamicArray<Rows>, PgError> q = l.conn().simpleQuery(sql: "select 1");
+                lost = match (q) { case Ok(value: v): "(it ran)"; case Err(error: e): e.message(); };
+                closed = l.conn().isClosed();
+            }
+            case Err(error: e): { }
+        };
+    }
+    { Result<Lease, PgError> unused = give c2; }   // its reset fails on the dead connection, which is then closed
+    f = f + check(ok: lostWords(m: lost, tls: false) && closed, what: "pool restart: a lease held across it fails in libpq's words: ".concat(other: lost));
+    Result<Lease, PgError> c3 = poolC.acquire();
+    Result<Lease, PgError> c4 = poolC.acquire();
+    Result<Lease, PgError> c5 = poolC.acquire();
+    string beyondC = outcome(r: c5);
+    string oneC = selectOne(r: give c3);
+    string twoC = selectOne(r: give c4);
+    f = f + check(ok: oneC.equals(other: "1") && twoC.equals(other: "1") && beyondC.equals(other: timedOut()),
+                  what: "pool restart: the places of leases held across it come back on release, used or not (".concat(other: oneC).concat(other: ", ")
+                        .concat(other: twoC).concat(other: "; ").concat(other: beyondC).concat(other: ")"));
+
+    // A: past a second since the release, acquire pings each idle connection, passes over the dead ones and connects.
+    sleepUntil(from: released, ms: 1100i64);
+    Result<Lease, PgError> a3 = poolA.acquire();
+    Result<Lease, PgError> a4 = poolA.acquire();
+    Result<Lease, PgError> a5 = poolA.acquire();
+    string beyondA = outcome(r: a5);
+    string oneA = selectOne(r: give a3);
+    string twoA = selectOne(r: give a4);
+    f = f + check(ok: oneA.equals(other: "1") && twoA.equals(other: "1") && beyondA.equals(other: timedOut()),
+                  what: "pool restart: idle connections the restart ended are passed over by acquire's ping, and the bound holds (".concat(other: oneA)
+                        .concat(other: ", ").concat(other: twoA).concat(other: "; ").concat(other: beyondA).concat(other: ")"));
+
+    // B: the maintenance pings its idle connections, closes the dead ones and connects minIdle again.
+    Result<Connection, PgError> w2 = open(conninfo: plainConninfoFor(user: "kp_trust"));
+    string keptAfter = match (give w2) {
+        case Ok(value: x): { Connection after = give x; := awaitValue(c: after, sql: sessionsNamed(name: nameB), want: "2", within: Duration.fromSecs(s: 10i64)); }
+        case Err(error: e): e.message();
+    };
+    f = f + check(ok: keptAfter.equals(other: "2"), what: "pool restart: the maintenance replaces the minIdle connections the restart ended (".concat(other: keptAfter).concat(other: ")"));
+    return f;
+}
+
+unsafe fn int32 whileDown() {
+    int32 f = 0;
+    f = f + check(ok: pgsh(what: "stop"), what: "pool restart: tools/pg.sh stop");
+    // D: made while the server is down, its maintenance's connects for minIdle failing.
+    string nameD = uniqueName(stem: "kp_pool_rs_down");
+    Result<Pool, PgError> madeD = plainPool(name: nameD, options: restartOptions(size: 2, least: 2, every: Duration.fromMillis(ms: 300i64)));
+    Pool poolD = match (give madeD) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool restart: make D"); } };
+    // E: one acquire more than maxSize, each the connect's error, never a timeout: each refused connect gives its place
+    // back.
+    string nameE = uniqueName(stem: "kp_pool_rs_refused");
+    Result<Pool, PgError> madeE = plainPool(name: nameE, options: restartOptions(size: 2, least: 0, every: Duration.fromSecs(s: 600i64)));
+    Pool poolE = match (give madeE) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool restart: make E"); } };
+    string want = refusedText();
+    string refusals = "";
+    bool refused = true;
+    isize i = 0;
+    while (i < 3) {
+        Result<Lease, PgError> r = poolE.acquire();
+        string m = outcome(r: r);
+        if (!m.equals(other: want)) { refused = false; if (refusals.length() == 0) { refusals = copy m; } }
+        i = i + 1;
+    }
+    f = f + check(ok: refused, what: "pool restart: acquires while the server is down fail with the connect's error, and keep the bound: ".concat(other: refusals));
+
+    f = f + check(ok: pgsh(what: "start"), what: "pool restart: tools/pg.sh start");
+
+    Result<Lease, PgError> e1 = poolE.acquire();
+    Result<Lease, PgError> e2 = poolE.acquire();
+    Result<Lease, PgError> e3 = poolE.acquire();
+    string beyond = outcome(r: e3);
+    string one = selectOne(r: give e1);
+    string two = selectOne(r: give e2);
+    f = f + check(ok: one.equals(other: "1") && two.equals(other: "1") && beyond.equals(other: timedOut()),
+                  what: "pool restart: the bound holds once the server is back (".concat(other: one).concat(other: ", ").concat(other: two)
+                        .concat(other: "; ").concat(other: beyond).concat(other: ")"));
+    Result<Connection, PgError> w = open(conninfo: plainConninfoFor(user: "kp_trust"));
+    string kept = match (give w) {
+        case Ok(value: x): { Connection seer = give x; := awaitValue(c: seer, sql: sessionsNamed(name: nameD), want: "2", within: Duration.fromSecs(s: 10i64)); }
+        case Err(error: e): e.message();
+    };
+    f = f + check(ok: kept.equals(other: "2"), what: "pool restart: minIdle is refilled once the server is back (".concat(other: kept).concat(other: ")"));
+    return f;
+}
+
+unsafe fn int32 poolRestartTests() {
+    int32 f = 0;
+    f = f + acrossRestart();
+    f = f + whileDown();
+    // Whatever happened, the server is left running.
+    f = f + check(ok: pgsh(what: "start"), what: "pool restart: the server is running at the end");
+    return f;
+}

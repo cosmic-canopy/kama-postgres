@@ -14,7 +14,7 @@ import { std::collections::DynamicArray, std::process::Command, std::process::Ou
          postgres::sqlstate::ADMIN_SHUTDOWN, postgres::sqlstate::CANNOT_CONNECT_NOW,
          postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::open,
          postgres_integration_tests::plainConninfoFor, postgres_integration_tests::scalar };
-export { restartTests };
+export { restartTests, pgsh, lostWords, serverClosed };
 
 // libpq's words for a connection the server has dropped (pqsecure_raw_read and pqsecure_raw_write on EPIPE and
 // ECONNRESET, pqReadData at EOF), and, over TLS, pgtls_read's for a session ended with or without close_notify.

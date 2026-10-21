@@ -11,7 +11,7 @@ import { std::collections::DynamicArray, std::concurrent::Channel, std::concurre
          postgres_integration_tests::check, postgres_integration_tests::conninfoFor,
          postgres_integration_tests::quietEnvironment, postgres_integration_tests::configWith, postgres_integration_tests::scalar,
          postgres_integration_tests::open };
-export { poolTests };
+export { poolTests, uniqueName, awaitValue, sessionsNamed };
 
 // A pool of `size` connections as `kp_trust`, named `name` (application_name), over this run's sslmode.
 unsafe fn Result<Pool, PgError> livePool(const ref string name, isize size) {

@@ -1,0 +1,202 @@
+[
+ {
+  "id": "W1",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "gone.close();\n        this.ends.put(slot: Slot::Empty);",
+  "new": "gone.close();",
+  "expect": "pool: a waiter in another isolate wakes for a closed connection's place"
+ },
+ {
+  "id": "W2",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        while (i < this.settings.maxSize) {\n            Optional<Slot> s = this.ends.take();\n            match (give s) {\n                case Some(value: x): {\n                    match (give x) {\n                        case Empty: { return true; }",
+  "new": "        while (i < this.settings.maxSize) {\n            Optional<Slot> s = this.ends.takeBy(deadline: monotonicNow() + Duration.fromSecs(s: 5i64));\n            match (give s) {\n                case Some(value: x): {\n                    match (give x) {\n                        case Empty: { return true; }",
+  "expect": "maintenance: dropping a pool whose connections are all leased stops its maintenance at once"
+ },
+ {
+  "id": "W3",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "int64 most = this.settings.lifetimeJitter.asMillis();",
+  "new": "int64 most = 0;",
+  "expect": "pool: lifetimes are spread over lifetimeJitter"
+ },
+ {
+  "id": "W4",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                        case Empty: { this.ends.put(slot: Slot::Empty); }\n                    };\n                }\n                case None: { return Optional::None; }",
+  "new": "                        case Empty: { }\n                    };\n                }\n                case None: { return Optional::None; }",
+  "expect": "pool: the closed connections' places an acquire passes over to reach an idle one stay the pool's"
+ },
+ {
+  "id": "W5",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        while (i < this.settings.maxSize) {\n            Optional<Slot> s = this.ends.take();\n            match (give s) {\n                case Some(value: x): {\n                    match (give x) {\n                        case Idle(conn: c, expires: until, checked: at): { return",
+  "new": "        while (i < 1) {\n            Optional<Slot> s = this.ends.take();\n            match (give s) {\n                case Some(value: x): {\n                    match (give x) {\n                        case Idle(conn: c, expires: until, checked: at): { return",
+  "expect": "pool: the closed connections' places an acquire passes over to reach an idle one stay the pool's"
+ },
+ {
+  "id": "W6",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "case Idle(conn: c, expires: until, checked: at): { this.ends.put(slot: Slot::Idle(conn: give c, expires: until, checked: at)); }",
+  "new": "case Idle(conn: c, expires: until, checked: at): { Connection lost = give c; }",
+  "expect": "maintenance: it passes over an idle connection to reach a free place for minIdle"
+ },
+ {
+  "id": "W7",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "        while (i < this.settings.maxSize) {\n            Optional<Slot> s = this.ends.take();\n            match (give s) {\n                case Some(value: x): {\n                    match (give x) {\n                        case Empty: { return true; }",
+  "new": "        while (i < 1) {\n            Optional<Slot> s = this.ends.take();\n            match (give s) {\n                case Some(value: x): {\n                    match (give x) {\n                        case Empty: { return true; }",
+  "expect": "maintenance: it passes over an idle connection to reach a free place for minIdle"
+ },
+ {
+  "id": "W8",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (this.settings.reset) {",
+  "new": "if (false) {",
+  "expect": "pool: a transaction window on a lease commits"
+ },
+ {
+  "id": "W9",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "options.lifetimeJitter.isNegative() || options.acquireTimeout",
+  "new": "options.acquireTimeout",
+  "expect": "pool: a negative lifetimeJitter is refused"
+ },
+ {
+  "id": "W10",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "options.acquireTimeout.isNegative() || options.queryGrace.isNegative() || !timeoutOk",
+  "new": "options.acquireTimeout.isNegative() || !timeoutOk",
+  "expect": "pool: a negative queryGrace is refused"
+ },
+ {
+  "id": "W11",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "case Some(value: d): !d.isNegative(); case None: true; };",
+  "new": "case Some(value: d): true; case None: true; };",
+  "expect": "pool: a negative queryTimeout is refused"
+ },
+ {
+  "id": "W12",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                        count = count - 1;\n                        if (prune > 0) { prune = prune - 1; }",
+  "new": "                        count = count - 1;",
+  "expect": "maintenance: pruning closes the median of the window's idle counts (1, 1, 3: one"
+ },
+ {
+  "id": "W13",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                                this.ends.put(slot: Slot::Empty);\n                                count = count - 1;",
+  "new": "                                this.ends.put(slot: Slot::Empty);",
+  "expect": "maintenance: a connection that fails its ping is replaced in the round that found it"
+ },
+ {
+  "id": "W14",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "                        case Empty: { this.ends.put(slot: Slot::Empty); }\n                    };\n                }\n                case None: { more = false; }\n            };\n            i = i + 1;\n        }\n        this.fill(",
+  "new": "                        case Empty: { }\n                    };\n                }\n                case None: { more = false; }\n            };\n            i = i + 1;\n        }\n        this.fill(",
+  "expect": "maintenance: the ping pass puts back the free places it meets"
+ },
+ {
+  "id": "W15",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "while (more && stale > 0 && i < this.settings.maxSize) {",
+  "new": "while (more && stale > 0 && i < 1) {",
+  "expect": "maintenance: a round pings every idle connection not known to be alive for a second"
+ },
+ {
+  "id": "W16",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "int64 secs = (ms + 999i64) / 1000i64;",
+  "new": "int64 secs = ms / 1000i64;",
+  "expect": "maintenance: its connects wait acquireTimeout rounded up to a whole second"
+ },
+ {
+  "id": "W17",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "if (secs < 1i64) { secs = 1i64; }",
+  "new": "",
+  "expect": "maintenance: with an acquireTimeout of 0, its connects still end within a second",
+  "timeout": 600
+ },
+ {
+  "id": "W18",
+  "suite": "unit",
+  "file": "src/pool/pool.kama",
+  "old": "this.ends.put(slot: Slot::Empty);\n                return Result::Err(error: give e);",
+  "new": "return Result::Err(error: give e);",
+  "expect": "pool: four isolates churning through one pool never wait out acquireTimeout"
+ },
+ {
+  "id": "WI1",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "if (checked.elapsed() <= pingAfter()) { return true; }\n        return this.alive(conn: ref conn);",
+  "new": "return true;",
+  "expect": "pool restart: idle connections the restart ended are passed over by acquire's ping",
+  "env": {
+   "PGTEST_RESTART": "1"
+  }
+ },
+ {
+  "id": "WI2",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "                                keep = this.alive(conn: ref conn);\n",
+  "new": "",
+  "expect": "pool restart: the maintenance replaces the minIdle connections the restart ended",
+  "env": {
+   "PGTEST_RESTART": "1"
+  }
+ },
+ {
+  "id": "WI3",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "gone.close();\n        this.ends.put(slot: Slot::Empty);",
+  "new": "gone.close();",
+  "expect": "pool restart: the places of leases held across it come back on release",
+  "env": {
+   "PGTEST_RESTART": "1"
+  }
+ },
+ {
+  "id": "WI4",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "this.ends.put(slot: Slot::Empty);\n                return Result::Err(error: give e);",
+  "new": "return Result::Err(error: give e);",
+  "expect": "pool restart: acquires while the server is down fail with the connect's error",
+  "env": {
+   "PGTEST_RESTART": "1"
+  }
+ },
+ {
+  "id": "WI5",
+  "suite": "integration",
+  "file": "src/pool/pool.kama",
+  "old": "this.fill(wanted: this.settings.minIdle - count);",
+  "new": "",
+  "expect": "pool restart: minIdle is refilled once the server is back",
+  "env": {
+   "PGTEST_RESTART": "1"
+  }
+ }
+]

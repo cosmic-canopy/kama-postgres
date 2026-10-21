@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-20: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2, S3 and S4 are done, and the ports to kama 0.9.673 and 0.9.690). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-21: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2, S3, S4 and S5 are done, and the ports to kama 0.9.673 and 0.9.690). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -52,7 +52,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690 and S4 done; S5 next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4 and S5 done; S6 next |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -263,9 +263,40 @@ it fail.
 
       Both came from a flaky trickle test: while the maintenance holds an idle connection for nothing, an acquire can
       find only an Empty and connect needlessly.
-- **S5, pool tests.**
-  - Unit, through `ScriptConnector` (S3's): what S3's cases leave, and reaping.
-  - Integration: S3 has N isolates under the bound and TLS; S5 adds a server restart, in the restart leg.
+- **S5, done: pool tests** (planned with the maintainer on 2026-10-21). No change to the source was needed.
+  - **Live, the pool across a server restart** (`tests/integration/src/pool_restart_test.kama`). It runs in the restart
+    leg after `restart_test.kama`'s group, with a restart and a stop/start of its own. Its pools connect over plain TCP,
+    so a refused connect is libpq's refusal, word for word:
+    - idle connections the restart ended are passed over by acquire's ping, and the bound holds;
+    - the maintenance replaces the minIdle connections the restart ended;
+    - a lease held across it fails in libpq's words, and its place comes back on release, used or not (the unused one's
+      reset fails on the dead connection);
+    - while the server is down, each acquire, one more than maxSize, fails with the connect's error and never with
+      PoolTimeout; once the server is back, the bound holds, and a pool made while it was down connects to minIdle.
+  - **Unit, what S3's and S4's cases left.** These were found by comparing `pool.kama` with S3's and S4's mutations, then
+    by a sweep of every `put`, `take` and loop bound not yet mutated:
+    - a waiter in another isolate woken by a closed connection's place, which it connects on through its joined pool's
+      connector;
+    - a pool dropped while every connection is leased: the maintenance, which finds no capacity, waits on no channel.
+      A lease that outlives its pool closes its connection when it is dropped;
+    - lifetimes spread by lifetimeJitter (every older case set the jitter to zero);
+    - the places an acquire passes over to reach an idle connection (`idleWaiting`), the idle connections the
+      maintenance passes over to reach a free place (`claim`), and the free places the ping pass meets while an acquire
+      takes a connection it counted (a strict server whose Stall step the ping takes, so the ping waits out
+      pingTimeout);
+    - a round pings every stale connection, and replaces one that fails in the same round;
+    - the median of counts 1, 1, 3 is 1: pruning closes the median's count, not every idle connection;
+    - the maintenance's connect bound is acquireTimeout rounded up to a whole second, and an acquireTimeout of 0 still
+      bounds it by a second (a connect_timeout of 0 would be none, and the pool's drop would hang);
+    - a transaction window on a lease, as the README shows it;
+    - a negative lifetimeJitter, queryGrace and queryTimeout refused;
+    - the bound under churn: four isolates acquire, close and release through one pool of 3 while connects are refused,
+      lifetimes of 30 to 60 ms end, pruning runs and minIdle is connected again; after it, 3 leases can be held and not
+      a fourth.
+  - **Mutations:** `tools/mutations/s5.json`, 18 unit and 5 integration (the restart leg's, with `PGTEST_RESTART=1`).
+    All are caught. The unit ones ran in a copy of the tree whose `main` runs only the pool group (see the gate below).
+  - **One line has no mutation:** the retire loop's `Empty` arm, which cannot be reached, since the sweep's list holds only
+    idle connections. S4's four lines stand as S4 left them.
 - **S6, examples.** `examples/<name>/`, each its own executable project, as in @kama/sodium: quickstart, typed rows,
   transactions, COPY from a CSV file, a LISTEN/NOTIFY worker, a pool shared by isolates, a batch. `tools/test.sh`
   builds them; `tools/test-integration.sh` runs them live.
@@ -292,28 +323,39 @@ it fail.
 - **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
   for changes.
 
-**What the next session needs to know** (written 2026-10-20, after S4):
-- **Where it stands.** S0, S0b, S1, S2, S3 and S4 are done, and so are the ports to kama 0.9.673 and 0.9.690. No gap is
-  open. Nothing is pushed: pushing waits for the maintainer.
-- **Next: S5, pool tests.** S4 brought its own unit and live cases (its bullet above), so S5 is what is left:
-  - **The pool across a server restart**, in the restart leg (`restart_test.kama`, `PGTEST_RESTART=1`, release):
-    - idle connections a restart ended are passed over by acquire's ping, then replaced by the maintenance;
-    - a lease held across the restart fails in libpq's words, and its place comes back on release;
-    - acquires while the server is down fail with the connect's error, and keep the bound;
-    - minIdle is refilled once the server is back.
-  - **Unit:** what S3's and S4's cases leave. Read both sections of `tests/unit/src/pool_test.kama` first.
-    `ScriptConnector.pinging` scripts are for pools whose maintenance pings; a strict script answers an unexpected ping
-    with FATAL. A connection's trace goes to the test's log (channel capacity 4096, which is plenty), and
-    `awaitLines` waits for lines in it.
-  - **Timing.** The maintenance cases are timed with margins of 200 ms or more: a round every 100 ms (400 ms for the
-    median), and waits of 1.1 s for the 1 s ping rule. Ten debug and release runs, some beside the integration suite,
-    passed. If a case flakes in CI, widen its margin rather than retrying it.
+**What the next session needs to know** (written 2026-10-21, after S5):
+- **Where it stands.** S0, S0b, S1, S2, S3, S4 and S5 are done, and so are the ports to kama 0.9.673 and 0.9.690. No
+  gap is open. Nothing is pushed: pushing waits for the maintainer.
+- **Next: S6, examples.** Each example is `examples/<name>/`, its own executable project, as in @kama/sodium
+  (`../kama-sodium/examples/udp_channel`, built by its `tools/test.sh`). There are seven:
+  - quickstart;
+  - typed rows;
+  - transactions;
+  - COPY from a CSV file;
+  - a LISTEN/NOTIFY worker;
+  - a pool shared by isolates;
+  - a batch.
+
+  `tools/test.sh` builds them, and `tools/test-integration.sh` runs them live. The README's code blocks should be the
+  examples' code, so that what a reader copies is code that compiles. The README's pool example
+  (`borrow lease.conn().transaction() as tx`) now has a unit case, `windowOnLease`.
+- **Writing a pool case** (`tests/unit/src/pool_test.kama`):
+  - **Choosing the connector.** `keptPool` (`ScriptConnector.pinging`) answers a ping whenever it comes, taking no step,
+    so a `Stall` in its script is reached only by a message that is not a ping. A case whose ping must go unanswered
+    uses the strict `poolOver`, and scripts the pings it expects (`pingPassKeepsPlaces`).
+  - **A script ends with its last step.** A message past the end of the script is never answered, and with no query
+    timeout the client waits for ever. A case that queries a lease it is not sure of sets the pool's `queryTimeout`.
+  - **Timing.** The maintenance cases keep margins of 200 ms or more around the rounds they count on. A case that needs
+    something under way (a ping that waits) waits for it in the log (`awaitLines`), rather than guessing which round
+    starts it. The new pool cases passed five debug and five release runs of the pool group, then the whole gate. If a
+    case flakes in CI, widen its margin rather than retrying it.
 - **The gate, per step:**
   - `tools/test.sh`, which runs the unit suite in debug and release;
   - `tools/test-integration.sh`, on 14–19 in debug, release and TLS, then the restart leg;
   - **`tools/mutate.sh tools/mutations/<step>.json --version 18`**. This runs each mutation in a copy of the tree and
     exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json`, S1's 35 in `s1.json`, S2's 47
-    in `s2.json`, S3's 27 in `s3.json` and S4's 44 in `s4.json`. All were run on 0.9.690, and S3's again on S4's code.
+    in `s2.json`, S3's 27 in `s3.json`, S4's 44 in `s4.json` and S5's 23 in `s5.json`. All were run on 0.9.690, and
+    S3's again on S4's code.
     Write a file per step, and re-run older files when their code changes. A `BAD-PATTERN` means the source moved on, so update the mutation. PANICKED is
     a run that died before any case failed; an entry may expect it, and may set `"env"` (the restart mutations set
     `PGTEST_RESTART=1`) and `"timeout"`. A run that times out is judged by what it printed first, since a pool mutant
@@ -321,6 +363,9 @@ it fail.
   - A mutation whose code another line already guarantees is equivalent: rewrite the code or drop the mutation, and do
     not keep one that cannot fail. S3 dropped a check of `isClosed()` that the final check made redundant.
   - Run the integration mutations after the matrix, not beside it: both use the same servers.
+  - To iterate on one group, build a scratch copy of the tree whose `tests/unit/src/main.kama` calls only that group.
+    A pool mutation then takes about a minute rather than three, and `tools/mutate.sh` run from that copy mutates
+    the copy.
   - A generator's output is committed: re-run it, and `git diff` must be empty (`tools/gen-reset-vectors.sh` for S1,
     `tools/gen-libpq-tables.sh` for S2a).
   - Never edit a script while it runs: `sh` reads it as it goes.

@@ -1,7 +1,8 @@
 // postgres::pool against scripted servers: each connection the pool makes runs the next script (ScriptConnector), so
 // every message a release sends is checked, and a connection the pool should have closed is seen to be replaced by a
-// new one. The bound, a waiter woken from another isolate, a timeout, what release closes, resets and rolls back, the
-// settings it puts back, lifetimes, and the options a pool refuses.
+// new one. The bound, waiters woken from another isolate, a timeout, what release closes, resets and rolls back, the
+// settings it puts back, lifetimes and their spread, a transaction window on a lease, the maintenance, the bound under
+// churn from four isolates, and the options a pool refuses.
 //
 // A script's steps are the conversation that connection must have. A message the script does not expect is answered
 // FATAL, and the pool then replaces the connection, so "it connected once" and "the sentinel ran" together say that
@@ -308,6 +309,41 @@ unsafe fn int32 waiterWokenAcrossIsolates() {
                  what: "pool: a waiter in another isolate gets the connection released, with no new connect (${got}, waited ${waited} ms, connects ${n})");
 }
 
+// The place a connection closed under its lease gives back wakes a waiter in another isolate, which connects on it
+// through its own pool's connector: freed capacity goes into `slots`, where waiters wait, never back to `permits`.
+unsafe fn int32 waiterWokenByFreedPlace() {
+    DynamicArray<Step> second = answersSentinel();               // the waiter's connection, and its query
+    second.add(item: resets(sql: resetDiscardAll()));            // the waiter's release
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = sized(size: 1);
+    o.acquireTimeout = Duration.fromSecs(s: 10i64);
+    Result<Pool, PgError> made = poolOver(scripts: twoScripts(a: opening(), b: give second), options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, freed place"); } };
+    Channel<string> results = Channel.bounded(capacity: 4);
+    Receiver<string> rx = results.receiver();
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        Lease held = match (give a) { case Ok(value: l): give l; case Err(error: e): { return check(ok: false, what: "pool: acquire, freed place"); } };
+        Result<PoolShare, PgError> sh = pool.share();
+        PoolShare share = match (give sh) { case Ok(value: x): give x; case Err(error: e): { return check(ok: false, what: "pool: share, freed place"); } };
+        Waiter job = Waiter.make(share: give share, report: results.sender());
+        Isolate worker = spawn waitInIsolate(job: give job);
+        sleep(d: Duration.fromMillis(ms: 300i64));
+        held.conn().close();
+        Lease released = give held;
+    }
+    Optional<string> outcome = rx.recv();
+    Optional<string> took = rx.recv();
+    string got = match (outcome) { case Some(value: v): copy v; case None: "(no report)"; };
+    string waited = match (took) { case Some(value: v): copy v; case None: "0"; };
+    Result<int64, ParseError> ms = parse::<int64>(s: waited);
+    bool waitedLong = match (ms) { case Ok(value: v): v >= 150i64; case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    return check(ok: got.equals(other: "ok") && waitedLong && n == 2,
+                 what: "pool: a waiter in another isolate wakes for a closed connection's place, and connects on it (${got}, waited ${waited} ms, connects ${n})");
+}
+
 // ---- what release closes ----
 
 unsafe fn int32 closedIsReplaced() {
@@ -415,6 +451,43 @@ unsafe fn int32 blockRolledBackAndReset() {
     isize n = connects(log: ref log);
     return check(ok: inBlock && ran && n == 1,
                  what: "pool: release in a block sends ROLLBACK, then DISCARD ALL, and keeps the connection (connects ${n})");
+}
+
+// A transaction window opened on a lease's connection, as the README shows it: BEGIN, a statement through tx.conn(),
+// COMMIT, and nothing as the window closes; then release resets, and the connection is kept.
+unsafe fn int32 windowOnLease() {
+    DynamicArray<Step> s = opening();
+    s.add(item: completes(sql: "BEGIN", tag: "BEGIN", status: INTX));
+    s.add(item: completes(sql: "INSERT INTO t VALUES (1)", tag: "INSERT 0 1", status: INTX));
+    s.add(item: completes(sql: "COMMIT", tag: "COMMIT", status: IDLE));
+    s.add(item: resets(sql: resetDiscardAll()));
+    s.add(item: sentinel());
+    Channel<string> ch = Channel.bounded(capacity: 256);
+    Receiver<string> log = ch.receiver();
+    Result<Pool, PgError> made = poolOver(scripts: scriptsOf(a: give s), options: sized(size: 1), log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, window"); } };
+    bool inserted = false;
+    bool committed = false;
+    {
+        Result<Lease, PgError> a = pool.acquire();
+        match (give a) {
+            case Ok(value: lease): {
+                Lease l = give lease;
+                borrow l.conn().transaction() as tx {
+                    Result<DynamicArray<Rows>, PgError> i = tx.conn().simpleQuery(sql: "INSERT INTO t VALUES (1)");
+                    inserted = match (i) { case Ok(value: rows): true; case Err(error: e): false; };
+                    Result<Unit, PgError> k = tx.commit();
+                    committed = match (k) { case Ok(value: u): true; case Err(error: e): false; };
+                }
+            }
+            case Err(error: e): { }
+        };
+    }
+    Result<Lease, PgError> b = pool.acquire();
+    bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
+    isize n = connects(log: ref log);
+    return check(ok: inserted && committed && ran && n == 1,
+                 what: "pool: a transaction window on a lease commits, then release resets and keeps the connection (connects ${n})");
 }
 
 unsafe fn int32 resetOffSendsNothing() {
@@ -861,6 +934,24 @@ unsafe fn int32 keeperPings() {
     f = f + check(ok: early == 0, what: "maintenance: a connection known to be alive less than a second ago is not pinged (${early})");
     f = f + check(ok: pinged == 1 && again == 0,
                   what: "maintenance: an idle connection is pinged once it has sat idle a second, and not again in the second after (${pinged}, then ${again})");
+
+    // Every stale connection in the round that finds them: with a round every 700 ms, both idle connections are pinged
+    // in the round at about 1.4 s, not one of them a round later at 2.1 s.
+    Channel<string> ch2 = Channel.bounded(capacity: 4096);
+    Receiver<string> log2 = ch2.receiver();
+    PoolOptions o = keeping(size: 2, least: 0);
+    o.healthCheck = Duration.fromMillis(ms: 700i64);
+    Instant start = monotonicNow();
+    Result<Pool, PgError> made2 = keptPool(scripts: openings(n: 2), options: o, log: give ch2);
+    Pool pool2 = match (give made2) { case Ok(value: p): give p; case Err(error: e): { return f + check(ok: false, what: "maintenance: make, pings in one round"); } };
+    {
+        Result<Lease, PgError> a = pool2.acquire();
+        Result<Lease, PgError> b = pool2.acquire();
+    }
+    sleepUntil(from: start, ms: 1750i64);
+    DynamicArray<string> lines = drained(log: ref log2);
+    isize both = countIn(lines: lines, what: pingLine());
+    f = f + check(ok: both == 2, what: "maintenance: a round pings every idle connection not known to be alive for a second (${both} by 1.75 s)");
     return f;
 }
 
@@ -874,8 +965,23 @@ unsafe fn int32 droppedFoundByKeeper() {
     Result<Lease, PgError> b = pool.acquire();
     bool ran = match (give b) { case Ok(value: lease): { Lease l = give lease; := selectsOne(c: l.conn()); } case Err(error: e): false; };
     isize more = connects(log: ref log);
-    return check(ok: n == 2 && ran && more == 0,
-                 what: "maintenance: a connection its server dropped is found by the maintenance's ping, and replaced (connects ${n}, then ${more})");
+    int32 f = check(ok: n == 2 && ran && more == 0,
+                    what: "maintenance: a connection its server dropped is found by the maintenance's ping, and replaced (connects ${n}, then ${more})");
+
+    // In the round that finds it: with a round every 700 ms, the ping at about 1.4 s finds it, and the connect follows
+    // at once, not a round later at 2.1 s.
+    Channel<string> ch2 = Channel.bounded(capacity: 4096);
+    Receiver<string> log2 = ch2.receiver();
+    PoolOptions o = keeping(size: 1, least: 1);
+    o.healthCheck = Duration.fromMillis(ms: 700i64);
+    Instant start = monotonicNow();
+    Result<Pool, PgError> made2 = keptPool(scripts: twoScripts(a: dropped(), b: opening()), options: o, log: give ch2);
+    Pool pool2 = match (give made2) { case Ok(value: p): give p; case Err(error: e): { return f + check(ok: false, what: "maintenance: make, dropped, same round"); } };
+    sleepUntil(from: start, ms: 1750i64);
+    DynamicArray<string> lines2 = drained(log: ref log2);
+    isize n2 = connectsIn(lines: lines2);
+    f = f + check(ok: n2 == 2, what: "maintenance: a connection that fails its ping is replaced in the round that found it (connects ${n2} by 1.75 s)");
+    return f;
 }
 
 unsafe fn int32 acquirePings() {
@@ -990,7 +1096,11 @@ unsafe fn int32 pingBounded() {
 //   1: three idle connections whose servers have stopped answering, dropped while the maintenance pings the first;
 //   2: minIdle 1 and a server that never answers the startup, dropped while the maintenance connects, which ends
 //      within acquireTimeout (1 s) since there is no connect_timeout;
-//   3: the same with connect_timeout=1 and acquireTimeout 5 s, which ends within connect_timeout.
+//   3: the same with connect_timeout=1 and acquireTimeout 5 s, which ends within connect_timeout;
+//   4: minIdle 1, its connection leased and the lease held while the pool drops, the maintenance finding no capacity
+//      each round; then the lease is dropped, and the report says whether its connection closed;
+//   5: kind 2 with acquireTimeout 0: the maintenance's connects are still bounded, by a second, since a
+//      connect_timeout of 0 would be none.
 type resource Dropper implements Sendable {
     Sender<string> report;
     int32 kind;
@@ -1005,10 +1115,14 @@ type resource Dropper implements Sendable {
             o = keeping(size: 3, least: 0);
             o.pingTimeout = Duration.fromSecs(s: 1i64);
             scripts.add(item: stalling()); scripts.add(item: stalling()); scripts.add(item: stalling());
+        } else if (this.kind == 4) {
+            o = keeping(size: 1, least: 1);
+            scripts.add(item: opening());
         } else if (this.kind >= 2) {
             o = keeping(size: 1, least: 1);
             o.acquireTimeout = Duration.fromSecs(s: 1i64);
             if (this.kind == 3) { o.acquireTimeout = Duration.fromSecs(s: 5i64); conninfo = "connect_timeout=1"; }
+            if (this.kind == 5) { o.acquireTimeout = Duration.zero(); }
             DynamicArray<Step> never = DynamicArray.empty();
             never.add(item: Step::Stall);
             scripts.add(item: give never);
@@ -1020,6 +1134,12 @@ type resource Dropper implements Sendable {
             Result<Lease, PgError> b = pool.acquire();
             Result<Lease, PgError> c = pool.acquire();
         }
+        DynamicArray<Lease> held = DynamicArray.empty();   // kind 4's lease, held while the pool drops
+        if (this.kind == 4) {
+            DynamicArray<string> made1 = awaitLines(log: ref log, what: "connect", n: 1, within: Duration.fromSecs(s: 2i64));
+            Result<Lease, PgError> a = pool.acquire();
+            match (give a) { case Ok(value: l): { held.add(item: give l); } case Err(error: e): { } };
+        }
         int64 wait = 200;
         if (this.kind == 1) { wait = 1500; }   // the first ping, from 1.1 s to 2.1 s
         sleep(d: Duration.fromMillis(ms: wait));
@@ -1027,6 +1147,16 @@ type resource Dropper implements Sendable {
         { Pool gone = give pool; }
         int64 ms = dropping.elapsed().asMillis();
         _ = this.report.send(item: "${ms}");
+        if (this.kind == 4) {
+            DynamicArray<string> before = drained(log: ref log);
+            isize leased = held.length();
+            Optional<Lease> last = held.pop();
+            match (give last) { case Some(value: l): { Lease outlived = give l; } case None: { } };
+            DynamicArray<string> after = awaitLines(log: ref log, what: closeLine(), n: 1, within: Duration.fromSecs(s: 2i64));
+            isize early = countIn(lines: before, what: closeLine());
+            isize closed = countIn(lines: after, what: closeLine());
+            _ = this.report.send(item: "leased ${leased}, closed ${early} before the lease was dropped and ${closed} after");
+        }
     }
 }
 
@@ -1056,6 +1186,56 @@ unsafe fn int32 dropStopsMaintenance() {
     f = f + droppedWithin(kind: 1, most: 1500i64, what: "maintenance: dropping a pool stops its maintenance after the ping under way, not the rest");
     f = f + droppedWithin(kind: 2, most: 1500i64, what: "maintenance: its connects end within acquireTimeout when there is no connect_timeout");
     f = f + droppedWithin(kind: 3, most: 2000i64, what: "maintenance: its connects keep the connect_timeout the Config has");
+    f = f + droppedWithin(kind: 5, most: 1500i64, what: "maintenance: with an acquireTimeout of 0, its connects still end within a second");
+    f = f + droppedWhileLeased();
+    f = f + connectBoundRoundsUp();
+    return f;
+}
+
+// The maintenance's connects are bounded by acquireTimeout rounded up to a whole second, connect_timeout's unit, never
+// down: with acquireTimeout 1.1 s, a connect to a silent server gives up after 2 s, not 1 s, and the next round's
+// connect follows it.
+unsafe fn int32 connectBoundRoundsUp() {
+    Channel<string> ch = Channel.bounded(capacity: 4096);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = keeping(size: 1, least: 1);
+    o.acquireTimeout = Duration.fromMillis(ms: 1100i64);
+    DynamicArray<DynamicArray<Step>> scripts = DynamicArray.empty();
+    isize i = 0;
+    while (i < 2) {
+        DynamicArray<Step> never = DynamicArray.empty();
+        never.add(item: Step::Stall);
+        scripts.add(item: give never);
+        i = i + 1;
+    }
+    Result<Pool, PgError> made = poolOverInfo(conninfo: "", scripts: give scripts, options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "maintenance: make, connect bound"); } };
+    DynamicArray<string> first = awaitLines(log: ref log, what: "connect", n: 1, within: Duration.fromSecs(s: 1i64));
+    DynamicArray<string> soon = awaitLines(log: ref log, what: "connect", n: 1, within: Duration.fromMillis(ms: 1600i64));
+    DynamicArray<string> later = awaitLines(log: ref log, what: "connect", n: 1, within: Duration.fromMillis(ms: 1500i64));
+    isize began = countIn(lines: first, what: "connect");
+    isize early = countIn(lines: soon, what: "connect");
+    isize next = countIn(lines: later, what: "connect");
+    return check(ok: began == 1 && early == 0 && next == 1,
+                 what: "maintenance: its connects wait acquireTimeout rounded up to a whole second (1.1 s: the next connect ${early} within 1.6 s, ${next} by 3.1 s)");
+}
+
+// A pool dropped while its every connection is leased: the maintenance, which finds no capacity for minIdle each round,
+// waits on no channel, so the drop is prompt. The lease outlives the pool, and its connection closes when it is dropped.
+unsafe fn int32 droppedWhileLeased() {
+    int32 f = 0;
+    Channel<string> results = Channel.bounded(capacity: 2);
+    Receiver<string> rx = results.receiver();
+    Dropper job = Dropper.make(report: results.sender(), kind: 4);
+    Isolate worker = spawn dropInIsolate(job: give job);
+    Result<string, RecvError> r = rx.recvTimeout(timeout: Duration.fromSecs(s: 10i64));
+    string took = match (give r) { case Ok(value: v): give v; case _: "(no report in 10 s)"; };
+    f = f + check(ok: tookUnder(took: took, most: 1000i64),
+                  what: "maintenance: dropping a pool whose connections are all leased stops its maintenance at once (".concat(other: took).concat(other: " ms)"));
+    Result<string, RecvError> r2 = rx.recvTimeout(timeout: Duration.fromSecs(s: 10i64));
+    string closed = match (give r2) { case Ok(value: v): give v; case _: "(no report in 10 s)"; };
+    f = f + check(ok: closed.equals(other: "leased 1, closed 0 before the lease was dropped and 1 after"),
+                  what: "pool: a lease that outlives its pool closes its connection when it is dropped (".concat(other: closed).concat(other: ")"));
     return f;
 }
 
@@ -1100,7 +1280,185 @@ unsafe fn int32 emptyBehindIdle() {
                   what: "pool: an acquire that takes a closed connection's place leases the idle connection behind it, with no connect (connects ${reused})");
     f = f + check(ok: another.equals(other: "ok") && beyond.equals(other: "pool timed out while waiting for an open connection"),
                   what: "pool: the place stays for the next acquire, and the bound holds (".concat(other: another).concat(other: ", ").concat(other: beyond).concat(other: ")"));
+
+    // Two closed connections' places in front of the idle one: the acquire passes over the second to reach it, and
+    // both places stay the pool's.
+    Channel<string> ch2 = Channel.bounded(capacity: 4096);
+    Receiver<string> log2 = ch2.receiver();
+    PoolOptions o2 = sized(size: 3);
+    o2.reset = false;
+    DynamicArray<DynamicArray<Step>> five = twoScripts(a: opening(), b: opening());
+    five.add(item: answersSentinel());
+    five.add(item: opening());
+    five.add(item: opening());
+    Result<Pool, PgError> made2 = poolOver(scripts: give five, options: o2, log: give ch2);
+    Pool pool2 = match (give made2) { case Ok(value: p): give p; case Err(error: e): { return f + check(ok: false, what: "pool: make, places passed over"); } };
+    Result<Lease, PgError> d = pool2.acquire();
+    Result<Lease, PgError> e2 = pool2.acquire();
+    Result<Lease, PgError> g = pool2.acquire();
+    {
+        Result<Lease, PgError> first = give d;
+        match (give first) { case Ok(value: lease): { Lease l = give lease; l.conn().close(); } case Err(error: x): { } };
+    }
+    {
+        Result<Lease, PgError> second = give e2;
+        match (give second) { case Ok(value: lease): { Lease l = give lease; l.conn().close(); } case Err(error: x): { } };
+    }
+    { Result<Lease, PgError> third = give g; }
+    isize grown2 = connects(log: ref log2);
+    Result<Lease, PgError> h = pool2.acquire();
+    bool ran2 = false;
+    isize reused2 = -1;
+    string fourth = "";
+    string fifth = "";
+    string sixth = "";
+    match (give h) {
+        case Ok(value: lease): {
+            Lease held = give lease;
+            reused2 = connects(log: ref log2);
+            ran2 = selectsOne(c: held.conn());
+            Result<Lease, PgError> x1 = pool2.acquire();
+            fourth = said(r: x1);
+            Result<Lease, PgError> x2 = pool2.acquire();
+            fifth = said(r: x2);
+            Result<Lease, PgError> x3 = pool2.acquire();
+            sixth = said(r: x3);
+        }
+        case Err(error: x): { }
+    };
+    f = f + check(ok: grown2 == 3 && ran2 && reused2 == 0 && fourth.equals(other: "ok") && fifth.equals(other: "ok")
+                      && sixth.equals(other: "pool timed out while waiting for an open connection"),
+                  what: "pool: the closed connections' places an acquire passes over to reach an idle one stay the pool's (connects ${reused2}; "
+                        .concat(other: fourth).concat(other: ", ").concat(other: fifth).concat(other: ", ").concat(other: sixth).concat(other: ")"));
     return f;
+}
+
+// The round's ping pass meets a free place only when an acquire takes a connection it counted: while its ping to the
+// first stale connection waits out pingTimeout (800 ms), an acquire leases the second, and the pass, owing one more
+// ping, then takes the free places behind them. It puts each back. The acquire comes as the ping is seen in the log.
+// The servers are strict, so that the ping is the message that takes the first one's Stall step (a `pinged` server
+// answers it without a step), and the second answers one ping, acquire's, before the sentinel.
+unsafe fn int32 pingPassKeepsPlaces() {
+    Channel<string> ch = Channel.bounded(capacity: 4096);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = keeping(size: 3, least: 0);
+    o.healthCheck = Duration.fromMillis(ms: 700i64);
+    o.pingTimeout = Duration.fromMillis(ms: 800i64);
+    o.acquireTimeout = Duration.fromMillis(ms: 500i64);
+    o.queryTimeout = Optional::Some(value: Duration.fromSecs(s: 2i64));   // a wrong lease fails, rather than waits for ever
+    Wire pong = Wire.make();
+    pong.emptyQuery();
+    pong.ready(status: IDLE);
+    DynamicArray<Step> answering = opening();
+    answering.add(item: answer(tag: 81ui8, reply: give pong));
+    answering.add(item: sentinel());
+    DynamicArray<DynamicArray<Step>> scripts = twoScripts(a: stalling(), b: give answering);
+    scripts.add(item: opening());   // closed under its lease
+    scripts.add(item: opening());
+    scripts.add(item: opening());
+    Result<Pool, PgError> made = poolOver(scripts: give scripts, options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "maintenance: make, ping pass"); } };
+    Result<Lease, PgError> a = pool.acquire();
+    Result<Lease, PgError> b = pool.acquire();
+    Result<Lease, PgError> c = pool.acquire();
+    { Result<Lease, PgError> silent = give a; }     // first in line
+    { Result<Lease, PgError> pinged = give b; }      // then the one acquire will ping
+    {
+        Result<Lease, PgError> lost = give c;       // closed under its lease: its place goes in behind them
+        match (give lost) { case Ok(value: lease): { Lease l = give lease; l.conn().close(); } case Err(error: e): { } };
+    }
+    DynamicArray<string> pinging = awaitLines(log: ref log, what: pingLine(), n: 1, within: Duration.fromSecs(s: 3i64));
+    isize seen = countIn(lines: pinging, what: pingLine());
+    Result<Lease, PgError> d = pool.acquire();
+    sleep(d: Duration.fromMillis(ms: 1200i64));   // the ping fails, and the pass goes on
+    bool ran = false;
+    string second = "";
+    string third = "";
+    string beyond = "";
+    match (give d) {
+        case Ok(value: lease): {
+            Lease held = give lease;
+            ran = selectsOne(c: held.conn());
+            Result<Lease, PgError> x1 = pool.acquire();
+            second = said(r: x1);
+            Result<Lease, PgError> x2 = pool.acquire();
+            third = said(r: x2);
+            Result<Lease, PgError> x3 = pool.acquire();
+            beyond = said(r: x3);
+        }
+        case Err(error: e): { }
+    };
+    return check(ok: seen == 1 && ran && second.equals(other: "ok") && third.equals(other: "ok") && beyond.equals(other: "pool timed out while waiting for an open connection"),
+                 what: "maintenance: the ping pass puts back the free places it meets while an acquire takes what it would ping (ping ${seen}, ran ${ran}; ".concat(other: second)
+                       .concat(other: ", ").concat(other: third).concat(other: ", ").concat(other: beyond).concat(other: ")"));
+}
+
+// Capacity for minIdle, behind an idle connection: the maintenance passes over the idle one to reach the free place,
+// connects on it, and keeps the idle one.
+unsafe fn int32 claimPassesIdle() {
+    Channel<string> ch = Channel.bounded(capacity: 4096);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = keeping(size: 2, least: 2);
+    o.acquireTimeout = Duration.fromMillis(ms: 500i64);
+    Result<Pool, PgError> made = keptPool(scripts: openings(n: 3), options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "maintenance: make, claim"); } };
+    DynamicArray<string> early = awaitLines(log: ref log, what: "connect", n: 2, within: Duration.fromSecs(s: 5i64));
+    isize first = countIn(lines: early, what: "connect");
+    Result<Lease, PgError> a = pool.acquire();
+    Result<Lease, PgError> b = pool.acquire();
+    { Result<Lease, PgError> kept = give a; }   // idle, first in line
+    {
+        Result<Lease, PgError> lost = give b;   // closed under its lease: its place goes in behind the idle one
+        match (give lost) { case Ok(value: lease): { Lease l = give lease; l.conn().close(); } case Err(error: e): { } };
+    }
+    // Within a few rounds, and before the idle one has sat a second: its ping would put it back behind the free place.
+    DynamicArray<string> later = awaitLines(log: ref log, what: "connect", n: 1, within: Duration.fromMillis(ms: 600i64));
+    DynamicArray<string> rest = drained(log: ref log);
+    isize refilled = countIn(lines: later, what: "connect") + countIn(lines: rest, what: "connect");
+    isize closed = countIn(lines: early, what: closeLine()) + countIn(lines: later, what: closeLine()) + countIn(lines: rest, what: closeLine());
+    Result<Lease, PgError> c = pool.acquire();
+    Result<Lease, PgError> d = pool.acquire();
+    isize leasing = connects(log: ref log);
+    Result<Lease, PgError> over = pool.acquire();
+    string third = said(r: over);
+    return check(ok: first == 2 && refilled == 1 && closed == 1 && said(r: c).equals(other: "ok") && said(r: d).equals(other: "ok") && leasing == 0
+                     && third.equals(other: "pool timed out while waiting for an open connection"),
+                 what: "maintenance: it passes over an idle connection to reach a free place for minIdle, and keeps the idle one (connects ${first}, ${refilled}, ${leasing}; closed ${closed}; "
+                       .concat(other: third).concat(other: ")"));
+}
+
+// Lifetimes spread by lifetimeJitter: of eight connections made together with a lifetime of 200 ms and up to a second
+// more, not all are closed within 400 ms (the chance of it is (1/5)^8), and all are closed once the second has passed.
+// With no spread, all eight close within a round of 200 ms.
+unsafe fn int32 lifetimesSpread() {
+    Channel<string> ch = Channel.bounded(capacity: 4096);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = keeping(size: 8, least: 0);
+    o.healthCheck = Duration.fromMillis(ms: 50i64);
+    o.lifetime = Optional::Some(value: Duration.fromMillis(ms: 200i64));
+    o.lifetimeJitter = Duration.fromMillis(ms: 1000i64);
+    Result<Pool, PgError> made = keptPool(scripts: openings(n: 8), options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, jitter"); } };
+    isize leased = 0;
+    Instant start = monotonicNow();
+    {
+        DynamicArray<Lease> held = DynamicArray.empty();
+        isize i = 0;
+        while (i < 8) {
+            Result<Lease, PgError> a = pool.acquire();
+            match (give a) { case Ok(value: l): { held.add(item: give l); } case Err(error: e): { } };
+            i = i + 1;
+        }
+        leased = held.length();
+        start = monotonicNow();
+    }
+    DynamicArray<string> early = awaitLines(log: ref log, what: closeLine(), n: 8, within: Duration.fromMillis(ms: 400i64));
+    isize soon = countIn(lines: early, what: closeLine());
+    sleepUntil(from: start, ms: 1700i64);
+    DynamicArray<string> rest = drained(log: ref log);
+    isize all = soon + countIn(lines: rest, what: closeLine());
+    return check(ok: leased == 8 && soon < 8 && all == 8,
+                 what: "pool: lifetimes are spread over lifetimeJitter, so connections made together are not all closed together (${soon} closed within 400 ms, ${all} by 1.7 s)");
 }
 
 // Sleep until `ms` after `from`.
@@ -1151,6 +1509,30 @@ unsafe fn int32 medianTests() {
     DynamicArray<string> lines = awaitLines(log: ref log2, what: closeLine(), n: 2, within: Duration.fromMillis(ms: 1200i64));
     isize closed = countIn(lines: lines, what: closeLine());
     f = f + check(ok: closed == 2, what: "maintenance: pruning closes the median of the window's idle counts (0, 2, 2: both; closed ${closed})");
+
+    // Counts 1, 1, 3: the median is 1, so one of the three idle is closed, not every one the round counted.
+    Channel<string> ch3 = Channel.bounded(capacity: 4096);
+    Receiver<string> log3 = ch3.receiver();
+    PoolOptions o3 = keeping(size: 3, least: 0);
+    o3.healthCheck = Duration.fromMillis(ms: 400i64);
+    o3.idleTimeout = Optional::Some(value: Duration.fromMillis(ms: 1200i64));
+    Result<Pool, PgError> made3 = keptPool(scripts: openings(n: 3), options: o3, log: give ch3);
+    Pool pool3 = match (give made3) { case Ok(value: p): give p; case Err(error: e): { return f + check(ok: false, what: "maintenance: make, median 1"); } };
+    Instant start3 = monotonicNow();
+    {
+        Result<Lease, PgError> a = pool3.acquire();
+        Result<Lease, PgError> b = pool3.acquire();
+        Result<Lease, PgError> c = pool3.acquire();
+        { Result<Lease, PgError> lead = give a; }    // the rounds at 400 and 800 ms count 1
+        sleepUntil(from: start3, ms: 1000i64);
+    }                                                  // the round at 1200 ms counts 3
+    DynamicArray<string> before = drained(log: ref log3);
+    sleepUntil(from: start3, ms: 2000i64);             // the next window's last round is at 2400 ms
+    DynamicArray<string> window = drained(log: ref log3);
+    isize early3 = countIn(lines: before, what: closeLine());
+    isize closed3 = countIn(lines: window, what: closeLine());
+    f = f + check(ok: early3 == 0 && closed3 == 1,
+                  what: "maintenance: pruning closes the median of the window's idle counts (1, 1, 3: one; closed ${early3}, then ${closed3})");
     return f;
 }
 
@@ -1189,6 +1571,9 @@ unsafe fn int32 maintenanceTests() {
     f = f + pruningTests();
     f = f + medianTests();
     f = f + emptyBehindIdle();
+    f = f + claimPassesIdle();
+    f = f + pingPassKeepsPlaces();
+    f = f + lifetimesSpread();
     f = f + lifetimeKept();
     f = f + keeperPings();
     f = f + droppedFoundByKeeper();
@@ -1197,6 +1582,132 @@ unsafe fn int32 maintenanceTests() {
     f = f + pingBounded();
     f = f + dropStopsMaintenance();
     f = f + boundKeptThroughRounds();
+    f = f + boundUnderChurn();
+    return f;
+}
+
+// ---- the bound under churn ----
+
+// Acquires from a pool it joins `rounds` times, holding each connection a moment, closing every third under its lease
+// and giving the rest back; then reports "ok" and the connects refused, or the first other failure.
+type resource Churner implements Sendable {
+    PoolShare share;
+    Sender<string> report;
+    public ctor make(PoolShare share, Sender<string> report) { this.share = give share; this.report = give report; }
+    public unsafe fn void run() {
+        Pool pool = Pool.join(share: this.share);
+        isize refused = 0;
+        string other = "";
+        isize round = 0;
+        while (round < 40) {
+            Result<Lease, PgError> got = pool.acquire();
+            match (give got) {
+                case Ok(value: lease): {
+                    Lease l = give lease;
+                    sleep(d: Duration.fromMillis(ms: 1i64));
+                    if (round % 3 == 0) { l.conn().close(); }
+                }
+                case Err(error: e): {
+                    string m = e.message();
+                    if (m.contains(substring: "sorry, too many clients already")) { refused = refused + 1; }
+                    else if (other.length() == 0) { other = copy m; }
+                }
+            };
+            round = round + 1;
+        }
+        string outcome = "ok, ${refused} refused";
+        if (other.length() > 0) { outcome = copy other; }
+        _ = this.report.send(item: give outcome);
+    }
+}
+
+fn void churnInIsolate(Churner job) { job.run(); }
+
+// A connect the server refuses (FATAL 53300).
+fn DynamicArray<Step> refusedConnect() {
+    Wire w = Wire.make();
+    w.report(tag: 69ui8, severity: "FATAL", code: "53300", message: "sorry, too many clients already");
+    DynamicArray<Step> s = DynamicArray.empty();
+    s.add(item: Step::Send(bytes: w.bytes()));
+    return s;
+}
+
+// Four isolates churn through one pool of 3 while every path that gives capacity back runs at once: connections
+// closed under their leases, connects refused, lifetimes of 30 to 60 ms ending on release, on acquire and in the
+// maintenance, pruning, and minIdle connected again. If a path lost a place, acquires would time out; if one made a
+// place, a release would block on the full channel. After it, 3 leases can be held and not a fourth.
+unsafe fn int32 boundUnderChurn() {
+    int32 f = 0;
+    Channel<string> ch = Channel.bounded(capacity: 4096);
+    Receiver<string> log = ch.receiver();
+    PoolOptions o = keeping(size: 3, least: 1);
+    o.healthCheck = Duration.fromMillis(ms: 20i64);
+    o.idleTimeout = Optional::Some(value: Duration.fromMillis(ms: 60i64));
+    o.lifetime = Optional::Some(value: Duration.fromMillis(ms: 30i64));
+    o.lifetimeJitter = Duration.fromMillis(ms: 30i64);
+    o.acquireTimeout = Duration.fromSecs(s: 1i64);
+    DynamicArray<DynamicArray<Step>> scripts = DynamicArray.empty();
+    isize i = 0;
+    while (i < 1000) {
+        if (i % 5 == 4) { scripts.add(item: refusedConnect()); } else { scripts.add(item: opening()); }
+        i = i + 1;
+    }
+    Result<Pool, PgError> made = keptPool(scripts: give scripts, options: o, log: give ch);
+    Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "pool: make, churn"); } };
+    Channel<string> results = Channel.bounded(capacity: 8);
+    Receiver<string> rx = results.receiver();
+    DynamicArray<Isolate> running = DynamicArray.empty();
+    i = 0;
+    while (i < 4) {
+        Result<PoolShare, PgError> sh = pool.share();
+        match (give sh) {
+            case Ok(value: x): {
+                Churner job = Churner.make(share: give x, report: results.sender());
+                Isolate w = spawn churnInIsolate(job: give job);
+                running.add(item: give w);
+            }
+            case Err(error: e): { }
+        };
+        i = i + 1;
+    }
+    // The reports, reading the log as they come so that its channel never fills.
+    string seen = "";
+    bool churned = running.length() == 4;
+    isize reports = 0;
+    Instant until = monotonicNow() + Duration.fromSecs(s: 60i64);
+    while (reports < 4 && monotonicNow() < until) {
+        Result<string, RecvError> r = rx.recvTimeout(timeout: Duration.fromMillis(ms: 50i64));
+        match (give r) {
+            case Ok(value: v): {
+                churned = churned && v.startsWith(prefix: "ok,");
+                if (seen.length() > 0) { seen = seen.concat(other: "; "); }
+                seen = seen.concat(other: v);
+                reports = reports + 1;
+            }
+            case _: { }
+        };
+        DynamicArray<string> lines = drained(log: ref log);
+    }
+    f = f + check(ok: churned && reports == 4, what: "pool: four isolates churning through one pool never wait out acquireTimeout (".concat(other: seen).concat(other: ")"));
+    // The bound: 3 leases (a refused connect gives its place back, and is tried again), then a fourth times out.
+    DynamicArray<Lease> held = DynamicArray.empty();
+    isize tries = 0;
+    string failed = "";
+    while (held.length() < 3 && tries < 10) {
+        Result<Lease, PgError> a = pool.acquire();
+        match (give a) {
+            case Ok(value: l): { held.add(item: give l); }
+            case Err(error: e): { string m = e.message(); if (!m.contains(substring: "sorry, too many clients already")) { failed = copy m; } }
+        };
+        tries = tries + 1;
+        DynamicArray<string> lines = drained(log: ref log);
+    }
+    isize leased = held.length();
+    Result<Lease, PgError> beyond = pool.acquire();
+    string fourth = said(r: beyond);
+    f = f + check(ok: leased == 3 && failed.length() == 0 && fourth.equals(other: "pool timed out while waiting for an open connection"),
+                  what: "pool: after the churn, maxSize (3) leases can be held and no more (${leased} in ${tries} tries; ".concat(other: failed)
+                        .concat(other: fourth).concat(other: ")"));
     return f;
 }
 
@@ -1227,6 +1738,15 @@ unsafe fn int32 refusals() {
     Result<Pool, PgError> negative = poolOver(scripts: give none2, options: o, log: Channel.bounded(capacity: 1));
     string neg = match (negative) { case Ok(value: p): "made"; case Err(error: e): e.message(); };
     f = f + check(ok: neg.equals(other: "pool durations must not be negative"), what: "pool: a negative duration is refused (".concat(other: neg).concat(other: ")"));
+    PoolOptions j = sized(size: 1);
+    j.lifetimeJitter = Duration.fromMillis(ms: -1i64);
+    f = f + check(ok: refusal(options: j).equals(other: "pool durations must not be negative"), what: "pool: a negative lifetimeJitter is refused");
+    PoolOptions g = sized(size: 1);
+    g.queryGrace = Duration.fromMillis(ms: -1i64);
+    f = f + check(ok: refusal(options: g).equals(other: "pool durations must not be negative"), what: "pool: a negative queryGrace is refused");
+    PoolOptions q = sized(size: 1);
+    q.queryTimeout = Optional::Some(value: Duration.fromMillis(ms: -1i64));
+    f = f + check(ok: refusal(options: q).equals(other: "pool durations must not be negative"), what: "pool: a negative queryTimeout is refused");
     PoolOptions o2 = sized(size: 1);
     o2.lifetime = Optional::Some(value: Duration.zero());
     DynamicArray<DynamicArray<Step>> none3 = DynamicArray.empty();
@@ -1279,9 +1799,11 @@ unsafe fn int32 poolTests() {
     f = f + sequentialKeepsOne();
     f = f + boundedAndTimesOut();
     f = f + waiterWokenAcrossIsolates();
+    f = f + waiterWokenByFreedPlace();
     f = f + closedIsReplaced();
     f = f + busyTests();
     f = f + blockRolledBackAndReset();
+    f = f + windowOnLease();
     f = f + resetOffSendsNothing();
     f = f + resetOffRollsBack();
     f = f + resetOffFailedRollbackDropped();

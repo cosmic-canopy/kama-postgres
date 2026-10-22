@@ -1,7 +1,7 @@
 # Roadmap
 
-Where this is, 2026-10-22: phases 0–8 are done, and phase 9 (Windows) is next. 0.3.0 carries phase 8, on kama 0.9.719;
-the registry publishes it on the maintainer's word. 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667. 0.1.0
+Where this is, 2026-10-22: phases 0–8 are done, and phase 9 (Windows) is under way on a Windows 11 machine; its plan
+is below. 0.3.0 carries phase 8, on kama 0.9.719, and is published. 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667. 0.1.0
 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
@@ -47,7 +47,9 @@ KPG-33 to KPG-38 are fixed. KPG-39 (std's JSON beside this package) and KPG-40 (
 and the freeze it relies on is fixed) were verified on the 0.9.673 release, which the package now needs. KPG-41 (on
 macOS, a release build with `std::process` beside `std::concurrent` failed in clang), found in S2c, is fixed in 0.9.679,
 and the package needed 0.9.690. kama 0.9.719's new `Poller` (KR-230) took a port of its own, and the package now
-needs 0.9.719. No gap is open. Phase 8 is done, and its plan and record are below. Phase 9 is not planned yet.
+needs 0.9.719. Phase 8 is done, and its plan and record are below. Phase 9 opened two gaps: KPG-42 (std has no
+application-data folder, where libpq keeps its files on Windows) and KPG-43 (std's parse of `NaN` takes the C library's
+bits, which differ on Windows).
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -63,8 +65,99 @@ matrix.
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
 | 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | **done** (0.3.0): S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4, S5, S6, the port to 0.9.719 and S7 |
-| 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
+| 9 | Windows: libpq's WIN32 branches, a native server on Windows, Windows CI legs. Ends at 0.4.0 | **under way**: S0 done, S1 next |
+| 10 | Kerberos: GSSAPI (Linux, macOS), SSPI (Windows) and `gssencmode` | planned, design first |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
+
+## Phase 9, planned
+
+Decided with the maintainer on 2026-10-22, on the Windows 11 machine. `@kama/tls` 0.1.7, its phase 7, is the
+Windows release this phase waited for. Each step commits on main once it is green: `tools/test.sh` on Windows, debug
+and release; from S2 on, the Windows integration leg; and Linux and macOS unchanged (CI, after a push on the
+maintainer's word). Each step's mutations go in `tools/mutations/p9-sN.json`.
+
+**Decisions:**
+- **The server on Windows is EDB's binaries zip**, unpacked by `tools/pg.sh` into `out/`, the same locally and on CI's
+  `windows-latest`.
+  - No podman: on Windows it runs Linux containers in a WSL2 VM, which this machine lacks and GitHub's Windows runners
+    cannot run.
+  - A server in a VM could not be reached by a Unix-domain socket.
+  - The zip's own `psql.exe` is a Windows libpq to ask the WIN32 cases of.
+- **One version on Windows: 18, moving to 19 at GA.** 19 is at rc1, and EDB has no Windows zip of it. The 14–19
+  matrix stays on Linux.
+- **Every file is LF in every checkout** (`.gitattributes`: `* text=auto eol=lf`).
+  - Git for Windows defaults to `core.autocrlf=true`, and so do GitHub's Windows runners.
+  - With CRLF, the container's init script breaks, and `copy_csv`'s byte comparison fails.
+- **SSPI and GSSAPI are refused in libpq's words in phase 9**, and phase 10 adds Kerberos on every platform.
+  - On Windows, libpq always has SSPI (Windows' Kerberos/NTLM sign-on).
+  - Npgsql, pgjdbc and asyncpg support it, and the package is to be complete rather than wait for a request.
+- **libpq's application-data folder is a kama gap** (KPG-42).
+  - libpq asks Windows for it: `SHGetFolderPath(CSIDL_APPDATA)`.
+  - `homeFrom` reads `APPDATA` until std can ask, as Go's `os.UserConfigDir` does.
+- **Phase 9 ends at 0.4.0.**
+
+**What is known** (read on 2026-10-22, from the pinned REL_18 sources and kama 0.9.719):
+- **libpq's WIN32 branches:**
+  - The home is the app-data folder plus `/postgresql`, holding `pgpass.conf`, `.pg_service.conf`, `postgresql.crt`,
+    `postgresql.key`, `root.crt` and `root.crl`.
+  - Nothing checks the password file's or the key's permissions.
+  - `DEFAULT_PGSOCKET_DIR` is `""`, so the default host is TCP `localhost`, and `is_absolute_path` takes `\`, `X:\`,
+    `X:/` and UNC paths.
+  - `requirepeer` fails the connect ("requirepeer parameter is not supported on this platform").
+  - Keepalives set only idle and interval (`SIO_KEEPALIVE_VALS`, defaulting to 7200 s and 1 s); `keepalives_count`
+    is not even parsed, and `tcp_user_timeout` is parsed and not applied.
+  - Socket errors are `winsock_strerror`'s table with ` (0x%08X/%d)` appended (`win32.c`, SHA256 `c68436eb…fdeb7`).
+  - The user name comes from `GetUserName`.
+- **kama on Windows:**
+  - std has TCP with its keepalive options, AF_UNIX path sockets (no abstract names) and the `Poller` (AFD over an
+    I/O completion port). The `Poller` had not run on Windows before this phase; the unit tests open no socket, so the
+    integration leg is its first live test.
+  - CreateProcess cannot run a `.sh`.
+  - The release with zig bundled (`kama-windows-x64-bundled-vX.tar.gz`) prefers its own zig to any clang on the PATH.
+
+**Steps:**
+- **S0, done: the baseline** (2026-10-22).
+  - **Line endings.** `.gitattributes` makes every file LF, and the tree was checked out again.
+  - **@kama/tls.** It is `^0.1.7` in the three manifests, and all ten locks pin 0.1.7.
+  - **The first Windows run.** `kama check` refused one line: `tls_test.kama` read `UserId.raw()`, which Windows has
+    not. With that gated, 7 of the unit cases failed, debug and release alike. Nothing else failed: no panic, nothing
+    from the `Poller`, which the unit tests do not reach.
+    - Five expected Unix's `HOME`. They became `homeTests` and `setHome`/`tlsHome`, with a Windows twin each that
+      checks `APPDATA`'s `postgresql`, `pgpass.conf`, and the TLS files with no `.postgresql/`.
+    - Two read `'NaN'` as text with other bits than binary: KPG-43. std's parse takes UCRT's NaN
+      (`7fffffffffffffff`). `floatText` now gives PostgreSQL's (`7ff8000000000000`) on every platform.
+    - The key-permission cases follow 001_ssltests.pl, which skips them on Windows: a key at 0644 or 0640 connects.
+  - **The gate is green on Windows**, on both compilers: `../kama` at v0.9.719 with msys2's clang, and the release with
+    zig bundled. That covers the unit program debug and release, the seven examples, and the README check.
+  - **Tooling for Git Bash.** `mutate.sh` copies the tree with tar when there is no rsync. Its Python reads and writes
+    UTF-8 with no newline translation, and gives an example `APPDATA` and `SYSTEMROOT`. It and `check-readme.sh` take
+    `$PYTHON`, else the first of `python3` and `python` that runs.
+  - **Mutations:** `tools/mutations/p9-s0.json` has 8, all caught: the NaN, the five parts of the Windows home and its
+    files, and the Windows key check.
+- **S1: libpq's WIN32 configuration branches**, each a `@compileFor(OS_WINDOWS)` twin, read from the pinned source:
+  the default socket directory and host, `is_unixsock_path`, the password file's checks, `requirepeer`, keepalives,
+  the user name's failure, and `winsock_strerror` (generated from `win32.c` by `tools/gen-libpq-tables.sh`). Unix's
+  `isSocketPath` stops taking `C:/x`, which Unix libpq does not.
+- **S2: a native PostgreSQL 18 on Windows** (`tools/pg.sh`, chosen when `uname` is MINGW or MSYS):
+  - EDB's zip, pinned by URL and SHA256;
+  - `initdb` from `tests/integration/server/`, sharing `00-setup.sh`'s steps with the container;
+  - a socket directory, and a standby by `pg_basebackup -R`;
+  - `up`, `down`, `stop`, `start`, `restart`, `smoke` and `logs`.
+
+  A Windows generator asks the zip's libpq the WIN32 cases, never touching the real `%APPDATA%\postgresql`.
+- **S3: the integration suite on Windows**, against 18:
+  - debug, release, TLS, the restart leg (`PGTEST_PGSH` run through `bash.exe`) and the examples (`APPDATA` and
+    `SYSTEMROOT` in their environment);
+  - Windows twins of the Unix-only expectations, and Unix-domain sockets live.
+- **S4: CI.** A `windows-latest` unit leg, with the bundled-zig kama by URL and SHA256 as `@kama/tls` installs it, and
+  a Windows integration leg on 18, with EDB's zip cached by its SHA256.
+- **S5: docs and 0.4.0.** The README's platforms, Windows file locations and known differences; the CHANGELOG;
+  AGENTS.postgres.md's Windows gate; this record.
+
+**How the gate runs here** (Git Bash):
+- `PATH=/c/msys64/ucrt64/bin:$PATH KAMA=../kama/out/UCRT64-x86_64/kama.exe tools/test.sh`. msys2's UCRT64 gives clang
+  and python3. Git Bash's own `python3` is the Microsoft Store's stub, which the scripts pass over.
+- The same, with `KAMA` set to the v0.9.719 bundled-zig release, is CI's compiler.
 
 ## Phase 8, planned
 
@@ -409,14 +502,13 @@ it fail.
 - **Check with cstar's newest build before calling a release ready.** The registry checks a publish with it, not with
   CI's tag, so run `kama check kama.json` with `../cstar/out/Darwin-arm64/kama` too. This is how 0.3.0 found it needed
   a port: kama tagged 0.9.707 and 0.9.719 between S6 and S7, and KR-230 changed `std::net`'s `Poller`.
-- **Next: phase 9, Windows.** It is not planned yet; plan it with the maintainer. What is known:
+- **Next: phase 9, Windows**, planned on 2026-10-22 (see "Phase 9, planned"). What was known before it:
   - **libpq's WIN32 branches** in the pinned sources say what changes: the password and service files' places, the
     key file's permission check, `requirepeer`, and Unix-domain sockets. Read them there, not from memory.
   - **The poller needs no branch.** KR-230 put std's `Poller` on AFD over an I/O completion port on Windows (0.9.718),
     so the `Waiter` stays as it is.
-  - **@kama/tls must build and pass there first.** Its phase 7 is Windows, cross-built from macOS with zig on
-    2026-10-19 (`../kama-tls/docs/ROADMAP.md`, "Windows"). Its `trustSystem()` reads a CA bundle file, which Windows
-    does not have, and `sslrootcert=system` relies on it.
+  - **@kama/tls had to build and pass there first.** Its 0.1.7 (its phase 7) does, and imports the certificate store's
+    roots for `trustSystem()`, which `sslrootcert=system` relies on.
   - **The target.** kama's `--target WINDOWS` is `<arch>-windows-gnu`, and the platform branches here are
     `@compileFor(OS_…)`.
 - **Writing an example** (`examples/<name>/`):

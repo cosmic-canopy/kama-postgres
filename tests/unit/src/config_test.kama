@@ -174,6 +174,49 @@ fn string startupText(const ref Config c) {
     return got;
 }
 
+// pqGetHomeDirectory: HOME when it is set and not empty, else the account's home from its passwd entry.
+@compileFor(!OS_WINDOWS)
+fn int32 homeTests() {
+    int32 f = 0;
+    Environment homeless = testEnvironment();
+    homeless.setAccountHome(path: "/home/account");
+    Optional<string> fromAccount = homeless.homeDirectory();
+    f = f + check(ok: match (fromAccount) { case Some(value: h): h.equals(other: "/home/account"); case None: false; }, what: "config: no HOME, the account's home");
+    homeless.set(name: "HOME", value: "");
+    Optional<string> emptyHome = homeless.homeDirectory();
+    f = f + check(ok: match (emptyHome) { case Some(value: h): h.equals(other: "/home/account"); case None: false; }, what: "config: an empty HOME, the account's home");
+    Result<Config, PgError> viaAccount = resolveWith(text: "host=h", env: homeless);
+    f = f + check(ok: match (viaAccount) { case Ok(value: c): c.passfile().equals(other: "/home/account/.pgpass"); case Err(error: e): false; }, what: "config: the password file is in the account's home");
+    homeless.set(name: "HOME", value: "/home/env");
+    Optional<string> fromEnv = homeless.homeDirectory();
+    f = f + check(ok: match (fromEnv) { case Some(value: h): h.equals(other: "/home/env"); case None: false; }, what: "config: HOME comes first");
+    Environment neither = testEnvironment();
+    Optional<string> none = neither.homeDirectory();
+    f = f + check(ok: match (none) { case Some(value: h): false; case None: true; }, what: "config: no HOME and no account home, no home directory");
+    return f;
+}
+
+// On Windows, the application-data folder with "/postgresql" appended (SHGetFolderPath(CSIDL_APPDATA), read from
+// APPDATA until KPG-42). HOME and the account's home are not looked at, and the password file is pgpass.conf.
+@compileFor(OS_WINDOWS)
+fn int32 homeTests() {
+    int32 f = 0;
+    Environment roaming = testEnvironment();
+    roaming.setAccountHome(path: "C:\\Users\\account");
+    roaming.set(name: "HOME", value: "C:\\Users\\env");
+    Optional<string> none = roaming.homeDirectory();
+    f = f + check(ok: match (none) { case Some(value: h): false; case None: true; }, what: "config: no APPDATA, no home directory, whatever HOME and the account say");
+    roaming.set(name: "APPDATA", value: "");
+    Optional<string> empty = roaming.homeDirectory();
+    f = f + check(ok: match (empty) { case Some(value: h): false; case None: true; }, what: "config: an empty APPDATA, no home directory");
+    roaming.set(name: "APPDATA", value: "C:\\Users\\t\\AppData\\Roaming");
+    Optional<string> found = roaming.homeDirectory();
+    f = f + check(ok: match (found) { case Some(value: h): h.equals(other: "C:\\Users\\t\\AppData\\Roaming/postgresql"); case None: false; }, what: "config: the home directory is APPDATA's postgresql");
+    Result<Config, PgError> viaAppData = resolveWith(text: "host=h", env: roaming);
+    f = f + check(ok: match (viaAppData) { case Ok(value: c): c.passfile().equals(other: "C:\\Users\\t\\AppData\\Roaming/postgresql/pgpass.conf"); case Err(error: e): false; }, what: "config: the password file is pgpass.conf in it");
+    return f;
+}
+
 fn int32 environmentTests() {
     int32 f = 0;
     Environment env = testEnvironment();
@@ -217,22 +260,7 @@ fn int32 environmentTests() {
     string nm = errorOf(r: n);
     f = f + check(ok: nm.equals(other: "the local user name is not known"), what: "config: no user anywhere is an error");
 
-    // pqGetHomeDirectory: HOME when it is set and not empty, else the account's home from its passwd entry.
-    Environment homeless = testEnvironment();
-    homeless.setAccountHome(path: "/home/account");
-    Optional<string> fromAccount = homeless.homeDirectory();
-    f = f + check(ok: match (fromAccount) { case Some(value: h): h.equals(other: "/home/account"); case None: false; }, what: "config: no HOME, the account's home");
-    homeless.set(name: "HOME", value: "");
-    Optional<string> emptyHome = homeless.homeDirectory();
-    f = f + check(ok: match (emptyHome) { case Some(value: h): h.equals(other: "/home/account"); case None: false; }, what: "config: an empty HOME, the account's home");
-    Result<Config, PgError> viaAccount = resolveWith(text: "host=h", env: homeless);
-    f = f + check(ok: match (viaAccount) { case Ok(value: c): c.passfile().equals(other: "/home/account/.pgpass"); case Err(error: e): false; }, what: "config: the password file is in the account's home");
-    homeless.set(name: "HOME", value: "/home/env");
-    Optional<string> fromEnv = homeless.homeDirectory();
-    f = f + check(ok: match (fromEnv) { case Some(value: h): h.equals(other: "/home/env"); case None: false; }, what: "config: HOME comes first");
-    Environment neither = testEnvironment();
-    Optional<string> none = neither.homeDirectory();
-    f = f + check(ok: match (none) { case Some(value: h): false; case None: true; }, what: "config: no HOME and no account home, no home directory");
+    f = f + homeTests();
 
     // A libpq built with SSL (pqConnectOptions2, fe-connect.c at c45ba888): PGREQUIRESSL=1 is sslmode=require,
     // sslrootcert=system makes verify-full the default and refuses a weaker mode, and direct negotiation needs
@@ -309,16 +337,26 @@ fn string tlsPaths(const ref Config c) {
     return line;
 }
 
+// A home directory, and the directory libpq's TLS files default to under it: ~/.postgresql/ off Windows, and on
+// Windows the home itself, which is already PostgreSQL's own (libpq-int.h's USER_CERT_FILE and the rest).
+@compileFor(!OS_WINDOWS) fn void setHome(ref Environment env) { env.set(name: "HOME", value: "/home/t"); }
+@compileFor(!OS_WINDOWS) fn string tlsHome() { return "/home/t/.postgresql/"; }
+@compileFor(OS_WINDOWS) fn void setHome(ref Environment env) { env.set(name: "APPDATA", value: "C:\\Users\\t\\AppData\\Roaming"); }
+@compileFor(OS_WINDOWS) fn string tlsHome() { return "C:\\Users\\t\\AppData\\Roaming/postgresql/"; }
+
 fn int32 tlsSettingTests() {
     int32 f = 0;
     Environment home = testEnvironment();
-    home.set(name: "HOME", value: "/home/t");
+    setHome(env: ref home);
     home.set(name: "SSL_CERT_FILE", value: "/etc/bundle.pem");
     Result<Config, PgError> r1 = resolveWith(text: "host=h sslmode=disable", env: home);
     match (give r1) {
         case Ok(value: c): {
             string got = tlsPaths(c: c);
-            f = f + check(ok: got.equals(other: "/home/t/.postgresql/postgresql.crt|/home/t/.postgresql/postgresql.key|/home/t/.postgresql/root.crt|/home/t/.postgresql/root.crl|"),
+            string d = tlsHome();
+            string want = d.concat(other: "postgresql.crt|").concat(other: d).concat(other: "postgresql.key|").concat(other: d)
+                          .concat(other: "root.crt|").concat(other: d).concat(other: "root.crl|");
+            f = f + check(ok: got.equals(other: want),
                           what: "tls: every file defaults under the home directory (".concat(other: got).concat(other: ")"));
             bool system = match (c.tls().sslCertFile()) { case Some(value: v): v.equals(other: "/etc/bundle.pem"); case None: false; };
             f = f + check(ok: system, what: "tls: SSL_CERT_FILE comes from the environment");

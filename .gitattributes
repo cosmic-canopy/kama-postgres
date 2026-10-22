@@ -1,0 +1,4 @@
+# Every text file is LF in every checkout, Windows included, where Git's core.autocrlf=true would otherwise write CRLF.
+# The scripts run under a POSIX shell (Git Bash on Windows), the container reads tests/integration/server/ as written,
+# and the tests compare bytes read from files (examples/copy_csv/items.csv, README.md against the examples).
+* text=auto eol=lf

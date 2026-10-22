@@ -1,0 +1,66 @@
+[
+  {
+    "id": "N1",
+    "suite": "unit",
+    "file": "src/types/codec.kama",
+    "old": "case Ok(value: x): Result::Ok(value: x != x ? bitcast<float64>(0x7ff8000000000000ui64) : x);",
+    "new": "case Ok(value: x): Result::Ok(value: x);",
+    "expect": "codec: float8 'NaN'"
+  },
+  {
+    "id": "H1",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "case Some(value: a): { if (a.length() == 0) { return Optional::None; } return Optional::Some(value: a.concat(other: \"/postgresql\")); }",
+    "new": "case Some(value: a): { if (a.length() == 0) { return Optional::None; } return Optional::Some(value: give a); }",
+    "expect": "config: the home directory is APPDATA's postgresql"
+  },
+  {
+    "id": "H2",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "case Some(value: a): { if (a.length() == 0) { return Optional::None; } return",
+    "new": "case Some(value: a): { if (a.length() == 0) { return Optional::Some(value: \"/postgresql\"); } return",
+    "expect": "config: an empty APPDATA, no home directory"
+  },
+  {
+    "id": "H3",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "Optional<string> appdata = vars.get(name: \"APPDATA\");",
+    "new": "Optional<string> appdata = vars.get(name: \"HOME\");",
+    "expect": "config: no APPDATA, no home directory, whatever HOME and the account say"
+  },
+  {
+    "id": "H4",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "@compileFor(OS_WINDOWS) fn string passfileName() { return \"pgpass.conf\"; }",
+    "new": "@compileFor(OS_WINDOWS) fn string passfileName() { return \".pgpass\"; }",
+    "expect": "config: the password file is pgpass.conf in it"
+  },
+  {
+    "id": "H5",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "@compileFor(OS_WINDOWS) fn string userKeyFile() { return \"postgresql.key\"; }",
+    "new": "@compileFor(OS_WINDOWS) fn string userKeyFile() { return \".postgresql/postgresql.key\"; }",
+    "expect": "tls: every file defaults under the home directory"
+  },
+  {
+    "id": "H6",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "@compileFor(OS_WINDOWS) fn string rootCrlFile() { return \"root.crl\"; }",
+    "new": "@compileFor(OS_WINDOWS) fn string rootCrlFile() { return \"root.crl.pem\"; }",
+    "expect": "tls: every file defaults under the home directory"
+  },
+  {
+    "id": "K1",
+    "suite": "unit",
+    "file": "src/secure/setup.kama",
+    "old": "@compileFor(OS_WINDOWS)\nfn bool keyTooOpen(const ref Metadata m) { return false; }",
+    "new": "@compileFor(OS_WINDOWS)\nfn bool keyTooOpen(const ref Metadata m) { return (m.permissions.mode() & 63ui32) != 0ui32; }",
+    "expect": "a key others can read, unchecked on Windows"
+  }
+]

@@ -1,6 +1,6 @@
 {
   "lockVersion": 1,
   "packages": {
-    "@kama/tls": { "source": "registry", "url": "https://registry.kama-lang.org/@kama/tls/0.1.6.tar.gz", "registry": "https://registry.kama-lang.org", "version": "0.1.6", "integrity": "sha256-c773df6a34bf9af9f1fb169609cd40bcdd551c5f5cb0d413aae62e9922649676", "treeHash": "sha256-d4e0dcac5471b1d30b8633adce560f0b43b9b61714371fb7d2605528375426a8", "dependencies": [] }
+    "@kama/tls": { "source": "registry", "url": "https://registry.kama-lang.org/@kama/tls/0.1.7.tar.gz", "registry": "https://registry.kama-lang.org", "version": "0.1.7", "integrity": "sha256-fb3a0e0ab392b88a26c2794b602da032611b7e098c865642b0b37336ce8b9df6", "treeHash": "sha256-cb24e2c9349a9608ba32b7f4d440e39c7cdf6d963c29133d6c2021068d7e04c3", "dependencies": [] }
   }
 }

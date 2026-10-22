@@ -6,6 +6,17 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+Phase 9, Windows, under way.
+
+### Changed
+- **Needs `@kama/tls` ^0.1.7**, up from ^0.1.6. 0.1.7 is the first that builds and passes on Windows, and its
+  `trustSystem()` (behind `sslrootcert=system`) imports the Windows certificate store's roots there.
+
+### Fixed
+- A `float4` or `float8` read as the text `NaN` has PostgreSQL's NaN bits (`7ff8000000000000`) on every platform. On
+  Windows, std's parse took the C runtime's NaN, so the same column read in text and in binary differed in its bits
+  (KPG-43).
+
 ## [0.3.0] — 2026-10-22
 
 Phase 8. It adds a connection pool shared by isolates, with maintenance, and transactions scoped by a borrow window.

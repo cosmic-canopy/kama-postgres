@@ -270,6 +270,19 @@ unsafe fn int32 afterTests() {
     return f;
 }
 
+// Whether libpq checks a private key's permissions: not on Windows, where fe-secure-openssl.c's check is
+// `#if !defined(WIN32) && !defined(__CYGWIN__)` and 001_ssltests.pl skips its wrong-permissions case.
+@compileFor(!OS_WINDOWS) fn bool keyModeChecked() { return true; }
+@compileFor(OS_WINDOWS) fn bool keyModeChecked() { return false; }
+
+// Whether the tests run as root (uid 0), whose key at 0640 libpq accepts. Windows has no uid; the check is off there.
+@compileFor(!OS_WINDOWS)
+unsafe fn bool runsAsRoot() {
+    Result<UserId, IoError> who = currentUser();
+    return match (who) { case Ok(value: u): u.raw() == 0ui32; case Err(error: e): false; };
+}
+@compileFor(OS_WINDOWS) unsafe fn bool runsAsRoot() { return false; }
+
 // sslcertmode, and the key's permissions.
 unsafe fn int32 certificateTests() {
     int32 f = 0;
@@ -293,17 +306,21 @@ unsafe fn int32 certificateTests() {
     string open = withCert.concat(other: sharedKey);
     string tooOpen = messageOf(r: overTls(script: trustScript(), conninfo: open, server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
     string want = "private key file \"".concat(other: sharedKey).concat(other: "\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root");
-    f = f + check(ok: tooOpen.equals(other: want), what: "tls certificate: a key others can read (".concat(other: tooOpen).concat(other: ")"));
+    if (keyModeChecked()) {
+        f = f + check(ok: tooOpen.equals(other: want), what: "tls certificate: a key others can read (".concat(other: tooOpen).concat(other: ")"));
+    } else {
+        f = f + check(ok: tooOpen.equals(other: "(connected)"), what: "tls certificate: a key others can read, unchecked on Windows (".concat(other: tooOpen).concat(other: ")"));
+    }
     // 0640 is libpq's exception for a key root owns. The key is this process's, so the case is accepted when the tests
     // run as root (the Linux container) and refused otherwise, with the same message as 0644.
     string groupKey = scratch(name: "client-0640.key");
     Result<isize, IoError> w3 = writeFile(path: groupKey, bytes: keyBytes);
     Result<Unit, IoError> p3 = setPermissions(path: groupKey, permissions: Permissions::OwnerRead | Permissions::OwnerWrite | Permissions::GroupRead);
-    Result<UserId, IoError> who = currentUser();
-    bool root = match (who) { case Ok(value: u): u.raw() == 0ui32; case Err(error: e): false; };
     string grouped = messageOf(r: overTls(script: trustScript(), conninfo: withCert.concat(other: groupKey), server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
     string wantGrouped = "private key file \"".concat(other: groupKey).concat(other: "\" has group or world access; file must have permissions u=rw (0600) or less if owned by the current user, or permissions u=rw,g=r (0640) or less if owned by root");
-    if (root) {
+    if (!keyModeChecked()) {
+        f = f + check(ok: grouped.equals(other: "(connected)"), what: "tls certificate: a key at 0640, unchecked on Windows (".concat(other: grouped).concat(other: ")"));
+    } else if (runsAsRoot()) {
         f = f + check(ok: grouped.equals(other: "(connected)"), what: "tls certificate: a root-owned key at 0640 is libpq's exception (".concat(other: grouped).concat(other: ")"));
     } else {
         f = f + check(ok: grouped.equals(other: wantGrouped), what: "tls certificate: a key at 0640 not owned by root (".concat(other: grouped).concat(other: ")"));

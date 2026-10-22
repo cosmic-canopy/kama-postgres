@@ -8,10 +8,17 @@
 #   tools/check-readme.sh
 #
 # Hermetic: it reads files and builds nothing. To change a README block, change the example and copy the lines.
+# Python is $PYTHON, else the first of python3 and python that runs (on Windows, `python3` may be the Microsoft Store's
+# stub, which runs nothing).
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PYTHON=${PYTHON:-}
+for p in python3 python; do
+    if [ -z "$PYTHON" ] && "$p" -c '' >/dev/null 2>&1; then PYTHON=$p; fi
+done
+[ -n "$PYTHON" ] || { echo "check-readme.sh: no python3 or python that runs (set PYTHON)" >&2; exit 2; }
 
-python3 -I - "$ROOT" <<'PY'
+"$PYTHON" -I - "$ROOT" <<'PY'
 import glob, os, re, sys
 root = sys.argv[1]
 

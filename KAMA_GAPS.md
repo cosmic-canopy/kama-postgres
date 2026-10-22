@@ -22,7 +22,8 @@ changes the right design here, say so and we will follow it.
 zig bundled (`kama-windows-x64-bundled-v0.9.719.tar.gz`, checksum verified) and `../kama` built at the `v0.9.719` tag
 (`2808da06`) with msys2's UCRT64 clang.
 
-**Open now:** KPG-42 (MED). Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Open now:** KPG-42 (MED) and KPG-43 (LOW). Every other gap is fixed, except KPG-8, which is closed as a non-goal
+(see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -100,6 +101,58 @@ can then still set it, and `homeFrom` stops reading the variable.
 **Why MED:** a real capability is missing, and the workaround costs fidelity, not function. A client launched with a
 changed `APPDATA` (some service managers and sandboxes do this) looks for `pgpass.conf` and its certificates somewhere
 psql would not.
+
+### KPG-43 · LOW · `parse::<float64>("NaN")` gives a different NaN on Windows — OPEN
+
+Found in phase 9's first unit run on Windows. The codec cases `float4 'NaN'` and `float8 'NaN'` failed: "text and
+binary differ in bits". The binary vector is PostgreSQL's NaN, `7ff8000000000000`, and the text `NaN` read through
+std's `parse` came back with other bits. These cases pass on Linux and macOS in CI.
+
+std's float parse is `strtod`/`strtof` (`lib/std/fmt/parse.kama`, `kama_parse_f64_ck` in `include/kama_fmt.h`). The C
+library chooses the NaN, and UCRT's is not glibc's. The repro, one file:
+
+```kama
+import { core::println, std::fmt::parse, std::fmt::ParseError };
+
+fn uint8 main() {
+    Result<float64, ParseError> d = parse::<float64>(s: "NaN");
+    float64 x = match (d) { case Ok(value: v): v; case Err(error: e): 0.0; };
+    uint64 bits = bitcast<uint64>(x);
+    println(s: "parse::<float64>(\"NaN\") bits: ${bits:016x}");
+    Result<float32, ParseError> f = parse::<float32>(s: "NaN");
+    float32 y = match (f) { case Ok(value: v): v; case Err(error: e): 0.0; };
+    uint32 fbits = bitcast<uint32>(y);
+    println(s: "parse::<float32>(\"NaN\") bits: ${fbits:08x}");
+    float64 z = cast<float64>(0) / cast<float64>(0);
+    uint64 zbits = bitcast<uint64>(z);
+    println(s: "0.0 / 0.0 at run time bits:  ${zbits:016x}");
+    return 0;
+}
+```
+
+On both 0.9.719 builds:
+
+```
+parse::<float64>("NaN") bits: 7fffffffffffffff
+parse::<float32>("NaN") bits: 7fffffff
+0.0 / 0.0 at run time bits:  fff8000000000000
+```
+
+With glibc, `strtod("NaN")` is `7ff8000000000000`, the quiet NaN that C's `NAN`, Rust's `f64::NAN` and PostgreSQL's
+`get_float8_nan()` all are. Rust parses the spelling itself, so `"NaN".parse::<f64>()` gives those bits on every
+platform. The third line is the processor's own default NaN, sign set, for comparison; nothing here depends on it.
+
+**The ask:** the spellings `kama__float_spelling` admits for NaN read as the canonical quiet NaN (`7ff8000000000000`,
+`7fc00000`) on every target, so a parse means the same bits everywhere, as an integer parse does.
+
+**The workaround:** `floatText` in `src/types/codec.kama` turns any NaN that `parse` returns into
+`7ff8000000000000`: `get_float8_nan()`, and what `float8in` gives for `'NaN'` on a server built with glibc. A NaN read as
+text then has the same bits on every platform, and the same as one read in binary from such a server. Delete it when
+`parse` does this itself.
+
+**Why LOW:** a NaN is a NaN to every comparison, and PostgreSQL's too. The bits show only through `bitcast`, or when the
+value goes back to a server in binary. But kama's promise is the same program behaving the same on every target, and
+this is a case where it does not.
 
 ## FIXED — kept for the record
 

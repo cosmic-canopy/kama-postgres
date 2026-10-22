@@ -18,7 +18,11 @@ Linux aarch64 inside `localhost/kama-dev`), and the first report against `0.9.47
 workaround can be deleted when the gap closes. **We are not attached to any workaround.** If a fix
 changes the right design here, say so and we will follow it.
 
-**Open now:** none. Every gap is fixed, except KPG-8, which is closed as a non-goal (see below).
+**Windows (phase 9):** entries from KPG-42 on were run on Windows 11 x86-64 with `kama 0.9.719`, both the release with
+zig bundled (`kama-windows-x64-bundled-v0.9.719.tar.gz`, checksum verified) and `../kama` built at the `v0.9.719` tag
+(`2808da06`) with msys2's UCRT64 clang.
+
+**Open now:** KPG-42 (MED). Every other gap is fixed, except KPG-8, which is closed as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -29,7 +33,73 @@ changes the right design here, say so and we will follow it.
 
 ## OPEN
 
-None.
+### KPG-42 · MED · std has no per-user application-data folder, where libpq keeps its files on Windows — OPEN
+
+Found in phase 9 (Windows). On Windows, libpq's "home" is the roaming application-data folder plus `/postgresql`:
+`pqGetHomeDirectory` (fe-connect.c, REL_18 `c45ba888`) calls `SHGetFolderPath(NULL, CSIDL_APPDATA, NULL, 0, tmppath)`.
+`pgpass.conf`, `.pg_service.conf`, `postgresql.crt`, `postgresql.key`, `root.crt` and `root.crl` all live there. libpq
+never reads the `APPDATA` variable. It asks Windows, which answers from the user's profile.
+
+std offers the profile directory (`std::process::homeDirectory()`, `UserId.homeDirectory()`) and nothing for
+application data. The only way to that folder is the environment variable, which any parent process can change. The repro,
+one file:
+
+```kama
+import { core::println, core::envOr, std::io::IoError, std::process::currentUser, std::process::homeDirectory, std::process::UserId };
+
+fn uint8 main() {
+    Result<string, IoError> h = homeDirectory();
+    match (h) {
+        case Ok(value: v): println(s: "homeDirectory():               ${v}");
+        case Err(error: e): println(s: "homeDirectory() failed");
+    };
+    Result<UserId, IoError> u = currentUser();
+    match (u) {
+        case Ok(value: id): {
+            UserId me = id;
+            Result<string, IoError> uh = me.homeDirectory();
+            match (uh) {
+                case Ok(value: v): println(s: "currentUser().homeDirectory(): ${v}");
+                case Err(error: e): println(s: "currentUser().homeDirectory() failed");
+            };
+        }
+        case Err(error: e): println(s: "currentUser() failed");
+    };
+    string appdata = envOr(name: "APPDATA", dflt: "(unset)");
+    println(s: "the APPDATA variable:          ${appdata}");
+    return 0;
+}
+```
+
+On both 0.9.719 builds:
+
+```
+homeDirectory():               C:\Users\Matt
+currentUser().homeDirectory(): C:\Users\Matt
+the APPDATA variable:          C:\Users\Matt\AppData\Roaming
+```
+
+Run again with `APPDATA='C:\elsewhere'`, the last line follows the variable: `C:\elsewhere`. Windows' own answer does
+not. With the variable changed the same way, `powershell -Command "[Environment]::GetFolderPath('ApplicationData')"`
+still prints `C:\Users\Matt\AppData\Roaming`.
+
+**What other languages give:**
+- .NET: `Environment.GetFolderPath(SpecialFolder.ApplicationData)`, which asks the shell.
+- Rust's `dirs` crate: `config_dir()`, which is `SHGetKnownFolderPath(FOLDERID_RoamingAppData)` on Windows.
+- Go: `os.UserConfigDir()`, which reads `%AppData%`.
+
+On macOS and Linux the same call names `~/Library/Application Support` and `$XDG_CONFIG_HOME` (else `~/.config`), so
+it fits beside `homeDirectory()` as a cross-platform function. What this package needs is the Windows answer:
+`FOLDERID_RoamingAppData`, which is `CSIDL_APPDATA`.
+
+**The workaround:** `homeFrom`'s Windows twin in `src/config.kama` reads `APPDATA` from the captured `Environment`, as
+Go does. It differs from libpq only when the variable is unset, empty or changed. Once std has the call,
+`Environment.process()` captures the folder as it captures the account's home on Unix (`accountHomeDirectory`). A test
+can then still set it, and `homeFrom` stops reading the variable.
+
+**Why MED:** a real capability is missing, and the workaround costs fidelity, not function. A client launched with a
+changed `APPDATA` (some service managers and sandboxes do this) looks for `pgpass.conf` and its certificates somewhere
+psql would not.
 
 ## FIXED — kept for the record
 

@@ -1,12 +1,14 @@
 # CI for @kama/postgres. Copied in shape from @kama/sodium's workflow.
 #
 # Two jobs:
-#   - unit: tools/test.sh, the hermetic program, debug and release, on linux-x64 and macos-arm64.
+#   - unit: tools/test.sh, the hermetic program, debug and release, on linux-x64 and macos-arm64; it also builds the
+#     examples and checks that each README code block is code from one of them.
 #   - integration: a real PostgreSQL per matrix entry via tools/pg.sh (docker on the Linux runner; macOS
 #     runners have no container runtime). `tools/pg.sh smoke` first, one login per auth method with the
 #     server's own psql, so a misconfigured server fails apart from a wrong client; then
-#     tools/test-integration.sh: the integration suite, debug and release, once more over TLS, and then the restart
-#     leg, which stops, starts and restarts the server through tools/pg.sh.
+#     tools/test-integration.sh: the integration suite, debug and release, once more over TLS, then the restart
+#     leg, which stops, starts and restarts the server through tools/pg.sh, and last the examples, in plaintext and
+#     over TLS.
 #     19 is a beta, so it may fail without failing the run.
 # @kama/tls comes from the registry, pinned by kama.lock. The test PKI needs OpenSSL 3, which the Linux image
 # has and macOS has through Homebrew rather than as /usr/bin/openssl.
@@ -86,7 +88,7 @@ jobs:
       - name: Server smoke (one login per auth method)
         run: tools/pg.sh smoke --version ${{ matrix.pg }}
 
-      - name: Integration tests (debug, release, release over TLS, and restarts)
+      - name: Integration tests (debug, release, release over TLS, restarts, and the examples)
         run: tools/test-integration.sh --version ${{ matrix.pg }}
 
       - name: Server log on failure

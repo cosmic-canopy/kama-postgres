@@ -1,0 +1,98 @@
+[
+ {
+  "id": "E1",
+  "suite": "example",
+  "example": "quickstart",
+  "file": "src/decode.kama",
+  "old": "    if (rows.isNull(row: row, column: index)) { return Result::Ok(value: Optional::None); }\n    Result<T, PgError> v = column::<T>(rows: rows, row: row, index: index);",
+  "new": "    Result<T, PgError> v = column::<T>(rows: rows, row: row, index: index);",
+  "expect": "is NULL"
+ },
+ {
+  "id": "E2",
+  "suite": "example",
+  "example": "typed_rows",
+  "file": "src/query.kama",
+  "old": "case None: { w.writeNull(); }",
+  "new": "case None: { string empty = \"\"; Serializable value = empty; Result<Unit, Owned<Error>> r = value.serialize(w: ref w); }",
+  "expect": "expected one row, nut: 40 each from anyone, 2 tags"
+ },
+ {
+  "id": "E3",
+  "suite": "example",
+  "example": "transactions",
+  "file": "src/connection.kama",
+  "old": "return this.command(sql: \"ROLLBACK TO SAVEPOINT sp_${point}; RELEASE SAVEPOINT sp_${point}\");",
+  "new": "return this.command(sql: \"RELEASE SAVEPOINT sp_${point}\");",
+  "expect": "commit unexpectedly resulted in rollback"
+ },
+ {
+  "id": "E4",
+  "suite": "example",
+  "example": "copy_csv",
+  "file": "src/connection.kama",
+  "old": "if (n == 0) { return this.endCopyIn(); }",
+  "new": "if (n < 100) { return this.endCopyIn(); }",
+  "expect": "expected 3 rows, one with no supplier"
+ },
+ {
+  "id": "E5",
+  "suite": "example",
+  "example": "notify_worker",
+  "file": "src/notice.kama",
+  "old": "this.payloadText = give payload;",
+  "new": "this.payloadText = \"\"; string dropped = give payload;",
+  "expect": "no job came within 10 s"
+ },
+ {
+  "id": "E6",
+  "suite": "example",
+  "example": "notify_worker",
+  "file": "src/notice.kama",
+  "old": "this.pid = processId; this.channelName",
+  "new": "this.pid = 0; this.channelName",
+  "expect": "each from the producer's session"
+ },
+ {
+  "id": "E7",
+  "suite": "example",
+  "example": "shared_pool",
+  "file": "src/pool/pool.kama",
+  "old": "usize room = cast<usize>(size);",
+  "new": "usize room = cast<usize>(size) + 2;",
+  "expect": "expected every job to run, on 1 or 2 sessions"
+ },
+ {
+  "id": "E8",
+  "suite": "example",
+  "example": "batch",
+  "file": "src/connection.kama",
+  "old": "case Aborted: { results.add(item: BatchResult::Aborted); }",
+  "new": "case Aborted: { }",
+  "expect": "expected rows, a duplicate key, aborted"
+ },
+ {
+  "id": "R1",
+  "suite": "readme",
+  "file": "README.md",
+  "old": "options.minIdle = 1;   // the maintenance keeps one connection ready",
+  "new": "options.minIdle = 1;   // the maintenance keeps a connection ready",
+  "expect": "is not code from any example"
+ },
+ {
+  "id": "R2",
+  "suite": "readme",
+  "file": "examples/batch/src/main.kama",
+  "old": "batch.add(q: pg\"select count(*) from items\");",
+  "new": "batch.add(q: pg\"select count(*) as n from items\");",
+  "expect": "nearest: examples/batch/src/main.kama"
+ },
+ {
+  "id": "R3",
+  "suite": "readme",
+  "file": "tools/check-readme.sh",
+  "old": "got = dedent(lines[j:j + n])",
+  "new": "got = [l.rstrip() for l in lines[j:j + n]]",
+  "expect": "is not code from any example"
+ }
+]

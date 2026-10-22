@@ -1,0 +1,106 @@
+// typed_rows: parameters in, typed rows out. A query's holes are always parameters, never text spliced into the SQL:
+// an empty Optional is NULL and a DynamicArray is an array. A row reads into a @generate(Deserializable) type by column
+// name, and into std's JsonValue when its shape is not known in advance.
+//
+//   kama pkg install examples/typed_rows/kama.json
+//   PGHOST=localhost PGUSER=app PGDATABASE=inventory kama run examples/typed_rows/kama.json
+//   kama run examples/typed_rows/kama.json -- "postgresql://app@db.internal/inventory"
+//
+// The server is the connection string given as the argument, or libpq's PG* variables without one. The table is
+// temporary. Exit 0 when every row reads back as it was written.
+import { core::args, core::println, std::collections::DynamicArray, std::memory::Owned,
+         std::serialization::text::json::JsonValue, std::serialization::text::json::serializeJsonBuffer,
+         postgres::Config, postgres::Connection, postgres::Limits, postgres::PgError, postgres::Query, postgres::Rows,
+         postgres::pg, postgres::rowAs };
+
+// A row of `items`, field by column name. A column no field names is skipped. A field with no column is an error,
+// unless it is an Optional (None) or @field(default) (its declared value).
+@generate(Deserializable)
+type resource Item {
+    @field string name;
+    @field(name: "qty") int32 quantity;
+    @field Optional<string> supplier;
+    @field DynamicArray<string> tags;
+    @field(default) string unit = "each";
+
+    public const fn string described() {
+        string from = match (this.supplier) { case Some(value: s): copy s; case None: "anyone"; };
+        isize tagged = this.tags.length();
+        return "${this.name}: ${this.quantity} ${this.unit} from ${from}, ${tagged} tags";
+    }
+}
+
+// The row as an Item, described; or the error's message.
+unsafe fn string itemAt(const ref Rows rows, isize row) {
+    Result<Item, PgError> item = rowAs::<Item>(rows: rows, row: row);
+    return match (item) { case Ok(value: x): x.described(); case Err(error: e): e.message(); };
+}
+
+// One row in. Each hole is a parameter of its value's type. False, with the error printed, when the insert fails.
+unsafe fn bool stock(ref Connection conn, string name, int32 qty, Optional<string> supplier, DynamicArray<string> tags) {
+    Result<Optional<int64>, PgError> r = conn.execute(q: pg"insert into items (name, qty, supplier, tags) values (${name}, ${qty}, ${supplier}, ${tags})");
+    return match (r) { case Ok(value: n): true; case Err(error: e): { println(s: e.message()); return false; } };
+}
+
+fn uint8 main() {
+    Optional<string> given = args().get(at: 0);
+    string conninfo = match (give given) { case Some(value: s): give s; case None: ""; };
+    Result<Config, PgError> parsed = Config.parse(text: conninfo);
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Limits limits = Limits.defaults();
+    limits.resultBytes = Optional::Some(value: 64 * 1024 * 1024);   // fail a result over 64 MiB, and keep the session
+    config.setLimits(limits: limits);
+    Result<Connection, PgError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+
+    Result<Optional<int64>, PgError> made = conn.execute(q: pg"create temp table items (name text, qty int4, supplier text, tags text[])");
+    match (give made) { case Ok(value: n): { } case Err(error: e): { println(s: e.message()); return 1; } };
+    DynamicArray<string> metal = DynamicArray.empty();
+    metal.add(item: "metal");
+    DynamicArray<string> small = DynamicArray.empty();
+    small.add(item: "metal");
+    small.add(item: "small");
+    bool bolts = stock(conn: ref conn, name: "bolt", qty: 12, supplier: Optional::Some(value: "acme"), tags: give metal);
+    bool nuts = stock(conn: ref conn, name: "nut", qty: 40, supplier: Optional::None, tags: give small);
+    bool washers = stock(conn: ref conn, name: "washer", qty: 3, supplier: Optional::None, tags: DynamicArray.empty());
+    if (!(bolts && nuts && washers)) { return 1; }
+
+    // The pg tag: an empty Optional is NULL, so this asks for the items no supplier sells.
+    int32 least = 5;
+    Optional<string> supplier = Optional::None;
+    Query q = pg"select name, qty, supplier, tags from items where qty > ${least} and supplier is not distinct from ${supplier}";
+    Result<Rows, PgError> r = conn.query(q: q);
+    Rows unsupplied = match (give r) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    string first = itemAt(rows: unsupplied, row: 0);
+    if (unsupplied.rowCount() != 1 || !first.equals(other: "nut: 40 each from anyone, 2 tags")) { println(s: "expected one row, nut: 40 each from anyone, 2 tags"); return 1; }
+    println(s: give first);
+
+    // The same row whatever its shape: std's JsonValue, written back out as JSON.
+    Result<JsonValue, PgError> json = rowAs::<JsonValue>(rows: unsupplied, row: 0);
+    Result<string, Owned<Error>> text = match (json) {
+        case Ok(value: v): serializeJsonBuffer(v: v);
+        case Err(error: e): { println(s: e.message()); return 1; }
+    };
+    string written = match (give text) { case Ok(value: t): give t; case Err(error: e): "(not writable)"; };
+    if (!written.equals(other: "{\"name\":\"nut\",\"qty\":40,\"supplier\":null,\"tags\":[\"metal\",\"small\"]}")) { println(s: "expected the row as JSON"); return 1; }
+    println(s: give written);
+
+    // A Query built by hand: $1 is a text[] here, from a DynamicArray<string>.
+    DynamicArray<string> wanted = DynamicArray.empty();
+    wanted.add(item: "bolt");
+    wanted.add(item: "washer");
+    Query byName = Query.make(sql: "select * from items where name = any($1) order by name");
+    byName.add(value: wanted);
+    Result<Rows, PgError> r2 = conn.query(q: byName);
+    Rows named = match (give r2) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    string bolt = itemAt(rows: named, row: 0);
+    string washer = itemAt(rows: named, row: 1);
+    if (!bolt.equals(other: "bolt: 12 each from acme, 1 tags") || !washer.equals(other: "washer: 3 each from anyone, 0 tags")) {
+        println(s: "expected bolt: 12 each from acme, 1 tags and washer: 3 each from anyone, 0 tags");
+        return 1;
+    }
+    println(s: give bolt);
+    println(s: give washer);
+    conn.close();
+    return 0;
+}

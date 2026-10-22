@@ -1,0 +1,114 @@
+// transactions: money moved between two accounts in a transaction window. The window commits when every statement
+// went through, and rolls back on any other way out of its block, so a refused debit leaves both balances as they
+// were. A window inside a window is a savepoint, which rolls back alone. Last, a read-only serializable transaction
+// begun and committed without a window.
+//
+//   kama pkg install examples/transactions/kama.json
+//   PGHOST=localhost PGUSER=app PGDATABASE=inventory kama run examples/transactions/kama.json
+//   kama run examples/transactions/kama.json -- "postgresql://app@db.internal/inventory"
+//
+// The server is the connection string given as the argument, or libpq's PG* variables without one. The table is
+// temporary. Exit 0 when the balances after each step are the ones expected.
+import { core::args, core::println, std::collections::DynamicArray,
+         postgres::Config, postgres::Connection, postgres::PgError, postgres::Rows, postgres::column, postgres::pg,
+         postgres::TransactionOptions, postgres::IsolationLevel, postgres::AccessMode, postgres::sqlstate::CHECK_VIOLATION };
+
+// Moves `cents` from account 1 to account 2, or nothing at all.
+unsafe fn Result<Unit, PgError> transfer(ref Connection conn, int64 cents) {
+    borrow conn.transaction() as tx {
+        Result<Unit, PgError> begun = tx.began();
+        match (give begun) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Optional<int64>, PgError> debit = tx.conn().execute(q: pg"update accounts set balance = balance - ${cents} where id = 1");
+        match (give debit) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: give e); } };   // rolls back
+        Result<Optional<int64>, PgError> credit = tx.conn().execute(q: pg"update accounts set balance = balance + ${cents} where id = 2");
+        match (give credit) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: give e); } };
+        return tx.commit();
+    }
+}
+
+// Pays `interest` into account 2, and in a savepoint tries to take `fee` from account 1. The savepoint rolls back
+// alone when the fee is refused, and the interest is still committed.
+unsafe fn Result<Unit, PgError> payInterest(ref Connection conn, int64 interest, int64 fee) {
+    borrow conn.transaction() as tx {
+        Result<Unit, PgError> begun = tx.began();
+        match (give begun) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+        Result<Optional<int64>, PgError> paid = tx.conn().execute(q: pg"update accounts set balance = balance + ${interest} where id = 2");
+        match (give paid) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: give e); } };
+        borrow tx.conn().transaction() as charge {   // SAVEPOINT
+            Result<Optional<int64>, PgError> taken = charge.conn().execute(q: pg"update accounts set balance = balance - ${fee} where id = 1");
+            match (give taken) {
+                case Ok(value: n): {
+                    Result<Unit, PgError> kept = charge.commit();   // RELEASE
+                    match (give kept) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
+                }
+                case Err(error: e): { println(s: "the fee is refused: ".concat(other: e.message())); }
+            };
+        }   // ROLLBACK TO and RELEASE, unless committed
+        return tx.commit();
+    }
+}
+
+// The balances, in account order ("7500 2500"), or the error's message.
+unsafe fn string balances(ref Connection conn) {
+    Result<Rows, PgError> r = conn.query(q: pg"select balance from accounts order by id");
+    Rows rows = match (give r) { case Ok(value: v): give v; case Err(error: e): { return e.message(); } };
+    string all = "";
+    isize i = 0;
+    while (i < rows.rowCount()) {
+        Result<int64, PgError> b = column::<int64>(rows: rows, row: i, index: 0);
+        int64 cents = match (b) { case Ok(value: v): v; case Err(error: e): { return e.message(); } };
+        if (i > 0) { all = all.concat(other: " "); }
+        all = all.concat(other: "${cents}");
+        i = i + 1;
+    }
+    return all;
+}
+
+fn uint8 main() {
+    Optional<string> given = args().get(at: 0);
+    string conninfo = match (give given) { case Some(value: s): give s; case None: ""; };
+    Result<Config, PgError> parsed = Config.parse(text: conninfo);
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, PgError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Optional<int64>, PgError> made = conn.execute(q: pg"create temp table accounts (id int4 primary key, balance int8 not null check (balance >= 0))");
+    match (give made) { case Ok(value: n): { } case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Optional<int64>, PgError> opening = conn.execute(q: pg"insert into accounts values (1, 10000), (2, 0)");
+    match (give opening) { case Ok(value: n): { } case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // Committed.
+    Result<Unit, PgError> moved = transfer(conn: ref conn, cents: 2500);
+    match (give moved) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+    string after = balances(conn: ref conn);
+    println(s: "after a transfer of 2500: ${after}");
+    if (!after.equals(other: "7500 2500")) { println(s: "expected 7500 2500"); return 1; }
+
+    // The debit breaks the CHECK, and the window rolls back: neither balance moves.
+    Result<Unit, PgError> refused = transfer(conn: ref conn, cents: 9000);
+    bool checked = match (refused) { case Ok(value: u): false; case Err(error: e): e.sqlstate() == CHECK_VIOLATION; };
+    string still = balances(conn: ref conn);
+    println(s: "after a transfer of 9000 is refused: ${still}");
+    if (!checked || !still.equals(other: "7500 2500")) { println(s: "expected the CHECK's error, and 7500 2500"); return 1; }
+
+    // The savepoint rolls back; the interest stays.
+    Result<Unit, PgError> paid = payInterest(conn: ref conn, interest: 100, fee: 99999);
+    match (give paid) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+    string withInterest = balances(conn: ref conn);
+    println(s: "after interest, with the fee refused: ${withInterest}");
+    if (!withInterest.equals(other: "7500 2600")) { println(s: "expected 7500 2600"); return 1; }
+
+    // Without a window: a consistent read of the total, which no concurrent writer can change underneath.
+    TransactionOptions options = TransactionOptions.of(isolation: IsolationLevel::Serializable, access: AccessMode::ReadOnly, deferrable: true);
+    Result<Unit, PgError> begun = conn.begin(options: options);
+    match (give begun) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Rows, PgError> total = conn.query(q: pg"select sum(balance)::int8 from accounts");
+    Result<Unit, PgError> done = conn.commit();
+    Rows sum = match (give total) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    match (give done) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<int64, PgError> cents = column::<int64>(rows: sum, row: 0, index: 0);
+    int64 held = match (cents) { case Ok(value: v): v; case Err(error: e): { println(s: e.message()); return 1; } };
+    println(s: "in all: ${held}");
+    conn.close();
+    if (held != 10100i64) { println(s: "expected 10100 in all"); return 1; }
+    return 0;
+}

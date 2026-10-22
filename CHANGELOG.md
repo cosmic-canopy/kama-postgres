@@ -92,6 +92,20 @@ All notable changes to this package are recorded here. The format follows
   flipped byte, four kinds of bad length, cut short, another type, dropped, sent twice, bytes inserted), with every
   choice drawn from a seed. The client must answer with a result or a `PgError` that says something, never panic, and
   end the session after a protocol error. `PGTEST_GARBLE_SEEDS` runs more seeds; 500 (a million cases) find nothing.
+- **Examples** (`examples/`), each a program of its own that checks what it reads back and exits 1 when something is
+  wrong:
+  - `quickstart`;
+  - `typed_rows`;
+  - `transactions`;
+  - `copy_csv`;
+  - `notify_worker`, a LISTEN/NOTIFY worker;
+  - `shared_pool`, a pool shared by isolates;
+  - `batch`.
+
+  Each takes a connection string as its argument, or reads libpq's `PG*` variables without one. `tools/test.sh` builds
+  them. `tools/test-integration.sh` runs them against every server, in plaintext and over TLS with
+  `sslmode=verify-full`. Every code block in the README is now code from one of them, which `tools/check-readme.sh`
+  checks, so what a reader copies compiles.
 
 ### Changed
 - **Needs kama ≥ 0.9.690.** It has, of what this package relies on:

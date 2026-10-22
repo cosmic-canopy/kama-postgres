@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-21: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2, S3, S4 and S5 are done, and the ports to kama 0.9.673 and 0.9.690). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-21: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2, S3, S4, S5 and S6 are done, and the ports to kama 0.9.673 and 0.9.690). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -52,7 +52,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4 and S5 done; S6 next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4, S5 and S6 done; S7 next |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -297,9 +297,39 @@ it fail.
     All are caught. The unit ones ran in a copy of the tree whose `main` runs only the pool group (see the gate below).
   - **One line has no mutation:** the retire loop's `Empty` arm, which cannot be reached, since the sweep's list holds only
     idle connections. S4's four lines stand as S4 left them.
-- **S6, examples.** `examples/<name>/`, each its own executable project, as in @kama/sodium: quickstart, typed rows,
-  transactions, COPY from a CSV file, a LISTEN/NOTIFY worker, a pool shared by isolates, a batch. `tools/test.sh`
-  builds them; `tools/test-integration.sh` runs them live.
+- **S6, done: examples** (planned with the maintainer on 2026-10-21). No change to the source was needed.
+  - **Seven programs**, each `examples/<name>/`, its own executable project, as in @kama/sodium and @kama/redis:
+    - `quickstart`;
+    - `typed_rows`;
+    - `transactions`;
+    - `copy_csv`, which reads the `items.csv` beside it;
+    - `notify_worker`;
+    - `shared_pool`;
+    - `batch`.
+
+    Each checks what it reads back, prints what was expected, and exits 1. Their tables are temporary: on 15 and later
+    `kp_trust` cannot create a table in `public`, and a pooled connection's reset drops temporary tables, so
+    `shared_pool` uses none.
+  - **The server comes from libpq's environment.** The connection string is the first argument, or `""`, so the `PG*`
+    variables, service file and `.pgpass` apply, as for psql with no argument.
+  - **Each example's `kama.lock`** pins the newest `@kama/tls` the range admits (0.1.6), as a consumer's would. That
+    is redis's practice. The package's own locks stay at 0.1.4.
+  - **The README is code from the examples.** `tools/check-readme.sh` (hermetic, run by `tools/test.sh`) requires
+    every ```` ```kama ```` block to be a run of consecutive lines of some `examples/*/src/*.kama`, after each side's
+    common indentation is stripped. A failure names the README line, the nearest run and the first line that differs.
+    This is stricter than redis's check, which builds only the README's complete programs. The README's
+    `setStatementCache` line became prose, and its pool section three excerpts of `shared_pool`.
+  - **Scripts:**
+    - `tools/test.sh` builds every example, debug and release, then runs the README check.
+    - `tools/test-integration.sh` builds them once, and per version, after the restart leg, runs each from its own
+      directory, debug in plaintext and release over TLS (`sslmode=verify-full`, with the test CA). Each run gets
+      `env -i` with the `PG*` variables and a scratch `HOME`, so nothing of the developer's environment is read.
+    - `tools/mutate.sh` gained two suites:
+      - `"example"`, which builds and runs one example as the integration runner does, in plaintext;
+      - `"readme"`, which runs `tools/check-readme.sh`.
+
+      In both, a mutation is caught when the run exits other than 0 and printed the `expect` text.
+  - **Mutations:** `tools/mutations/s6.json`, 8 for the examples and 3 for the README check. All are caught.
 - **S7, docs and 0.3.0.**
   - Make the README's links absolute, because the registry renders a relative link as plain text.
   - Update the CHANGELOG, this file and AGENTS.postgres.md.
@@ -323,22 +353,29 @@ it fail.
 - **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
   for changes.
 
-**What the next session needs to know** (written 2026-10-21, after S5):
-- **Where it stands.** S0, S0b, S1, S2, S3, S4 and S5 are done, and so are the ports to kama 0.9.673 and 0.9.690. No
+**What the next session needs to know** (written 2026-10-21, after S6):
+- **Where it stands.** S0, S0b, S1, S2, S3, S4, S5 and S6 are done, and so are the ports to kama 0.9.673 and 0.9.690. No
   gap is open. Nothing is pushed: pushing waits for the maintainer.
-- **Next: S6, examples.** Each example is `examples/<name>/`, its own executable project, as in @kama/sodium
-  (`../kama-sodium/examples/udp_channel`, built by its `tools/test.sh`). There are seven:
-  - quickstart;
-  - typed rows;
-  - transactions;
-  - COPY from a CSV file;
-  - a LISTEN/NOTIFY worker;
-  - a pool shared by isolates;
-  - a batch.
-
-  `tools/test.sh` builds them, and `tools/test-integration.sh` runs them live. The README's code blocks should be the
-  examples' code, so that what a reader copies is code that compiles. The README's pool example
-  (`borrow lease.conn().transaction() as tx`) now has a unit case, `windowOnLease`.
+- **Next: S7, docs and 0.3.0.**
+  - The README's relative links (`docs/ROADMAP.md`, the licenses) become absolute: the registry renders a relative link
+    as plain text. The links S6 added are absolute already.
+  - The README's status note still says the pool is "coming in 0.3.0", and its install line says `^0.2.0`.
+  - The CHANGELOG's `[Unreleased]` becomes `[0.3.0]`, `kama.json`'s version is raised, and `v0.3.0` is tagged for the
+    registry to publish, after the gate. Publishing happens only when the maintainer says so.
+  - **Ask the maintainer about `@kama/tls`.** The locks pin 0.1.4. 0.1.5 fixed a race between a shared `TlsConfig`'s
+    setters, which this package never reaches: it builds a `TlsConfig` per attempt and never shares one. 0.1.6 builds on
+    kama 0.9.707. The examples' locks already resolve 0.1.6, and run on 0.9.690. Raising the floor (`^0.1.3`) is not
+    needed for anything this package does.
+- **Writing an example** (`examples/<name>/`):
+  - The manifest is the other examples' (`"@kama/postgres": { "path": "../.." }` alone), and `kama pkg install` writes its
+    `kama.lock`, which is committed.
+  - It takes the connection string from its first argument, or `""`. It checks what it reads back and exits 1 with one
+    line saying what was expected.
+  - Its tables are temporary. A table a pooled connection needs across leases cannot be temporary, and `kp_trust`
+    cannot create one in `public` on 15 and later.
+  - A README block is copied from an example, never typed: change the example, then copy its lines. `tools/check-readme.sh`
+    names the nearest run and the first line that differs.
+  - A new example needs a mutation in `src/` that its own check catches (`"suite": "example"`).
 - **Writing a pool case** (`tests/unit/src/pool_test.kama`):
   - **Choosing the connector.** `keptPool` (`ScriptConnector.pinging`) answers a ping whenever it comes, taking no step,
     so a `Stall` in its script is reached only by a message that is not a ping. A case whose ping must go unanswered
@@ -350,12 +387,12 @@ it fail.
     starts it. The new pool cases passed five debug and five release runs of the pool group, then the whole gate. If a
     case flakes in CI, widen its margin rather than retrying it.
 - **The gate, per step:**
-  - `tools/test.sh`, which runs the unit suite in debug and release;
-  - `tools/test-integration.sh`, on 14–19 in debug, release and TLS, then the restart leg;
+  - `tools/test.sh`, which runs the unit suite in debug and release, builds the examples and checks the README;
+  - `tools/test-integration.sh`, on 14–19 in debug, release and TLS, then the restart leg, then the examples;
   - **`tools/mutate.sh tools/mutations/<step>.json --version 18`**. This runs each mutation in a copy of the tree and
     exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json`, S1's 35 in `s1.json`, S2's 47
-    in `s2.json`, S3's 27 in `s3.json`, S4's 44 in `s4.json` and S5's 23 in `s5.json`. All were run on 0.9.690, and
-    S3's again on S4's code.
+    in `s2.json`, S3's 27 in `s3.json`, S4's 44 in `s4.json`, S5's 23 in `s5.json` and S6's 11 in `s6.json`. All were
+    run on 0.9.690, and S3's again on S4's code.
     Write a file per step, and re-run older files when their code changes. A `BAD-PATTERN` means the source moved on, so update the mutation. PANICKED is
     a run that died before any case failed; an entry may expect it, and may set `"env"` (the restart mutations set
     `PGTEST_RESTART=1`) and `"timeout"`. A run that times out is judged by what it printed first, since a pool mutant

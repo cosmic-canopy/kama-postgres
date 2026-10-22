@@ -12,6 +12,12 @@
 # or PANICKED for a mutation the program must die of. An entry may add "env": {"NAME": "value", …} for its run, and
 # "timeout": seconds (900 by default); a run that times out is judged by what it printed before it was stopped.
 #
+# Two more suites check what is not a test program:
+#   "suite": "example", "example": "<name>"   examples/<name>, built in debug and run as tools/test-integration.sh runs
+#                                             it in plaintext (needs --version);
+#   "suite": "readme"                         tools/check-readme.sh.
+# Neither prints FAIL lines: the run fails when it exits other than 0, and `expect` is part of any line it printed.
+#
 # The tree is copied to a scratch directory (without .git and out/), so the working tree is never touched. For each
 # mutation, the copy's file is changed, the suite is built in debug and run, and the file is put back. The verdict:
 #   CAUGHT            the targeted case failed;
@@ -52,6 +58,12 @@ python3 -I - "$tmp" "$KAMA" "$ROOT/$FILE" "$ROOT/out/test-certs" "$envfile" "$so
 import json, os, subprocess, sys, tempfile
 tmp, kama, path, certs, envfile, sockets = sys.argv[1:7]
 only = set(sys.argv[7:])
+installed = set()
+
+def printed(out):
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", "replace")
+    return out or ""
 tree = os.path.join(tmp, "tree")
 env = dict(os.environ, PGTEST_CERTDIR=certs)
 if envfile:
@@ -64,7 +76,7 @@ missed = 0
 for m in json.load(open(path)):
     if only and m["id"] not in only:
         continue
-    if m["suite"] == "integration" and not envfile:
+    if m["suite"] in ("integration", "example") and not envfile:
         continue
     target = os.path.join(tree, m["file"])
     src = open(target).read()
@@ -75,28 +87,55 @@ for m in json.load(open(path)):
         continue
     open(target, "w").write(src.replace(m["old"], m["new"]))
     try:
-        exe = os.path.join(tmp, "mutant")
-        manifest = os.path.join(tree, "tests", m["suite"], "kama.json")
-        b = subprocess.run([kama, "build", manifest, "--debug", "-o", exe], capture_output=True, text=True)
-        if b.returncode != 0:
-            print(f"{m['id']}: BUILD-FAILED\n{(b.stdout + b.stderr)[-600:]}", flush=True)
-            missed += 1
-            continue
-        work = tempfile.mkdtemp(dir=tmp)
-        os.makedirs(os.path.join(work, "home"))
-        try:
-            r = subprocess.run([exe], capture_output=True, text=True, timeout=m.get("timeout", 900),
-                               env=dict(env, PGTEST_TMP=work, PGTEST_SOCKDIR=sockets, **m.get("env", {})))
-            fails = [l.strip()[5:] for l in r.stdout.splitlines() if l.strip().startswith("FAIL ")]
-            # A run that ends badly with no case failed died before one could: a panic, or a signal.
-            if not fails and r.returncode != 0:
-                fails = ["PANICKED: " + (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]]
-        except subprocess.TimeoutExpired as e:
-            # A mutant may fail its case and then hang (a deadlock it causes later): what it printed still counts.
-            out = e.stdout or ""
-            if isinstance(out, bytes):
-                out = out.decode("utf-8", "replace")
-            fails = [l.strip()[5:] for l in out.splitlines() if l.strip().startswith("FAIL ")] + ["(timed out)"]
+        if m["suite"] == "readme":
+            r = subprocess.run(["sh", os.path.join(tree, "tools", "check-readme.sh")], capture_output=True, text=True)
+            fails = [l.strip() for l in (r.stdout + r.stderr).splitlines() if l.strip()] if r.returncode != 0 else []
+        elif m["suite"] == "example":
+            # Run as tools/test-integration.sh runs it in plaintext: from its directory, the server in PG* alone.
+            exe = os.path.join(tmp, "mutant")
+            where = os.path.join(tree, "examples", m["example"])
+            manifest = os.path.join(where, "kama.json")
+            if manifest not in installed:
+                subprocess.run([kama, "pkg", "install", manifest], capture_output=True, text=True)
+                installed.add(manifest)
+            b = subprocess.run([kama, "build", manifest, "--debug", "-o", exe], capture_output=True, text=True)
+            if b.returncode != 0:
+                print(f"{m['id']}: BUILD-FAILED\n{(b.stdout + b.stderr)[-600:]}", flush=True)
+                missed += 1
+                continue
+            work = tempfile.mkdtemp(dir=tmp)
+            alone = {"PATH": os.environ["PATH"], "HOME": work, "PGHOST": env["PGTEST_HOST"], "PGPORT": env["PGTEST_PORT"],
+                     "PGDATABASE": env["PGTEST_DATABASE"], "PGUSER": "kp_trust", "PGSSLMODE": "disable"}
+            try:
+                r = subprocess.run([exe], capture_output=True, text=True, timeout=m.get("timeout", 900), cwd=where,
+                                   env=dict(alone, **m.get("env", {})))
+                # Last line first: an example says what was wrong as it exits.
+                fails = [l.strip() for l in (r.stdout + r.stderr).splitlines() if l.strip()][::-1] if r.returncode != 0 else []
+                if r.returncode < 0:
+                    fails = ["PANICKED: signal %d" % -r.returncode] + fails
+            except subprocess.TimeoutExpired as e:
+                fails = [l.strip() for l in (printed(e.stdout) + printed(e.stderr)).splitlines() if l.strip()] + ["(timed out)"]
+        else:
+            exe = os.path.join(tmp, "mutant")
+            manifest = os.path.join(tree, "tests", m["suite"], "kama.json")
+            b = subprocess.run([kama, "build", manifest, "--debug", "-o", exe], capture_output=True, text=True)
+            if b.returncode != 0:
+                print(f"{m['id']}: BUILD-FAILED\n{(b.stdout + b.stderr)[-600:]}", flush=True)
+                missed += 1
+                continue
+            work = tempfile.mkdtemp(dir=tmp)
+            os.makedirs(os.path.join(work, "home"))
+            try:
+                r = subprocess.run([exe], capture_output=True, text=True, timeout=m.get("timeout", 900),
+                                   env=dict(env, PGTEST_TMP=work, PGTEST_SOCKDIR=sockets, **m.get("env", {})))
+                fails = [l.strip()[5:] for l in r.stdout.splitlines() if l.strip().startswith("FAIL ")]
+                # A run that ends badly with no case failed died before one could: a panic, or a signal.
+                if not fails and r.returncode != 0:
+                    fails = ["PANICKED: " + (r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1]]
+            except subprocess.TimeoutExpired as e:
+                # A mutant may fail its case and then hang (a deadlock it causes later): what it printed still counts.
+                out = printed(e.stdout)
+                fails = [l.strip()[5:] for l in out.splitlines() if l.strip().startswith("FAIL ")] + ["(timed out)"]
         hits = [f for f in fails if m["expect"] in f]
         if hits:
             verdict, shown = "CAUGHT", hits[0]

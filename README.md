@@ -19,46 +19,90 @@ release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta.
 ## Using it
 
 ```kama
-import { core::println, std::collections::DynamicArray,
+import { core::args, core::println, std::collections::DynamicArray,
          postgres::Config, postgres::Connection, postgres::PgError, postgres::Rows, postgres::column,
          postgres::columnOpt };
 
 fn uint8 main() {
     // A libpq connection string; the service file, PG* variables and ~/.pgpass apply as they do for psql.
-    Result<Config, PgError> parsed = Config.parse(text: "postgresql://app@db.internal/inventory?connect_timeout=5");
+    Optional<string> given = args().get(at: 0);
+    string conninfo = match (give given) { case Some(value: s): give s; case None: ""; };
+    Result<Config, PgError> parsed = Config.parse(text: conninfo);
     Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
     Result<Connection, PgError> opened = Connection.connect(config: config);
     Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
 
-    Result<DynamicArray<Rows>, PgError> r = conn.simpleQuery(sql: "select name, qty from items order by name");
+    bool encrypted = conn.sslInUse();
+    Optional<string> protocol = conn.sslAttribute(name: "protocol");   // "TLSv1.3"
+    string version = match (give protocol) { case Some(value: p): give p; case None: "none"; };
+    println(s: "encrypted: ${encrypted} (${version})");
+
+    // A simple query may hold several statements, and gives one Rows for each.
+    string sql = "create temp table items (name text, qty int4);"
+        .concat(other: "insert into items values ('bolt', 12), ('nut', 40), (null, 3);")
+        .concat(other: "select name, qty from items order by qty");
+    Result<DynamicArray<Rows>, PgError> r = conn.simpleQuery(sql: sql);
     DynamicArray<Rows> results = match (give r) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    string listed = "";
     isize i = 0;
-    while (i < results[0].rowCount()) {
-        // Typed access, as PQgetvalue addresses a value: the result, the row, the column.
-        Result<Optional<string>, PgError> name = columnOpt::<string>(rows: results[0], row: i, index: 0);
-        Result<int32, PgError> qty = column::<int32>(rows: results[0], row: i, index: 1);
-        match (give name) {
-            case Ok(value: n): { match (give n) { case Some(value: s): { println(s: give s); } case None: { println(s: "(null)"); } }; }
-            case Err(error: e): { println(s: e.message()); }
-        };
+    while (i < results[2].rowCount()) {
+        // Typed access, as PQgetvalue addresses a value: the result, the row, the column. NULL reads only into an Optional.
+        Result<Optional<string>, PgError> name = columnOpt::<string>(rows: results[2], row: i, index: 0);
+        Result<int32, PgError> qty = column::<int32>(rows: results[2], row: i, index: 1);
+        Optional<string> named = match (give name) { case Ok(value: n): give n; case Err(error: e): { println(s: e.message()); return 1; } };
+        int32 count = match (qty) { case Ok(value: q): q; case Err(error: e): { println(s: e.message()); return 1; } };
+        string shown = match (give named) { case Some(value: s): give s; case None: "(no name)"; };
+        println(s: "${shown}: ${count}");
+        if (i > 0) { listed = listed.concat(other: ", "); }
+        listed = listed.concat(other: "${shown} ${count}");
         i = i + 1;
     }
     conn.close();
+    if (!listed.equals(other: "(no name) 3, bolt 12, nut 40")) { println(s: "expected (no name) 3, bolt 12, nut 40"); return 1; }
     return 0;
 }
 ```
+
+That is [`examples/quickstart`](https://github.com/cosmic-canopy/kama-postgres/blob/main/examples/quickstart/src/main.kama),
+and every code block in this README comes from one of the [examples](#examples), each of which has run against every
+server this package is tested on.
 
 Parameters go through the extended protocol, with the `pg` tag or a `Query`. A hole is always a parameter, never
 text in the SQL. Holes are typed: an empty `Optional` is NULL, and a `DynamicArray<uint8>` is bytea:
 
 ```kama
+int32 least = 5;
 Optional<string> supplier = Optional::None;
-Query q = pg"select name, qty from items where qty > ${least} and supplier is not distinct from ${supplier}";
+Query q = pg"select name, qty, supplier, tags from items where qty > ${least} and supplier is not distinct from ${supplier}";
 Result<Rows, PgError> r = conn.query(q: q);
 ```
 
-`rowAs::<T>` reads a row into a `@generate(Deserializable)` type by column name. A row or a column also reads into
-std's `JsonValue`, when its shape is not known in advance. `prepare` gives a reusable
+`rowAs::<T>` reads a row into a `@generate(Deserializable)` type by column name:
+
+```kama
+@generate(Deserializable)
+type resource Item {
+    @field string name;
+    @field(name: "qty") int32 quantity;
+    @field Optional<string> supplier;
+    @field DynamicArray<string> tags;
+    @field(default) string unit = "each";
+
+    public const fn string described() {
+        string from = match (this.supplier) { case Some(value: s): copy s; case None: "anyone"; };
+        isize tagged = this.tags.length();
+        return "${this.name}: ${this.quantity} ${this.unit} from ${from}, ${tagged} tags";
+    }
+}
+
+// The row as an Item, described; or the error's message.
+unsafe fn string itemAt(const ref Rows rows, isize row) {
+    Result<Item, PgError> item = rowAs::<Item>(rows: rows, row: row);
+    return match (item) { case Ok(value: x): x.described(); case Err(error: e): e.message(); };
+}
+```
+
+A row or a column also reads into std's `JsonValue`, when its shape is not known in advance. `prepare` gives a reusable
 `Statement`. `startRows`/`nextRows` read a large result a chunk at a time, and `openPortal`/`fetch` read a
 cursor inside a transaction.
 
@@ -76,9 +120,13 @@ TLS and then plaintext, `allow` the other way round, each on a new connection af
 verified under any `sslmode`, and `verify-full` checks the server's name by libpq's rules (subjectAltNames, then the
 CN, one-label wildcards).
 
+```sh
+kama run examples/quickstart/kama.json -- "host=db.internal dbname=inventory user=app sslmode=verify-full sslrootcert=/etc/pg/ca.crt"
+```
+
+The quickstart then reads back what the session negotiated:
+
 ```kama
-Result<Config, PgError> parsed = Config.parse(text: "host=db.internal dbname=inventory user=app sslmode=verify-full sslrootcert=/etc/pg/ca.crt");
-// … connect as above; then:
 bool encrypted = conn.sslInUse();
 Optional<string> protocol = conn.sslAttribute(name: "protocol");   // "TLSv1.3"
 ```
@@ -113,7 +161,8 @@ left by any path (its end, `return`, `break`, `continue`): ROLLBACK, unless it w
 window, and `tx.conn()` reaches it:
 
 ```kama
-fn Result<Unit, PgError> transfer(ref Connection conn, int64 cents) {
+// Moves `cents` from account 1 to account 2, or nothing at all.
+unsafe fn Result<Unit, PgError> transfer(ref Connection conn, int64 cents) {
     borrow conn.transaction() as tx {
         Result<Unit, PgError> begun = tx.began();
         match (give begun) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
@@ -149,7 +198,8 @@ fn Result<Unit, PgError> transfer(ref Connection conn, int64 cents) {
 ```kama
 TransactionOptions options = TransactionOptions.of(isolation: IsolationLevel::Serializable, access: AccessMode::ReadOnly, deferrable: true);
 Result<Unit, PgError> begun = conn.begin(options: options);
-// … queries …
+match (give begun) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return 1; } };
+Result<Rows, PgError> total = conn.query(q: pg"select sum(balance)::int8 from accounts");
 Result<Unit, PgError> done = conn.commit();
 ```
 
@@ -159,8 +209,8 @@ COPY runs as libpq runs it, and std::io drives it, as pgx's CopyFrom and CopyTo 
 
 ```kama
 Result<File, IoError> opened = File.open(path: "items.csv", mode: OpenMode::Read);
-// … unwrap it into `file` …
-Result<Optional<int64>, PgError> copied = conn.copyFrom(sql: "copy items (name, qty) from stdin (format csv)", source: file);
+File file = match (give opened) { case Ok(value: f): give f; case Err(error: e): { println(s: e.message()); return 1; } };
+Result<Optional<int64>, PgError> copied = conn.copyFrom(sql: "copy items (name, qty, supplier) from stdin (format csv, header true)", source: file);
 ```
 
 `copyTo(sql:, sink:)` writes COPY OUT to any `Writer`. The calls underneath are libpq's:
@@ -177,13 +227,8 @@ the rest.
 
 Each SQL text is prepared once, as a named statement, and bound directly after that. A repeated query then takes one
 round trip instead of two. This is pgx's design, and it is on by default, with 512 statements kept and the least
-recently used closed. It is set on the `Config`, since libpq has no keyword for it:
-
-```kama
-config.setStatementCache(mode: CacheMode::Describe, capacity: 512);   // for a pooler without named statements
-```
-
-The modes:
+recently used closed. It is set on the `Config`, since libpq has no keyword for it, with
+`config.setStatementCache(mode:, capacity:)`. The modes:
 
 - `CacheMode::Describe` keeps only descriptions, and parses the unnamed statement on each run.
 - `CacheMode::Off` describes before every run.
@@ -198,7 +243,12 @@ A `Batch` sends many queries in one round trip, and is pgx's SendBatch:
 
 ```kama
 Batch batch = Batch.make();
-batch.add(q: pg"insert into items (name, qty) values (${name}, 0)");
+isize i = 0;
+while (i < names.length()) {
+    string name = copy names[i];
+    batch.add(q: pg"insert into items (name, qty) values (${name}, 0)");
+    i = i + 1;
+}
 batch.add(q: pg"select count(*) from items");
 Result<DynamicArray<BatchResult>, PgError> results = conn.runBatch(batch: batch);
 ```
@@ -266,26 +316,46 @@ It is refused, as any command is, while a result, a COPY or pipeline mode is in 
 ## A pool
 
 `postgres::pool` keeps connections for the isolates of a program to share, as pgxpool, HikariCP and Npgsql keep theirs.
+
+```kama
+PoolOptions options = PoolOptions.defaults();
+options.maxSize = 2;
+options.minIdle = 1;   // the maintenance keeps one connection ready
+Result<Pool, PgError> made = Pool.make(config: config, options: options);
+Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { println(s: e.message()); return 1; } };
+```
+
 `acquire()` returns a `Lease`, and the lease gives its connection back when it is dropped, on every path out of its
 scope. `lease.conn()` is the connection: pass it wherever a `ref Connection` goes, or open a transaction window on it.
 
 ```kama
-PoolOptions options = PoolOptions.defaults();
-options.maxSize = 8;
-Result<Pool, PgError> made = Pool.make(config: config, options: options);
-Pool pool = match (give made) { case Ok(value: p): give p; case Err(error: e): { println(s: e.message()); return 1; } };
-
-Result<Lease, PgError> got = pool.acquire();
-Lease lease = match (give got) { case Ok(value: l): give l; case Err(error: e): { println(s: e.message()); return 1; } };
-borrow lease.conn().transaction() as tx {
-    Result<Optional<int64>, PgError> moved = tx.conn().execute(q: pg"update stock set shelf = 'B' where shelf = 'A'");
-    Result<Unit, PgError> done = tx.commit();
+unsafe fn int32 job(ref Pool pool) {
+    Result<Lease, PgError> got = pool.acquire();
+    Lease lease = match (give got) { case Ok(value: l): give l; case Err(error: e): { println(s: e.message()); return -1; } };
+    borrow lease.conn().transaction() as tx {
+        Result<Unit, PgError> begun = tx.began();
+        match (give begun) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return -1; } };
+        Result<Rows, PgError> r = tx.conn().query(q: pg"select pg_backend_pid() from pg_advisory_xact_lock(42)");
+        Rows rows = match (give r) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return -1; } };
+        Result<int32, PgError> backend = column::<int32>(rows: rows, row: 0, index: 0);
+        int32 pid = match (backend) { case Ok(value: p): p; case Err(error: e): { println(s: e.message()); return -1; } };
+        Result<Unit, PgError> done = tx.commit();
+        match (give done) { case Ok(value: u): { } case Err(error: e): { println(s: e.message()); return -1; } };
+        return pid;
+    }
 }
 ```
 
 A pool belongs to the isolate that made it. To use it from another, `pool.share()` makes a `PoolShare`, which is
-`Sendable`, and `Pool.join(share: s)` in that isolate makes a pool over the same connections, with the same maxSize
+`Sendable`, and `Pool.join(share:)` in that isolate makes a pool over the same connections, with the same maxSize
 between them all. Only the pool that made the connections' channels can share them.
+
+```kama
+Result<PoolShare, PgError> shared = pool.share();
+PoolShare share = match (give shared) { case Ok(value: s): give s; case Err(error: e): { println(s: e.message()); return 1; } };
+Worker w = Worker.make(share: give share, report: answers.sender());
+Isolate t = spawn work(w: give w);
+```
 
 - **The bound.** At most `maxSize` connections are open at once, leased and idle together, across every isolate. A
   connection is made when one is acquired and none is idle, or by the maintenance to keep `minIdle`. One acquire at a
@@ -430,11 +500,44 @@ A connection string can list several hosts, as libpq's can:
 
 No GSSAPI/Kerberos/SSPI: a server that asks for them gets a clear error.
 
+## Examples
+
+Each is a program of its own under [`examples/`](https://github.com/cosmic-canopy/kama-postgres/tree/main/examples).
+Each takes a connection string as its argument, or reads libpq's `PG*` variables when given none, as psql does:
+
+```sh
+kama pkg install examples/quickstart/kama.json
+PGHOST=localhost PGUSER=app PGDATABASE=inventory kama run examples/quickstart/kama.json
+kama run examples/quickstart/kama.json -- "postgresql://app@db.internal/inventory"
+```
+
+- [`quickstart`](https://github.com/cosmic-canopy/kama-postgres/blob/main/examples/quickstart/src/main.kama): connect,
+  run a simple query of several statements, read typed values and a NULL, and show the TLS the session negotiated.
+- [`typed_rows`](https://github.com/cosmic-canopy/kama-postgres/blob/main/examples/typed_rows/src/main.kama): the `pg`
+  tag's typed holes (NULL, an array), a row into a `@generate(Deserializable)` type and into std's `JsonValue`, and a
+  bound on a result's size.
+- [`transactions`](https://github.com/cosmic-canopy/kama-postgres/blob/main/examples/transactions/src/main.kama): a
+  transfer in a transaction window, committed whole or rolled back whole; a savepoint window that rolls back alone; and
+  a read-only serializable transaction without a window.
+- [`copy_csv`](https://github.com/cosmic-canopy/kama-postgres/blob/main/examples/copy_csv/src/main.kama): a CSV file
+  in with COPY FROM, and the table out again with COPY TO. Run it from its own directory, where its `items.csv` is.
+- [`notify_worker`](https://github.com/cosmic-canopy/kama-postgres/blob/main/examples/notify_worker/src/main.kama): a
+  worker that waits for LISTEN/NOTIFY jobs sent from another isolate, each job bounded by a query timeout.
+- [`shared_pool`](https://github.com/cosmic-canopy/kama-postgres/blob/main/examples/shared_pool/src/main.kama): one
+  pool shared by four worker isolates, a transaction per job, and never more sessions than `maxSize`.
+- [`batch`](https://github.com/cosmic-canopy/kama-postgres/blob/main/examples/batch/src/main.kama): queries in one
+  round trip, and a batch that fails halfway and rolls back.
+
+Each one checks what it reads back, and exits 1 if anything is wrong. The tables they make are temporary, so they need
+no privilege beyond connecting. `tools/test.sh` builds them, and `tools/check-readme.sh` holds every code block in this
+README to one of them. `tools/test-integration.sh` runs them against every server, in plaintext and over TLS with
+`sslmode=verify-full`.
+
 ## Tests
 
 ```sh
-KAMA=/path/to/kama tools/test.sh               # hermetic unit tests, debug and release
-KAMA=/path/to/kama tools/test-integration.sh   # live tests on PostgreSQL 14–18 and 19 beta, debug and release
+KAMA=/path/to/kama tools/test.sh               # hermetic unit tests debug and release, the examples built, the README checked
+KAMA=/path/to/kama tools/test-integration.sh   # live tests on PostgreSQL 14–18 and 19 beta, debug and release, then the examples
 tools/test-integration.sh --version 18         # one version
 tools/pg.sh smoke --version 18                 # one login per auth and TLS method, with the server's own psql
 tools/pg.sh restart --version 18               # also stop and start: the server keeps its data

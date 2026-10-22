@@ -1,0 +1,87 @@
+// notify_worker: a worker that waits for jobs sent with NOTIFY and handles each one as it arrives. The producer is
+// another isolate with a session of its own. A Connection is Sendable, so one can be handed to it. It sends three jobs,
+// then "stop". Each job runs a query, and a query timeout bounds it: past the timeout the query is cancelled, and the
+// session goes on.
+//
+//   kama pkg install examples/notify_worker/kama.json
+//   PGHOST=localhost PGUSER=app PGDATABASE=inventory kama run examples/notify_worker/kama.json
+//   kama run examples/notify_worker/kama.json -- "postgresql://app@db.internal/inventory"
+//
+// The server is the connection string given as the argument, or libpq's PG* variables without one. Exit 0 when every
+// job is handled, in the order sent, and each came from the producer's session.
+import { core::args, core::println, std::concurrent::Isolate, std::time::Duration,
+         postgres::Config, postgres::Connection, postgres::Notification, postgres::PgError, postgres::Rows,
+         postgres::column, postgres::pg };
+
+// Sends the jobs over its own session, in another isolate.
+type resource Producer implements Sendable {
+    Connection conn;
+    public ctor make(Connection conn) { this.conn = give conn; }
+    public unsafe fn void run() {
+        isize i = 1;
+        while (i <= 4) {
+            string job = "order ${i}";
+            if (i == 4) { job = "stop"; }
+            Result<Optional<int64>, PgError> sent = this.conn.execute(q: pg"select pg_notify('jobs', ${job})");
+            match (give sent) { case Ok(value: n): { } case Err(error: e): { println(s: e.message()); } };
+            i = i + 1;
+        }
+        this.conn.close();
+    }
+}
+
+fn void produce(Producer p) { p.run(); }
+
+fn uint8 main() {
+    Optional<string> given = args().get(at: 0);
+    string conninfo = match (give given) { case Some(value: s): give s; case None: ""; };
+    Result<Config, PgError> parsed = Config.parse(text: conninfo);
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, PgError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    conn.setQueryTimeout(timeout: Optional::Some(value: Duration.fromSecs(s: 30i64)), grace: Duration.fromSecs(s: 2i64));
+    Result<Optional<int64>, PgError> listening = conn.execute(q: pg"listen jobs");
+    match (give listening) { case Ok(value: n): { } case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // The producer starts once the worker listens, so no job is sent before anyone is listening.
+    Result<Connection, PgError> second = Connection.connect(config: config);
+    Connection sender = match (give second) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    int32 producerPid = sender.processId();
+    Producer producer = Producer.make(conn: give sender);
+    Isolate running = spawn produce(p: give producer);
+
+    string handled = "";
+    bool fromProducer = true;
+    bool stopped = false;
+    while (!stopped) {
+        // None when nothing comes in time. Notices that arrive on the way are taken in too.
+        Result<Optional<Notification>, PgError> next = conn.waitForNotification(timeout: Optional::Some(value: Duration.fromSecs(s: 10i64)));
+        Optional<Notification> got = match (give next) { case Ok(value: o): give o; case Err(error: e): { println(s: e.message()); return 1; } };
+        match (give got) {
+            case Some(value: n): {
+                fromProducer = fromProducer && n.processId() == producerPid;
+                string job = copy n.payload();
+                if (job.equals(other: "stop")) {
+                    stopped = true;
+                } else {
+                    // The job's work: a query, bounded by the query timeout.
+                    Result<Rows, PgError> r = conn.query(q: pg"select upper(${job})");
+                    Rows done = match (give r) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+                    Result<string, PgError> outcome = column::<string>(rows: done, row: 0, index: 0);
+                    string result = match (give outcome) { case Ok(value: t): give t; case Err(error: e): { println(s: e.message()); return 1; } };
+                    println(s: "handled ${job}: ${result}");
+                    if (handled.length() > 0) { handled = handled.concat(other: ", "); }
+                    handled = handled.concat(other: result);
+                }
+            }
+            case None: { println(s: "no job came within 10 s"); return 1; }
+        };
+    }
+    running.join();
+    conn.close();
+    if (!handled.equals(other: "ORDER 1, ORDER 2, ORDER 3") || !fromProducer) {
+        println(s: "expected ORDER 1, ORDER 2, ORDER 3, each from the producer's session");
+        return 1;
+    }
+    return 0;
+}

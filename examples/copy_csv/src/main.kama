@@ -1,0 +1,54 @@
+// copy_csv: a CSV file into a table with COPY FROM, and the table back out as CSV with COPY TO. std::io drives both
+// ends: copyFrom reads any Reader (here a File), and copyTo writes to any Writer (here a StringWriter).
+//
+//   cd examples/copy_csv && kama pkg install kama.json
+//   cd examples/copy_csv && PGHOST=localhost PGUSER=app PGDATABASE=inventory kama run kama.json
+//   cd examples/copy_csv && kama run kama.json -- "postgresql://app@db.internal/inventory"
+//
+// Run it from its own directory: it reads items.csv there. The server is the connection string given as the argument,
+// or libpq's PG* variables without one. The table is temporary. The file is in PostgreSQL's own CSV form (a field is
+// quoted only when it has to be, and an empty one is NULL), so the export reads exactly as the file does. Exit 0 when
+// it does.
+import { core::args, core::println, std::fs::File, std::fs::OpenMode, std::fs::readText, std::io::IoError,
+         std::io::StringWriter, std::collections::DynamicArray,
+         postgres::Config, postgres::Connection, postgres::PgError, postgres::Rows, postgres::column, postgres::pg };
+
+fn uint8 main() {
+    Optional<string> given = args().get(at: 0);
+    string conninfo = match (give given) { case Some(value: s): give s; case None: ""; };
+    Result<Config, PgError> parsed = Config.parse(text: conninfo);
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, PgError> connected = Connection.connect(config: config);
+    Connection conn = match (give connected) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Optional<int64>, PgError> made = conn.execute(q: pg"create temp table items (name text, qty int4, supplier text)");
+    match (give made) { case Ok(value: n): { } case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // In: the file, 64 KiB at a time. The count is COPY's own, from its command tag.
+    Result<File, IoError> opened = File.open(path: "items.csv", mode: OpenMode::Read);
+    File file = match (give opened) { case Ok(value: f): give f; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Optional<int64>, PgError> copied = conn.copyFrom(sql: "copy items (name, qty, supplier) from stdin (format csv, header true)", source: file);
+    Optional<int64> count = match (give copied) { case Ok(value: n): n; case Err(error: e): { println(s: e.message()); return 1; } };
+    int64 rows = match (count) { case Some(value: n): n; case None: -1i64; };
+    println(s: "copied ${rows} rows in");
+
+    // An empty field is NULL: one item has no supplier.
+    Result<Rows, PgError> r = conn.query(q: pg"select count(*) - count(supplier) from items");
+    Rows unsupplied = match (give r) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<int64, PgError> missing = column::<int64>(rows: unsupplied, row: 0, index: 0);
+    int64 nulls = match (missing) { case Ok(value: n): n; case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // Out: the table as CSV, into any Writer.
+    StringWriter sink = StringWriter.make();
+    Result<Optional<int64>, PgError> exported = conn.copyTo(sql: "copy (select name, qty, supplier from items order by name) to stdout (format csv, header true)", sink: sink);
+    match (give exported) { case Ok(value: n): { } case Err(error: e): { println(s: e.message()); return 1; } };
+    string csv = sink.finish();
+    conn.close();
+    println(s: "copied out:");
+    println(s: copy csv);
+
+    Result<string, IoError> read = readText(path: "items.csv");
+    string original = match (give read) { case Ok(value: t): give t; case Err(error: e): { println(s: e.message()); return 1; } };
+    if (rows != 3i64 || nulls != 1i64) { println(s: "expected 3 rows, one with no supplier; copied ${rows}, ${nulls} with none"); return 1; }
+    if (!csv.equals(other: original)) { println(s: "expected the export to read exactly as items.csv"); return 1; }
+    return 0;
+}

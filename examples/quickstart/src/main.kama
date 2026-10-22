@@ -1,0 +1,51 @@
+// quickstart: connect, make a table, read its rows back typed, and close.
+//
+//   kama pkg install examples/quickstart/kama.json
+//   PGHOST=localhost PGUSER=app PGDATABASE=inventory kama run examples/quickstart/kama.json
+//   kama run examples/quickstart/kama.json -- "postgresql://app@db.internal/inventory?sslmode=verify-full"
+//
+// The server is the connection string given as the argument. Without one, the string is empty, and libpq's PG*
+// variables, service file and ~/.pgpass decide, as they do for psql. The table is temporary, so the example needs no
+// privilege beyond connecting. Exit 0 when every value read back is the one written.
+import { core::args, core::println, std::collections::DynamicArray,
+         postgres::Config, postgres::Connection, postgres::PgError, postgres::Rows, postgres::column,
+         postgres::columnOpt };
+
+fn uint8 main() {
+    // A libpq connection string; the service file, PG* variables and ~/.pgpass apply as they do for psql.
+    Optional<string> given = args().get(at: 0);
+    string conninfo = match (give given) { case Some(value: s): give s; case None: ""; };
+    Result<Config, PgError> parsed = Config.parse(text: conninfo);
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, PgError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+
+    bool encrypted = conn.sslInUse();
+    Optional<string> protocol = conn.sslAttribute(name: "protocol");   // "TLSv1.3"
+    string version = match (give protocol) { case Some(value: p): give p; case None: "none"; };
+    println(s: "encrypted: ${encrypted} (${version})");
+
+    // A simple query may hold several statements, and gives one Rows for each.
+    string sql = "create temp table items (name text, qty int4);"
+        .concat(other: "insert into items values ('bolt', 12), ('nut', 40), (null, 3);")
+        .concat(other: "select name, qty from items order by qty");
+    Result<DynamicArray<Rows>, PgError> r = conn.simpleQuery(sql: sql);
+    DynamicArray<Rows> results = match (give r) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    string listed = "";
+    isize i = 0;
+    while (i < results[2].rowCount()) {
+        // Typed access, as PQgetvalue addresses a value: the result, the row, the column. NULL reads only into an Optional.
+        Result<Optional<string>, PgError> name = columnOpt::<string>(rows: results[2], row: i, index: 0);
+        Result<int32, PgError> qty = column::<int32>(rows: results[2], row: i, index: 1);
+        Optional<string> named = match (give name) { case Ok(value: n): give n; case Err(error: e): { println(s: e.message()); return 1; } };
+        int32 count = match (qty) { case Ok(value: q): q; case Err(error: e): { println(s: e.message()); return 1; } };
+        string shown = match (give named) { case Some(value: s): give s; case None: "(no name)"; };
+        println(s: "${shown}: ${count}");
+        if (i > 0) { listed = listed.concat(other: ", "); }
+        listed = listed.concat(other: "${shown} ${count}");
+        i = i + 1;
+    }
+    conn.close();
+    if (!listed.equals(other: "(no name) 3, bolt 12, nut 40")) { println(s: "expected (no name) 3, bolt 12, nut 40"); return 1; }
+    return 0;
+}

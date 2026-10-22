@@ -1,0 +1,95 @@
+// batch: many queries in one round trip, as pgx's SendBatch sends them. Each query's result is Rows, Failed or Aborted.
+// A batch is one implicit transaction, so a failure aborts the queries after it and rolls back the ones before it.
+//
+//   kama pkg install examples/batch/kama.json
+//   PGHOST=localhost PGUSER=app PGDATABASE=inventory kama run examples/batch/kama.json
+//   kama run examples/batch/kama.json -- "postgresql://app@db.internal/inventory"
+//
+// The server is the connection string given as the argument, or libpq's PG* variables without one. The table is
+// temporary. Exit 0 when the first batch keeps its rows and the second, which fails halfway, keeps none.
+import { core::args, core::println, std::collections::DynamicArray,
+         postgres::Batch, postgres::BatchResult, postgres::Config, postgres::Connection, postgres::PgError,
+         postgres::Rows, postgres::column, postgres::pg };
+
+// Each query's outcome in a word ("rows failed aborted"), and the error of the one that failed.
+fn string outcomes(const ref DynamicArray<BatchResult> results) {
+    string all = "";
+    isize i = 0;
+    while (i < results.length()) {
+        string word = match (results[i]) {
+            case Rows(rows: rows): "rows";
+            case Failed(error: e): "failed (".concat(other: e.primary()).concat(other: ")");
+            case Aborted: "aborted";
+        };
+        if (i > 0) { all = all.concat(other: " "); }
+        all = all.concat(other: word);
+        i = i + 1;
+    }
+    return all;
+}
+
+// The count a `select count(*)` result holds, or -1.
+unsafe fn int64 countIn(const ref BatchResult result) {
+    return match (result) {
+        case Rows(rows: rows): match (column::<int64>(rows: rows, row: 0, index: 0)) { case Ok(value: n): n; case Err(error: e): -1i64; };
+        case Failed(error: e): -1i64;
+        case Aborted: -1i64;
+    };
+}
+
+fn uint8 main() {
+    Optional<string> given = args().get(at: 0);
+    string conninfo = match (give given) { case Some(value: s): give s; case None: ""; };
+    Result<Config, PgError> parsed = Config.parse(text: conninfo);
+    Config config = match (give parsed) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Connection, PgError> opened = Connection.connect(config: config);
+    Connection conn = match (give opened) { case Ok(value: c): give c; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<Optional<int64>, PgError> made = conn.execute(q: pg"create temp table items (name text primary key, qty int4)");
+    match (give made) { case Ok(value: n): { } case Err(error: e): { println(s: e.message()); return 1; } };
+
+    // Three inserts and a count, in one round trip. SQL the statement cache has not seen yet is described first, all
+    // of it in a single round trip too.
+    DynamicArray<string> names = DynamicArray.empty();
+    names.add(item: "bolt");
+    names.add(item: "nut");
+    names.add(item: "washer");
+    Batch batch = Batch.make();
+    isize i = 0;
+    while (i < names.length()) {
+        string name = copy names[i];
+        batch.add(q: pg"insert into items (name, qty) values (${name}, 0)");
+        i = i + 1;
+    }
+    batch.add(q: pg"select count(*) from items");
+    Result<DynamicArray<BatchResult>, PgError> results = conn.runBatch(batch: batch);
+    DynamicArray<BatchResult> first = match (give results) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    string went = outcomes(results: first);
+    int64 counted = countIn(result: first[3]);
+    println(s: "the first batch: ${went}, and ${counted} items");
+
+    // A duplicate fails the second query: the count after it is aborted, and the insert before it rolled back.
+    string screw = "screw";
+    string bolt = "bolt";
+    Batch failing = Batch.make();
+    failing.add(q: pg"insert into items (name, qty) values (${screw}, 0)");
+    failing.add(q: pg"insert into items (name, qty) values (${bolt}, 0)");
+    failing.add(q: pg"select count(*) from items");
+    Result<DynamicArray<BatchResult>, PgError> again = conn.runBatch(batch: failing);
+    DynamicArray<BatchResult> second = match (give again) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    string failed = outcomes(results: second);
+    println(s: "the second batch: ${failed}");
+
+    Result<Rows, PgError> r = conn.query(q: pg"select count(*) from items");
+    Rows after = match (give r) { case Ok(value: v): give v; case Err(error: e): { println(s: e.message()); return 1; } };
+    Result<int64, PgError> kept = column::<int64>(rows: after, row: 0, index: 0);
+    int64 left = match (kept) { case Ok(value: n): n; case Err(error: e): { println(s: e.message()); return 1; } };
+    println(s: "items after both: ${left}");
+    conn.close();
+
+    if (!went.equals(other: "rows rows rows rows") || counted != 3i64) { println(s: "expected four rows results and a count of 3"); return 1; }
+    if (!failed.startsWith(prefix: "rows failed (duplicate key") || !failed.endsWith(suffix: ") aborted") || left != 3i64) {
+        println(s: "expected rows, a duplicate key, aborted, and 3 items left");
+        return 1;
+    }
+    return 0;
+}

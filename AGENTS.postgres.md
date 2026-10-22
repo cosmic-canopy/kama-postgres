@@ -54,7 +54,7 @@ release it is built and tested with, and the first with everything this package 
     never published) with `"overrides": { "@kama/tls": { "path": "<relative path to kama-tls>" } }`, then
     `kama pkg install`. postgres can only publish once that change is in a published `@kama/tls`.
 
-- **Two test programs, and neither is typed from memory.**
+- **Two test programs, neither typed from memory, and the examples.**
   - `tests/unit` is hermetic. It needs no server and no network, and runs through `tools/test.sh`, debug
     and release.
     It includes a scripted fake server (`fake_server.kama`) that drives `Connection` through every startup and
@@ -68,6 +68,16 @@ release it is built and tested with, and the first with everything this package 
     while the server is down). Both stop, start and restart the server through `tools/pg.sh` (`PGTEST_PGSH`) with
     `std::process`, in the release build. Never run the leg beside anything else that uses the same server. `types_test.kama` reads every
     codec vector on each version: its binary bytes, its text both ways, and its kama value sent back.
+  - **The examples** (`examples/<name>/`, seven programs) are tests too. Each checks what it reads back and exits 1 if
+    anything is wrong.
+    - `tools/test.sh` builds them. `tools/test-integration.sh` runs each per version from its own directory, debug in
+      plaintext and release over `sslmode=verify-full`, with `env -i`: the `PG*` variables and a scratch `HOME`.
+    - An example takes its connection string from its first argument, or `""` for libpq's environment.
+    - Their tables are temporary.
+    - Their `kama.lock`s pin the newest `@kama/tls` the range admits, as a consumer's would.
+  - **Every ```` ```kama ```` block in README.md is code from an example**: a run of consecutive lines, indentation
+    aside. `tools/check-readme.sh` checks it, and `tools/test.sh` runs the check. To change a block, change the
+    example and copy its lines.
   - `tools/mutate.sh <file> [--version N]` tests the tests. Each mutation in `tools/mutations/*.json` changes the
     source in a copy of the tree and must make the case it names fail. A test is not called good until one does.
   - Vectors come from upstream by script:

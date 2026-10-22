@@ -1,0 +1,10 @@
+[
+  {
+    "id": "T1",
+    "suite": "unit",
+    "file": "src/pool/pool.kama",
+    "old": "// place is not filled while another sits idle.\n                    Optional<Slot> other = this.idleWaiting();",
+    "new": "// place is not filled while another sits idle.\n                    Optional<Slot> other = Optional::None;",
+    "expect": "pruned to what a trickle uses"
+  }
+]

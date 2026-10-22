@@ -369,9 +369,19 @@ it fail.
   - Its status note, install line and kama floor say 0.3.0, and "What it covers" gives `column::<T>`'s real signature.
   - The CHANGELOG's 0.3.0 entry opens with what upgrading from 0.2 takes. `kama.json` says 0.3.0.
   - AGENTS.postgres.md says how a release goes.
-  - **The release:** main was pushed with the 0.3.0 commit. That push is CI's first run of S2 to S7, the restart leg
-    on Linux included. `v0.3.0` is tagged only once CI is green on it, so a missing tag means CI failed: read its log
-    first.
+  - **The release:** main was pushed with the 0.3.0 commit. That push was CI's first run of S2 to S7. Every Linux job
+    passed, the restart leg included, and `unit (macos-arm64)` failed.
+    - The log needs a token, so a fresh clone was run as CI runs it, and it failed the trickle pruning case. It is S4's
+      race: a sweep counts the idle connections by taking them. An acquire that lands between two of its takes finds
+      only an Empty and connects, and the script had no connection to spare, so the connect was refused.
+    - The same transient exists beside pgxpool's health check (`AcquireAllIdle`). std's channel has no length, so the
+      sweep cannot count without taking. The production cost is one extra connect within maxSize, which the next prune
+      undoes.
+    - Measured on 100 runs of the case: 98 connect 0 times and 2 connect once. With no `idleWaiting`, every run
+      connects 3 times.
+    - So the case now allows one connect, and spare scripts let it succeed. `s7.json`'s T1, which removes
+      `idleWaiting`, is caught. The pool group then passed 15 debug and 10 release runs.
+    - `v0.3.0` is tagged only once CI is green, so a missing tag means CI failed: read its log first.
 
 **Decisions:**
 - **On release, roll back and reset the session.** Npgsql and asyncpg do; pgx and deadpool do not. It is the safer
@@ -434,8 +444,8 @@ it fail.
   - `tools/test-integration.sh`, on 14–19 in debug, release and TLS, then the restart leg, then the examples;
   - **`tools/mutate.sh tools/mutations/<step>.json --version 18`**. This runs each mutation in a copy of the tree and
     exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json`, S1's 35 in `s1.json`, S2's 47
-    in `s2.json`, S3's 27 in `s3.json`, S4's 44 in `s4.json`, S5's 23 in `s5.json`, S6's 11 in `s6.json` and the port to 0.9.719's 2 in
-    `port719.json`. All were run on 0.9.690, S3's again on S4's code, and the port's with S2's `wire.kama` ones on 0.9.719.
+    in `s2.json`, S3's 27 in `s3.json`, S4's 44 in `s4.json`, S5's 23 in `s5.json`, S6's 11 in `s6.json`, the port to 0.9.719's 2 in
+    `port719.json` and S7's 1 in `s7.json`. All were run on 0.9.690, S3's again on S4's code, and the port's with S2's `wire.kama` ones on 0.9.719.
     Write a file per step, and re-run older files when their code changes. A `BAD-PATTERN` means the source moved on, so update the mutation. PANICKED is
     a run that died before any case failed; an entry may expect it, and may set `"env"` (the restart mutations set
     `PGTEST_RESTART=1`) and `"timeout"`. A run that times out is judged by what it printed first, since a pool mutant

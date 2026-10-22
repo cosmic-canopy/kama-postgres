@@ -246,7 +246,6 @@ type resource Connection implements Sendable, Transactional {
             }
             case Err(error: e): { return Result::Err(error: give e); }
         };
-        return Result::Err(error: PgError::Closed);
     }
 
     // Start a session over a transport the caller opened (tokio-postgres's connect_raw). `config` supplies everything
@@ -441,7 +440,6 @@ type resource Connection implements Sendable, Transactional {
                 }
             };
         }
-        return Visit::Stop;
     }
 
     // One connection: encryption as `plan` has it now, then startup. What a failure leads to is libpq's: a TLS failure
@@ -477,7 +475,6 @@ type resource Connection implements Sendable, Transactional {
             }
             case Fatal(error: e): { return Attempt::Final(error: give e); }
         };
-        return Attempt::Final(error: PgError::Closed);
     }
 
     // Startup over a connection whose encryption is settled; or, for a cancel request, the request in its place.
@@ -529,7 +526,6 @@ type resource Connection implements Sendable, Transactional {
                 return Attempt::Final(error: give e);
             }
         };
-        return Attempt::Final(error: PgError::Closed);
     }
 
     // ---- the session ----
@@ -1234,7 +1230,6 @@ type resource Connection implements Sendable, Transactional {
                 case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place at a pipeline's sync")); }
             };
         }
-        return Result::Ok(value: Unit::Unit);
     }
 
     // A pipeline's Close: CloseComplete, or an error.
@@ -1253,7 +1248,6 @@ type resource Connection implements Sendable, Transactional {
                 case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place after a Close")); }
             };
         }
-        return Result::Ok(value: Unit::Unit);
     }
 
     // A pipeline's Parse and Describe of statement `name`: the Statement.
@@ -1490,7 +1484,6 @@ type resource Connection implements Sendable, Transactional {
                 case _: { return Result::Err(error: this.broken(detail: "unexpected response from server: a message out of place in COPY TO STDOUT")); }
             };
         }
-        return Result::Err(error: PgError::Closed);
     }
 
     // COPY FROM STDIN with the data read from `source` until its end (pgx's CopyFrom over an io.Reader). A read that
@@ -1516,7 +1509,6 @@ type resource Connection implements Sendable, Transactional {
                 }
             };
         }
-        return Result::Err(error: PgError::Closed);
     }
 
     // COPY TO STDOUT with the data written to `sink` as it arrives (pgx's CopyTo). A write that fails leaves the rest
@@ -1541,7 +1533,6 @@ type resource Connection implements Sendable, Transactional {
                 }
             };
         }
-        return Result::Err(error: PgError::Closed);
     }
 
     // Run `sql` and read up to the COPY's start: CopyInResponse for `wanted` 1, CopyOutResponse for 2. Anything else is
@@ -1638,7 +1629,6 @@ type resource Connection implements Sendable, Transactional {
                 }
             };
         }
-        return Result::Ok(value: Unit::Unit);
     }
 
     // The end of a COPY: its CommandComplete ("COPY n"), any error, then ReadyForQuery. Gives the rows the tag reports.
@@ -1707,7 +1697,6 @@ type resource Connection implements Sendable, Transactional {
             Result<Unit, PgError> sent = this.cancelRunning();
             match (give sent) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: PgError::Timeout); } };
         }
-        return Result::Err(error: PgError::Timeout);
     }
 
     // Cancel this session's command, through the route and dialer it connected with, within the grace.
@@ -2260,7 +2249,6 @@ type resource Connection implements Sendable, Transactional {
                 }
             };
         }
-        return Result::Ok(value: Optional::None);
     }
 
     // ---- target_session_attrs ----
@@ -2482,7 +2470,6 @@ type resource Connection implements Sendable, Transactional {
                 };
             }
         }
-        return Result::Err(error: PgError::Closed);
     }
 
     // pg_SASL_init: choose a mechanism the server offered and this client may use, and send the client-first

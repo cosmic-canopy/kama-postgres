@@ -1,8 +1,17 @@
 import { std::collections::View, std::collections::ConstView, std::io::IoError, std::io::IoErrorKind, std::net::TcpStream,
-         std::net::SocketAddr, std::net::Poller, std::net::Interest, std::net::Ready, std::net::Shutdown,
+         std::net::SocketAddr, std::net::Poller, std::net::Interest, std::net::Event, std::net::Events, std::net::Shutdown,
          std::net::UnixStream, std::net::UnixAddr, std::net::PeerCredentials, std::process::UserId,
          std::time::Duration, std::memory::Owned, postgres::PgError };
-export { Transport, TcpTransport, UnixTransport, socketPathMax, Dialer, DialTarget };
+export { Transport, Ready, TcpTransport, UnixTransport, socketPathMax, Dialer, DialTarget };
+
+// What a transport's `wait` found: the transport can be read from, written to, both, or neither (the wait timed out).
+// `readable` also covers a peer that closed or failed, so the read that follows reports it. This package's own type,
+// the shape of the `std::net::Ready` kama 0.9.718 removed, so a change to std's poller never changes a `Transport`.
+@generate(of)
+type value Ready implements Sendable {
+    public bool readable;
+    public bool writable;
+}
 
 // The byte stream a connection runs over. It is non-blocking: `read` and `write` move what they can now, or say
 // `WouldBlock`, and `wait` blocks until one of them can proceed or a timeout passes. This is libpq's own shape
@@ -78,16 +87,56 @@ type resource DialTarget implements Sendable, Copyable<This>(bare: give) {
     public const fn bool linuxAbstract() { return this.abstractName; }
 }
 
+// One socket's own `Poller`, with the one-event list its wait fills. A socket is registered again only when the
+// interest changes, since each registration is a system call (epoll_ctl, kevent); a wait is then one more.
+type resource Waiter implements Sendable {
+    Poller poller;
+    Events events;
+    isize handle = 0;
+    Optional<Interest> watched = Optional::None;
+
+    unsafe ctor make(Poller poller, isize handle) {
+        this.poller = give poller;
+        Events list = Events.withCapacity(capacity: 1);
+        this.events = give list;
+        this.handle = handle;
+        this.watched = Optional::None;
+    }
+
+    public unsafe ctor Result<Waiter, IoError> over(isize handle) {
+        Result<Poller, IoError> made = Poller.create();
+        Poller poller = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
+        return Result::Ok(value: Waiter.make(poller: give poller, handle: handle));
+    }
+
+    // Block until `interest` can proceed, or `timeoutMs` passes (< 0: no limit), as `Transport.wait` does.
+    public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
+        bool same = match (this.watched) { case Some(value: w): w == interest; case None: false; };
+        if (!same) {
+            Result<Unit, IoError> added = this.poller.add(fd: this.handle, interest: interest, token: 0);
+            match (added) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
+            this.watched = Optional::Some(value: interest);
+        }
+        Result<int32, IoError> waited = this.poller.wait(events: this.events, timeoutMs: timeoutMs);
+        match (waited) { case Ok(value: n): { } case Err(error: e): { return Result::Err(error: e); } };
+        bool readable = false;
+        bool writable = false;
+        foreach (Event e in this.events) {
+            readable = readable || e.readable;
+            writable = writable || e.writable;
+        }
+        return Result::Ok(value: Ready.of(readable: readable, writable: writable));
+    }
+}
+
 // TCP, as `Connection.connect` makes it: a non-blocking `TcpStream` and its own `Poller`.
 type resource TcpTransport implements Transport, Sendable {
     TcpStream stream;
-    Poller poller;
-    isize handle = 0;
+    Waiter waiter;
 
-    unsafe ctor make(TcpStream stream, Poller poller) {
-        this.handle = stream.rawHandle();
+    unsafe ctor make(TcpStream stream, Waiter waiter) {
         this.stream = give stream;
-        this.poller = give poller;
+        this.waiter = give waiter;
     }
 
     // Connect to `address` within `timeoutMs` (< 0: no limit). A timeout is a `TimedOut` error, the same error the
@@ -96,17 +145,16 @@ type resource TcpTransport implements Transport, Sendable {
     public unsafe ctor Result<TcpTransport, IoError> connect(const ref SocketAddr address, int32 timeoutMs) {
         Result<TcpStream, IoError> started = TcpStream.connectToNonBlocking(address: address);
         TcpStream stream = match (give started) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: e); } };
-        Result<Poller, IoError> made = Poller.create();
-        Poller poller = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
-        poller.add(fd: stream.rawHandle(), interest: Interest::Write);
-        Result<int32, IoError> waited = poller.wait(timeoutMs: timeoutMs);
-        int32 ready = match (waited) { case Ok(value: n): n; case Err(error: e): { return Result::Err(error: e); } };
-        if (ready == 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
+        Result<Waiter, IoError> made = Waiter.over(handle: stream.rawHandle());
+        Waiter waiter = match (give made) { case Ok(value: w): give w; case Err(error: e): { return Result::Err(error: e); } };
+        Result<Ready, IoError> waited = waiter.wait(interest: Interest::Write, timeoutMs: timeoutMs);
+        Ready ready = match (waited) { case Ok(value: r): r; case Err(error: e): { return Result::Err(error: e); } };
+        if (!ready.readable && !ready.writable) { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
         Result<Unit, IoError> connected = stream.checkConnected();
         match (connected) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
         Result<Unit, IoError> nodelay = stream.setNoDelay(on: true);
         match (nodelay) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
-        return Result::Ok(value: TcpTransport.make(stream: give stream, poller: give poller));
+        return Result::Ok(value: TcpTransport.make(stream: give stream, waiter: give waiter));
     }
 
     // TCP keepalive, as libpq's `keepalives`, `keepalives_idle`, `keepalives_interval` and `keepalives_count`
@@ -123,11 +171,7 @@ type resource TcpTransport implements Transport, Sendable {
     public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) { return this.stream.write(bytes: bytes); }
 
     public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
-        this.poller.add(fd: this.handle, interest: interest);
-        Result<int32, IoError> waited = this.poller.wait(timeoutMs: timeoutMs);
-        int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): { return Result::Err(error: e); } };
-        if (n == 0) { return Result::Ok(value: Ready.of(readable: false, writable: false)); }
-        return Result::Ok(value: this.poller.readyFor(fd: this.handle));
+        return this.waiter.wait(interest: interest, timeoutMs: timeoutMs);
     }
 
     public unsafe fn void shutdown() {
@@ -143,13 +187,11 @@ type resource TcpTransport implements Transport, Sendable {
 // libpq reports that as this host's failure rather than waiting.
 type resource UnixTransport implements Transport, Sendable {
     UnixStream stream;
-    Poller poller;
-    isize handle = 0;
+    Waiter waiter;
 
-    unsafe ctor make(UnixStream stream, Poller poller) {
-        this.handle = stream.rawHandle();
+    unsafe ctor make(UnixStream stream, Waiter waiter) {
         this.stream = give stream;
-        this.poller = give poller;
+        this.waiter = give waiter;
     }
 
     // Connect to the socket at `path`, or, on Linux, to the abstract name `path` names when `linuxAbstract` is set,
@@ -159,16 +201,15 @@ type resource UnixTransport implements Transport, Sendable {
         UnixAddr target = match (address) { case Ok(value: a): a; case Err(error: e): { return Result::Err(error: e); } };
         Result<UnixStream, IoError> started = UnixStream.connectToNonBlocking(address: target);
         UnixStream stream = match (give started) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: e); } };
-        Result<Poller, IoError> made = Poller.create();
-        Poller poller = match (give made) { case Ok(value: p): give p; case Err(error: e): { return Result::Err(error: e); } };
+        Result<Waiter, IoError> made = Waiter.over(handle: stream.rawHandle());
+        Waiter waiter = match (give made) { case Ok(value: w): give w; case Err(error: e): { return Result::Err(error: e); } };
         // A local connect has usually completed already; one in flight resolves once the socket is writable.
-        poller.add(fd: stream.rawHandle(), interest: Interest::Write);
-        Result<int32, IoError> waited = poller.wait(timeoutMs: timeoutMs);
-        int32 ready = match (waited) { case Ok(value: n): n; case Err(error: e): { return Result::Err(error: e); } };
-        if (ready == 0) { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
+        Result<Ready, IoError> waited = waiter.wait(interest: Interest::Write, timeoutMs: timeoutMs);
+        Ready ready = match (waited) { case Ok(value: r): r; case Err(error: e): { return Result::Err(error: e); } };
+        if (!ready.readable && !ready.writable) { return Result::Err(error: IoError.of(kind: IoErrorKind::TimedOut)); }
         Result<Unit, IoError> connected = stream.checkConnected();
         match (connected) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: e); } };
-        return Result::Ok(value: UnixTransport.make(stream: give stream, poller: give poller));
+        return Result::Ok(value: UnixTransport.make(stream: give stream, waiter: give waiter));
     }
 
     // The name of the account the server process runs as, from the socket's peer credentials: what libpq's
@@ -184,11 +225,7 @@ type resource UnixTransport implements Transport, Sendable {
     public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) { return this.stream.write(bytes: bytes); }
 
     public unsafe fn Result<Ready, IoError> wait(Interest interest, int32 timeoutMs) {
-        this.poller.add(fd: this.handle, interest: interest);
-        Result<int32, IoError> waited = this.poller.wait(timeoutMs: timeoutMs);
-        int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): { return Result::Err(error: e); } };
-        if (n == 0) { return Result::Ok(value: Ready.of(readable: false, writable: false)); }
-        return Result::Ok(value: this.poller.readyFor(fd: this.handle));
+        return this.waiter.wait(interest: interest, timeoutMs: timeoutMs);
     }
 
     public unsafe fn void shutdown() {

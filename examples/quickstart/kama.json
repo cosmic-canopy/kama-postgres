@@ -2,7 +2,7 @@
   "name": "quickstart",
   "version": "0.1.0",
   "kind": "executable",
-  "kama": ">=0.9.690",
+  "kama": ">=0.9.719",
   "entry": "src/main.kama",
   "dependencies": { "@kama/postgres": { "path": "../.." } },
   "modules": { ".": { "visibility": "internal" } }

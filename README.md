@@ -8,7 +8,7 @@ install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls)
 kama pkg add kama.json @kama/postgres --version ^0.2.0     # from the official registry, registry.kama-lang.org
 ```
 
-Needs **kama ≥ 0.9.690**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
+Needs **kama ≥ 0.9.719**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
 release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta.
 
 > **Status: early.** It connects, authenticates and runs queries, with typed parameters and typed rows, over TCP, a

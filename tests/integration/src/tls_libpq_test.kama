@@ -33,14 +33,14 @@ fn DynamicArray<string> frames() {
 fn isize libraryWordsAt(const ref string line) {
     DynamicArray<string> known = frames();
     foreach (string frame in known) {
-        Optional<usize> at = line.find(substring: frame);
+        Optional<isize> at = line.find(substring: frame);
         match (at) {
             case Some(value: i): {
-                isize start = cast<isize>(i) + frame.length();
+                isize start = i + frame.length();
                 if (!frame.endsWith(suffix: "\"")) { return start; }
                 string rest = line.substring(start: start, end: line.length());
-                Optional<usize> close = rest.find(substring: "\": ");
-                match (close) { case Some(value: c): { return start + cast<isize>(c) + 3; } case None: { return -1; } };
+                Optional<isize> close = rest.find(substring: "\": ");
+                match (close) { case Some(value: c): { return start + c + 3; } case None: { return -1; } };
             }
             case None: { }
         };
@@ -81,14 +81,14 @@ fn string maskClient(const ref string text) {
     string rest = copy text;
     bool more = true;
     while (more) {
-        Optional<usize> at = rest.find(substring: marker);
+        Optional<isize> at = rest.find(substring: marker);
         match (at) {
             case Some(value: i): {
-                isize start = cast<isize>(i) + marker.length();
+                isize start = i + marker.length();
                 result = result.concat(other: rest.substring(start: 0, end: start)).concat(other: "@CLIENT@");
                 string after = rest.substring(start: start, end: rest.length());
-                Optional<usize> close = after.find(substring: "\"");
-                isize end = match (close) { case Some(value: c): cast<isize>(c); case None: 0; };
+                Optional<isize> close = after.find(substring: "\"");
+                isize end = match (close) { case Some(value: c): c; case None: 0; };
                 rest = after.substring(start: end, end: after.length());
             }
             case None: { more = false; }
@@ -140,8 +140,8 @@ unsafe fn int32 tlsLibpqTests() {
         Environment vars = quietEnvironment();
         if (!environments[i].equals(other: "-")) {
             string assignment = fill(text: environments[i], certDir: certDir, keyDir: keyDir);
-            Optional<usize> eq = assignment.find(substring: "=");
-            isize at = match (eq) { case Some(value: e): cast<isize>(e); case None: 0; };
+            Optional<isize> eq = assignment.find(substring: "=");
+            isize at = match (eq) { case Some(value: e): e; case None: 0; };
             vars.set(name: assignment.substring(start: 0, end: at), value: assignment.substring(start: at + 1, end: assignment.length()));
         }
         string what = "tls (libpq) ".concat(other: names[i]).concat(other: ": ");

@@ -32,7 +32,7 @@ type resource Numeric implements Formattable, Serializable, Deserializable<This>
     public ctor fromInt64(int64 v) {
         string text = "${v}";
         Result<Numeric, DecodeError> n = Numeric.parse(text: text);
-        Numeric parsed = match (give n) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "Numeric.fromInt64"); return Numeric.zero(); } };
+        Numeric parsed = match (give n) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "Numeric.fromInt64"); } };
         this.sign = parsed.sign; this.weight = parsed.weight; this.dscale = parsed.dscale; this.digits = copy parsed.digits;
     }
 

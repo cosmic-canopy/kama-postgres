@@ -40,9 +40,9 @@ fn bool resolved(const ref Result<Config, PgError> r) { return match (r) { case 
 // checks them before connecting. The message is the rest.
 fn string withoutAttempt(const ref string message) {
     if (!message.startsWith(prefix: "connection to server at ")) { return copy message; }
-    Optional<usize> at = message.find(substring: "failed: ");
+    Optional<isize> at = message.find(substring: "failed: ");
     return match (at) {
-        case Some(value: i): message.substring(start: cast<isize>(i) + 8, end: message.length());
+        case Some(value: i): message.substring(start: i + 8, end: message.length());
         case None: copy message;
     };
 }

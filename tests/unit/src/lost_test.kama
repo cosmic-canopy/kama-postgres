@@ -3,7 +3,7 @@
 // A server that hung up is "server closed the connection unexpectedly…" whatever the client was doing; any other
 // failure names what failed, with the error's own words. After a failed write, what the read finds comes first.
 import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::memory::Owned,
-         std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready,
+         std::io::IoError, std::io::IoErrorKind, std::net::Interest, postgres::Ready,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Transport,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome };

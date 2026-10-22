@@ -108,7 +108,12 @@ All notable changes to this package are recorded here. The format follows
   checks, so what a reader copies compiles.
 
 ### Changed
-- **Needs kama ≥ 0.9.690.** It has, of what this package relies on:
+- **Needs kama ≥ 0.9.719.** It has, of what this package relies on:
+  - `std::net`'s `Poller` over epoll and kqueue, which fills a caller's `Events` list (KR-230), first in 0.9.717. It
+    replaced `std::net::Ready`, so no source builds on both sides of it. A socket's transport registers again only when
+    what it waits for changes, since each registration is now a system call;
+  - the refusal of code that cannot run (after a `while (true)` with no `break`, a `panic`, or a `match` whose every
+    arm leaves), first in 0.9.707;
   - channels that return `Result` (`Undelivered<T>`, `RecvError`), which the pool is written against, first in 0.9.690;
   - a release build on macOS with `std::process` beside `std::concurrent` (KPG-41), first in 0.9.679: an application
     that uses the pool and starts a process;
@@ -125,7 +130,12 @@ All notable changes to this package are recorded here. The format follows
     connection, as pgx closes one whose rollback failed, and logs a warning under `postgres`.
   - BEGIN's options are `tx.setOptions(options:)`, since a mint takes no arguments, and BEGIN's outcome is
     `tx.began()`, since a mint cannot return a Result.
-- **Needs `@kama/tls` ≥ 0.1.3**, the first whose `TlsError` is `Sendable`.
+- **Needs `@kama/tls` ≥ 0.1.6**, the first that builds on kama 0.9.707 and later. (0.1.3 was the first whose
+  `TlsError` is `Sendable`, which `PgError` needs.)
+- **Breaking: `Transport.wait` returns `postgres::Ready`**, this package's own type, where it returned
+  `std::net::Ready`, which kama 0.9.718 removed. It has the same shape (`Ready.of(readable:, writable:)`), so a
+  `Transport` of your own changes its import and nothing else, and a later change to std's poller cannot break it
+  again.
 - **Breaking:** a session's I/O failure is `PgError::Lost(detail, cause)` instead of `PgError::Io`. `Io` stays for a
   failure to connect and for the caller's own streams (`copyFrom`'s Reader, `copyTo`'s Writer).
 - **Breaking:** `postgres::protocol::frame` takes a `Framing` (`Startup`, `Session` or `CopyOut`), and `Frame` has an

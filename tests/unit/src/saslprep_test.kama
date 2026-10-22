@@ -18,9 +18,9 @@ export { saslprepTests };
 // The UTF-8 text a vector holds in hex.
 unsafe fn string textOf(const ref string hex) {
     Result<DynamicArray<uint8>, HexError> bytes = hexDecode(text: hex);
-    DynamicArray<uint8> b = match (give bytes) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "saslprep vector: bad hex"); return ""; } };
+    DynamicArray<uint8> b = match (give bytes) { case Ok(value: v): give v; case Err(error: e): { panic(msg: "saslprep vector: bad hex"); } };
     Result<string, Utf8Error> s = utf8Decode(bytes: b.view());
-    return match (give s) { case Ok(value: t): give t; case Err(error: e): { panic(msg: "saslprep vector: not UTF-8"); return ""; } };
+    return match (give s) { case Ok(value: t): give t; case Err(error: e): { panic(msg: "saslprep vector: not UTF-8"); } };
 }
 
 // The outcome as the test module prints it.
@@ -38,16 +38,16 @@ unsafe fn bool matchesVerifier(const ref string password, const ref string verif
     string prefix = "SCRAM-SHA-256$";
     if (!verifier.startsWith(prefix: prefix)) { return false; }
     string rest = verifier.substring(start: prefix.length(), end: verifier.length());
-    Optional<usize> colon = rest.find(substring: ":");
-    Optional<usize> dollar = rest.find(substring: "$");
-    isize c = match (colon) { case Some(value: i): cast<isize>(i); case None: -1; };
-    isize d = match (dollar) { case Some(value: i): cast<isize>(i); case None: -1; };
+    Optional<isize> colon = rest.find(substring: ":");
+    Optional<isize> dollar = rest.find(substring: "$");
+    isize c = match (colon) { case Some(value: i): i; case None: -1; };
+    isize d = match (dollar) { case Some(value: i): i; case None: -1; };
     if (c < 0 || d < c) { return false; }
     string iterationText = rest.substring(start: 0, end: c);
     string saltText = rest.substring(start: c + 1, end: d);
     string keys = rest.substring(start: d + 1, end: rest.length());
-    Optional<usize> split = keys.find(substring: ":");
-    isize k = match (split) { case Some(value: i): cast<isize>(i); case None: -1; };
+    Optional<isize> split = keys.find(substring: ":");
+    isize k = match (split) { case Some(value: i): i; case None: -1; };
     if (k < 0) { return false; }
     string storedText = keys.substring(start: 0, end: k);
     string serverText = keys.substring(start: k + 1, end: keys.length());

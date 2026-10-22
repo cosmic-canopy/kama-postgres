@@ -1,7 +1,7 @@
 import { std::collections::FixedArray, std::collections::DynamicArray, std::collections::ConstView, std::io::IoError,
-         std::io::IoErrorKind, std::memory::Owned, std::net::Interest, std::net::Ready, std::time::Instant,
+         std::io::IoErrorKind, std::memory::Owned, std::net::Interest, std::time::Instant,
          std::time::Duration, std::time::monotonicNow, std::encoding::utf8::decode as utf8Decode, std::encoding::utf8::Utf8Error,
-         postgres::Transport, postgres::PgError, postgres::ServerError,
+         postgres::Transport, postgres::Ready, postgres::PgError, postgres::ServerError,
          postgres::protocol::Frame, postgres::protocol::Framing, postgres::protocol::frame, postgres::protocol::decode,
          postgres::protocol::BackendMessage, postgres::protocol::ProtocolError, postgres::protocol::ErrorFields,
          postgres::protocol::HEADER_BYTES, postgres::protocol::STARTUP_ERROR_MAX, postgres::protocol::invalidErrorText };
@@ -136,7 +136,6 @@ type resource Wire implements Sendable {
                 }
             };
         }
-        return Result::Err(error: PgError::Closed);
     }
 
     // A pre-3.0 server's error before authentication, as PQconnectPoll reads it: the text after the 'E' up to a NUL,
@@ -252,7 +251,6 @@ type resource Wire implements Sendable {
                 match (give ready) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: give e); } };
             }
         }
-        return Result::Ok(value: false);
     }
 
     // Bytes received and not yet taken as messages.

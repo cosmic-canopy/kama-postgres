@@ -5,7 +5,7 @@
 // messages are libpq's, from its source at REL_18_STABLE (fe-connect.c, fe-secure-openssl.c, fe-auth.c).
 // Certificates come from tools/gen-test-certs.sh (PGTEST_CERTDIR, set by tools/test.sh).
 import { core::env, std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::memory::Owned,
-         std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready, std::fs::readFile, std::fs::writeFile,
+         std::io::IoError, std::io::IoErrorKind, std::net::Interest, postgres::Ready, std::fs::readFile, std::fs::writeFile,
          std::fs::setPermissions, std::fs::Permissions, std::fs::readText, std::fs::stat, std::fs::Metadata, std::fs::remove,
          std::process::currentUser, std::process::UserId,
          tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion, tls::Certificate,
@@ -16,13 +16,13 @@ export { tlsTests, certPath, serverTls, serverEndPoint };
 
 unsafe fn string certPath(const ref string name) {
     Optional<string> dir = env(name: "PGTEST_CERTDIR");
-    string d = match (give dir) { case Some(value: v): give v; case None: { panic(msg: "PGTEST_CERTDIR is not set: run tools/test.sh"); return ""; } };
+    string d = match (give dir) { case Some(value: v): give v; case None: { panic(msg: "PGTEST_CERTDIR is not set: run tools/test.sh"); } };
     return d.concat(other: "/").concat(other: name);
 }
 
 unsafe fn string scratch(const ref string name) {
     Optional<string> dir = env(name: "PGTEST_TMP");
-    string d = match (give dir) { case Some(value: v): give v; case None: { panic(msg: "PGTEST_TMP is not set: run tools/test.sh"); return ""; } };
+    string d = match (give dir) { case Some(value: v): give v; case None: { panic(msg: "PGTEST_TMP is not set: run tools/test.sh"); } };
     return d.concat(other: "/").concat(other: name);
 }
 
@@ -30,7 +30,7 @@ unsafe fn string scratch(const ref string name) {
 // "postgresql" when `alpn`, held to TLS 1.3 when `only13`, and asking for a client certificate when `askCert`.
 unsafe fn TlsConfig serverTls(bool alpn, bool only13, bool askCert) {
     Result<TlsConfig, TlsError> made = TlsConfig.server();
-    TlsConfig c = match (give made) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "server config"); return serverTls(alpn: alpn, only13: only13, askCert: askCert); } };
+    TlsConfig c = match (give made) { case Ok(value: x): give x; case Err(error: e): { panic(msg: "server config"); } };
     string nopw = "";
     Result<Unit, TlsError> id = c.identityFiles(certificate: certPath(name: "server.crt"), key: certPath(name: "server.key"), password: nopw);
     match (give id) { case Ok(value: u): { } case Err(error: e): { string m = e.message(); panic(msg: "server identity: ${m}"); } };
@@ -42,7 +42,7 @@ unsafe fn TlsConfig serverTls(bool alpn, bool only13, bool askCert) {
 
 unsafe fn DynamicArray<uint8> serverEndPoint() {
     Result<DynamicArray<uint8>, IoError> pem = readFile(path: certPath(name: "server.crt"));
-    DynamicArray<uint8> bytes = match (give pem) { case Ok(value: b): give b; case Err(error: e): { panic(msg: "read server.crt"); return DynamicArray.empty(); } };
+    DynamicArray<uint8> bytes = match (give pem) { case Ok(value: b): give b; case Err(error: e): { panic(msg: "read server.crt"); } };
     Result<Certificate, TlsError> parsed = Certificate.parse(bytes: bytes.view());
     return match (give parsed) { case Ok(value: c): c.tlsServerEndPoint(); case Err(error: e): DynamicArray.empty(); };
 }

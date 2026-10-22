@@ -1,8 +1,8 @@
 import { std::collections::View, std::collections::ConstView, std::collections::DynamicArray, std::io::IoError, std::io::IoErrorKind,
-         std::net::ReliableStream, std::net::Interest, std::net::Ready, std::memory::Owned, std::time::Duration,
+         std::net::ReliableStream, std::net::Interest, std::memory::Owned, std::time::Duration,
          std::fs::File, std::fs::OpenMode, std::fs::Permissions, std::log::logWarn,
          tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress, tls::TlsVersion, tls::CertificateNames,
-         postgres::Transport, postgres::PgError, postgres::wire::Deadline, postgres::wire::strerror };
+         postgres::Transport, postgres::Ready, postgres::PgError, postgres::wire::Deadline, postgres::wire::strerror };
 export { TransportStream, TlsTransport, TlsSession };
 
 // TLS over any transport. @kama/tls runs a session over a `ReliableStream`; `TransportStream` makes a `Transport`
@@ -127,7 +127,6 @@ type resource TlsTransport implements Transport, Sendable {
             if (want == Interest::Write) { ready = r.writable; }
             if (!ready) { return Result::Err(error: PgError::Timeout); }
         }
-        return Result::Ok(value: Unit::Unit);
     }
 
     // The settled session, once the handshake is done. `certificateLoaded`: this side had a certificate to send.

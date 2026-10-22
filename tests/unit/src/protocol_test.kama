@@ -21,7 +21,7 @@ export { protocolTests, unhex };
 fn DynamicArray<uint8> unhex(const ref string text) {
     string compact = text.replace(old: " ", with: "");
     Result<DynamicArray<uint8>, DecodeError> r = hexDecode(text: compact);
-    return match (give r) { case Ok(value: b): give b; case Err(error: e): { panic(msg: "unhex: a typo in a test vector"); return DynamicArray.empty(); } };
+    return match (give r) { case Ok(value: b): give b; case Err(error: e): { panic(msg: "unhex: a typo in a test vector"); } };
 }
 
 // Indexing a view a call returns is KTLS-2 (../kama-tls/KAMA_GAPS.md); a view parameter is not.
@@ -298,7 +298,7 @@ fn bool errIs(Result<BackendMessage, ProtocolError> r, int32 kind) {
 fn BackendMessage ok(Result<BackendMessage, ProtocolError> r, const ref string what) {
     return match (give r) {
         case Ok(value: m): give m;
-        case Err(error: e): { string why = e.message(); panic(msg: "decode failed for ".concat(other: what).concat(other: ": ").concat(other: why)); return BackendMessage::NoData; }
+        case Err(error: e): { string why = e.message(); panic(msg: "decode failed for ".concat(other: what).concat(other: ": ").concat(other: why)); }
     };
 }
 

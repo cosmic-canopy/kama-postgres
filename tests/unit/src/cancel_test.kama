@@ -44,7 +44,6 @@ type resource ScriptDialer implements Dialer, Sendable {
             }
             case None: { return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused)); }
         };
-        return Result::Err(error: IoError.of(kind: IoErrorKind::ConnectionRefused));
     }
 }
 

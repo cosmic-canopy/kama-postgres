@@ -26,8 +26,8 @@ fn bool matches(const ref string text, const ref string pattern) {
     isize from = 0;
     foreach (string part in pattern.split(separator: ".*")) {
         string rest = text.substring(start: from, end: text.length());
-        Optional<usize> at = rest.find(substring: part);
-        isize found = match (at) { case Some(value: i): cast<isize>(i); case None: -1; };
+        Optional<isize> at = rest.find(substring: part);
+        isize found = match (at) { case Some(value: i): i; case None: -1; };
         if (found < 0) { return false; }
         from = from + found + part.length();
     }
@@ -41,9 +41,9 @@ fn isize lastSeparator(const ref string text) {
     bool more = true;
     while (more) {
         string rest = text.substring(start: from, end: text.length());
-        Optional<usize> at = rest.find(substring: ": ");
+        Optional<isize> at = rest.find(substring: ": ");
         match (at) {
-            case Some(value: i): { cut = from + cast<isize>(i) + 2; from = cut; }
+            case Some(value: i): { cut = from + i + 2; from = cut; }
             case None: { more = false; }
         };
     }

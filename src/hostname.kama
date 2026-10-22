@@ -231,7 +231,6 @@ fn Optional<DynamicArray<uint8>> atonBytes(ConstView<uint8> s) {
             return Optional::Some(value: give address);
         }
     }
-    return Optional::None;
 }
 
 // inet_pton4 (resolv/inet_pton.c): exactly four decimal parts of 0 to 255, no leading zeros, nothing else.

@@ -1,7 +1,7 @@
 import { std::collections::DynamicArray, std::collections::FixedArray, std::collections::ConstView, std::io::IoError,
-         std::io::IoErrorKind, std::memory::Owned, std::net::Interest, std::net::Ready,
+         std::io::IoErrorKind, std::memory::Owned, std::net::Interest,
          tls::CertificateNames,
-         postgres::SslMode, postgres::TlsSettings, postgres::Transport, postgres::PgError, postgres::verifyServerName,
+         postgres::SslMode, postgres::TlsSettings, postgres::Transport, postgres::Ready, postgres::PgError, postgres::verifyServerName,
          postgres::wire::Deadline, postgres::wire::strerror, postgres::protocol::MessageWriter, postgres::protocol::sslRequest,
          postgres::secure::TlsTransport, postgres::secure::TlsSession, postgres::secure::ClientTls, postgres::secure::prepareTls };
 export { EncryptionPlan, Encryption, Fallback, Secured, secure };

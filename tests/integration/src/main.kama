@@ -20,7 +20,7 @@ unsafe fn string setting(string name) {
     Optional<string> v = env(name: copy name);
     return match (give v) {
         case Some(value: s): give s;
-        case None: { panic(msg: "PGTEST settings are missing: run tools/test-integration.sh, or source out/pgtest-N.env"); return ""; }
+        case None: { panic(msg: "PGTEST settings are missing: run tools/test-integration.sh, or source out/pgtest-N.env"); }
     };
 }
 

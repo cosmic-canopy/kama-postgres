@@ -3,7 +3,7 @@
 // Unix transport (connect, peer credentials, non-blocking I/O) against a real PostgreSQL.
 import { std::collections::DynamicArray, std::collections::FixedArray, std::collections::View,
          std::collections::ConstView, std::io::IoError, std::net::UnixListener, std::net::UnixStream,
-         std::net::TcpStream, std::net::Poller, std::net::Interest, std::net::Ready,
+         std::net::TcpStream, std::net::Poller, std::net::Interest, std::net::Event, std::net::Events,
          std::concurrent::Channel, std::concurrent::Sender, std::concurrent::Receiver,
          std::process::currentUser, std::process::UserId,
          postgres::Connection, postgres::PgError, postgres::Environment,
@@ -25,7 +25,9 @@ unsafe fn bool forward(ref UnixStream unix, ref TcpStream tcp, bool fromUnix, Vi
     if (n <= 0) { return false; }
     Result<Poller, IoError> made = Poller.create();
     Poller waiter = match (give made) { case Ok(value: p): give p; case Err(error: e): { return false; } };
-    waiter.add(fd: toFd, interest: Interest::Write);
+    Result<Unit, IoError> watched = waiter.add(fd: toFd, interest: Interest::Write, token: 0);
+    match (watched) { case Ok(value: u): { } case Err(error: e): { return false; } };
+    Events events = Events.withCapacity(capacity: 1);
     isize sent = 0;
     while (sent < n) {
         Result<isize, IoError> w = Result::Ok(value: 0);
@@ -35,7 +37,7 @@ unsafe fn bool forward(ref UnixStream unix, ref TcpStream tcp, bool fromUnix, Vi
             case Ok(value: k): { m = k; }
             case Err(error: e): { match (e.kind()) { case WouldBlock: { m = 0; } case _: { return false; } }; }
         };
-        if (m == 0) { Result<int32, IoError> ready = waiter.wait(timeoutMs: 5000); }
+        if (m == 0) { Result<int32, IoError> ready = waiter.wait(events: events, timeoutMs: 5000); }
         sent = sent + m;
     }
     return true;
@@ -49,16 +51,25 @@ unsafe fn void pump(UnixStream unix, TcpStream tcp) {
     Poller p = match (give made) { case Ok(value: x): give x; case Err(error: e): { return; } };
     isize uf = unix.rawHandle();
     isize tf = tcp.rawHandle();
-    p.add(fd: uf, interest: Interest::Read);
-    p.add(fd: tf, interest: Interest::Read);
+    Result<Unit, IoError> watchUnix = p.add(fd: uf, interest: Interest::Read, token: 1);
+    match (watchUnix) { case Ok(value: u): { } case Err(error: e): { return; } };
+    Result<Unit, IoError> watchTcp = p.add(fd: tf, interest: Interest::Read, token: 2);
+    match (watchTcp) { case Ok(value: u): { } case Err(error: e): { return; } };
+    Events events = Events.withCapacity(capacity: 2);
     FixedArray<uint8> buf = FixedArray.make(size: 65536);
     bool open = true;
     while (open) {
-        Result<int32, IoError> waited = p.wait(timeoutMs: 30000);
+        Result<int32, IoError> waited = p.wait(events: events, timeoutMs: 30000);
         int32 n = match (waited) { case Ok(value: k): k; case Err(error: e): 0; };
         if (n == 0) { open = false; }
-        if (open && p.readyFor(fd: uf).readable) { open = forward(unix: ref unix, tcp: ref tcp, fromUnix: true, buf: buf.viewMut(), toFd: tf); }
-        if (open && p.readyFor(fd: tf).readable) { open = forward(unix: ref unix, tcp: ref tcp, fromUnix: false, buf: buf.viewMut(), toFd: uf); }
+        bool unixReadable = false;
+        bool tcpReadable = false;
+        foreach (Event ev in events) {
+            if (ev.token == 1 && ev.readable) { unixReadable = true; }
+            if (ev.token == 2 && ev.readable) { tcpReadable = true; }
+        }
+        if (open && unixReadable) { open = forward(unix: ref unix, tcp: ref tcp, fromUnix: true, buf: buf.viewMut(), toFd: tf); }
+        if (open && tcpReadable) { open = forward(unix: ref unix, tcp: ref tcp, fromUnix: false, buf: buf.viewMut(), toFd: uf); }
     }
 }
 
@@ -77,11 +88,13 @@ type resource Relay implements Sendable {
         Result<Unit, IoError> nb = this.listener.setNonBlocking(on: true);
         Result<Poller, IoError> made = Poller.create();
         Poller p = match (give made) { case Ok(value: x): give x; case Err(error: e): { _ = this.done.send(item: -1); return; } };
-        p.add(fd: this.listener.rawHandle(), interest: Interest::Read);
+        Result<Unit, IoError> watched = p.add(fd: this.listener.rawHandle(), interest: Interest::Read, token: 0);
+        match (watched) { case Ok(value: u): { } case Err(error: e): { _ = this.done.send(item: -1); return; } };
+        Events events = Events.withCapacity(capacity: 1);
         int32 served = 0;
         bool waiting = true;
         while (served < this.count && waiting) {
-            Result<int32, IoError> w = p.wait(timeoutMs: 10000);
+            Result<int32, IoError> w = p.wait(events: events, timeoutMs: 10000);
             int32 ready = match (w) { case Ok(value: k): k; case Err(error: e): 0; };
             if (ready == 0) { waiting = false; continue; }
             Result<UnixStream, IoError> accepted = this.listener.accept();

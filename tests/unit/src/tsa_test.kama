@@ -60,9 +60,9 @@ fn isize occurrences(const ref string text, const ref string part) {
     isize n = 0;
     string rest = copy text;
     while (true) {
-        Optional<usize> at = rest.find(substring: part);
+        Optional<isize> at = rest.find(substring: part);
         match (at) {
-            case Some(value: i): { n = n + 1; rest = rest.substring(start: cast<isize>(i) + part.length(), end: rest.length()); }
+            case Some(value: i): { n = n + 1; rest = rest.substring(start: i + part.length(), end: rest.length()); }
             case None: { break; }
         };
     }

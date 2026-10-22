@@ -1,0 +1,18 @@
+[
+  {
+    "id": "W1",
+    "suite": "integration",
+    "file": "src/transport.kama",
+    "old": "case Some(value: w): w == interest;",
+    "new": "case Some(value: w): true;",
+    "expect": "login: kp_trust"
+  },
+  {
+    "id": "W2",
+    "suite": "integration",
+    "file": "src/transport.kama",
+    "old": "return Result::Ok(value: Ready.of(readable: readable, writable: writable));",
+    "new": "return Result::Ok(value: Ready.of(readable: writable, writable: readable));",
+    "expect": "login: kp_trust"
+  }
+]

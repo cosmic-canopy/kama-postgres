@@ -12,7 +12,7 @@ edit.
   The cstar project reads that file and fixes from it, usually within a session. So do not build a
   workaround you would not want to delete. If a workaround is unavoidable, name it in the entry.
 
-**The package needs kama ≥ 0.9.690**, declared as `"kama"` in every manifest here, and pinned in CI. That is the
+**The package needs kama ≥ 0.9.719**, declared as `"kama"` in every manifest here, and pinned in CI. That is the
 release it is built and tested with, and the first with everything this package relies on:
 - a non-fatal write to a closed socket;
 - a `Sendable` `TcpStream`;
@@ -39,7 +39,10 @@ release it is built and tested with, and the first with everything this package 
 - a release build with `std::process` beside `std::concurrent` on macOS (KPG-41, 0.9.679), which the pool and the
   restart tests need;
 - channels that return `Result` (`Undelivered<T>`, `RecvError`), a `Result` that cannot be dropped unnoticed
-  (`_ = expr;` is the explicit discard), and `fn uint8 main()` (KR-214 and the exit status, both 0.9.690).
+  (`_ = expr;` is the explicit discard), and `fn uint8 main()` (KR-214 and the exit status, both 0.9.690);
+- the refusal of code that cannot run (0.9.707), and `std::net`'s `Poller` over epoll and kqueue, filling a caller's
+  `Events` (KR-230, 0.9.717–0.9.718, first tagged in 0.9.719). KR-230 removed `std::net::Ready`, so no source builds on
+  both sides of it.
 
 ## What is true here and nowhere else
 
@@ -47,9 +50,10 @@ release it is built and tested with, and the first with everything this package 
   There is no libpq, no `csrc/` and no `csources`, and it should stay that way. TLS comes from the sibling
   package `@kama/tls` (`../kama-tls`), which vendors Mbed TLS. That is the only native code in the dependency tree.
   What postgres needs from TLS that the package lacks is added THERE, with its own tests, not worked around here.
-  - All three manifests (root, `tests/unit`, `tests/integration`) take it from the registry (`"version": "^0.1.3"`),
-    pinned by their `kama.lock`, so CI and a consumer build the published bytes. 0.1.3 is the floor because its
-    `TlsError` is `Sendable`, and `PgError`, which carries one, must be.
+  - All three manifests (root, `tests/unit`, `tests/integration`) take it from the registry (`"version": "^0.1.6"`),
+    pinned by their `kama.lock`, so CI and a consumer build the published bytes. 0.1.6 is the floor because it is the
+    first that builds on kama 0.9.707 and later. (0.1.3 was the first whose `TlsError` is `Sendable`, which `PgError`,
+    which carries one, must be.)
   - To develop against an unpublished change in `../kama-tls`, give each manifest a `kama.local.json` (gitignored,
     never published) with `"overrides": { "@kama/tls": { "path": "<relative path to kama-tls>" } }`, then
     `kama pkg install`. postgres can only publish once that change is in a published `@kama/tls`.
@@ -213,8 +217,12 @@ release it is built and tested with, and the first with everything this package 
   which words a failure as libpq does for that layer (a plain socket answers None, and `Wire.failure` then words it as
   libpq's socket layer does: `PgError::Lost`, "server closed the connection unexpectedly…" for a peer that hung up, else
   "could not receive data from server: …", "could not send data to server: …" or "select() failed: …").
-  - `TcpTransport` is a non-blocking `TcpStream` plus a `std::net::Poller`. The internal module
-    `postgres::wire` frames messages over any transport, with deadlines.
+  - `wait` returns `postgres::Ready`, the package's own type with the shape of the `std::net::Ready` that kama 0.9.718
+    removed. A consumer's `Transport` must not break when std's poller changes again, so never put a std poller type
+    in the contract.
+  - `TcpTransport` is a non-blocking `TcpStream` plus a `Waiter`: its own `std::net::Poller` and a one-event `Events`.
+    It registers the socket again only when the interest changes, since each registration is a system call. The
+    internal module `postgres::wire` frames messages over any transport, with deadlines.
   - `UnixTransport` is the same for a socket host (a directory, or `@name` on Linux). Its connect is
     non-blocking too, bounded by connect_timeout.
   - `TlsTransport` wraps any `Owned<Transport>` (through `TransportStream`, a `ReliableStream` adapter). It never
@@ -293,6 +301,11 @@ release it is built and tested with, and the first with everything this package 
   - A `Result` in statement position is refused: bind it, or discard it with `_ = expr;` (which drops it, and an
     `Undelivered` item with it).
   - `main` is `fn uint8 main()`, the exit status as macOS and Linux keep it.
+  - Code that cannot run is refused: nothing may follow a `while (true)` with no `break`, a `panic`, or a `match` whose
+    every arm leaves. Delete it; a `panic` arm needs no `return` after it.
+  - `Poller.add(fd:, interest:, token:)` and `remove` return `Result`. `wait(events:, timeoutMs:)` fills an `Events`
+    the caller owns (`Events.withCapacity`), read with `foreach (Event ev in events)` and matched by token.
+  - `string.find` returns `Optional<isize>`.
   - A channel's `tryRecv` and `recvTimeout` are `Result<T, RecvError>`: `Ok(value:)`, or `Err` with `Empty` (none yet)
     or `Closed` (no sender left).
   - Nothing moves a field out of a resource, not even out of a by-value parameter. A type whose contents must be

@@ -65,7 +65,6 @@ fn uint32 oidOf(const ref string type) {
     if (type.equals(other: "interval")) { return INTERVAL; }
     if (type.equals(other: "numeric")) { return NUMERIC; }
     panic(msg: "typed test: no OID for a vector type");
-    return 0ui32;
 }
 
 fn DynamicArray<uint8> bytesOf(ConstView<uint8> v) {

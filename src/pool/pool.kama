@@ -361,7 +361,6 @@ type resource PoolCore implements Sendable {
                 return Result::Err(error: give e);
             }
         };
-        return Result::Err(error: PgError::Closed);
     }
 
     // When a connection made now reaches its lifetime: the lifetime and a random part of the jitter from now.

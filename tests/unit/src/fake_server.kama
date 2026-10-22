@@ -12,7 +12,7 @@
 // negotiation takes a TLS ClientHello in place of an SSLRequest; one that does not hangs up on it, as a server older
 // than 17 does.
 import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView,
-         std::collections::FixedArray, std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::Ready,
+         std::collections::FixedArray, std::io::IoError, std::io::IoErrorKind, std::net::Interest, postgres::Ready,
          std::net::ReliableStream, std::concurrent::Sender, std::time::Duration, std::time::sleep,
          tls::TlsStream, tls::TlsConfig, tls::TlsError, tls::Progress,
          std::encoding::base64::encode as b64encode, std::encoding::base64::decode as b64decode,
@@ -727,8 +727,8 @@ type resource FakeServer implements Transport, Sendable {
             }
             case ScramFinal(signature: sig, then: t): {
                 string clientFinal = textFrom(body: body, from: 0);
-                Optional<usize> proofAt = clientFinal.find(substring: ",p=");
-                isize cut = match (proofAt) { case Some(value: i): cast<isize>(i); case None: -1; };
+                Optional<isize> proofAt = clientFinal.find(substring: ",p=");
+                isize cut = match (proofAt) { case Some(value: i): i; case None: -1; };
                 if (tag != 112ui8 || cut < 0) { this.refuse(); return; }
                 string withoutProof = clientFinal.substring(start: 0, end: cut);
                 string proof = clientFinal.substring(start: cut + 3, end: clientFinal.length());

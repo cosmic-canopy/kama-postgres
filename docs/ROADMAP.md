@@ -1,6 +1,6 @@
 # Roadmap
 
-Where this is, 2026-10-21: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2, S3, S4, S5 and S6 are done, and the ports to kama 0.9.673 and 0.9.690). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-21: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2, S3, S4, S5 and S6 are done, and the ports to kama 0.9.673, 0.9.690 and 0.9.719). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -37,7 +37,8 @@ and ask the container's libpq about each `target_session_attrs` case against a p
 KPG-33 to KPG-38 are fixed. KPG-39 (std's JSON beside this package) and KPG-40 (nesting through `tx.conn()` is intended,
 and the freeze it relies on is fixed) were verified on the 0.9.673 release, which the package now needs. KPG-41 (on
 macOS, a release build with `std::process` beside `std::concurrent` failed in clang), found in S2c, is fixed in 0.9.679,
-and the package now needs 0.9.690. No gap is open. Phase 8 is under way: its plan is below.
+and the package needed 0.9.690. kama 0.9.719's new `Poller` (KR-230) took a port of its own, and the package now
+needs 0.9.719. No gap is open. Phase 8 is under way: its plan is below.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -52,7 +53,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4, S5 and S6 done; S7 next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4, S5, S6 and the port to 0.9.719 done; S7 next |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -330,6 +331,29 @@ it fail.
 
       In both, a mutation is caught when the run exits other than 0 and printed the `expect` text.
   - **Mutations:** `tools/mutations/s6.json`, 8 for the examples and 3 for the README check. All are caught.
+- **The port to kama 0.9.719, done (2026-10-22).** kama tagged v0.9.707 and v0.9.719 after S6. The registry checks a
+  publish with cstar's newest build, so a 0.3.0 left on 0.9.690 could not publish: `kama check` found 74 errors on
+  0.9.719, in this package and in `@kama/tls` 0.1.4. @kama/redis met the same wall (its KRD-16).
+  - **The floor is `>=0.9.719`**, the first tag with KR-230. No source builds on both sides of KR-230. `@kama/tls` is
+    `^0.1.6`, the first that builds on 0.9.707. All three locks pin 0.1.6, as the examples' already did.
+  - **KR-230 removed `std::net::Ready`**, which `Transport.wait` returned. It now returns `postgres::Ready`, the
+    package's own type, with the same shape, so a consumer's `Transport` changes only its import. This was decided
+    with the maintainer on 2026-10-22: @kama/redis's KRD-16 plans the same, and tokio kept its own `Ready` when mio 0.7
+    removed mio's. cstar's ruling (ROADMAP_DETAIL §6) said nothing of downstream contracts.
+  - **`TcpTransport` and `UnixTransport` share a `Waiter`:** a `Poller`, a one-event `Events`, and the interest last
+    registered. Each registration is now a system call (epoll_ctl, kevent), so it registers again only when the
+    interest changes.
+  - **0.9.707 refuses code that cannot run:** 19 statements in `src/` and 12 in the tests, each a `return` after a
+    `while (true)`, a `panic`, or a `match` whose every arm leaves. `string.find` returns `Optional<isize>`, which only
+    the tests use.
+  - The relay in `socket_test.kama` waits on `Events`, by token.
+  - **Mutations:** `tools/mutations/port719.json`, two integration mutations of the `Waiter`. W1 never registers the
+    socket again; W2 swaps readable and writable. Both are caught: the first login times out. S2's ten `wire.kama`
+    mutations ran again and are caught. Each of the 213 older entries' patterns still occurs once.
+  - **Two lines have no mutation:**
+    - The connect's timeout check: no live case connects to an address that never answers, and the unit tests never
+      open a socket.
+    - The `foreach` that ORs the events together: with one event per wait it matches a plain read of that event.
 - **S7, docs and 0.3.0.**
   - Make the README's links absolute, because the registry renders a relative link as plain text.
   - Update the CHANGELOG, this file and AGENTS.postgres.md.
@@ -391,8 +415,8 @@ it fail.
   - `tools/test-integration.sh`, on 14–19 in debug, release and TLS, then the restart leg, then the examples;
   - **`tools/mutate.sh tools/mutations/<step>.json --version 18`**. This runs each mutation in a copy of the tree and
     exits 1 unless every one makes its targeted case fail. S0b's 26 are in `s0b.json`, S1's 35 in `s1.json`, S2's 47
-    in `s2.json`, S3's 27 in `s3.json`, S4's 44 in `s4.json`, S5's 23 in `s5.json` and S6's 11 in `s6.json`. All were
-    run on 0.9.690, and S3's again on S4's code.
+    in `s2.json`, S3's 27 in `s3.json`, S4's 44 in `s4.json`, S5's 23 in `s5.json`, S6's 11 in `s6.json` and the port to 0.9.719's 2 in
+    `port719.json`. All were run on 0.9.690, S3's again on S4's code, and the port's with S2's `wire.kama` ones on 0.9.719.
     Write a file per step, and re-run older files when their code changes. A `BAD-PATTERN` means the source moved on, so update the mutation. PANICKED is
     a run that died before any case failed; an entry may expect it, and may set `"env"` (the restart mutations set
     `PGTEST_RESTART=1`) and `"timeout"`. A run that times out is judged by what it printed first, since a pool mutant
@@ -406,7 +430,7 @@ it fail.
   - A generator's output is committed: re-run it, and `git diff` must be empty (`tools/gen-reset-vectors.sh` for S1,
     `tools/gen-libpq-tables.sh` for S2a).
   - Never edit a script while it runs: `sh` reads it as it goes.
-- **The compiler.** Build with the v0.9.690 release, as CI does. The dev tree (`../cstar/out`) may be past the release,
+- **The compiler.** Build with the v0.9.719 release, as CI does. The dev tree (`../cstar/out`) may be past the release,
   and `~/.kama/bin/kama` is an old 0.9.440.
   - To get one: `kama-macos-universal-vX.tar.gz` from the `cosmic-canopy/kama` GitHub release, checked against its
     `.sha256` and unpacked anywhere (it holds `kama-macos-universal-vX/bin/kama`). A session's scratchpad does not

@@ -59,7 +59,7 @@ unsafe fn Connection opened(const ref string conninfo) {
     Result<Connection, PgError> r = open(conninfo: conninfo);
     return match (give r) {
         case Ok(value: c): give c;
-        case Err(error: e): { string m = e.message(); panic(msg: "restart: connect before the restart: ".concat(other: m)); return opened(conninfo: conninfo); }
+        case Err(error: e): { string m = e.message(); panic(msg: "restart: connect before the restart: ".concat(other: m)); }
     };
 }
 

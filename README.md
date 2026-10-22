@@ -5,7 +5,7 @@ in kama, over `std::net`, the way pgx, tokio-postgres, pgjdbc and Npgsql do. The
 install. TLS comes from [`@kama/tls`](https://github.com/cosmic-canopy/kama-tls).
 
 ```sh
-kama pkg add kama.json @kama/postgres --version ^0.2.0     # from the official registry, registry.kama-lang.org
+kama pkg add kama.json @kama/postgres --version ^0.3.0     # from the official registry, registry.kama-lang.org
 ```
 
 Needs **kama ≥ 0.9.719**, declared in the manifest, so an older compiler is refused by name. Tested, debug and
@@ -14,7 +14,10 @@ release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta.
 > **Status: early.** It connects, authenticates and runs queries, with typed parameters and typed rows, over TCP, a
 > Unix-domain socket or TLS (every `sslmode`, client certificates, SCRAM-SHA-256-PLUS). The statement cache,
 > transactions and savepoints, COPY, waiting for notifications, pipelining and batches, cancellation and query timeouts,
-> `target_session_attrs` and `load_balance_hosts` came in 0.2.0, and a pool shared by isolates is coming in 0.3.0. See [docs/ROADMAP.md](docs/ROADMAP.md). In 0.x, a minor version may break the API.
+> `target_session_attrs` and `load_balance_hosts` came in 0.2.0. A pool shared by isolates, transactions scoped by a
+> borrow window, and bounds on what a server can make a connection hold came in 0.3.0. Windows is next: see the
+> [roadmap](https://github.com/cosmic-canopy/kama-postgres/blob/main/docs/ROADMAP.md). In 0.x, a minor version may
+> break the API.
 
 ## Using it
 
@@ -64,7 +67,8 @@ fn uint8 main() {
 ```
 
 That is [`examples/quickstart`](https://github.com/cosmic-canopy/kama-postgres/blob/main/examples/quickstart/src/main.kama),
-and every code block in this README comes from one of the [examples](#examples), each of which has run against every
+and every code block in this README comes from one of the
+[examples](https://github.com/cosmic-canopy/kama-postgres/tree/main/examples), each of which has run against every
 server this package is tested on.
 
 Parameters go through the extended protocol, with the `pg` tag or a `Query`. A hole is always a parameter, never
@@ -489,7 +493,7 @@ A connection string can list several hosts, as libpq's can:
     interpolations (never splices them).
   - A statement cache.
   - Streaming rows, portals, pipelining and batches.
-- **Data:** `column::<T>(row:, index:)` and `rowAs::<T>` into `@generate(Deserializable)` structs.
+- **Data:** `column::<T>(rows:, row:, index:)` and `rowAs::<T>` into `@generate(Deserializable)` structs.
   Types are the built-ins plus numeric, interval, inet/cidr, arrays and ranges, with UUIDs and timestamps
   through `std::uuid` and `std::time`.
 - **Everything else:**
@@ -565,8 +569,8 @@ committed. See `tests/integration/server/`.
 
 `@kama/postgres` is licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/cosmic-canopy/kama-postgres/blob/main/LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](https://github.com/cosmic-canopy/kama-postgres/blob/main/LICENSE-MIT))
 
 at your option. It vendors nothing; its TLS comes from `@kama/tls`, whose README says what that bundles.
 

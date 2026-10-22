@@ -355,3 +355,11 @@ release it is built and tested with, and the first with everything this package 
 - **Publishing** goes through `../kama-registry` (`./ops publish ../kama-postgres/kama.json`) and happens
   only when the user says so, because a version is permanent. `@kama/tls` is published first.
   `kama publish kama.json --dry-run` must list no certificates and none of the agent files.
+  - **A release, step by step:**
+    1. One commit on main raises `kama.json`'s version and turns the CHANGELOG's `[Unreleased]` into the version.
+    2. Push it, on the user's word, and wait for CI to be green on it.
+    3. Make an annotated tag `vX.Y.Z` on that commit and push the tag.
+    4. The user has the registry publish it.
+  - **The registry checks a publish with cstar's newest build, not CI's tag.** Run `kama check kama.json` with
+    `../cstar/out/Darwin-arm64/kama` before calling a release ready. A kama release between steps can need a port first,
+    as 0.3.0 did.

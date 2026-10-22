@@ -6,6 +6,19 @@ All notable changes to this package are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-22
+
+Phase 8. It adds a connection pool shared by isolates, with maintenance, and transactions scoped by a borrow window.
+It is hardened against a hostile server, with libpq's header checks, bounds on what a server can make a connection
+hold, and seeded garbling of every reply, and against a restarting one. Seven examples are added, from which every
+code block in the README is taken. Needs **kama ≥ 0.9.719** and `@kama/tls` ^0.1.6. Verified on kama 0.9.719, debug
+and release, on macOS arm64 and Linux, against PostgreSQL 14–18 and 19 beta, in plaintext and over TLS, each server
+with a hot standby.
+
+Upgrading from 0.2: a transaction body becomes the block of a `borrow conn.transaction() as tx` window. A session's
+I/O failure is `PgError::Lost`, and an exhaustive `match` on `PgError` needs arms for its three new cases, `Lost`,
+`Limit` and `PoolTimeout`. A `Transport` of your own imports `postgres::Ready`. Each is under Changed or Removed below.
+
 ### Added
 - `Transaction`, the transaction a borrow window scopes, which `transaction()` now mints. Its methods are `conn()`,
   `began()`, `commit()`, `rollback()` and `setOptions(options:)`, which runs SET TRANSACTION.
@@ -145,7 +158,8 @@ All notable changes to this package are recorded here. The format follows
 - A NoticeResponse before authentication is refused, as libpq refuses it. A server sends none there.
 - A pre-3.0 error whose text is empty is "received invalid error message", where libpq reports an empty error: what it
   holds is a v3 header with a length under 8. Found by the seeded mutations of every scripted reply (below).
-- **Breaking:** `PgError` has a new case, `PoolTimeout`, so an exhaustive `match` on it needs one more arm.
+- **Breaking:** `PgError` has three new cases, `Lost`, `Limit` and `PoolTimeout`, so an exhaustive `match` on it needs
+  an arm for each.
 - `PgError` is `Sendable`, and so are `ServerError`, `ConnectError`, `ConnectAttempt`, `ProtocolError` and
   `ErrorFields`, so an error can cross isolates (a `Channel<PgError>`, or a `Sendable` type that holds one).
 

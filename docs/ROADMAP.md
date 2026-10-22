@@ -1,6 +1,8 @@
 # Roadmap
 
-Where this is, 2026-10-21: phases 0–7 are done, and phase 8 is under way (S0, S0b, S1, S2, S3, S4, S5 and S6 are done, and the ports to kama 0.9.673, 0.9.690 and 0.9.719). 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667 (published). S0b's scoped transactions are a breaking change, unreleased until 0.3.0. 0.1.0 was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
+Where this is, 2026-10-22: phases 0–8 are done, and phase 9 (Windows) is next. 0.3.0 carries phase 8, on kama 0.9.719;
+the registry publishes it on the maintainer's word. 0.2.0 carried phase 7, and 0.2.1 is 0.2.0 on kama 0.9.667. 0.1.0
+was phases 0–6, with `@kama/tls` 0.1.0. The client connects and queries on every supported server
 (14–18, 19 beta), debug and release, in plaintext and over TLS:
 - **Connecting.** It resolves its configuration exactly as libpq does: connection string, service file, PG*
   environment, password file, and require_auth. It tries each host and address within connect_timeout, over
@@ -25,6 +27,13 @@ Where this is, 2026-10-21: phases 0–7 are done, and phase 8 is under way (S0, 
   - libpq's pipeline mode, with pgx's Batch on top.
   - Cancel requests (libpq 17's, encrypted), and query timeouts that cancel and keep the connection.
   - `target_session_attrs` against a real hot standby, and `load_balance_hosts=random`.
+- **Phase 8.**
+  - A pool shared by isolates, with a maintenance isolate: minIdle, Npgsql's pruning, pings and lifetimes.
+  - Transactions scoped by a borrow window, which nests as savepoints.
+  - Hardening against a hostile server: libpq's header checks, bounds on what a server can make a connection hold, and
+    seeded garbling of every reply.
+  - Sessions and the pool across a server restart, tested live.
+  - Seven examples, from which every code block in the README is taken.
 
 Expected values come from PostgreSQL itself: its TAP tests and test modules, a live libpq asked case by case, and a
 live server's send and output functions. For TLS that is `005_negotiate_encryption.pl`'s 53 negotiation cases (replayed
@@ -38,7 +47,7 @@ KPG-33 to KPG-38 are fixed. KPG-39 (std's JSON beside this package) and KPG-40 (
 and the freeze it relies on is fixed) were verified on the 0.9.673 release, which the package now needs. KPG-41 (on
 macOS, a release build with `std::process` beside `std::concurrent` failed in clang), found in S2c, is fixed in 0.9.679,
 and the package needed 0.9.690. kama 0.9.719's new `Poller` (KR-230) took a port of its own, and the package now
-needs 0.9.719. No gap is open. Phase 8 is under way: its plan is below.
+needs 0.9.719. No gap is open. Phase 8 is done, and its plan and record are below. Phase 9 is not planned yet.
 
 Each phase ends green: `tools/test.sh`, and from phase 4 on, the integration suite on the whole server
 matrix.
@@ -53,7 +62,7 @@ matrix.
 | 5 | Extended query: parameters and the `pg"…"` tag, `column::<T>` / `rowAs::<T>`, streaming, portals; type round-trips on 14–19 | **done** |
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
-| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | in progress: S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4, S5, S6 and the port to 0.9.719 done; S7 next |
+| 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | **done** (0.3.0): S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4, S5, S6, the port to 0.9.719 and S7 |
 | 9 | Windows: libpq's WIN32 branches, a Windows CI leg | |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -354,10 +363,15 @@ it fail.
     - The connect's timeout check: no live case connects to an address that never answers, and the unit tests never
       open a socket.
     - The `foreach` that ORs the events together: with one event per wait it matches a plain read of that event.
-- **S7, docs and 0.3.0.**
-  - Make the README's links absolute, because the registry renders a relative link as plain text.
-  - Update the CHANGELOG, this file and AGENTS.postgres.md.
-  - Tag `v0.3.0` for the registry to publish.
+- **S7, done: docs and 0.3.0** (2026-10-22).
+  - The README's links are absolute, because the registry renders a relative link as plain text and `docs/` is not
+    shipped.
+  - Its status note, install line and kama floor say 0.3.0, and "What it covers" gives `column::<T>`'s real signature.
+  - The CHANGELOG's 0.3.0 entry opens with what upgrading from 0.2 takes. `kama.json` says 0.3.0.
+  - AGENTS.postgres.md says how a release goes.
+  - **The release:** main was pushed with the 0.3.0 commit. That push is CI's first run of S2 to S7, the restart leg
+    on Linux included. `v0.3.0` is tagged only once CI is green on it, so a missing tag means CI failed: read its log
+    first.
 
 **Decisions:**
 - **On release, roll back and reset the session.** Npgsql and asyncpg do; pgx and deadpool do not. It is the safer
@@ -377,19 +391,24 @@ it fail.
 - **Phase 8 ends at 0.3.0, not 1.0.0.** kama is pre-1.0, Windows is not done, and the first users of the pool may ask
   for changes.
 
-**What the next session needs to know** (written 2026-10-21, after S6):
-- **Where it stands.** S0, S0b, S1, S2, S3, S4, S5 and S6 are done, and so are the ports to kama 0.9.673 and 0.9.690. No
-  gap is open. Nothing is pushed: pushing waits for the maintainer.
-- **Next: S7, docs and 0.3.0.**
-  - The README's relative links (`docs/ROADMAP.md`, the licenses) become absolute: the registry renders a relative link
-    as plain text. The links S6 added are absolute already.
-  - The README's status note still says the pool is "coming in 0.3.0", and its install line says `^0.2.0`.
-  - The CHANGELOG's `[Unreleased]` becomes `[0.3.0]`, `kama.json`'s version is raised, and `v0.3.0` is tagged for the
-    registry to publish, after the gate. Publishing happens only when the maintainer says so.
-  - **Ask the maintainer about `@kama/tls`.** The locks pin 0.1.4. 0.1.5 fixed a race between a shared `TlsConfig`'s
-    setters, which this package never reaches: it builds a `TlsConfig` per attempt and never shares one. 0.1.6 builds on
-    kama 0.9.707. The examples' locks already resolve 0.1.6, and run on 0.9.690. Raising the floor (`^0.1.3`) is not
-    needed for anything this package does.
+**What the next session needs to know** (written 2026-10-22, after 0.3.0):
+- **Where it stands.**
+  - Phase 8 is done, in 0.3.0, and no gap is open.
+  - The registry publishes 0.3.0 on the maintainer's word (`../kama-registry`, `./ops publish`).
+  - Pushing and tagging also wait for the maintainer.
+- **Check with cstar's newest build before calling a release ready.** The registry checks a publish with it, not with
+  CI's tag, so run `kama check kama.json` with `../cstar/out/Darwin-arm64/kama` too. This is how 0.3.0 found it needed
+  a port: kama tagged 0.9.707 and 0.9.719 between S6 and S7, and KR-230 changed `std::net`'s `Poller`.
+- **Next: phase 9, Windows.** It is not planned yet; plan it with the maintainer. What is known:
+  - **libpq's WIN32 branches** in the pinned sources say what changes: the password and service files' places, the
+    key file's permission check, `requirepeer`, and Unix-domain sockets. Read them there, not from memory.
+  - **The poller needs no branch.** KR-230 put std's `Poller` on AFD over an I/O completion port on Windows (0.9.718),
+    so the `Waiter` stays as it is.
+  - **@kama/tls must build and pass there first.** Its phase 7 is Windows, cross-built from macOS with zig on
+    2026-10-19 (`../kama-tls/docs/ROADMAP.md`, "Windows"). Its `trustSystem()` reads a CA bundle file, which Windows
+    does not have, and `sslrootcert=system` relies on it.
+  - **The target.** kama's `--target WINDOWS` is `<arch>-windows-gnu`, and the platform branches here are
+    `@compileFor(OS_…)`.
 - **Writing an example** (`examples/<name>/`):
   - The manifest is the other examples' (`"@kama/postgres": { "path": "../.." }` alone), and `kama pkg install` writes its
     `kama.lock`, which is committed.
@@ -438,13 +457,14 @@ it fail.
   - Run with `KAMA=<that>/bin/kama tools/test.sh`, or `curl -fsSL https://kama-lang.org/install.sh | KAMA_VERSION=vX sh`.
   - **The editor's diagnostics come from that old 0.9.440 language server.** It rejects a view's `~dtor` and cannot
     resolve this package's imports, so ignore it and trust `kama check`.
-- **kama-tls.** `../kama-tls` is readable. The package needs `@kama/tls` ≥ 0.1.3 (its `TlsError` is `Sendable`), and
-  the locks pin 0.1.4. kama-tls is busy with its own roadmap, so ask the maintainer before you need something there.
+- **kama-tls.** `../kama-tls` is readable. The package needs `@kama/tls` ≥ 0.1.6, the first that builds on kama
+  0.9.707 and later, and every lock pins 0.1.6. kama-tls is busy with its own roadmap, so ask the maintainer before you
+  need something there.
 - **The servers.** `kama-pg-14` to `kama-pg-19` and their standbys run under podman (`tools/pg.sh`). The superuser's
   reset test leaves one object behind, by design: `kp_reset_seq`, a sequence in `kp_test`, made with `if not exists`.
   The restart leg leaves each primary running, and `test-integration.sh` runs `pg.sh up` after it.
-- **CI has not run the restart leg yet.** It has run here under podman on macOS only. CI's integration job (docker on
-  Linux) runs it from the first push of S2.
+- **CI.** The push of 0.3.0 was CI's first run of the restart leg, on Linux under docker. Before that it had run only
+  here, under podman on macOS.
 - **Other sessions commit here.** @kama/redis's session committed `bacbcc4` to this repo during S0b. Read `git status`
   and `git log` before committing, and stage only your own files.
 

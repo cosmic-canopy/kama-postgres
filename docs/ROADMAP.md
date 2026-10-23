@@ -65,7 +65,7 @@ matrix.
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
 | 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | **done** (0.3.0): S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4, S5, S6, the port to 0.9.719 and S7 |
-| 9 | Windows: libpq's WIN32 branches, a native server on Windows, Windows CI legs. Ends at 0.4.0 | **under way**: S0 done, S1 next |
+| 9 | Windows: libpq's WIN32 branches, a native server on Windows, Windows CI legs. Ends at 0.4.0 | **under way**: S0 and S1 done, S2 next |
 | 10 | Kerberos: GSSAPI (Linux, macOS), SSPI (Windows) and `gssencmode` | planned, design first |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -125,7 +125,7 @@ maintainer's word). Each step's mutations go in `tools/mutations/p9-sN.json`.
     - Five expected Unix's `HOME`. They became `homeTests` and `setHome`/`tlsHome`, with a Windows twin each that
       checks `APPDATA`'s `postgresql`, `pgpass.conf`, and the TLS files with no `.postgresql/`.
     - Two read `'NaN'` as text with other bits than binary: KPG-43. std's parse takes UCRT's NaN
-      (`7fffffffffffffff`). `floatText` now gives PostgreSQL's (`7ff8000000000000`) on every platform.
+      (`7fffffffffffffff`). `floatText` now gives the canonical NaN (`7ff8000000000000`) wherever it runs.
     - The key-permission cases follow 001_ssltests.pl, which skips them on Windows: a key at 0644 or 0640 connects.
   - **The gate is green on Windows**, on both compilers: `../kama` at v0.9.719 with msys2's clang, and the release with
     zig bundled. That covers the unit program debug and release, the seven examples, and the README check.
@@ -134,10 +134,50 @@ maintainer's word). Each step's mutations go in `tools/mutations/p9-sN.json`.
     `$PYTHON`, else the first of `python3` and `python` that runs.
   - **Mutations:** `tools/mutations/p9-s0.json` has 8, all caught: the NaN, the five parts of the Windows home and its
     files, and the Windows key check.
-- **S1: libpq's WIN32 configuration branches**, each a `@compileFor(OS_WINDOWS)` twin, read from the pinned source:
-  the default socket directory and host, `is_unixsock_path`, the password file's checks, `requirepeer`, keepalives,
-  the user name's failure, and `winsock_strerror` (generated from `win32.c` by `tools/gen-libpq-tables.sh`). Unix's
-  `isSocketPath` stops taking `C:/x`, which Unix libpq does not.
+- **S1, done: libpq's WIN32 branches** (2026-10-22). Each is a `@compileFor(OS_WINDOWS)` twin, read from the pinned
+  source.
+  - **Configuration** (`src/config.kama`, `src/conninfo/pgpass.kama`):
+    - `defaultSocketDir()` is `""`, so the default host is `localhost` over TCP, and no socket directory is
+      `localhost` to the password file.
+    - `isSocketPath` is `is_unixsock_path` over a per-platform `is_absolute_path`: `/` on Unix, which fixes Unix
+      taking `C:/x`; `/`, `\`, UNC and `X:\`/`X:/` on Windows.
+    - `passfileUsable` checks nothing.
+    - `keepalives_count` is not read.
+    - The user name's failure reads "user name lookup failure: error code N".
+  - **Connecting** (`src/session/route.kama`):
+    - `requirepeer` over a socket is refused ("requirepeer parameter is not supported on this platform").
+    - Keepalives are set as `pqSetKeepalivesWin32` sets them (7200 s and 1 s by default, failing in
+      `WSAIoctl(SIO_KEEPALIVE_VALS)`'s words), and `tcp_user_timeout` sets nothing.
+    - `absent()` takes only the not-found kind: `win32error.c` maps nothing to ENOTDIR.
+    - A cancel request's connection that fails a read while it waits for the server's close has closed
+      (`Wire.awaitEnd`). `PQcancelPoll`'s errno check is `#ifndef WIN32`, since Windows reports a clean close as
+      `ECONNRESET` at times. The first live run found it: every cancel failed on Windows, so a query timeout closed its
+      session.
+  - **The OS's words** (`src/wire/wire.kama`, `src/wire/win32.kama`):
+    - A Winsock code (10000–11999) is `winsock_strerror`'s: its table, then ` (0x%08X/%d)`.
+    - Any other code goes through PostgreSQL's `_dosmaperr` to an errno, in the UCRT's `strerror` words.
+    - `tools/gen-win32-errors.sh` generates the three tables. The sources are the pinned `win32.c` and `win32error.c`,
+      and mingw-w64 v13.0.0's `winerror.h` and `errno.h` for the constants. The UCRT texts come from a probe, which
+      only runs on Windows.
+  - **libpq's order for a client key:** one that is not a regular file is refused from its `stat`, before it is
+    opened. On Windows a directory cannot be opened as a file, so the open failed first with "Permission denied".
+  - **EDB 18.6's `psql` agreed, asked live** against the native server:
+    - a password file others can read is used;
+    - `NUL`, `/dev/null`, a directory and a missing file give no password and no warning;
+    - a refused connect reads `Connection refused (0x0000274D/10061)`;
+    - `keepalives_count=abc` is accepted;
+    - the default host is reached over TCP.
+  - **Tests.**
+    - `config_test`'s `platformTests`: the socket-path forms, `keepalives_count`, and a real password file at 0600,
+      at 0644 and as a directory, with or without libpq's warning by platform.
+    - A Windows twin of the pgpass default-socket case.
+    - `lost_test`'s `osWordTests`: a real EADDRINUSE from a second listener on a held port, injected into a session.
+    - `tls_test`: a key that is a directory, and the keylog warning's ENOENT words, one warning per secret.
+    - The `lost` cases now say `sslmode=disable`. On Windows the default host is TCP, and an SSLRequest went first.
+  - **Mutations:** `tools/mutations/p9-s1.json` has 19, all caught. `p9-s1-unix.json` holds the Unix half (the
+    `C:/x` fix and `keepalives_count`), for the Mac, since a mutation compiled out here cannot fail.
+  - **Left to S3's live suite:** the keepalive, `requirepeer` and cancel twins, the user name's failure, and
+    `absent()`. The unit tests open no socket, and cannot make the account lookup fail.
 - **S2: a native PostgreSQL 18 on Windows** (`tools/pg.sh`, chosen when `uname` is MINGW or MSYS):
   - EDB's zip, pinned by URL and SHA256;
   - `initdb` from `tests/integration/server/`, sharing `00-setup.sh`'s steps with the container;

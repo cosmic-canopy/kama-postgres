@@ -8,14 +8,43 @@ All notable changes to this package are recorded here. The format follows
 
 Phase 9, Windows, under way.
 
+### Added
+- **libpq's Windows rules**, read from its WIN32 branches at REL_18:
+  - With no host given, the default is `localhost` over TCP: libpq has no default socket directory on Windows. For
+    the same reason, no socket directory matches `localhost` in the password file.
+  - A host is a socket path when it starts with `/` or `\` (UNC paths included) or a drive letter and a separator
+    (`C:\…`, `C:/…`), or `@`.
+  - The password file is used whatever its permissions, and a directory or unreadable file gives no password and no
+    warning.
+  - `requirepeer` over a Unix-domain socket ends the connect with "requirepeer parameter is not supported on this
+    platform".
+  - Keepalives are on with an idle time and an interval, 2 hours and 1 second when unset or not positive, as
+    `SIO_KEEPALIVE_VALS` sets them. `keepalives_count` is not read at all, so a value that is not a number is no
+    error. `tcp_user_timeout` is checked but sets nothing, since Windows has no `TCP_USER_TIMEOUT`.
+  - A local user name that cannot be looked up is "user name lookup failure: error code N".
+  - A cancel request whose connection fails while it waits for the server to close it has succeeded, as libpq takes
+    it there: Windows sometimes reports a clean close as a reset.
+  - The operating system's errors are worded as libpq words them there:
+    - a Winsock error in libpq's own words with its code appended, "Connection refused (0x0000274D/10061)"
+      (`winsock_strerror`);
+    - any other error as the errno PostgreSQL's port maps it to, in the Windows C runtime's words ("No such file or
+      directory", "Permission denied").
+
+    The tables are generated from libpq's source and the runtime itself (`tools/gen-win32-errors.sh`).
+
 ### Changed
 - **Needs `@kama/tls` ^0.1.7**, up from ^0.1.6. 0.1.7 is the first that builds and passes on Windows, and its
   `trustSystem()` (behind `sslrootcert=system`) imports the Windows certificate store's roots there.
 
 ### Fixed
-- A `float4` or `float8` read as the text `NaN` has PostgreSQL's NaN bits (`7ff8000000000000`) on every platform. On
-  Windows, std's parse took the C runtime's NaN, so the same column read in text and in binary differed in its bits
-  (KPG-43).
+- A client key that is not a regular file is refused from its `stat`, before it is opened, as libpq refuses it. The
+  words were the same on Linux and macOS. On Windows, where a directory cannot be opened as a file, the open failed
+  first with "Permission denied".
+- On Linux and macOS, a host such as `C:/data` was taken for a Unix-domain socket path. libpq takes only a host that
+  starts with `/` or `@` there, and now so does this client.
+- A `float4` or `float8` read as the text `NaN` has the canonical NaN's bits (`7ff8000000000000`) wherever the client
+  runs. On Windows, std's parse took the C runtime's NaN (`7fffffffffffffff`) (KPG-43). A NaN read in binary keeps the
+  server's bits, which follow its own C library.
 
 ## [0.3.0] — 2026-10-22
 

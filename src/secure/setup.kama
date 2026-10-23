@@ -168,11 +168,18 @@ fn bool looksLikeAddress(const ref string host) {
 }
 
 // stat failing with ENOENT or ENOTDIR: the file is not there, which for the client certificate means none.
+@compileFor(!OS_WINDOWS)
 fn bool absent(const ref IoError e) {
     bool notFound = match (e.kind()) { case NotFound: true; case _: false; };
     if (notFound) { return true; }
     return match (e.rawOsError()) { case Some(value: code): code == 20; case None: false; };   // ENOTDIR
 }
+
+// On Windows, stat's errno comes from PostgreSQL's _dosmaperr (src/port/win32error.c), which maps a missing file or
+// path (ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND) to ENOENT and nothing to ENOTDIR. rawOsError() there is the Win32
+// code, so the POSIX number is not compared.
+@compileFor(OS_WINDOWS)
+fn bool absent(const ref IoError e) { return match (e.kind()) { case NotFound: true; case _: false; }; }
 
 unsafe fn bool exists(const ref string path) {
     Result<Metadata, IoError> m = stat(path: path);
@@ -218,7 +225,9 @@ unsafe fn Result<Unit, PgError> loadKey(ref TlsConfig config, const ref TlsSetti
     }
     Result<Metadata, IoError> found = stat(path: keyFile);
     match (found) {
-        case Ok(value: m): { }
+        // libpq's order: a key that is not a regular file is refused from its stat, before it is opened (on Windows a
+        // directory cannot be opened as a file at all).
+        case Ok(value: m): { if (!m.isFile()) { return Result::Err(error: tlsFailure(detail: "private key file \"".concat(other: keyFile).concat(other: "\" is not a regular file"))); } }
         case Err(error: e): {
             bool notFound = match (e.kind()) { case NotFound: true; case _: false; };
             if (notFound) { return Result::Err(error: tlsFailure(detail: "certificate present, but not private key file \"".concat(other: keyFile).concat(other: "\""))); }

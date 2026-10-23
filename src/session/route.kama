@@ -56,9 +56,13 @@ type resource Opener implements Sendable {
             if (target.linuxAbstract()) { path = path.substring(start: 1, end: path.length()); }
             Result<Owned<UnixTransport>, IoError> made = new UnixTransport.connect(path: path, linuxAbstract: target.linuxAbstract(), timeoutMs: deadline.remainingMs());
             Owned<UnixTransport> local = match (give made) { case Ok(value: t): give t; case Err(error: e): { return unreachable(e: e, hint: hint); } };
-            // requirepeer: the server must run as this account, by the socket's peer credentials.
+            // requirepeer: the server must run as this account, by the socket's peer credentials. libpq has no
+            // getpeereid on Windows, so there the setting ends the connect.
             string peer = config.requirePeer();
             if (peer.length() > 0) {
+                if (!peerCredentialsChecked()) {
+                    return Opened::Refused(error: PgError::Auth(detail: "requirepeer parameter is not supported on this platform"));
+                }
                 Result<string, IoError> who = local.peerUserName();
                 string refusal = match (give who) {
                     case Ok(value: name): peerMismatch(wanted: peer, actual: name);
@@ -90,6 +94,11 @@ fn Opened unreachable(const ref IoError e, const ref string hint) {
     return Opened::Unreachable(error: PgError::Io(error: e), note: copy hint);
 }
 
+// Whether libpq can check requirepeer: getpeereid is src/port's ENOSYS stub on Windows, where libpq reports
+// "requirepeer parameter is not supported on this platform" (PQconnectPoll).
+@compileFor(!OS_WINDOWS) fn bool peerCredentialsChecked() { return true; }
+@compileFor(OS_WINDOWS) fn bool peerCredentialsChecked() { return false; }
+
 // libpq's requirepeer refusal, or "" when the server runs as the account required.
 fn string peerMismatch(const ref string wanted, const ref string actual) {
     if (actual.equals(other: wanted)) { return ""; }
@@ -98,6 +107,7 @@ fn string peerMismatch(const ref string wanted, const ref string actual) {
 
 // Keepalive and tcp_user_timeout, as libpq applies them to each socket. A failure is reported as libpq reports it,
 // and the next address is tried.
+@compileFor(!OS_WINDOWS)
 unsafe fn Result<Owned<TcpTransport>, PgError> socketOptions(Owned<TcpTransport> tcp, const ref Config config) {
     if (config.keepalives()) {
         Result<Unit, IoError> on = tcp.keepAlive(on: true);
@@ -121,6 +131,32 @@ unsafe fn Result<Owned<TcpTransport>, PgError> socketOptions(Owned<TcpTransport>
         match (r) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: setsockopt(option: "TCP_USER_TIMEOUT", e: e)); } };
     }
     return Result::Ok(value: give tcp);
+}
+
+// libpq on Windows (prepKeepalivesWin32 and pqSetKeepalivesWin32): keepalives on, with an idle time and an interval
+// in one SIO_KEEPALIVE_VALS ioctl, 2 hours and 1 second when unset or not positive. keepalives_count is not read, and
+// tcp_user_timeout sets nothing: Windows has no TCP_USER_TIMEOUT. std sets the same three values with SO_KEEPALIVE,
+// TCP_KEEPIDLE and TCP_KEEPINTVL; a failure of any is reported in the ioctl's words, with Windows' code.
+@compileFor(OS_WINDOWS)
+unsafe fn Result<Owned<TcpTransport>, PgError> socketOptions(Owned<TcpTransport> tcp, const ref Config config) {
+    if (!config.keepalives()) { return Result::Ok(value: give tcp); }
+    int32 idle = config.keepalivesIdle();
+    if (idle <= 0) { idle = 7200; }
+    int32 interval = config.keepalivesInterval();
+    if (interval <= 0) { interval = 1; }
+    Result<Unit, IoError> on = tcp.keepAlive(on: true);
+    match (on) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: keepaliveIoctl(e: e)); } };
+    Result<Unit, IoError> i = tcp.keepAliveIdle(idle: Duration.fromSecs(s: cast<int64>(idle)));
+    match (i) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: keepaliveIoctl(e: e)); } };
+    Result<Unit, IoError> v = tcp.keepAliveInterval(interval: Duration.fromSecs(s: cast<int64>(interval)));
+    match (v) { case Ok(value: u): { } case Err(error: e): { return Result::Err(error: keepaliveIoctl(e: e)); } };
+    return Result::Ok(value: give tcp);
+}
+
+@compileFor(OS_WINDOWS)
+fn PgError keepaliveIoctl(const ref IoError e) {
+    int32 code = match (e.rawOsError()) { case Some(value: c): c; case None: 0; };
+    return PgError::Config(detail: "WSAIoctl(SIO_KEEPALIVE_VALS) failed: error code ${code}");
 }
 
 fn PgError setsockopt(const ref string option, const ref IoError e) {

@@ -7,9 +7,12 @@ export { pgpassLookup, defaultSocketDir };
 // Each line is `hostname:port:database:username:password`. A field of exactly `*` matches anything, `\` escapes
 // the next byte (so `\:` and `\\`), a line starting `#` is a comment, and the first line that matches wins.
 
-// libpq's DEFAULT_PGSOCKET_DIR, as PostgreSQL builds it: where a client looks for the server's socket when no host
-// is given. A host of exactly this path matches the password file's `localhost`, as an empty host does.
-fn string defaultSocketDir() { return "/tmp"; }
+// libpq's DEFAULT_PGSOCKET_DIR, as PostgreSQL builds it (pg_config_manual.h): where a client looks for the server's
+// socket when no host is given. A host of exactly this path matches the password file's `localhost`, as an empty host
+// does. On Windows it is "": there is no standard place for a socket there, so the default host is TCP's localhost,
+// and no socket directory is localhost to the password file.
+@compileFor(!OS_WINDOWS) fn string defaultSocketDir() { return "/tmp"; }
+@compileFor(OS_WINDOWS) fn string defaultSocketDir() { return ""; }
 
 // The password `file` gives for this host, port, database and user: its bytes, de-escaped, or None. libpq's
 // defaults are applied first: an empty or default-socket host is "localhost", an empty port is 5432, and an

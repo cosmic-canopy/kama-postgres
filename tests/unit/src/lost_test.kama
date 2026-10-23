@@ -3,7 +3,7 @@
 // A server that hung up is "server closed the connection unexpectedly…" whatever the client was doing; any other
 // failure names what failed, with the error's own words. After a failed write, what the read finds comes first.
 import { std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::memory::Owned,
-         std::io::IoError, std::io::IoErrorKind, std::net::Interest, postgres::Ready,
+         std::io::IoError, std::io::IoErrorKind, std::net::Interest, std::net::TcpListener, std::net::SocketAddr, postgres::Ready,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Transport,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome };
@@ -22,16 +22,29 @@ type resource Faulty implements Transport, Sendable {
     IoErrorKind readKind;
     bool waitFails = false;
     IoErrorKind waitKind;
+    Optional<IoError> readError;   // the read's failure as the OS reported it, code and all, in place of readKind's
 
     public ctor make(Owned<Transport> inner, isize writeAt, IoErrorKind writeKind, isize readAt, IoErrorKind readKind, bool waitFails, IoErrorKind waitKind) {
         this.inner = give inner; this.writes = 0; this.reads = 0;
         this.writeAt = writeAt; this.writeKind = writeKind; this.readAt = readAt; this.readKind = readKind;
-        this.waitFails = waitFails; this.waitKind = waitKind;
+        this.waitFails = waitFails; this.waitKind = waitKind; this.readError = Optional::None;
+    }
+
+    // The `readAt`-th read fails with `error`, an IoError the operating system reported.
+    public ctor failingRead(Owned<Transport> inner, isize readAt, IoError error) {
+        this.inner = give inner; this.writes = 0; this.reads = 0;
+        this.writeAt = 0; this.writeKind = IoErrorKind::Other; this.readAt = readAt; this.readKind = IoErrorKind::Other;
+        this.waitFails = false; this.waitKind = IoErrorKind::Other; this.readError = Optional::Some(value: error);
     }
 
     public unsafe fn Result<isize, IoError> read(View<uint8> into) {
         this.reads = this.reads + 1;
-        if (this.reads == this.readAt) { return Result::Err(error: IoError.of(kind: this.readKind)); }
+        if (this.reads == this.readAt) {
+            return match (this.readError) {
+                case Some(value: e): Result::Err(error: e);
+                case None: Result::Err(error: IoError.of(kind: this.readKind));
+            };
+        }
         return this.inner.read(into: into);
     }
     public unsafe fn Result<isize, IoError> write(ConstView<uint8> bytes) {
@@ -60,8 +73,10 @@ unsafe fn string queried(isize writeAt, IoErrorKind writeKind, isize readAt, IoE
     Wire rows = Wire.make(); rows.complete(tag: "SELECT 0"); rows.ready(status: 73ui8);
     s.add(item: Step::Expect(tag: 81ui8, body: "", then: rows.bytes()));
     Environment vars = testEnvironment();
-    string none = "";
-    Result<Config, PgError> c = resolveWith(text: none, env: vars);
+    // Plaintext, so the faults count only the session's own reads and writes: on Windows the default host is TCP's
+    // localhost, where sslmode prefer would send an SSLRequest first.
+    string plain = "sslmode=disable";
+    Result<Config, PgError> c = resolveWith(text: plain, env: vars);
     Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return "config: ".concat(other: e.message()); } };
     Owned<Transport> fake = new FakeServer.make(steps: give s, chunk: 4096, writeLimit: 4096);
     Owned<Transport> faulty = new Faulty.make(inner: give fake, writeAt: writeAt, writeKind: writeKind, readAt: readAt, readKind: readKind, waitFails: waitFails, waitKind: waitKind);
@@ -98,5 +113,46 @@ unsafe fn int32 lostTests() {
     // The end of the stream mid-session.
     string eof = queried(writeAt: 0, writeKind: none, readAt: 0, readKind: none, waitFails: false, waitKind: none, hangUp: true);
     f = f + check(ok: eof.equals(other: serverClosed()), what: "lost: the end of the stream mid-session: ".concat(other: eof));
+    f = f + osWordTests();
     return f;
+}
+
+// A failure the operating system reported, worded as libpq words its code. The error is a real one: a second listener
+// on a port a first one holds on 127.0.0.1 (EADDRINUSE, WSAEADDRINUSE on Windows), which no network is needed for.
+unsafe fn int32 osWordTests() {
+    Result<TcpListener, IoError> first = TcpListener.bind(host: "127.0.0.1", port: 0ui16);
+    TcpListener holder = match (give first) { case Ok(value: l): give l; case Err(error: e): { return check(ok: false, what: "lost: a listener on 127.0.0.1 (".concat(other: e.message()).concat(other: ")")); } };
+    Result<SocketAddr, IoError> at = holder.localAddr();
+    uint16 port = match (at) { case Ok(value: a): a.port; case Err(error: e): 0ui16; };
+    Result<TcpListener, IoError> second = TcpListener.bind(host: "127.0.0.1", port: port);
+    IoError taken = match (give second) {
+        case Ok(value: l): { return check(ok: false, what: "lost: a second listener on a held port is refused"); }
+        case Err(error: e): e;
+    };
+    string got = readFailsWith(error: taken);
+    string want = "could not receive data from server: ".concat(other: addrInUseWords());
+    return check(ok: got.equals(other: want), what: "lost: a read the OS failed, in libpq's words for its code: ".concat(other: got));
+}
+
+// strerror(EADDRINUSE) in glibc and macOS's libc.
+@compileFor(!OS_WINDOWS) fn string addrInUseWords() { return "Address already in use"; }
+// winsock_strerror(WSAEADDRINUSE): libpq's table, then the code (src/interfaces/libpq/win32.c).
+@compileFor(OS_WINDOWS) fn string addrInUseWords() { return "Address already in use (0x00002740/10048)"; }
+
+// A session whose second read fails with `error`, and what a query on it reports.
+unsafe fn string readFailsWith(IoError error) {
+    DynamicArray<Step> s = DynamicArray.empty();
+    s.add(item: Step::Send(bytes: welcome()));
+    Wire rows = Wire.make(); rows.complete(tag: "SELECT 0"); rows.ready(status: 73ui8);
+    s.add(item: Step::Expect(tag: 81ui8, body: "", then: rows.bytes()));
+    Environment vars = testEnvironment();
+    string plain = "sslmode=disable";
+    Result<Config, PgError> c = resolveWith(text: plain, env: vars);
+    Config config = match (give c) { case Ok(value: v): give v; case Err(error: e): { return "config: ".concat(other: e.message()); } };
+    Owned<Transport> fake = new FakeServer.make(steps: give s, chunk: 4096, writeLimit: 4096);
+    Owned<Transport> faulty = new Faulty.failingRead(inner: give fake, readAt: 2, error: error);
+    Result<Connection, PgError> made = Connection.connectOver(transport: give faulty, config: config);
+    Connection conn = match (give made) { case Ok(value: x): give x; case Err(error: e): { return "connect: ".concat(other: e.message()); } };
+    Result<DynamicArray<Rows>, PgError> q = conn.simpleQuery(sql: "select");
+    return match (q) { case Ok(value: v): "(it ran)"; case Err(error: e): e.message(); };
 }

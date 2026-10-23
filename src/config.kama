@@ -139,15 +139,23 @@ unsafe fn string accountHomeDirectory() {
 @compileFor(OS_WINDOWS)
 unsafe fn string accountHomeDirectory() { return ""; }
 
+// pg_fe_getusername on Windows: GetUserName, and on failure "user name lookup failure: error code %lu" with
+// GetLastError(). std asks for the process token's account, whose failure carries the same kind of code.
 @compileFor(OS_WINDOWS)
 unsafe fn Result<string, ConnInfoError> localUserName() {
     Result<UserId, IoError> who = currentUser();
-    UserId id = match (who) { case Ok(value: u): u; case Err(error: e): { return Result::Err(error: fail(detail: "user name lookup failure: ".concat(other: e.message()))); } };
+    UserId id = match (who) { case Ok(value: u): u; case Err(error: e): { return Result::Err(error: fail(detail: userLookupFailure(e: e))); } };
     Result<string, IoError> name = id.name();
     return match (give name) {
         case Ok(value: n): Result::Ok(value: give n);
-        case Err(error: e): Result::Err(error: fail(detail: "user name lookup failure: ".concat(other: e.message())));
+        case Err(error: e): Result::Err(error: fail(detail: userLookupFailure(e: e)));
     };
+}
+
+@compileFor(OS_WINDOWS)
+fn string userLookupFailure(const ref IoError e) {
+    int32 code = match (e.rawOsError()) { case Some(value: c): c; case None: 0; };
+    return "user name lookup failure: error code ${code}";
 }
 
 @compileFor(!OS_WINDOWS)
@@ -950,7 +958,8 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
             HostKind kind = HostKind::Name;
             if (a.length() > 0) { kind = HostKind::Address; }
             else if (n.length() > 0) { if (isSocketPath(path: n)) { kind = HostKind::Socket; } }
-            else { n = defaultSocketDir(); kind = HostKind::Socket; }
+            else if (defaultSocketDir().length() > 0) { n = defaultSocketDir(); kind = HostKind::Socket; }
+            else { n = "localhost"; }   // DefaultHost, by name, where there is no default socket directory (Windows)
             this.hostList.add(item: Host.make(name: give n, address: give a, port: give p, kind: kind));
             i = i + 1;
         }
@@ -1038,9 +1047,13 @@ type resource Config implements Sendable, Copyable<This>(bare: give) {
         Result<int32, ConnInfoError> interval = this.nonNegative(keyword: "keepalives_interval");
         int32 intervalValue = match (give interval) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
         this.intervalSeconds = intervalValue;
-        Result<int32, ConnInfoError> count = this.nonNegative(keyword: "keepalives_count");
-        int32 countValue = match (give count) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
-        this.probeCount = countValue;
+        if (readsKeepalivesCount()) {
+            Result<int32, ConnInfoError> count = this.nonNegative(keyword: "keepalives_count");
+            int32 countValue = match (give count) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
+            this.probeCount = countValue;
+        } else {
+            this.probeCount = -1;
+        }
         Result<int32, ConnInfoError> user = this.nonNegative(keyword: "tcp_user_timeout");
         int32 userValue = match (give user) { case Ok(value: v): v; case Err(error: e): { return Result::Err(error: give e); } };
         this.userTimeoutMs = userValue;
@@ -1117,17 +1130,35 @@ fn isize commaCount(const ref string s) {
     return n;
 }
 
-// is_unixsock_path: an absolute path, or a Linux abstract-namespace name ('@').
+// is_unixsock_path (pqcomm.h): an absolute path, by the platform's is_absolute_path (port.h), or an abstract-namespace
+// name ('@').
 fn bool isSocketPath(const ref string path) {
     if (path.length() == 0) { return false; }
+    return path[0] == 64ui8 || isAbsolutePath(path: path);   // '@'
+}
+
+// is_nonwindows_absolute_path: a leading '/'.
+@compileFor(!OS_WINDOWS)
+fn bool isAbsolutePath(const ref string path) { return path.length() > 0 && path[0] == 47ui8; }
+
+// is_windows_absolute_path: a leading '/' or '\' (a UNC path too), or a drive letter, a colon and either separator
+// ("C:\…", "C:/…"). "C:x" is relative.
+@compileFor(OS_WINDOWS)
+fn bool isAbsolutePath(const ref string path) {
+    if (path.length() == 0) { return false; }
     uint8 first = path[0];
-    if (first == 47ui8 || first == 64ui8) { return true; }   // '/', '@'
-    // A Windows drive path: "C:\…" or "C:/…".
+    if (first == 47ui8 || first == 92ui8) { return true; }
     if (path.length() >= 3 && path[1] == 58ui8 && (path[2] == 92ui8 || path[2] == 47ui8)) {
         return (first >= 65ui8 && first <= 90ui8) || (first >= 97ui8 && first <= 122ui8);
     }
     return false;
 }
+
+// Whether keepalives_count is read at all. libpq on Windows sets keepalives through SIO_KEEPALIVE_VALS, which takes an
+// idle time and an interval only (prepKeepalivesWin32), so it never parses keepalives_count there, and a value that
+// is not a number is no error.
+@compileFor(!OS_WINDOWS) fn bool readsKeepalivesCount() { return true; }
+@compileFor(OS_WINDOWS) fn bool readsKeepalivesCount() { return false; }
 
 // passwordFromFile's checks, on the open file: one that is not a regular file (`/dev/null`, a FIFO, a directory)
 // is not a plain file, and one with group or world access is ignored with libpq's warning.
@@ -1146,12 +1177,10 @@ unsafe fn bool passfileUsable(const ref string path, ref File file) {
     return true;
 }
 
-// On Windows the directory is protected, and libpq checks nothing; a directory cannot be read as a file.
+// On Windows libpq checks nothing ("the directory is protected, so we don't have to check the file"). A file that
+// cannot be opened or read, a directory among them, gives no password and no warning, as fopen's NULL does there.
 @compileFor(OS_WINDOWS)
-unsafe fn bool passfileUsable(const ref string path, ref File file) {
-    Result<Metadata, IoError> meta = file.metadata();
-    return match (meta) { case Ok(value: m): !m.isDir(); case Err(error: e): false; };
-}
+unsafe fn bool passfileUsable(const ref string path, ref File file) { return true; }
 
 // pqParseIntParam: strtol in base 10, surrounding whitespace allowed, the whole value an int.
 fn Optional<int32> parseIntParam(const ref string text) { return parseIntBytes(b: text.bytes()); }

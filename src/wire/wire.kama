@@ -4,7 +4,8 @@ import { std::collections::FixedArray, std::collections::DynamicArray, std::coll
          postgres::Transport, postgres::Ready, postgres::PgError, postgres::ServerError,
          postgres::protocol::Frame, postgres::protocol::Framing, postgres::protocol::frame, postgres::protocol::decode,
          postgres::protocol::BackendMessage, postgres::protocol::ProtocolError, postgres::protocol::ErrorFields,
-         postgres::protocol::HEADER_BYTES, postgres::protocol::STARTUP_ERROR_MAX, postgres::protocol::invalidErrorText };
+         postgres::protocol::HEADER_BYTES, postgres::protocol::STARTUP_ERROR_MAX, postgres::protocol::invalidErrorText,
+         winsockText, errnoOfWin32, crtStrerror };
 export { Wire, Deadline, strerror, serverClosedText };
 
 // postgres::wire — messages over a `Transport`: framing the bytes that arrive into backend messages, and writing
@@ -12,10 +13,46 @@ export { Wire, Deadline, strerror, serverClosedText };
 
 // What libpq prints for an I/O failure, strerror's words: the operating system's own text for its code ("Connection
 // refused"), or, for an error kama raised itself, the kind's.
+@compileFor(!OS_WINDOWS)
 fn string strerror(const ref IoError e) {
     Optional<string> words = e.osMessage();
     return match (give words) { case Some(value: w): give w; case None: e.message(); };
 }
+
+// On Windows libpq words a Winsock code (10000-11999) as winsock_strerror does: its own table, then the code. Any other
+// code is a Win32 one, which PostgreSQL's port maps to an errno (_dosmaperr) and libpq prints in the UCRT's strerror
+// words (src/wire/win32.kama). An error kama raised itself has no code, and keeps its kind's words.
+@compileFor(OS_WINDOWS)
+fn string strerror(const ref IoError e) {
+    Optional<int32> raw = e.rawOsError();
+    int32 code = match (raw) { case Some(value: c): c; case None: 0; };
+    if (code == 0) { return e.message(); }
+    if (code >= 10000 && code <= 11999) { return winsockStrerror(e: e, code: code); }
+    return crtStrerror(n: errnoOfWin32(code: code));
+}
+
+// winsock_strerror (src/interfaces/libpq/win32.c): the table's words, else the system's, else "unrecognized socket
+// error"; then the code in hex and decimal. For a code outside the table libpq asks FormatMessage for English, where
+// std gives the system language's: the one place the words can differ.
+@compileFor(OS_WINDOWS)
+fn string winsockStrerror(const ref IoError e, int32 code) {
+    Optional<string> listed = winsockText(code: code);
+    string words = match (give listed) { case Some(value: w): give w; case None: systemWords(e: e); };
+    if (words.length() == 0) { return "unrecognized socket error: 0x${code:08X}/${code}"; }
+    return words.concat(other: " (0x${code:08X}/${code})");
+}
+
+@compileFor(OS_WINDOWS)
+fn string systemWords(const ref IoError e) {
+    Optional<string> m = e.osMessage();
+    return match (give m) { case Some(value: w): give w; case None: ""; };
+}
+
+// Whether a failed read, while a cancel request's connection waits for the server to close it, is that close. On
+// Windows libpq takes it so (PQcancelPoll's errno check is #ifndef WIN32): Windows "will sometimes error with an
+// ECONNRESET when there is a clean connection closure", and PQcancel reports success then too.
+@compileFor(!OS_WINDOWS) fn bool readErrorIsCancelEnd() { return false; }
+@compileFor(OS_WINDOWS) fn bool readErrorIsCancelEnd() { return true; }
 
 // libpq's words for a connection the server dropped: pqReadData at EOF, and pqsecure_raw_read and pqsecure_raw_write
 // on EPIPE and ECONNRESET.
@@ -243,7 +280,14 @@ type resource Wire implements Sendable {
                     return Result::Ok(value: true);
                 }
                 case Err(error: e): {
-                    match (e.kind()) { case WouldBlock: { wait = true; } case Interrupted: { } case _: { return Result::Err(error: this.failure(error: e, doing: Doing::Reading)); } };
+                    match (e.kind()) {
+                        case WouldBlock: { wait = true; }
+                        case Interrupted: { }
+                        case _: {
+                            if (readErrorIsCancelEnd()) { return Result::Ok(value: false); }
+                            return Result::Err(error: this.failure(error: e, doing: Doing::Reading));
+                        }
+                    };
                 }
             };
             if (wait) {

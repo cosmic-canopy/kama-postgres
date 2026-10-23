@@ -7,7 +7,7 @@ import { std::collections::DynamicArray, std::memory::Owned,
          postgres::PipelineResult, postgres::Batch, postgres::BatchResult, postgres::CacheMode,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome };
-export { limitsTests, captureLog, warningsLogged };
+export { limitsTests, captureLog, warningsLogged, notFoundWarningsLogged };
 
 comptime uint8 IDLE = 73ui8;     // 'I'
 comptime uint8 INTX = 84ui8;     // 'T'
@@ -18,14 +18,21 @@ comptime uint8 EXECUTE = 69ui8;  // 'E'
 comptime uint8 SYNC = 83ui8;     // 'S'
 comptime uint8 QUERY = 81ui8;    // 'Q'
 
-// The log sink main installs: warnings under `postgres` are counted, and nothing is printed.
+// The log sink main installs: warnings under `postgres` are counted, and nothing is printed. Those that end in
+// strerror's words for ENOENT are counted apart, so a case can see a file's absence worded as libpq words it on every
+// platform (on Windows through _dosmaperr and the UCRT's strerror).
 static int32 warnings = 0;
+static int32 notFoundWarnings = 0;
 
 fn void captureLog(int32 level, string tag, string msg) {
-    if (tag.equals(other: "postgres") && level == 1) { warnings = warnings + 1; }
+    if (tag.equals(other: "postgres") && level == 1) {
+        warnings = warnings + 1;
+        if (msg.endsWith(suffix: ": No such file or directory")) { notFoundWarnings = notFoundWarnings + 1; }
+    }
 }
 
 fn int32 warningsLogged() { return warnings; }
+fn int32 notFoundWarningsLogged() { return notFoundWarnings; }
 
 fn Step quiet(uint8 tag) { return Step::Expect(tag: tag, body: "", then: DynamicArray.empty()); }
 fn Step answer(uint8 tag, Wire reply) { return Step::Expect(tag: tag, body: "", then: reply.bytes()); }

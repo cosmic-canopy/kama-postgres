@@ -1,0 +1,154 @@
+[
+  {
+    "id": "D1",
+    "suite": "unit",
+    "file": "src/conninfo/pgpass.kama",
+    "old": "@compileFor(OS_WINDOWS) fn string defaultSocketDir() { return \"\"; }",
+    "new": "@compileFor(OS_WINDOWS) fn string defaultSocketDir() { return \"/tmp\"; }",
+    "expect": "config: the default host is libpq's"
+  },
+  {
+    "id": "D2",
+    "suite": "unit",
+    "file": "src/conninfo/pgpass.kama",
+    "old": "if (h.length() == 0 || h.equals(other: defaultSocketDir())) { h = \"localhost\"; }",
+    "new": "if (h.length() == 0 || h.equals(other: defaultSocketDir()) || h.equals(other: \"/tmp\")) { h = \"localhost\"; }",
+    "expect": "pgpass: on Windows an empty host matches localhost, and no socket directory does"
+  },
+  {
+    "id": "D3",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "else { n = \"localhost\"; }",
+    "new": "else { n = \"127.0.0.1\"; }",
+    "expect": "config: the default host is libpq's"
+  },
+  {
+    "id": "A1",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "    if (first == 47ui8 || first == 92ui8) { return true; }\n",
+    "new": "    if (first == 47ui8) { return true; }\n",
+    "expect": "config: \"\\pg\" is a socket"
+  },
+  {
+    "id": "A2",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "    if (first == 47ui8 || first == 92ui8) { return true; }\n",
+    "new": "    if (first == 47ui8) { return true; }\n",
+    "expect": "config: \"\\\\server\\share\" is a socket"
+  },
+  {
+    "id": "A3",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "    if (path.length() >= 3 && path[1] == 58ui8 && (path[2] == 92ui8 || path[2] == 47ui8)) {\n        return (first >= 65ui8 && first <= 90ui8) || (first >= 97ui8 && first <= 122ui8);\n    }\n    return false;\n}",
+    "new": "    return false;\n}",
+    "expect": "config: \"C:/pg\" is a socket"
+  },
+  {
+    "id": "A4",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "    if (path.length() >= 3 && path[1] == 58ui8 && (path[2] == 92ui8 || path[2] == 47ui8)) {\n        return (first >= 65ui8 && first <= 90ui8) || (first >= 97ui8 && first <= 122ui8);",
+    "new": "    if (path.length() >= 2 && path[1] == 58ui8) {\n        return (first >= 65ui8 && first <= 90ui8) || (first >= 97ui8 && first <= 122ui8);",
+    "expect": "config: \"C:pg\" is a host name"
+  },
+  {
+    "id": "A5",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "        return (first >= 65ui8 && first <= 90ui8) || (first >= 97ui8 && first <= 122ui8);\n    }\n    return false;\n}",
+    "new": "        return true;\n    }\n    return false;\n}",
+    "expect": "config: \"1:/pg\" is a host name"
+  },
+  {
+    "id": "A6",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "        return (first >= 65ui8 && first <= 90ui8) || (first >= 97ui8 && first <= 122ui8);\n    }\n    return false;\n}",
+    "new": "        return first >= 65ui8 && first <= 90ui8;\n    }\n    return false;\n}",
+    "expect": "config: \"c:\\pg\" is a socket"
+  },
+  {
+    "id": "K1",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "@compileFor(OS_WINDOWS) fn bool readsKeepalivesCount() { return false; }",
+    "new": "@compileFor(OS_WINDOWS) fn bool readsKeepalivesCount() { return true; }",
+    "expect": "config: keepalives_count is not read on Windows"
+  },
+  {
+    "id": "P1",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "unsafe fn bool passfileUsable(const ref string path, ref File file) { return true; }",
+    "new": "unsafe fn bool passfileUsable(const ref string path, ref File file) { return false; }",
+    "expect": "config: on Windows a password file others can read is used"
+  },
+  {
+    "id": "P2",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "unsafe fn bool passfileUsable(const ref string path, ref File file) { return true; }",
+    "new": "unsafe fn bool passfileUsable(const ref string path, ref File file) { logWarn(tag: \"postgres\", msg: \"checked\"); return true; }",
+    "expect": "config: on Windows a password file others can read is used"
+  },
+  {
+    "id": "W1",
+    "suite": "unit",
+    "file": "src/wire/win32.kama",
+    "old": "if (code == 10048) { return Optional::Some(value: \"Address already in use\"); }",
+    "new": "if (code == 10048) { return Optional::Some(value: \"Address in use\"); }",
+    "expect": "lost: a read the OS failed, in libpq's words for its code"
+  },
+  {
+    "id": "W2",
+    "suite": "unit",
+    "file": "src/wire/wire.kama",
+    "old": "return words.concat(other: \" (0x${code:08X}/${code})\");",
+    "new": "return words.concat(other: \" (${code})\");",
+    "expect": "lost: a read the OS failed, in libpq's words for its code"
+  },
+  {
+    "id": "W3",
+    "suite": "unit",
+    "file": "src/wire/wire.kama",
+    "old": "    if (code >= 10000 && code <= 11999) { return winsockStrerror(e: e, code: code); }\n",
+    "new": "",
+    "expect": "lost: a read the OS failed, in libpq's words for its code"
+  },
+  {
+    "id": "W4",
+    "suite": "unit",
+    "file": "src/wire/wire.kama",
+    "old": "    return crtStrerror(n: errnoOfWin32(code: code));",
+    "new": "    return systemWords(e: e);",
+    "expect": "tls keylog: the warning says \"No such file or directory\""
+  },
+  {
+    "id": "W5",
+    "suite": "unit",
+    "file": "src/wire/win32.kama",
+    "old": "    if (code == 3) { return 2; }   // ERROR_PATH_NOT_FOUND -> ENOENT",
+    "new": "    if (code == 3) { return 22; }   // ERROR_PATH_NOT_FOUND -> ENOENT",
+    "expect": "tls keylog: the warning says \"No such file or directory\""
+  },
+  {
+    "id": "W6",
+    "suite": "unit",
+    "file": "src/wire/win32.kama",
+    "old": "    if (n == 2) { return \"No such file or directory\"; }",
+    "new": "    if (n == 2) { return \"No such file\"; }",
+    "expect": "tls keylog: the warning says \"No such file or directory\""
+  },
+  {
+    "id": "R1",
+    "suite": "unit",
+    "file": "src/secure/setup.kama",
+    "old": "case Ok(value: m): { if (!m.isFile()) { return Result::Err(error: tlsFailure(detail: \"private key file \\\"\".concat(other: keyFile).concat(other: \"\\\" is not a regular file\"))); } }",
+    "new": "case Ok(value: m): { }",
+    "expect": "tls certificate: a key that is a directory"
+  }
+]

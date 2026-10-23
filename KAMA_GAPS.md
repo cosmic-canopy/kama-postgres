@@ -138,17 +138,18 @@ parse::<float32>("NaN") bits: 7fffffff
 0.0 / 0.0 at run time bits:  fff8000000000000
 ```
 
-With glibc, `strtod("NaN")` is `7ff8000000000000`, the quiet NaN that C's `NAN`, Rust's `f64::NAN` and PostgreSQL's
-`get_float8_nan()` all are. Rust parses the spelling itself, so `"NaN".parse::<f64>()` gives those bits on every
-platform. The third line is the processor's own default NaN, sign set, for comparison; nothing here depends on it.
+With glibc, `strtod("NaN")` is `7ff8000000000000`, the canonical quiet NaN that Rust's `f64::NAN` is too. Rust
+parses the spelling itself, so `"NaN".parse::<f64>()` gives those bits on every platform. The third line is the
+processor's own default NaN, sign set, for comparison; nothing here depends on it. A server's own NaN follows its C
+library the same way: a PostgreSQL 18.6 built with glibc sends `float8send('NaN')` as `7ff8000000000000`, and EDB's
+Windows build sends `7fffffffffffffff`.
 
 **The ask:** the spellings `kama__float_spelling` admits for NaN read as the canonical quiet NaN (`7ff8000000000000`,
 `7fc00000`) on every target, so a parse means the same bits everywhere, as an integer parse does.
 
-**The workaround:** `floatText` in `src/types/codec.kama` turns any NaN that `parse` returns into
-`7ff8000000000000`: `get_float8_nan()`, and what `float8in` gives for `'NaN'` on a server built with glibc. A NaN read as
-text then has the same bits on every platform, and the same as one read in binary from such a server. Delete it when
-`parse` does this itself.
+**The workaround:** `floatText` in `src/types/codec.kama` turns any NaN that `parse` returns into the canonical
+`7ff8000000000000`. A NaN read as text then has the same bits wherever the client runs, which is what this package's
+codec vectors (from a glibc server) assert. Delete it when `parse` does this itself.
 
 **Why LOW:** a NaN is a NaN to every comparison, and PostgreSQL's too. The bits show only through `bitcast`, or when the
 value goes back to a server in binary. But kama's promise is the same program behaving the same on every target, and

@@ -143,8 +143,8 @@ unsafe fn Result<float64, DecodeError> floatText(ConstView<uint8> raw, const ref
     string text = match (give t) { case Ok(value: s): give s; case Err(error: e): { return Result::Err(error: give e); } };
     Result<float64, ParseError> v = parse::<float64>(s: text);
     return match (v) {
-        // KPG-43: std's parse takes the C library's NaN, 7fffffffffffffff on Windows. PostgreSQL's (get_float8_nan(),
-        // and float8in's with glibc) is the quiet 7ff8000000000000, on every platform.
+        // KPG-43: std's parse takes the C library's NaN, 7fffffffffffffff on Windows. The canonical quiet NaN,
+        // 7ff8000000000000, is the same wherever the client runs.
         case Ok(value: x): Result::Ok(value: x != x ? bitcast<float64>(0x7ff8000000000000ui64) : x);
         case Err(error: e): match (e) {
             case OutOfRange: Result::Err(error: DecodeError::OutOfRange(type: copy type));

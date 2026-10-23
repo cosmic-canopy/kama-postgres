@@ -1,0 +1,18 @@
+[
+  {
+    "id": "U1",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "@compileFor(!OS_WINDOWS)\nfn bool isAbsolutePath(const ref string path) { return path.length() > 0 && path[0] == 47ui8; }",
+    "new": "@compileFor(!OS_WINDOWS)\nfn bool isAbsolutePath(const ref string path) { return path.length() > 2 && (path[0] == 47ui8 || path[1] == 58ui8); }",
+    "expect": "config: \"C:/pg\" is a name"
+  },
+  {
+    "id": "U2",
+    "suite": "unit",
+    "file": "src/config.kama",
+    "old": "@compileFor(!OS_WINDOWS) fn bool readsKeepalivesCount() { return true; }",
+    "new": "@compileFor(!OS_WINDOWS) fn bool readsKeepalivesCount() { return false; }",
+    "expect": "config: keepalives_count=abc is refused"
+  }
+]

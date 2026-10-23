@@ -7,12 +7,12 @@
 import { core::env, std::collections::DynamicArray, std::collections::View, std::collections::ConstView, std::memory::Owned,
          std::io::IoError, std::io::IoErrorKind, std::net::Interest, postgres::Ready, std::fs::readFile, std::fs::writeFile,
          std::fs::setPermissions, std::fs::Permissions, std::fs::readText, std::fs::stat, std::fs::Metadata, std::fs::remove,
-         std::process::currentUser, std::process::UserId,
+         std::process::currentUser, std::process::UserId, std::fs::createDirAll, postgres_unit_tests::notFoundWarningsLogged, postgres_unit_tests::warningsLogged,
          tls::TlsConfig, tls::TlsError, tls::Verify, tls::TlsVersion, tls::Certificate,
          postgres::Connection, postgres::Config, postgres::Environment, postgres::PgError, postgres::Rows, postgres::Transport,
          postgres_unit_tests::check, postgres_unit_tests::testEnvironment, postgres_unit_tests::resolveWith,
          postgres_unit_tests::FakeServer, postgres_unit_tests::Step, postgres_unit_tests::Wire, postgres_unit_tests::welcome };
-export { tlsTests, certPath, serverTls, serverEndPoint };
+export { tlsTests, certPath, scratch, serverTls, serverEndPoint };
 
 unsafe fn string certPath(const ref string name) {
     Optional<string> dir = env(name: "PGTEST_CERTDIR");
@@ -325,6 +325,13 @@ unsafe fn int32 certificateTests() {
     } else {
         f = f + check(ok: grouped.equals(other: wantGrouped), what: "tls certificate: a key at 0640 not owned by root (".concat(other: grouped).concat(other: ")"));
     }
+    // A directory: libpq stats the key and refuses what is not a regular file before it opens it. On Windows a
+    // directory cannot be opened as a file, so the order is what makes the words the same there.
+    string keyDir = scratch(name: "key-dir");
+    Result<Unit, IoError> made = createDirAll(path: keyDir);
+    string dm = messageOf(r: overTls(script: trustScript(), conninfo: withCert.concat(other: keyDir), server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
+    string wantDir = "private key file \"".concat(other: keyDir).concat(other: "\" is not a regular file");
+    f = f + check(ok: dm.equals(other: wantDir), what: "tls certificate: a key that is a directory (".concat(other: dm).concat(other: ")"));
     string missingKey = withCert.concat(other: scratch(name: "no-such.key"));
     string gm = messageOf(r: overTls(script: trustScript(), conninfo: missingKey, server: serverTls(alpn: true, only13: false, askCert: true), direct: false, sni: ""));
     string wantMissing = "certificate present, but not private key file \"".concat(other: scratch(name: "no-such.key")).concat(other: "\"");
@@ -357,8 +364,16 @@ unsafe fn int32 keylogTests() {
     bool owner = match (m) { case Ok(value: x): x.permissions.mode() == 384ui32; case Err(error: e): false; };   // 0600
     f = f + check(ok: owner, what: "tls keylog: the file is readable by its owner alone");
     string nowhere = "host=localhost user=u dbname=d sslmode=require sslkeylogfile=".concat(other: scratch(name: "no-such-dir/keys.log"));
+    int32 warnedBefore = warningsLogged();
+    int32 notFoundBefore = notFoundWarningsLogged();
     string gn = messageOf(r: overTls(script: trustScript(), conninfo: nowhere, server: serverTls(alpn: true, only13: false, askCert: false), direct: false, sni: ""));
     f = f + check(ok: gn.equals(other: "(connected)"), what: "tls keylog: a file that cannot be written does not stop the connection (".concat(other: gn).concat(other: ")"));
+    // A warning per secret, as libpq's callback opens the file per line, and each ends in strerror's words for ENOENT:
+    // on Windows too, where the open fails with ERROR_PATH_NOT_FOUND and libpq's port maps that to ENOENT (_dosmaperr)
+    // before the UCRT words it.
+    int32 warned = warningsLogged() - warnedBefore;
+    int32 notFound = notFoundWarningsLogged() - notFoundBefore;
+    f = f + check(ok: notFound > 0 && notFound == warned, what: "tls keylog: the warning says \"No such file or directory\" (${notFound} of ${warned})");
     return f;
 }
 

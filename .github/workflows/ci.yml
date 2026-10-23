@@ -1,8 +1,8 @@
 # CI for @kama/postgres. Copied in shape from @kama/sodium's workflow.
 #
-# Two jobs:
-#   - unit: tools/test.sh, the hermetic program, debug and release, on linux-x64 and macos-arm64; it also builds the
-#     examples and checks that each README code block is code from one of them.
+# Three jobs:
+#   - unit: tools/test.sh, the hermetic program, debug and release, on linux-x64, macos-arm64 and windows-x64; it also
+#     builds the examples and checks that each README code block is code from one of them.
 #   - integration: a real PostgreSQL per matrix entry via tools/pg.sh (docker on the Linux runner; macOS
 #     runners have no container runtime). `tools/pg.sh smoke` first, one login per auth method with the
 #     server's own psql, so a misconfigured server fails apart from a wrong client; then
@@ -10,9 +10,12 @@
 #     leg, which stops, starts and restarts the server through tools/pg.sh, and last the examples, in plaintext and
 #     over TLS.
 #     19 is a beta, so it may fail without failing the run.
+#   - integration (windows): the same against PostgreSQL 18, which tools/pg.sh runs natively from EDB's binaries zip
+#     (tools/pg-native.sh), cached by the zip's SHA256.
 # @kama/tls comes from the registry, pinned by kama.lock. The test PKI needs OpenSSL 3, which the Linux image
-# has and macOS has through Homebrew rather than as /usr/bin/openssl.
-# Windows is not in the matrix; the package has never been built there.
+# has, macOS has through Homebrew rather than as /usr/bin/openssl, and Windows has in Git Bash.
+# On Windows every step runs in Git Bash, and kama is its release with zig bundled, so the C compiler is part of the
+# pin: install.ps1 would choose the slim release, which compiles with whichever clang the image puts first.
 
 name: ci
 
@@ -26,6 +29,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Pinned rather than `latest`, so a compiler release cannot turn this repository red without a commit.
+  # Raise it deliberately, in the same commit that raises the manifests' "kama" floor.
+  KAMA_VERSION: v0.9.719
+
 jobs:
   unit:
     name: unit (${{ matrix.name }})
@@ -35,18 +43,31 @@ jobs:
         include:
           - { os: ubuntu-latest, name: linux-x64 }
           - { os: macos-14, name: macos-arm64 }
+          - { os: windows-latest, name: windows-x64 }
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash   # Git Bash on Windows
     steps:
       - uses: actions/checkout@v5
 
-      # Pinned rather than `latest`, so a compiler release cannot turn this repository red without a commit.
-      # Raise it deliberately, in the same commit that raises the manifests' "kama" floor.
       - name: Install kama
-        env:
-          KAMA_VERSION: v0.9.719
+        if: runner.os != 'Windows'
         run: |
           curl -fsSL https://kama-lang.org/install.sh | sh
           echo "$HOME/.kama/bin" >> "$GITHUB_PATH"
+
+      - name: Install kama (Windows, with its bundled zig)
+        if: runner.os == 'Windows'
+        run: |
+          asset="kama-windows-x64-bundled-$KAMA_VERSION.tar.gz"
+          url="https://github.com/cosmic-canopy/kama/releases/download/$KAMA_VERSION/$asset"
+          curl -fsSLO "$url"
+          want=$(curl -fsSL "$url.sha256" | cut -d' ' -f1)
+          echo "$want *$asset" | sha256sum -c -
+          mkdir -p "$HOME/.kama/$KAMA_VERSION"
+          tar -xzf "$asset" -C "$HOME/.kama/$KAMA_VERSION" --strip-components=1
+          cygpath -w "$HOME/.kama/$KAMA_VERSION/bin" >> "$GITHUB_PATH"
 
       - name: OpenSSL 3 for the test PKI
         if: runner.os == 'macOS'
@@ -76,8 +97,6 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install kama
-        env:
-          KAMA_VERSION: v0.9.719
         run: |
           curl -fsSL https://kama-lang.org/install.sh | sh
           echo "$HOME/.kama/bin" >> "$GITHUB_PATH"
@@ -98,3 +117,47 @@ jobs:
       - name: Stop PostgreSQL
         if: always()
         run: tools/pg.sh down --version ${{ matrix.pg }}
+
+  integration-windows:
+    name: integration (windows, PostgreSQL 18)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash   # Git Bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install kama (with its bundled zig)
+        run: |
+          asset="kama-windows-x64-bundled-$KAMA_VERSION.tar.gz"
+          url="https://github.com/cosmic-canopy/kama/releases/download/$KAMA_VERSION/$asset"
+          curl -fsSLO "$url"
+          want=$(curl -fsSL "$url.sha256" | cut -d' ' -f1)
+          echo "$want *$asset" | sha256sum -c -
+          mkdir -p "$HOME/.kama/$KAMA_VERSION"
+          tar -xzf "$asset" -C "$HOME/.kama/$KAMA_VERSION" --strip-components=1
+          cygpath -w "$HOME/.kama/$KAMA_VERSION/bin" >> "$GITHUB_PATH"
+
+      # EDB's zip is 340 MB; tools/pg-native.sh checks its SHA256 whether it was downloaded or restored.
+      - name: Cache EDB's PostgreSQL binaries
+        uses: actions/cache@v4
+        with:
+          path: out/pg-dist
+          key: edb-postgresql-18.6-1-windows-x64-fbe23da234ee31547bf8a36d29dfd81e82b849df2d2b78d2eecb43d360252f8c
+
+      - name: Start PostgreSQL 18
+        run: tools/pg.sh up --version 18
+
+      - name: Server smoke (one login per auth method)
+        run: tools/pg.sh smoke --version 18
+
+      - name: Integration tests (debug, release, release over TLS, restarts, and the examples)
+        run: tools/test-integration.sh --version 18
+
+      - name: Server log on failure
+        if: failure()
+        run: tools/pg.sh logs --version 18 || true
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: tools/pg.sh down --version 18

@@ -1,5 +1,6 @@
 #!/bin/sh
-# pg.sh — the PostgreSQL server the integration tests run against, in a container.
+# pg.sh — the PostgreSQL server the integration tests run against, in a container (on Windows, natively: see
+# tools/pg-native.sh).
 #
 #   tools/pg.sh up      [--version N]   start (or reuse) postgres:N and a hot standby of it, wait until both accept logins
 #   tools/pg.sh down    [--version N]   remove the container
@@ -29,12 +30,6 @@ case "$VERSION" in
     14|15|16|17|18|19) ;;
     *) echo "pg.sh: unsupported version '$VERSION' (14–19)" >&2; exit 2 ;;
 esac
-
-if [ -n "${CONTAINER_RUNTIME:-}" ]; then RT=$CONTAINER_RUNTIME
-elif command -v podman >/dev/null 2>&1; then RT=podman
-elif command -v docker >/dev/null 2>&1; then RT=docker
-else echo "pg.sh: neither podman nor docker found (set CONTAINER_RUNTIME)" >&2; exit 1
-fi
 
 NAME="kama-pg-$VERSION"
 PORT="543$VERSION"
@@ -77,6 +72,20 @@ PGTEST_CLIENT_KEY_PASSWORD=kp_client_key_pw
 PGTEST_SASLPREP_PASSWORD='$SASLPREP_PW'
 EOF
 }
+
+# On Windows there is no container runtime: the server is EDB's binaries, run natively (tools/pg-native.sh), with the
+# same ports, roles, configuration and environment file. PGTEST_NATIVE=1 or 0 overrides the choice.
+NATIVE=${PGTEST_NATIVE:-}
+if [ -z "$NATIVE" ]; then
+    case "$(uname -s)" in MINGW*|MSYS*) NATIVE=1 ;; *) NATIVE=0 ;; esac
+fi
+if [ "$NATIVE" = 1 ]; then . "$ROOT/tools/pg-native.sh"; exit 0; fi
+
+if [ -n "${CONTAINER_RUNTIME:-}" ]; then RT=$CONTAINER_RUNTIME
+elif command -v podman >/dev/null 2>&1; then RT=podman
+elif command -v docker >/dev/null 2>&1; then RT=docker
+else echo "pg.sh: neither podman nor docker found (set CONTAINER_RUNTIME)" >&2; exit 1
+fi
 
 # Ready means the FINAL server answers over TCP. The image's entrypoint first runs a temporary server
 # listening on the Unix socket only, so a socket-only probe would pass during initialisation.

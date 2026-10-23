@@ -13,7 +13,7 @@ import { std::collections::DynamicArray, std::encoding::hex::encode as hexEncode
          postgres_integration_tests::check, postgres_integration_tests::conninfoFor,
          postgres_integration_tests::open, postgres_integration_tests::codecTypes,
          postgres_integration_tests::codecLiterals, postgres_integration_tests::codecTexts,
-         postgres_integration_tests::codecBinaries };
+         postgres_integration_tests::codecBinaries, postgres_integration_tests::onWindows };
 export { typesTests };
 
 // The server's comparison of $1, sent as a kama value, with $2, the literal. json has no equality operator, so its
@@ -103,7 +103,13 @@ unsafe fn int32 typesTests() {
         Result<Rows, PgError> r = c.query(q: q);
         Rows rows = match (give r) { case Ok(value: v): give v; case Err(error: e): { string m = e.message(); f = f + check(ok: false, what: label.concat(other: m)); i = i + 1; continue; } };
         string hex = hexEncode(bytes: rows.bytes(row: 0, column: 0));
-        f = f + check(ok: rows.field(index: 0).format() == 1i16 && hex.equals(other: binaries[i]), what: label.concat(other: "this server's binary is ").concat(other: hex));
+        // The vectors are a Linux server's float4send and float8send, whose NaN is glibc's (7fc00000, 7ff8000000000000).
+        // The native server on Windows sends the UCRT's: 7fffffff and 7fffffffffffffff.
+        string want = copy binaries[i];
+        if (onWindows() && literal.contains(substring: "NaN")) {
+            want = want.replace(old: "7ff8000000000000", with: "7fffffffffffffff").replace(old: "7fc00000", with: "7fffffff");
+        }
+        f = f + check(ok: rows.field(index: 0).format() == 1i16 && hex.equals(other: want), what: label.concat(other: "this server's binary is ").concat(other: hex));
         Result<string, PgError> asText = column::<string>(rows: rows, row: 0, index: 0);
         string got = match (give asText) { case Ok(value: s): give s; case Err(error: e): e.message(); };
         bool textMatches = got.equals(other: text);

@@ -10,7 +10,7 @@ import { std::collections::DynamicArray, std::collections::FixedArray, std::coll
          postgres_integration_tests::check, postgres_integration_tests::setting,
          postgres_integration_tests::quietEnvironment, postgres_integration_tests::openWith,
          postgres_integration_tests::scalar, postgres_integration_tests::passwordFor,
-         postgres_integration_tests::writePrivate, postgres_integration_tests::scratchDir };
+         postgres_integration_tests::writePrivate, postgres_integration_tests::scratchDir, postgres_integration_tests::onWindows };
 export { socketTests };
 
 // Copy what `from` has to `to`: false once `from` has closed or failed.
@@ -144,9 +144,11 @@ unsafe fn int32 socketTests() {
     string me = myName();
     string through = "host=".concat(other: dir).concat(other: " port=").concat(other: port).concat(other: " dbname=").concat(other: db).concat(other: " user=");
 
-    // A password file whose host field is the socket directory: it matches the path, as libpq matches it.
+    // A password file whose host field is the socket directory: it matches the path, as libpq matches it. A field
+    // escapes its ':' and '\' (a Windows directory has a drive letter's colon).
     string passfile = scratchDir().concat(other: "/pgpass_socket");
-    bool written = writePrivate(path: passfile, text: dir.concat(other: ":").concat(other: port).concat(other: ":").concat(other: db).concat(other: ":kp_scram:").concat(other: passwordFor(user: "kp_scram")).concat(other: "\n"));
+    string field = dir.replace(old: "\\", with: "\\\\").replace(old: ":", with: "\\:");
+    bool written = writePrivate(path: passfile, text: field.concat(other: ":").concat(other: port).concat(other: ":").concat(other: db).concat(other: ":kp_scram:").concat(other: passwordFor(user: "kp_scram")).concat(other: "\n"));
 
     Channel<int32> results = Channel.bounded(capacity: 1);
     Receiver<int32> rx = results.receiver();
@@ -167,18 +169,27 @@ unsafe fn int32 socketTests() {
     }
     Optional<int32> served = rx.recv();
     f = f + check(ok: plain.equals(other: "connected as kp_trust"), what: "socket: a query over a Unix-domain socket: ".concat(other: plain));
-    f = f + check(ok: peerOk.equals(other: "connected as kp_trust"), what: "socket: requirepeer names the server's account: ".concat(other: peerOk));
-    string wantPeer = "connection to server on socket \"".concat(other: path).concat(other: "\" failed: requirepeer specifies \"kp_nobody\", but actual peer user name is \"").concat(other: me).concat(other: "\"");
-    f = f + check(ok: peerWrong.equals(other: wantPeer), what: "socket: requirepeer refuses another account: ".concat(other: peerWrong));
+    if (onWindows()) {
+        // libpq has no getpeereid there: requirepeer ends the connect, whatever it names.
+        string unsupported = "connection to server on socket \"".concat(other: path).concat(other: "\" failed: requirepeer parameter is not supported on this platform");
+        f = f + check(ok: peerOk.equals(other: unsupported) && peerWrong.equals(other: unsupported), what: "socket: on Windows requirepeer is not supported: ".concat(other: peerOk));
+    } else {
+        f = f + check(ok: peerOk.equals(other: "connected as kp_trust"), what: "socket: requirepeer names the server's account: ".concat(other: peerOk));
+        string wantPeer = "connection to server on socket \"".concat(other: path).concat(other: "\" failed: requirepeer specifies \"kp_nobody\", but actual peer user name is \"").concat(other: me).concat(other: "\"");
+        f = f + check(ok: peerWrong.equals(other: wantPeer), what: "socket: requirepeer refuses another account: ".concat(other: peerWrong));
+    }
     f = f + check(ok: written && viaFile.equals(other: "connected as kp_scram"), what: "socket: a password file entry for the socket directory: ".concat(other: viaFile));
     f = f + check(ok: match (served) { case Some(value: n): n == 4; case None: false; }, what: "socket: every connection went through the socket");
 
-    // No server at the path: libpq's message, and its hint.
+    // No server at the path: libpq's message, and its hint. Windows' AF_UNIX reports a directory that is not there as
+    // WSAENETDOWN, which EDB 18.6's psql words "Network is down (0x00002742/10050)".
     Environment env = quietEnvironment();
     string missingDir = dir.concat(other: "/nowhere");
     string missing = attempt(conninfo: "host=".concat(other: missingDir).concat(other: " port=").concat(other: port).concat(other: " dbname=x user=kp_trust"), env: env);
+    string missingWords = "No such file or directory";
+    if (onWindows()) { missingWords = "Network is down (0x00002742/10050)"; }
     string wantMissing = "connection to server on socket \"".concat(other: missingDir).concat(other: "/.s.PGSQL.").concat(other: port)
-        .concat(other: "\" failed: No such file or directory\n\tIs the server running locally and accepting connections on that socket?");
+        .concat(other: "\" failed: ").concat(other: missingWords).concat(other: "\n\tIs the server running locally and accepting connections on that socket?");
     f = f + check(ok: missing.equals(other: wantMissing), what: "socket: no server at the path, in libpq's words: ".concat(other: missing));
 
     // A directory too long for a socket path.

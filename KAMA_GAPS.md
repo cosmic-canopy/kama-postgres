@@ -22,8 +22,8 @@ changes the right design here, say so and we will follow it.
 zig bundled (`kama-windows-x64-bundled-v0.9.719.tar.gz`, checksum verified) and `../kama` built at the `v0.9.719` tag
 (`2808da06`) with msys2's UCRT64 clang.
 
-**Open now:** KPG-42 (MED) and KPG-43 (LOW). Every other gap is fixed, except KPG-8, which is closed as a non-goal
-(see below).
+**Open now:** KPG-42 (MED), KPG-43, KPG-44 and KPG-45 (LOW). Every other gap is fixed, except KPG-8, which is closed
+as a non-goal (see below).
 
 **Priorities:**
 - **HIGH:** wrong or dangerous behaviour today: a crash, or a permanent bad publish.
@@ -151,7 +151,99 @@ Windows build sends `7fffffffffffffff`.
 `7ff8000000000000`. A NaN read as text then has the same bits wherever the client runs, which is what this package's
 codec vectors (from a glibc server) assert. Delete it when `parse` does this itself.
 
-**Why LOW:** a NaN is a NaN to every comparison, and PostgreSQL's too. The bits show only through `bitcast`, or when the
+**Why LOW:** a NaN is a NaN to every comparison, and PostgreSQL's too.
+
+### KPG-44 · LOW · A Unix-socket connect to a path with no socket reports a Win32 code that Windows did not give — OPEN
+
+Found in phase 9's Windows cases (`tests/integration/src/windows_test.kama`), against the psql of EDB's PostgreSQL 18.6
+for Windows. On Windows, connecting to an AF_UNIX path with no socket file answers `WSAECONNREFUSED`. std looks at the
+path (`kama__connect_fail` in `include/kama_os.h`) and reports a missing file as NotFound, which is right for the kind.
+But it also replaces the code: `rawOsError()` becomes `ERROR_FILE_NOT_FOUND` (2), which no call returned. libpq prints
+Winsock's answer, `Connection refused (0x0000274D/10061)`, and a client that words errors as libpq does needs the code
+Windows gave.
+
+The repro, one file, run with `KPG_DIR` set to an empty directory, then to one that is not there:
+
+```kama
+import { core::println, core::envOr, std::io::IoError, std::net::UnixStream };
+
+fn uint8 main() {
+    string dir = envOr(name: "KPG_DIR", dflt: "");
+    string path = dir.concat(other: "/.s.PGSQL.5432");
+    Result<UnixStream, IoError> r = UnixStream.connect(path: path);
+    match (r) {
+        case Ok(value: s): println(s: "connected?");
+        case Err(error: e): {
+            Optional<int32> raw = e.rawOsError();
+            int32 code = match (raw) { case Some(value: c): c; case None: 0; };
+            Optional<string> words = e.osMessage();
+            string w = match (give words) { case Some(value: x): give x; case None: "(none)"; };
+            string m = e.message();
+            println(s: "message: ${m}");
+            println(s: "rawOsError: ${code}");
+            println(s: "osMessage: ${w}");
+        }
+    };
+    return 0;
+}
+```
+
+On 0.9.719 (`../kama` at the tag, msys2 clang), Windows 11 26200:
+
+```
+message: not found (os error 2: The system cannot find the file specified)
+rawOsError: 2
+osMessage: The system cannot find the file specified
+--- a directory that is not there:
+message: i/o error (os error 10050: A socket operation encountered a dead network)
+rawOsError: 10050
+osMessage: A socket operation encountered a dead network
+```
+
+The second run shows the other half: a directory that is not there answers `WSAENETDOWN`, which std passes through
+with its code but as the kind Other, though on POSIX both cases are ENOENT.
+
+**The ask:** keep the code the operating system gave in `rawOsError()` (10061 for the first, 10050 for the second),
+whatever kind std classifies the failure as, as Rust's `io::Error` keeps `raw_os_error` apart from `kind`. The two
+could then share the kind NotFound.
+
+**The workaround:** none in the source. `windows_test.kama` checks the case's lead and hint, and not its words, naming
+this entry. Delete that when this is fixed: the generated case then passes as it is.
+
+**Why LOW:** the connect fails, and the next host is tried, as libpq tries it. Only the words differ.
+
+### KPG-45 · LOW · `UnixAddr.fromAbstract` does not exist on Windows, so a client cannot let Winsock refuse the name — OPEN
+
+Found beside KPG-44. libpq takes a host that starts with `@` as an abstract Unix-socket name on every platform, and
+PostgreSQL's documentation lists Windows as supporting it. Asked on Windows 11 26200, EDB 18.6's psql tried to connect,
+and Winsock refused the address: `connection to server on socket "@kpg_none/.s.PGSQL.5432" failed: Invalid argument
+(0x00002726/10022)`. std offers `UnixAddr.fromAbstract` on Linux alone. So on Windows this client refuses the name
+itself, with no OS code, and can only say "invalid input".
+
+```kama
+import { core::println, std::io::IoError, std::net::UnixAddr, std::net::UnixStream };
+
+fn uint8 main() {
+    Result<UnixAddr, IoError> a = UnixAddr.fromAbstract(name: "kpg_none/.s.PGSQL.5432");
+    match (a) {
+        case Ok(value: where): println(s: "an abstract address");
+        case Err(error: e): println(s: "refused");
+    };
+    return 0;
+}
+```
+
+`kama check abstract.kama --target LINUX` is OK. On Windows (0.9.719): `error: type UnixAddr has no constructor
+fromAbstract`.
+
+**The ask:** either `fromAbstract` on Windows too, leaving the refusal to Winsock (a later Windows that supports
+abstract names would then just work); or a documented error from it there that carries `WSAEINVAL`, which is what
+Windows answers today.
+
+**The workaround:** none in the source. `transport.kama` refuses `@name` off Linux with `InvalidInput`, and
+`windows_test.kama` checks the case's lead and hint, naming this entry.
+
+**Why LOW:** no Windows server listens on an abstract name. The connect fails, and the next host is tried. The bits show only through `bitcast`, or when the
 value goes back to a server in binary. But kama's promise is the same program behaving the same on every target, and
 this is a case where it does not.
 

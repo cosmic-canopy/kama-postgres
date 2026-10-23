@@ -9,7 +9,7 @@
 import { std::collections::DynamicArray, std::time::Duration, std::time::Instant, std::time::monotonicNow,
          std::time::sleep, postgres::Config, postgres::Connection, postgres::Environment, postgres::PgError,
          postgres::Rows, postgres::pool::Pool, postgres::pool::PoolOptions, postgres::pool::Lease,
-         postgres_integration_tests::check, postgres_integration_tests::setting,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::refusedWords,
          postgres_integration_tests::plainConninfoFor, postgres_integration_tests::quietEnvironment,
          postgres_integration_tests::configWith, postgres_integration_tests::scalar, postgres_integration_tests::open,
          postgres_integration_tests::pgsh, postgres_integration_tests::lostWords,
@@ -49,7 +49,7 @@ unsafe fn string selectOne(Result<Lease, PgError> r) {
 // libpq's refusal while the server is down (as stoppedTests has it).
 unsafe fn string refusedText() {
     string port = setting(name: "PGTEST_PORT");
-    return "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?");
+    return "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: ").concat(other: refusedWords()).concat(other: "\n\tIs the server running on that host and accepting TCP/IP connections?");
 }
 
 // Sleep until `ms` after `from`.

@@ -67,7 +67,7 @@ release it is built and tested with, and the first with everything this package 
     `Garble`): the client must never panic, and a protocol error must end the session. A new kind of reply goes into
     one of its exercises. `PGTEST_GARBLE_SEEDS=N` runs more seeds, and `PGTEST_GARBLE_TRACE=1` names each case first.
   - `tests/integration` needs a live server. `tools/test-integration.sh` starts each version itself (all of
-    14–19 by default, `--version N` for one) and runs the suite debug and release. A last leg per version
+    14–19 by default, 18 on Windows, `--version N` for one) and runs the suite debug and release. A last leg per version
     (`PGTEST_RESTART=1`) runs only `restart_test.kama` and then `pool_restart_test.kama` (the pool across a restart, and
     while the server is down). Both stop, start and restart the server through `tools/pg.sh` (`PGTEST_PGSH`) with
     `std::process`, in the release build. Never run the leg beside anything else that uses the same server. `types_test.kama` reads every
@@ -104,6 +104,11 @@ release it is built and tested with, and the first with everything this package 
       asked of a libpq on the host network against the primary and its standby.
     - for the session reset, Npgsql's own source (`tools/gen-reset-vectors.sh`): its statements, their version gates,
       and DISCARD ALL.
+    - for Windows:
+      - libpq's `win32.c`, PostgreSQL's `win32error.c`, mingw-w64's headers and the UCRT's own `strerror`, for the OS's
+        words (`tools/gen-win32-errors.sh`, Windows only);
+      - the psql of EDB's Windows build, asked live about each WIN32 branch a server can show
+        (`tools/gen-libpq-win-cases.sh`, replayed by `windows_test.kama`).
 
     A message this client prints is libpq's message, compared exactly. Where libpq prints a type byte with `%c`, the
     byte prints as C prints it, through `postgres::protocol::cFormat`: an ASCII byte as itself, a NUL ending the message
@@ -119,6 +124,13 @@ release it is built and tested with, and the first with everything this package 
 - **`tools/pg.sh` is the server.**
   - It runs the official `postgres:N` image (14–18, plus 19 beta) under podman or docker, and
     `tests/integration/server/` configures it.
+  - **On Windows it runs natively** (`tools/pg-native.sh`), since there is no container runtime there.
+    - It uses EDB's binaries zip for 18, pinned by SHA256 and unpacked into `out/pg-18`.
+    - The rest matches the container: initdb with the same configuration (`00-setup.sh` is shared), the same roles,
+      ports and environment file, a standby by `pg_basebackup -R`, and `pg_ctl` for stop, start and restart.
+    - It listens on loopback only, since binding every interface raises Windows Firewall's prompt.
+    - `pg_ctl` runs with every handle detached. On Windows the server it starts inherits them, and would hold a
+      caller's pipe open for as long as it runs.
   - There is one role per authentication method: `kp_trust`, `kp_password`, `kp_md5`, `kp_scram`,
     `kp_cert`, `kp_ssl_only` and `kp_nossl`. A test picks the method by picking the user.
   - `kp_saslprep` has a password that SASLprep changes, so it logs in only if this client prepares it as the
@@ -197,7 +209,15 @@ release it is built and tested with, and the first with everything this package 
 - **A connection is libpq's, step for step.**
   - `Config` resolves settings in libpq's order, and every setting is either honoured or refused with a clear
     error. Nothing is silently ignored.
-  - This client is libpq built with SSL (Mbed TLS) and without GSSAPI, and says so in libpq's words.
+  - This client is libpq built with SSL (Mbed TLS) and without GSSAPI, and says so in libpq's words. On Windows it is
+    also without SSPI, which a real Windows libpq always has; phase 10 (Kerberos) adds both.
+  - On Windows it takes libpq's WIN32 branches, each a `@compileFor(OS_WINDOWS)` twin beside the Unix code:
+    - the home is APPDATA's `postgresql` (KPG-42), with no default socket directory;
+    - Windows' `is_absolute_path`, and no file permission checks;
+    - `requirepeer` refused, and keepalives as `SIO_KEEPALIVE_VALS` sets them;
+    - a cancel's reset taken as its close, and the OS's words as `winsock_strerror` and `_dosmaperr` give them.
+
+    A new platform branch gets a twin, a case in `windows_test.kama` or the unit tests, and a mutation.
   - `Connection.connect` walks PQconnectPoll: each host, each address, and at each address the encryption sslmode
     allows in its order (`postgres::secure::EncryptionPlan`). What a failure leads to is libpq's: 'N' goes on in
     plaintext on the same socket; a TLS failure or a refusal before authentication tries the next method on a new

@@ -7,7 +7,7 @@ import { core::println, core::env, std::log::setLogSink, postgres_integration_te
          postgres_integration_tests::extendedTests, postgres_integration_tests::typesTests, postgres_integration_tests::tlsTests,
          postgres_integration_tests::tlsLibpqTests, postgres_integration_tests::cancelTests, postgres_integration_tests::notifyTests, postgres_integration_tests::transactionTests, postgres_integration_tests::copyTests, postgres_integration_tests::cacheTests, postgres_integration_tests::pipelineTests, postgres_integration_tests::batchTests, postgres_integration_tests::tsaTests, postgres_integration_tests::lbTests,
          postgres_integration_tests::resetTests, postgres_integration_tests::limitsTests, postgres_integration_tests::poolTests,
-         postgres_integration_tests::restartTests, postgres_integration_tests::poolRestartTests };
+         postgres_integration_tests::restartTests, postgres_integration_tests::poolRestartTests, postgres_integration_tests::windowsTests };
 export { check, setting };
 
 fn int32 check(bool ok, string what) {
@@ -46,6 +46,7 @@ fn uint8 main() {
     failed = failed + typesTests();
     failed = failed + sessionTests();
     failed = failed + socketTests();
+    failed = failed + windowsTests();
     failed = failed + tlsTests();
     failed = failed + tlsLibpqTests();
     failed = failed + cancelTests();

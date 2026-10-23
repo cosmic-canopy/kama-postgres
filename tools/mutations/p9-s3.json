@@ -1,0 +1,74 @@
+[
+  {
+    "id": "C1",
+    "suite": "integration",
+    "file": "src/wire/wire.kama",
+    "old": "@compileFor(OS_WINDOWS) fn bool readErrorIsCancelEnd() { return true; }",
+    "new": "@compileFor(OS_WINDOWS) fn bool readErrorIsCancelEnd() { return false; }",
+    "expect": "cancel: the request is sent"
+  },
+  {
+    "id": "R1",
+    "suite": "integration",
+    "file": "src/session/route.kama",
+    "old": "@compileFor(OS_WINDOWS) fn bool peerCredentialsChecked() { return false; }",
+    "new": "@compileFor(OS_WINDOWS) fn bool peerCredentialsChecked() { return true; }",
+    "expect": "socket: on Windows requirepeer is not supported"
+  },
+  {
+    "id": "B1",
+    "suite": "integration",
+    "file": "src/secure/setup.kama",
+    "old": "@compileFor(OS_WINDOWS)\nfn bool absent(const ref IoError e) { return match (e.kind()) { case NotFound: true; case _: false; }; }",
+    "new": "@compileFor(OS_WINDOWS)\nfn bool absent(const ref IoError e) { return false; }",
+    "expect": "tls"
+  },
+  {
+    "id": "D1",
+    "suite": "integration",
+    "file": "src/conninfo/pgpass.kama",
+    "old": "@compileFor(OS_WINDOWS) fn string defaultSocketDir() { return \"\"; }",
+    "new": "@compileFor(OS_WINDOWS) fn string defaultSocketDir() { return \"/tmp\"; }",
+    "expect": "windows default_host"
+  },
+  {
+    "id": "P1",
+    "suite": "integration",
+    "file": "src/config.kama",
+    "old": "unsafe fn bool passfileUsable(const ref string path, ref File file) { return true; }",
+    "new": "unsafe fn bool passfileUsable(const ref string path, ref File file) { return false; }",
+    "expect": "windows pgpass_shared"
+  },
+  {
+    "id": "K1",
+    "suite": "integration",
+    "file": "src/config.kama",
+    "old": "@compileFor(OS_WINDOWS) fn bool readsKeepalivesCount() { return false; }",
+    "new": "@compileFor(OS_WINDOWS) fn bool readsKeepalivesCount() { return true; }",
+    "expect": "windows keepalives_count_text"
+  },
+  {
+    "id": "A1",
+    "suite": "integration",
+    "file": "src/config.kama",
+    "old": "    if (path.length() >= 3 && path[1] == 58ui8 && (path[2] == 92ui8 || path[2] == 47ui8)) {\n        return (first >= 65ui8 && first <= 90ui8) || (first >= 97ui8 && first <= 122ui8);\n    }\n    return false;\n}",
+    "new": "    return false;\n}",
+    "expect": "windows socket_missing_directory"
+  },
+  {
+    "id": "S1",
+    "suite": "integration",
+    "file": "src/wire/wire.kama",
+    "old": "    if (code >= 10000 && code <= 11999) { return winsockStrerror(e: e, code: code); }\n",
+    "new": "",
+    "expect": "windows refused"
+  },
+  {
+    "id": "F1",
+    "suite": "integration",
+    "file": "src/secure/setup.kama",
+    "old": "case Ok(value: m): { if (!m.isFile()) { return Result::Err(error: tlsFailure(detail: \"private key file \\\"\".concat(other: keyFile).concat(other: \"\\\" is not a regular file\"))); } }",
+    "new": "case Ok(value: m): { }",
+    "expect": "windows key_directory"
+  }
+]

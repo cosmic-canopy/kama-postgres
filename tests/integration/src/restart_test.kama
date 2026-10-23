@@ -12,7 +12,7 @@ import { std::collections::DynamicArray, std::process::Command, std::process::Ou
          std::time::Instant,
          postgres::Connection, postgres::PgError, postgres::Rows, postgres::Query, postgres::PipelineResult,
          postgres::sqlstate::ADMIN_SHUTDOWN, postgres::sqlstate::CANNOT_CONNECT_NOW,
-         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::open,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::open, postgres_integration_tests::refusedWords,
          postgres_integration_tests::plainConninfoFor, postgres_integration_tests::scalar };
 export { restartTests, pgsh, lostWords, serverClosed };
 
@@ -29,12 +29,20 @@ fn bool lostWords(const ref string m, bool tls) {
     return false;
 }
 
-// Run tools/pg.sh with `what` (stop, start, restart) for this server's version; true when it succeeded.
-unsafe fn bool pgsh(const ref string what) {
-    Command c = Command.make(program: setting(name: "PGTEST_PGSH"));
+// tools/pg.sh with `what` (stop, start, restart) for this server's version, run by `sh`: Windows cannot start a shell
+// script itself, and Git Bash's sh is on the PATH there.
+unsafe fn Command pgshCommand(const ref string what) {
+    Command c = Command.make(program: "sh");
+    c.arg(a: setting(name: "PGTEST_PGSH"));
     c.arg(a: copy what);
     c.arg(a: "--version");
     c.arg(a: setting(name: "PGTEST_VERSION"));
+    return c;
+}
+
+// Run tools/pg.sh with `what`; true when it succeeded.
+unsafe fn bool pgsh(const ref string what) {
+    Command c = pgshCommand(what: what);
     Result<Output, IoError> r = c.run();
     return match (r) { case Ok(value: o): o.status().success(); case Err(error: e): false; };
 }
@@ -119,7 +127,7 @@ unsafe fn int32 stoppedTests() {
     string port = setting(name: "PGTEST_PORT");
     Result<Connection, PgError> refused = open(conninfo: plainConninfoFor(user: "kp_trust"));
     string m = match (refused) { case Ok(value: c): "(connected)"; case Err(error: e): e.message(); };
-    string want = "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?");
+    string want = "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: ").concat(other: refusedWords()).concat(other: "\n\tIs the server running on that host and accepting TCP/IP connections?");
     f = f + check(ok: m.equals(other: want), what: "restart: a connect while the server is down, in libpq's words: ".concat(other: m));
     string standbyPort = setting(name: "PGTEST_STANDBY_PORT");
     string both = "host=127.0.0.1,127.0.0.1 port=".concat(other: port).concat(other: ",").concat(other: standbyPort)
@@ -134,14 +142,11 @@ unsafe fn int32 stoppedTests() {
 // (the refusal; the lost connection, where the port's forwarder accepts before postgres listens; 57P03).
 unsafe fn int32 startingTests() {
     int32 f = 0;
-    Command c = Command.make(program: setting(name: "PGTEST_PGSH"));
-    c.arg(a: "start");
-    c.arg(a: "--version");
-    c.arg(a: setting(name: "PGTEST_VERSION"));
+    Command c = pgshCommand(what: "start");
     Result<Process, IoError> launched = c.start();
     Process starting = match (give launched) { case Ok(value: p): give p; case Err(error: e): { return check(ok: false, what: "restart: tools/pg.sh start"); } };
     string port = setting(name: "PGTEST_PORT");
-    string refusedText = "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?");
+    string refusedText = "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: ").concat(other: refusedWords()).concat(other: "\n\tIs the server running on that host and accepting TCP/IP connections?");
     string lead = "connection to server at \"127.0.0.1\", port ".concat(other: port).concat(other: " failed: ");
     Instant began = monotonicNow();
     bool up = false;

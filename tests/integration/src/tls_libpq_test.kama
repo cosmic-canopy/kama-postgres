@@ -8,7 +8,7 @@ import { std::collections::DynamicArray, std::io::IoError, std::fs::readFile, st
          std::fs::setPermissions, std::fs::Permissions,
          postgres::Connection, postgres::PgError, postgres::Environment,
          postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::openWith,
-         postgres_integration_tests::quietEnvironment, postgres_integration_tests::scalar,
+         postgres_integration_tests::quietEnvironment, postgres_integration_tests::scalar, postgres_integration_tests::onWindows,
          postgres_integration_tests::tlsNames, postgres_integration_tests::tlsEnvironments, postgres_integration_tests::tlsSettings,
          postgres_integration_tests::tlsConnects, postgres_integration_tests::tlsEncrypted, postgres_integration_tests::tlsMessages };
 export { tlsLibpqTests, sameAsLibpq };
@@ -145,6 +145,11 @@ unsafe fn int32 tlsLibpqTests() {
             vars.set(name: assignment.substring(start: 0, end: at), value: assignment.substring(start: at + 1, end: assignment.length()));
         }
         string what = "tls (libpq) ".concat(other: names[i]).concat(other: ": ");
+        // libpq on Windows checks no key's permissions (fe-secure-openssl.c's check is #if !defined(WIN32), and
+        // 001_ssltests.pl skips the case there): EDB 18.6's psql connects, encrypted, with the key others can read.
+        bool connectsHere = connects[i];
+        string encryptedHere = copy encrypted[i];
+        if (onWindows() && names[i].equals(other: "cert_key_shared")) { connectsHere = true; encryptedHere = "true"; }
         Result<Connection, PgError> opened = openWith(conninfo: conninfo, env: vars);
         match (give opened) {
             case Ok(value: c): {
@@ -152,16 +157,16 @@ unsafe fn int32 tlsLibpqTests() {
                 string server = scalar(c: conn, sql: "select coalesce((select ssl::text from pg_stat_ssl where pid = pg_backend_pid()), 'false')");
                 string mine = "false";
                 if (conn.sslInUse()) { mine = "true"; }
-                f = f + check(ok: connects[i], what: what.concat(other: "connected, where libpq was refused: ").concat(other: fill(text: messages[i], certDir: certDir, keyDir: keyDir)));
-                if (connects[i]) {
-                    f = f + check(ok: server.equals(other: encrypted[i]) && mine.equals(other: encrypted[i]),
-                                  what: what.concat(other: "encrypted ").concat(other: mine).concat(other: " (server ").concat(other: server).concat(other: "), libpq ").concat(other: encrypted[i]));
+                f = f + check(ok: connectsHere, what: what.concat(other: "connected, where libpq was refused: ").concat(other: fill(text: messages[i], certDir: certDir, keyDir: keyDir)));
+                if (connectsHere) {
+                    f = f + check(ok: server.equals(other: encryptedHere) && mine.equals(other: encryptedHere),
+                                  what: what.concat(other: "encrypted ").concat(other: mine).concat(other: " (server ").concat(other: server).concat(other: "), libpq ").concat(other: encryptedHere));
                 }
             }
             case Err(error: e): {
                 string got = maskClient(text: e.message());
                 string want = fill(text: messages[i], certDir: certDir, keyDir: keyDir);
-                if (!connects[i]) {
+                if (!connectsHere) {
                     f = f + check(ok: sameAsLibpq(expected: want, actual: got), what: what.concat(other: "\n    libpq: ").concat(other: want).concat(other: "\n    here:  ").concat(other: got));
                 } else {
                     f = f + check(ok: false, what: what.concat(other: "refused, where libpq connected: ").concat(other: got));

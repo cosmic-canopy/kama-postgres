@@ -7,7 +7,7 @@ import { core::env as getenv, std::collections::DynamicArray, std::concurrent::S
          postgres::conninfo::ConnInfoError, postgres::conninfo::parseConnInfo,
          postgres_integration_tests::setting };
 export { conninfoFor, plainConninfoFor, passwordFor, quietEnvironment, configWith, openWith, open, scalar, writePrivate, writeShared, capture,
-         warningsLogged, infosLogged, NoticeCollector, scratchDir };
+         warningsLogged, infosLogged, NoticeCollector, scratchDir, onWindows, refusedWords };
 
 // The connection string for `user` on the test server, with the sslmode of this run: PGTEST_SSLMODE, which
 // tools/test-integration.sh sets to require for its second pass, so every query path runs over TLS too; disable by
@@ -46,13 +46,22 @@ unsafe fn string passwordFor(const ref string user) {
 unsafe fn string scratchDir() { return setting(name: "PGTEST_TMP"); }
 
 // An environment with nothing in it but a home directory that holds no .pgpass or .pg_service.conf, so the
-// developer's own settings cannot leak into a test.
+// developer's own settings cannot leak into a test. On Windows libpq's home is APPDATA's postgresql.
 unsafe fn Environment quietEnvironment() {
     Environment env = Environment.empty();
     env.setUser(name: "kp_trust");
     env.set(name: "HOME", value: scratchDir().concat(other: "/home"));
+    env.set(name: "APPDATA", value: scratchDir().concat(other: "/home"));
     return env;
 }
+
+@compileFor(!OS_WINDOWS) fn bool onWindows() { return false; }
+@compileFor(OS_WINDOWS) fn bool onWindows() { return true; }
+
+// libpq's words for a refused TCP connect: strerror(ECONNREFUSED), or on Windows winsock_strerror's, which appends
+// the code (src/interfaces/libpq/win32.c). EDB 18.6's psql prints the second.
+@compileFor(!OS_WINDOWS) fn string refusedWords() { return "Connection refused"; }
+@compileFor(OS_WINDOWS) fn string refusedWords() { return "Connection refused (0x0000274D/10061)"; }
 
 unsafe fn Result<Config, PgError> configWith(const ref string conninfo, const ref Environment env) {
     Result<ConnInfo, ConnInfoError> parsed = parseConnInfo(text: conninfo);

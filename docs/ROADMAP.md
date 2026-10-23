@@ -65,7 +65,7 @@ matrix.
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
 | 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | **done** (0.3.0): S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4, S5, S6, the port to 0.9.719 and S7 |
-| 9 | Windows: libpq's WIN32 branches, a native server on Windows, Windows CI legs. Ends at 0.4.0 | **under way**: S0 and S1 done, S2 next |
+| 9 | Windows: libpq's WIN32 branches, a native server on Windows, Windows CI legs. Ends at 0.4.0 | **under way**: S0, S1, S2 and S3 done; S4 written, untested until pushed |
 | 10 | Kerberos: GSSAPI (Linux, macOS), SSPI (Windows) and `gssencmode` | planned, design first |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -178,19 +178,60 @@ maintainer's word). Each step's mutations go in `tools/mutations/p9-sN.json`.
     `C:/x` fix and `keepalives_count`), for the Mac, since a mutation compiled out here cannot fail.
   - **Left to S3's live suite:** the keepalive, `requirepeer` and cancel twins, the user name's failure, and
     `absent()`. The unit tests open no socket, and cannot make the account lookup fail.
-- **S2: a native PostgreSQL 18 on Windows** (`tools/pg.sh`, chosen when `uname` is MINGW or MSYS):
-  - EDB's zip, pinned by URL and SHA256;
-  - `initdb` from `tests/integration/server/`, sharing `00-setup.sh`'s steps with the container;
-  - a socket directory, and a standby by `pg_basebackup -R`;
-  - `up`, `down`, `stop`, `start`, `restart`, `smoke` and `logs`.
-
-  A Windows generator asks the zip's libpq the WIN32 cases, never touching the real `%APPDATA%\postgresql`.
-- **S3: the integration suite on Windows**, against 18:
-  - debug, release, TLS, the restart leg (`PGTEST_PGSH` run through `bash.exe`) and the examples (`APPDATA` and
-    `SYSTEMROOT` in their environment);
-  - Windows twins of the Unix-only expectations, and Unix-domain sockets live.
-- **S4: CI.** A `windows-latest` unit leg, with the bundled-zig kama by URL and SHA256 as `@kama/tls` installs it, and
-  a Windows integration leg on 18, with EDB's zip cached by its SHA256.
+- **S2, done: a native PostgreSQL 18 on Windows** (`tools/pg-native.sh`, which `tools/pg.sh` sources when `uname` is
+  MINGW or MSYS; `PGTEST_NATIVE` overrides the choice).
+  - **The binaries:** EDB's `postgresql-18.6-1-windows-x64-binaries.zip`, cached in `out/pg-dist/`.
+    - EDB publishes no checksums, so its SHA256 (`fbe23da2…252f8c`) is the one taken when it was first pinned.
+    - Only `bin`, `lib` and `share` are unpacked: about 150 MB of the 900. Git for Windows' unzip stops `*` at a `/`,
+      so the patterns are `**`.
+  - **The server:** initdb (UTF8, `en-US`), then `00-setup.sh`, which now takes `KP_CERTS` and `KP_DIR`, so the
+    container and the native mode share it. It listens on loopback only, since binding every interface raises Windows
+    Firewall's prompt. The roles come from `10-roles.sql`, and the standby from `pg_basebackup -R` on 544N.
+  - **The commands:** `up`, `down`, `stop`, `start`, `restart`, `env`, `psql`, `logs` and `smoke`, with the
+    container's ports and environment file. A first `up` takes 17 seconds.
+  - **`pg_ctl` runs with every handle detached.** On Windows the server it starts (through `cmd.exe`) inherits them:
+    the first `pg.sh up | tail` never ended, since the server held the pipe.
+  - **`smoke` uses the zip's own psql**, and all 20 logins pass. `kp_saslprep`'s password goes through a password file,
+    since libpq reads `PGPASSWORD` in the ANSI code page on Windows, which cannot hold it.
+  - **`tools/gen-libpq-win-cases.sh`** asks that psql 17 cases into `tests/integration/src/libpq_win_cases.kama`, with
+    each path and port as a placeholder. Run twice, its output is identical. The cases are:
+    - the password file's checks;
+    - socket paths: a missing directory (`WSAENETDOWN`), an empty one (`WSAECONNREFUSED`), and `@name` (`WSAEINVAL`);
+    - `requirepeer` over TCP;
+    - keepalives and `tcp_user_timeout`;
+    - the key's checks;
+    - the default host;
+    - a refused connect.
+- **S3, done: the integration suite on Windows**, against 18.
+  - **The runner.** `tools/test-integration.sh` defaults to 18 on Windows, and gives the examples `APPDATA`. The restart
+    tests run `sh` with `tools/pg.sh` as its argument (`pgshCommand`), since CreateProcess cannot start a script.
+  - **Windows twins**, each from the live psql:
+    - the refused-connect words (`refusedWords()`);
+    - `auth_test`'s password-file cases: no checks, and the null device is `NUL`;
+    - `socket_test`: the drive letter's colon escaped in the password file, `requirepeer` not supported, and a missing
+      directory's `WSAENETDOWN`;
+    - `tls_libpq_test`'s shared key, which connects;
+    - `types_test`'s NaN: the Windows server sends the UCRT's bits.
+  - **`windows_test.kama`** replays the 17 generated cases through this client. 15 are compared exactly. Two check
+    libpq's lead and hint, their words awaiting KPG-44 (std reports `ERROR_FILE_NOT_FOUND` where Winsock answered
+    `WSAECONNREFUSED`) and KPG-45 (std has no abstract address on Windows). A configuration error is compared without
+    the connection lead, as the unit settings cases are.
+  - **The first live run found three things:**
+    - Every cancel failed: Windows reported the server's clean close as a reset. The port went into S1.
+    - A pipeline's query timeout then closed its session, and the test's `drained` loop spun on the closed connection
+      for six hours. It now stops once the connection is closed.
+    - The server's NaN differs, which corrected KPG-43's premise.
+  - **The whole suite is green on Windows:** debug, release, TLS, the restart leg, and the seven examples in plaintext
+    and over `verify-full`. Unix-domain sockets ran live through the relay, and kama's `Poller` (AFD over IOCP) carried
+    every connection.
+  - **Mutations:** `tools/mutations/p9-s3.json` has 9 integration mutations: the cancel, `requirepeer`, `absent()`,
+    default host, password file, `keepalives_count`, socket path, Winsock words and key-order twins.
+  - **Two twins have no mutation:** the keepalive values and `tcp_user_timeout`. A server cannot see a client socket's
+    options, and both connect either way.
+- **S4, written: CI** (`.github/workflows/ci.yml`). It runs on the next push, on the maintainer's word.
+  - A `windows-latest` unit leg, with kama's release with zig bundled, by URL and SHA256, as `@kama/tls` installs it.
+  - An `integration (windows, PostgreSQL 18)` job, with EDB's zip under `actions/cache`, keyed by its SHA256.
+  - Every Windows step runs in Git Bash, and `KAMA_VERSION` is set once for the workflow.
 - **S5: docs and 0.4.0.** The README's platforms, Windows file locations and known differences; the CHANGELOG;
   AGENTS.postgres.md's Windows gate; this record.
 

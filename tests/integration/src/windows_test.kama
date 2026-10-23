@@ -1,0 +1,127 @@
+// libpq's WIN32 branches against the server, as a Windows libpq takes them: the cases tools/gen-libpq-win-cases.sh
+// asked of the psql of EDB's PostgreSQL 18.6 for Windows (libpq_win_cases.kama), each run through this client with the
+// same files in place. The password file's checks, Unix-domain socket paths, requirepeer, keepalives and
+// tcp_user_timeout, the private key's checks, the default host, and the words of a refused connect. Off Windows the
+// group runs nothing: libpq's answers there are the other tests'.
+import { std::collections::DynamicArray, std::io::IoError, std::fs::createDirAll, std::fs::readFile, std::fs::writeFile,
+         std::fs::setPermissions, std::fs::Permissions,
+         postgres::Connection, postgres::PgError, postgres::Environment,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::openWith,
+         postgres_integration_tests::quietEnvironment, postgres_integration_tests::scalar,
+         postgres_integration_tests::writeShared, postgres_integration_tests::passwordFor,
+         postgres_integration_tests::winNames, postgres_integration_tests::winEnvironments,
+         postgres_integration_tests::winSettings, postgres_integration_tests::winConnects,
+         postgres_integration_tests::winMessages };
+export { windowsTests };
+
+@compileFor(!OS_WINDOWS)
+unsafe fn int32 windowsTests() { return 0; }
+
+@compileFor(OS_WINDOWS)
+unsafe fn int32 windowsTests() {
+    int32 f = 0;
+    string port = setting(name: "PGTEST_PORT");
+    string scratch = setting(name: "PGTEST_TMP").concat(other: "/win");
+    string keys = setting(name: "PGTEST_TMP").concat(other: "/win-keys");
+    string sock = setting(name: "PGTEST_SOCKDIR");
+    string certs = setting(name: "PGTEST_CERTDIR");
+    // The generator's files: a password file others can read, a directory, and the client key copied for others to
+    // read, beside a directory in the key's place.
+    Result<Unit, IoError> d1 = createDirAll(path: scratch.concat(other: "/adir"));
+    Result<Unit, IoError> d2 = createDirAll(path: keys.concat(other: "/keydir"));
+    bool files = writeShared(path: scratch.concat(other: "/pgpass_open"),
+                             text: "127.0.0.1:".concat(other: port).concat(other: ":kp_test:kp_scram:").concat(other: passwordFor(user: "kp_scram")).concat(other: "\n"));
+    Result<DynamicArray<uint8>, IoError> key = readFile(path: certs.concat(other: "/client.key"));
+    match (give key) {
+        case Ok(value: bytes): {
+            string shared = keys.concat(other: "/client-0644.key");
+            Result<isize, IoError> w = writeFile(path: shared, bytes: bytes);
+            Result<Unit, IoError> p = setPermissions(path: shared, permissions: Permissions::OwnerRead | Permissions::OwnerWrite | Permissions::GroupRead | Permissions::OtherRead);
+        }
+        case Err(error: e): { files = false; }
+    };
+    f = f + check(ok: files, what: "windows: the test files");
+
+    DynamicArray<string> names = winNames();
+    DynamicArray<string> environments = winEnvironments();
+    DynamicArray<string> settings = winSettings();
+    DynamicArray<bool> connects = winConnects();
+    DynamicArray<string> messages = winMessages();
+    isize i = 0;
+    while (i < names.length()) {
+        string conninfo = fill(text: settings[i], port: port, scratch: scratch, sock: sock, certs: certs, keys: keys);
+        Environment vars = quietEnvironment();
+        if (!environments[i].equals(other: "-")) {
+            string assignment = fill(text: environments[i], port: port, scratch: scratch, sock: sock, certs: certs, keys: keys);
+            Optional<isize> eq = assignment.find(substring: "=");
+            isize at = match (eq) { case Some(value: e): e; case None: 0; };
+            vars.set(name: assignment.substring(start: 0, end: at), value: assignment.substring(start: at + 1, end: assignment.length()));
+        }
+        string want = fill(text: messages[i], port: port, scratch: scratch, sock: sock, certs: certs, keys: keys);
+        string what = "windows ".concat(other: names[i]).concat(other: ": ");
+        Result<Connection, PgError> opened = openWith(conninfo: conninfo, env: vars);
+        match (give opened) {
+            case Ok(value: c): {
+                Connection conn = give c;
+                string who = scalar(c: conn, sql: "select 'connected'");
+                f = f + check(ok: connects[i] && who.equals(other: "connected"), what: what.concat(other: "connected, where libpq was refused: ").concat(other: want));
+            }
+            case Err(error: e): {
+                string got = e.message();
+                // libpq checks some settings while connecting, after the attempt's lead; this client checks them as the
+                // configuration resolves (tests/unit's settingTests). The message is the rest.
+                bool early = match (e) { case Config(detail: d): true; case _: false; };
+                if (early) { want = withoutLead(message: want); }
+                string gap = awaitedGap(name: names[i]);
+                if (connects[i]) {
+                    f = f + check(ok: false, what: what.concat(other: "refused, where libpq connected: ").concat(other: got));
+                } else if (gap.length() > 0) {
+                    bool shaped = got.startsWith(prefix: leadOf(message: want)) && got.endsWith(suffix: hintOf(message: want));
+                    f = f + check(ok: shaped, what: what.concat(other: "libpq's lead and hint, its words awaiting ").concat(other: gap).concat(other: ": ").concat(other: got));
+                } else {
+                    f = f + check(ok: got.equals(other: want), what: what.concat(other: "\n    libpq: ").concat(other: want).concat(other: "\n    here:  ").concat(other: got));
+                }
+            }
+        };
+        i = i + 1;
+    }
+    f = f + check(ok: names.length() >= 15, what: "windows: the cases are all there");
+    return f;
+}
+
+// The cases whose words wait on a kama gap: the attempt is checked for libpq's lead and hint, not its words.
+//   KPG-44: std reports ERROR_FILE_NOT_FOUND where Winsock answered WSAECONNREFUSED (a path with no socket file).
+//   KPG-45: std has no abstract address on Windows, so Winsock's WSAEINVAL is never reached.
+@compileFor(OS_WINDOWS)
+fn string awaitedGap(const ref string name) {
+    if (name.equals(other: "socket_empty_directory")) { return "KPG-44"; }
+    if (name.equals(other: "socket_abstract")) { return "KPG-45"; }
+    return "";
+}
+
+// "connection to server …failed: " and what follows it; the hint is the line after the last newline.
+@compileFor(OS_WINDOWS)
+fn string leadOf(const ref string message) {
+    Optional<isize> at = message.find(substring: "failed: ");
+    return match (at) { case Some(value: n): message.substring(start: 0, end: n + 8); case None: ""; };
+}
+
+@compileFor(OS_WINDOWS)
+fn string hintOf(const ref string message) {
+    isize i = message.length();
+    while (i > 0 && message[i - 1] != 10ui8) { i = i - 1; }
+    return message.substring(start: i, end: message.length());
+}
+
+@compileFor(OS_WINDOWS)
+fn string withoutLead(const ref string message) {
+    if (!message.startsWith(prefix: "connection to server ")) { return copy message; }
+    Optional<isize> at = message.find(substring: "failed: ");
+    return match (at) { case Some(value: n): message.substring(start: n + 8, end: message.length()); case None: copy message; };
+}
+
+@compileFor(OS_WINDOWS)
+fn string fill(const ref string text, const ref string port, const ref string scratch, const ref string sock, const ref string certs, const ref string keys) {
+    return text.replace(old: "@PORT@", with: port).replace(old: "@TMP@", with: scratch).replace(old: "@SOCK@", with: sock)
+               .replace(old: "@CERTDIR@", with: certs).replace(old: "@KEYDIR@", with: keys);
+}

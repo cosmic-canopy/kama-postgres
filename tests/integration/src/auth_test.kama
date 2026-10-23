@@ -6,7 +6,7 @@ import { std::collections::DynamicArray, std::fs::createDirAll, std::fs::remove,
          postgres::sqlstate::INVALID_PASSWORD, postgres::sqlstate::INVALID_AUTHORIZATION_SPECIFICATION,
          postgres::sqlstate::INVALID_CATALOG_NAME,
          postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::plainConninfoFor,
-         postgres_integration_tests::conninfoFor, postgres_integration_tests::passwordFor,
+         postgres_integration_tests::conninfoFor, postgres_integration_tests::passwordFor, postgres_integration_tests::onWindows,
          postgres_integration_tests::quietEnvironment, postgres_integration_tests::openWith,
          postgres_integration_tests::open, postgres_integration_tests::scalar,
          postgres_integration_tests::writePrivate, postgres_integration_tests::writeShared,
@@ -183,24 +183,35 @@ unsafe fn int32 passfileTests() {
     f = f + check(ok: bad.contains(substring: "password authentication failed") && bad.contains(substring: "password retrieved from file \"".concat(other: wrong).concat(other: "\"")),
                   what: "pgpass: a wrong password names the file it came from: ".concat(other: bad));
 
+    // On Windows libpq checks nothing about the file (passwordFromFile's checks are #ifndef WIN32): one others can read
+    // is used, and the null device, a directory or a file that is not there gives no password and no warning. EDB
+    // 18.6's psql answered each so.
+    int32 warned = 1;
+    if (onWindows()) { warned = 0; }
     int32 before = warningsLogged();
     env.set(name: "PGPASSFILE", value: copy readable);
     string loose = attempt(conninfo: conninfoFor(user: "kp_scram"), env: env);
-    f = f + check(ok: loose.contains(substring: "fe_sendauth: no password supplied") && warningsLogged() == before + 1,
-                  what: "pgpass: a file others can read is ignored, with a warning: ".concat(other: loose));
+    if (onWindows()) {
+        f = f + check(ok: loose.length() == 0 && warningsLogged() == before, what: "pgpass: on Windows a file others can read is used: ".concat(other: loose));
+    } else {
+        f = f + check(ok: loose.contains(substring: "fe_sendauth: no password supplied") && warningsLogged() == before + 1,
+                      what: "pgpass: a file others can read is ignored, with a warning: ".concat(other: loose));
+    }
 
     // passwordFromFile checks the file it opened: /dev/null and a directory are not plain files, and are ignored
-    // with libpq's warning (PGPASSFILE=/dev/null is the usual way to turn the file off).
+    // with libpq's warning (PGPASSFILE=/dev/null is the usual way to turn the file off). Windows' null device is NUL.
     before = warningsLogged();
-    env.set(name: "PGPASSFILE", value: "/dev/null");
+    string nullDevice = "/dev/null";
+    if (onWindows()) { nullDevice = "NUL"; }
+    env.set(name: "PGPASSFILE", value: copy nullDevice);
     string devnull = attempt(conninfo: conninfoFor(user: "kp_scram"), env: env);
-    f = f + check(ok: devnull.contains(substring: "fe_sendauth: no password supplied") && warningsLogged() == before + 1,
-                  what: "pgpass: /dev/null is not a plain file, with a warning: ".concat(other: devnull));
+    f = f + check(ok: devnull.contains(substring: "fe_sendauth: no password supplied") && warningsLogged() == before + warned,
+                  what: "pgpass: the null device gives no password, warned of where libpq checks: ".concat(other: devnull));
     before = warningsLogged();
     env.set(name: "PGPASSFILE", value: copy dir);
     string directory = attempt(conninfo: conninfoFor(user: "kp_scram"), env: env);
-    f = f + check(ok: directory.contains(substring: "fe_sendauth: no password supplied") && warningsLogged() == before + 1,
-                  what: "pgpass: a directory is not a plain file, with a warning: ".concat(other: directory));
+    f = f + check(ok: directory.contains(substring: "fe_sendauth: no password supplied") && warningsLogged() == before + warned,
+                  what: "pgpass: a directory gives no password, warned of where libpq checks: ".concat(other: directory));
 
     Environment keyword = quietEnvironment();
     string passfile = attempt(conninfo: conninfoFor(user: "kp_scram").concat(other: " passfile=").concat(other: good), env: keyword);

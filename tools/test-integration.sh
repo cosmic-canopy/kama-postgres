@@ -5,7 +5,7 @@
 # run alone so that no other case meets a server going down. Then every example under examples/, debug in plaintext and
 # release over TLS (sslmode=verify-full), each of which checks its own results.
 #
-#   tools/test-integration.sh                    every version: 14 15 16 17 18 19
+#   tools/test-integration.sh                    every version: 14 15 16 17 18 19 (on Windows, 18: see tools/pg-native.sh)
 #   tools/test-integration.sh --version 18 …     the versions named
 #   tools/test-integration.sh --down …           remove each server when its run is done
 #
@@ -24,7 +24,10 @@ while [ $# -gt 0 ]; do
         *) echo "test-integration.sh: unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
-[ -n "$VERSIONS" ] || VERSIONS="14 15 16 17 18 19"
+if [ -z "$VERSIONS" ]; then
+    # On Windows tools/pg.sh runs EDB's binaries natively, and pins those of 18 alone.
+    case "$(uname -s)" in MINGW*|MSYS*) VERSIONS="18" ;; *) VERSIONS="14 15 16 17 18 19" ;; esac
+fi
 tmp=$(mktemp -d)
 # Unix sockets get a directory of their own under /tmp: a socket path is at most 103 bytes on macOS.
 sockets=$(mktemp -d /tmp/kpg.XXXXXX)
@@ -59,8 +62,8 @@ for v in $VERSIONS; do
     # The leg leaves the server running; this makes sure, with its standby back in recovery.
     "$ROOT/tools/pg.sh" up --version "$v" >/dev/null
     # Each example runs from its own directory, as a reader runs it. It gets the server in libpq's PG* variables and
-    # nothing else of this shell's environment, and HOME is a scratch directory, so no ~/.pgpass, service file or
-    # ~/.postgresql of this machine's is read.
+    # nothing else of this shell's environment, and HOME (APPDATA on Windows) is a scratch directory, so no ~/.pgpass,
+    # service file or ~/.postgresql of this machine's is read. Git Bash's env -i still passes Windows its SYSTEMROOT.
     for leg in --debug:disable --release:verify-full; do
         mode=${leg%%:*}; sslmode=${leg#*:}
         echo "== PostgreSQL $v examples ($mode, sslmode=$sslmode)"
@@ -68,7 +71,7 @@ for v in $VERSIONS; do
             work="$tmp/work-$v-$name$mode"; mkdir -p "$work"
             echo "-- $name"
             if ( set -a; . "$ROOT/out/pgtest-$v.env"; set +a; cd "$ROOT/examples/$name" &&
-                 env -i PATH="$PATH" HOME="$work" PGHOST="$PGTEST_HOST" PGPORT="$PGTEST_PORT" PGDATABASE="$PGTEST_DATABASE" \
+                 env -i PATH="$PATH" HOME="$work" APPDATA="$work" PGHOST="$PGTEST_HOST" PGPORT="$PGTEST_PORT" PGDATABASE="$PGTEST_DATABASE" \
                      PGUSER=kp_trust PGSSLMODE="$sslmode" PGSSLROOTCERT="$PGTEST_CERTDIR/ca.crt" "$tmp/example-$name$mode" )
             then :; else failed="$failed $v-$name$mode"; fi
         done

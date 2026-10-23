@@ -45,11 +45,15 @@ unsafe fn string drained(ref Connection c) {
     string all = "";
     bool first = true;
     while (true) {
-        string one = shown(r: c.getResult());
+        Result<Optional<PipelineResult>, PgError> r = c.getResult();
+        bool failed = match (r) { case Err(error: e): true; case _: false; };
+        string one = shown(r: give r);
         if (one.equals(other: "none")) { break; }
         if (!first) { all = all.concat(other: " | "); }
         all = all.concat(other: one);
         first = false;
+        // A closed connection fails every call from then on: say so once, rather than for ever.
+        if (failed && c.isClosed()) { break; }
     }
     return all;
 }

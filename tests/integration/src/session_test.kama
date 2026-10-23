@@ -6,7 +6,7 @@ import { std::collections::DynamicArray, std::concurrent::Channel, std::concurre
          postgres::Connection, postgres::PgError, postgres::Rows, postgres::Environment,
          postgres::protocol::PROTOCOL_3_0, postgres::protocol::PROTOCOL_3_2,
          postgres::sqlstate::ADMIN_SHUTDOWN,
-         postgres_integration_tests::check, postgres_integration_tests::setting,
+         postgres_integration_tests::check, postgres_integration_tests::setting, postgres_integration_tests::refusedWords,
          postgres_integration_tests::conninfoFor, postgres_integration_tests::open,
          postgres_integration_tests::openWith, postgres_integration_tests::quietEnvironment,
          postgres_integration_tests::scalar, postgres_integration_tests::infosLogged };
@@ -86,7 +86,8 @@ unsafe fn int32 unreachableTests() {
     Environment env = quietEnvironment();
     Result<Connection, PgError> refused = openWith(conninfo: "host=127.0.0.1 port=1 user=kp_trust dbname=kp_test sslmode=disable", env: env);
     string rm = match (refused) { case Ok(value: c): "connected"; case Err(error: e): e.message(); };
-    f = f + check(ok: rm.equals(other: "connection to server at \"127.0.0.1\", port 1 failed: Connection refused\n\tIs the server running on that host and accepting TCP/IP connections?"), what: "unreachable: a closed port, in libpq's words: ".concat(other: rm));
+    string refusedText = "connection to server at \"127.0.0.1\", port 1 failed: ".concat(other: refusedWords()).concat(other: "\n\tIs the server running on that host and accepting TCP/IP connections?");
+    f = f + check(ok: rm.equals(other: refusedText), what: "unreachable: a closed port, in libpq's words: ".concat(other: rm));
 
     // A listener that never answers: the TCP handshake completes in the kernel, the StartupMessage gets no reply.
     string host = "127.0.0.1";

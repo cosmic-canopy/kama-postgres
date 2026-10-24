@@ -65,7 +65,7 @@ matrix.
 | 6 | TLS through `@kama/tls`: SSLRequest and direct negotiation, every sslmode, verify-full, SCRAM-SHA-256-PLUS, client certificates, CRLs, `sslkeylogfile`; the integration suite on 14–19 plaintext and over TLS | **done** |
 | 7 | Statement cache, transactions and savepoints, COPY, waiting for LISTEN/NOTIFY, pipelining and batches, cancel and query timeouts, `target_session_attrs` and `load_balance_hosts` | **done** (0.2.0, published 2026-10-03) |
 | 8 | Scoped transactions; pool (cross-isolate, with maintenance); hardening (server restart, bounded memory, hostile input); examples; docs. Ends at 0.3.0 | **done** (0.3.0): S0 (0.2.1), S0b, S1, the port to kama 0.9.673, S2, S3, the port to 0.9.690, S4, S5, S6, the port to 0.9.719 and S7 |
-| 9 | Windows: libpq's WIN32 branches, a native server on Windows, Windows CI legs. Ends at 0.4.0 | **under way**: S0, S1, S2 and S3 done; S4 written, untested until pushed |
+| 9 | Windows: libpq's WIN32 branches, a native server on Windows, Windows CI legs. Ends at 0.4.0 | **under way**: S0–S4 done, CI green on every leg; S5 (docs and 0.4.0) next |
 | 10 | Kerberos: GSSAPI (Linux, macOS), SSPI (Windows) and `gssencmode` | planned, design first |
 | — | Publish `@kama/tls` 0.1.0, then `@kama/postgres` 0.1.0, its `@kama/tls` dependency switched from the path to that version | **done** (2026-10-02) |
 
@@ -240,6 +240,9 @@ maintainer's word). Each step's mutations go in `tools/mutations/p9-sN.json`.
     (KPG-46, HIGH). This machine never met it, since its store already held `@kama/tls`.
   - **`tools/seed-kama-store.sh`** is the workaround, a step in both Windows jobs. It puts each locked package into
     kama's store, checked against the lock's integrity hash, byte-identical to kama's own entry.
+  - **The third run** (`95f1a3b`, run 40050001859) is green on all ten jobs. The Windows unit leg passed with the
+    bundled zig, and the Windows integration job passed against the native 18 on GitHub's runner: debug, release,
+    TLS, the restart leg and the examples.
 - **S5: docs and 0.4.0.** The README's platforms, Windows file locations and known differences; the CHANGELOG;
   AGENTS.postgres.md's Windows gate; this record.
 

@@ -22,7 +22,7 @@ changes the right design here, say so and we will follow it.
 zig bundled (`kama-windows-x64-bundled-v0.9.719.tar.gz`, checksum verified) and `../kama` built at the `v0.9.719` tag
 (`2808da06`) with msys2's UCRT64 clang.
 
-**Open now:** KPG-42 (MED), KPG-43, KPG-44 and KPG-45 (LOW). Every other gap is fixed, except KPG-8, which is closed
+**Open now:** KPG-46 (HIGH), KPG-42 (MED), KPG-43, KPG-44 and KPG-45 (LOW). Every other gap is fixed, except KPG-8, which is closed
 as a non-goal (see below).
 
 **Priorities:**
@@ -33,6 +33,54 @@ as a non-goal (see below).
 ---
 
 ## OPEN
+
+### KPG-46 · HIGH · On Windows, `kama pkg install` cannot unpack a registry package — OPEN
+
+Found by phase 9's first Windows CI run: both Windows jobs failed in their first `kama pkg install`. A runner's kama
+store starts empty, and so `@kama/tls` 0.1.7 had to be unpacked from the registry:
+
+```
+tar: C\:\\Users\runneradmin/.kama/store/.tmp-1900-@kama_tls: Cannot open: No such file or directory
+tar: Error is not recoverable: exiting now
+kama pkg install: cannot unpack '@kama/tls'
+```
+
+(read through `tools/ci-annotate.sh`, since a job's log needs an admin token). It reproduces on Windows 11 with any
+project that has a registry dependency, here a fresh clone of this repo at `aae0d4b`, and a store that does not hold
+the package yet. `HOME` names an empty directory, so the store is `$HOME/.kama/store`:
+
+```sh
+HOME=/tmp/empty PATH="<kama>/bin:/usr/bin:/mingw64/bin:/c/Windows/system32:/c/Windows" kama pkg install kama.json
+```
+
+It failed the same way in every combination tried, on 0.9.719:
+
+| kama | the `tar` it finds first | result |
+|---|---|---|
+| the release with zig bundled | Git for Windows' GNU tar (Git Bash, GitHub's `shell: bash`) | `cannot unpack '@kama/tls'` |
+| the release | msys2's GNU tar | `cannot unpack '@kama/tls'` |
+| the release | Windows' own `System32\tar.exe` (bsdtar), as from PowerShell | bsdtar prints its usage: `--force-local` is not a bsdtar option |
+| `../kama` built at the tag | Git for Windows' GNU tar | `cannot unpack '@kama/tls'` |
+
+`fetchToStore` (`src/kama.driver.cpp`, "--force-local on Windows") runs
+`tar --force-local -xzf "<staging>.tgz" -C "<staging>" --strip-components=1` through `system()`. GNU tar's complaint
+names the staging directory, not the `.tgz`, so the archive argument does not arrive as written. `runCmd`'s comment
+on `cmd.exe`'s quote stripping may be where it is lost. bsdtar is refused one step earlier, by the GNU-only flag.
+
+A machine whose store already holds the package never meets this: `pkg install` links the existing
+`store/<label>-<tree hash>` and unpacks nothing. That is why this package's own Windows runs passed.
+
+**The ask:** unpack a registry tarball on Windows whatever `tar` the PATH holds. One way is to name
+`%SystemRoot%\System32\tar.exe`, without `--force-local`, which every Windows 10 1803+ has. Another is to unpack in
+kama itself.
+
+**The workaround:** `tools/seed-kama-store.sh`, run by CI's Windows jobs before the tests. For each registry package a
+`kama.lock` here pins, it downloads the tarball, checks it against the lock's integrity hash, and unpacks it with the
+shell's tar into `<store>/<label>-<tree hash>`. The result is byte-identical to kama's own entry for `@kama/tls` 0.1.7
+(`diff -r`). Delete the script and its CI step when this is fixed.
+
+**Why HIGH:** a Windows user cannot install any package that depends on a registry package, from any shell, until
+something else has put it into their store. A consumer of this package on Windows is that user.
 
 ### KPG-42 · MED · std has no per-user application-data folder, where libpq keeps its files on Windows — OPEN
 

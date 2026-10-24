@@ -228,10 +228,18 @@ maintainer's word). Each step's mutations go in `tools/mutations/p9-sN.json`.
     default host, password file, `keepalives_count`, socket path, Winsock words and key-order twins.
   - **Two twins have no mutation:** the keepalive values and `tcp_user_timeout`. A server cannot see a client socket's
     options, and both connect either way.
-- **S4, written: CI** (`.github/workflows/ci.yml`). It runs on the next push, on the maintainer's word.
+- **S4: CI** (`.github/workflows/ci.yml`), pushed on 2026-10-23 with the maintainer's word.
   - A `windows-latest` unit leg, with kama's release with zig bundled, by URL and SHA256, as `@kama/tls` installs it.
   - An `integration (windows, PostgreSQL 18)` job, with EDB's zip under `actions/cache`, keyed by its SHA256.
   - Every Windows step runs in Git Bash, and `KAMA_VERSION` is set once for the workflow.
+  - **The first run** (`aae0d4b`) passed all eight Linux and macOS jobs, the Unix half of S1–S3 included. Both Windows
+    jobs failed within 20 seconds, and a job's log needs an admin token.
+  - **`tools/ci-annotate.sh`:** each test step now tees its output, and a failure turns its last 60 lines into an
+    annotation, which the public check-runs API serves.
+  - **The second run** (`bed1a36`) showed the cause: kama's `pkg install` cannot unpack a registry package on Windows
+    (KPG-46, HIGH). This machine never met it, since its store already held `@kama/tls`.
+  - **`tools/seed-kama-store.sh`** is the workaround, a step in both Windows jobs. It puts each locked package into
+    kama's store, checked against the lock's integrity hash, byte-identical to kama's own entry.
 - **S5: docs and 0.4.0.** The README's platforms, Windows file locations and known differences; the CHANGELOG;
   AGENTS.postgres.md's Windows gate; this record.
 

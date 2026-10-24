@@ -80,6 +80,12 @@ jobs:
           kama --version
           "${OPENSSL:-openssl}" version
 
+      # KPG-46: kama's `pkg install` cannot unpack a registry package on Windows, so the locked ones are put into its
+      # store first. Delete this step with tools/seed-kama-store.sh once it is fixed.
+      - name: Seed kama's store (Windows, KPG-46)
+        if: runner.os == 'Windows'
+        run: tools/seed-kama-store.sh
+
       - name: Unit tests
         run: |
           set -o pipefail
@@ -150,6 +156,11 @@ jobs:
           mkdir -p "$HOME/.kama/$KAMA_VERSION"
           tar -xzf "$asset" -C "$HOME/.kama/$KAMA_VERSION" --strip-components=1
           cygpath -w "$HOME/.kama/$KAMA_VERSION/bin" >> "$GITHUB_PATH"
+
+      # KPG-46: kama's `pkg install` cannot unpack a registry package on Windows, so the locked ones are put into its
+      # store first. Delete this step with tools/seed-kama-store.sh once it is fixed.
+      - name: Seed kama's store (KPG-46)
+        run: tools/seed-kama-store.sh
 
       # EDB's zip is 340 MB; tools/pg-native.sh checks its SHA256 whether it was downloaded or restored.
       - name: Cache EDB's PostgreSQL binaries

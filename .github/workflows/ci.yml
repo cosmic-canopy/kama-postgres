@@ -81,7 +81,14 @@ jobs:
           "${OPENSSL:-openssl}" version
 
       - name: Unit tests
-        run: tools/test.sh
+        run: |
+          set -o pipefail
+          mkdir -p out
+          tools/test.sh 2>&1 | tee out/ci-step.log
+
+      - name: The failure's last lines, as an annotation (readable without the log's token)
+        if: failure()
+        run: tools/ci-annotate.sh out/ci-step.log
 
   integration:
     name: integration (PostgreSQL ${{ matrix.pg }})
@@ -108,7 +115,13 @@ jobs:
         run: tools/pg.sh smoke --version ${{ matrix.pg }}
 
       - name: Integration tests (debug, release, release over TLS, restarts, and the examples)
-        run: tools/test-integration.sh --version ${{ matrix.pg }}
+        run: |
+          set -o pipefail
+          tools/test-integration.sh --version ${{ matrix.pg }} 2>&1 | tee out/ci-step.log
+
+      - name: The failure's last lines, as an annotation (readable without the log's token)
+        if: failure()
+        run: tools/ci-annotate.sh out/ci-step.log
 
       - name: Server log on failure
         if: failure()
@@ -152,7 +165,13 @@ jobs:
         run: tools/pg.sh smoke --version 18
 
       - name: Integration tests (debug, release, release over TLS, restarts, and the examples)
-        run: tools/test-integration.sh --version 18
+        run: |
+          set -o pipefail
+          tools/test-integration.sh --version 18 2>&1 | tee out/ci-step.log
+
+      - name: The failure's last lines, as an annotation (readable without the log's token)
+        if: failure()
+        run: tools/ci-annotate.sh out/ci-step.log
 
       - name: Server log on failure
         if: failure()
